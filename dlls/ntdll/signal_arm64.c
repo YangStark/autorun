@@ -890,6 +890,27 @@ __ASM_GLOBAL_FUNC( NTDLL__setjmpex,
                    "ret" )
 
 
+void __cdecl DECLSPEC_NORETURN longjmp_regs( _JUMP_BUFFER *buf, int retval );
+__ASM_GLOBAL_FUNC( longjmp_regs,
+                   ".seh_endprologue\n\t"
+                   "ldp x19, x20, [x0, #0x10]\n\t"
+                   "ldp x21, x22, [x0, #0x20]\n\t"
+                   "ldp x23, x24, [x0, #0x30]\n\t"
+                   "ldp x25, x26, [x0, #0x40]\n\t"
+                   "ldp x27, x28, [x0, #0x50]\n\t"
+                   "ldp x29, x30, [x0, #0x60]\n\t"
+                   "ldr x2,       [x0, #0x70]\n\t"
+                   "ldp w3, w4,   [x0, #0x78]\n\t"
+                   "msr fpcr, x3\n\t"
+                   "msr fpsr, x4\n\t"
+                   "ldp d8,  d9,  [x0, #0x80]\n\t"
+                   "ldp d10, d11, [x0, #0x90]\n\t"
+                   "ldp d12, d13, [x0, #0xa0]\n\t"
+                   "ldp d14, d15, [x0, #0xb0]\n\t"
+                   "mov sp, x2\n\t"
+                   "mov w0, w1\n\t"
+                   "ret" )
+
 /*******************************************************************
  *		longjmp (NTDLL.@)
  */
@@ -898,6 +919,8 @@ void __cdecl NTDLL_longjmp( _JUMP_BUFFER *buf, int retval )
     EXCEPTION_RECORD rec;
 
     if (!retval) retval = 1;
+    /* Like x86-64, a NULL frame requests a register restore without SEH unwind. */
+    if (!buf->Frame) longjmp_regs( buf, retval );
 
     rec.ExceptionCode = STATUS_LONGJUMP;
     rec.ExceptionFlags = 0;

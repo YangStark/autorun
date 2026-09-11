@@ -1294,10 +1294,26 @@ NTSTATUS WINAPI Wow64KiUserCallbackDispatcher( ULONG id, void *args, ULONG len,
             ctx.Eip = pLdrSystemDllInitBlock->pKiUserCallbackDispatcher;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
 
-            if (!setjmp( frame.jmpbuf ))
-                cpu_simulate();
+            /* NtCallbackReturn is an internal non-local return to this frame. The
+             * Wine-NX backend crosses PE, Unix and generated-code frames, so an
+             * ARM64 unwind cannot reliably walk back to this callback frame. A
+             * NULL unwind frame makes ntdll restore the saved registers directly. */
+#ifdef __aarch64__
+            if (__wine_switch_cpu_backend == IMAGE_FILE_MACHINE_I386)
+            {
+                if (!_setjmpex( frame.jmpbuf, NULL ))
+                    cpu_simulate();
+                else
+                    pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &orig_ctx );
+            }
             else
-                pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &orig_ctx );
+#endif
+            {
+                if (!setjmp( frame.jmpbuf ))
+                    cpu_simulate();
+                else
+                    pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &orig_ctx );
+            }
         }
         break;
 
