@@ -3519,8 +3519,33 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
     process_driver_events( QS_ALLINPUT, wake_mask, changed_mask );
     if (!(changed_mask & QS_SMRESULT) && (event = get_user_thread_info()->idle_event)) NtSetEvent( event, NULL );
 
+#ifdef __SWITCH__
+    /* The Switch display driver polls controller and touch input from the
+     * message loop rather than from a descriptor the server could watch. Wait
+     * in 10 ms slices and poll it in between, so input still arrives while a
+     * menu, a dialog or a SendMessage waits here. */
+    for (;;)
+    {
+        LARGE_INTEGER slice = {.QuadPart = -100000}, *wait = &slice;
+
+        if (abs)
+        {
+            NtQuerySystemTime( &now );
+            if (abs->QuadPart - now.QuadPart <= 100000) wait = abs;
+        }
+        ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), wait );
+        if (ret == STATUS_TIMEOUT && wait != abs)
+        {
+            user_driver->pProcessEvents( QS_ALLINPUT );
+            continue;
+        }
+        if (ret == count - 1 && !process_driver_events( QS_ALLINPUT, wake_mask, changed_mask )) continue;
+        break;
+    }
+#else
     do ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), abs );
     while (ret == count - 1 && !process_driver_events( QS_ALLINPUT, wake_mask, changed_mask ));
+#endif
 
     if (HIWORD(ret)) /* is it an error code? */
     {
