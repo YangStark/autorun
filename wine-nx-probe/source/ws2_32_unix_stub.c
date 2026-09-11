@@ -234,6 +234,30 @@ const unixlib_entry_t wine_nx_ws2_32_unix_funcs[] =
     stub_not_implemented,  /* unix_getnameinfo */
 };
 
+/* 32-bit DLLs under WoW64 pass 32-bit argument structures, so the tables
+ * above cannot serve them. These let the DLLs load; every call reports the
+ * feature as unavailable. Sizes are checked against the Wine enums by
+ * tests/check_wow64_unix_tables.py. */
+const unixlib_entry_t wine_nx_ws2_32_wow64_unix_funcs[5] =
+{
+    stub_not_implemented,  /* unix_getaddrinfo */
+    stub_not_implemented,  /* unix_gethostbyaddr */
+    stub_not_implemented,  /* unix_gethostbyname */
+    stub_not_implemented,  /* unix_gethostname */
+    stub_not_implemented,  /* unix_getnameinfo */
+};
+
+/* opengl32: enum unix_funcs in dlls/opengl32/unixlib.h. DllMain fails unless
+ * process and thread attach succeed; there is no OpenGL, which programs using
+ * GDI (such as OpenTTD's win32 video driver) never ask for. */
+const unixlib_entry_t wine_nx_opengl32_wow64_unix_funcs[3102] =
+{
+    stub_success,  /* unix_process_attach */
+    stub_success,  /* unix_thread_attach */
+    stub_success,  /* unix_process_detach */
+    [3 ... 3101] = stub_not_implemented,
+};
+
 /* crypt32: 7 functions. Layout: enum unix_funcs in
  * dlls/crypt32/crypt32_private.h. process_attach must succeed for DllMain
  * to complete (it does global setup). The rest can fail until we have a

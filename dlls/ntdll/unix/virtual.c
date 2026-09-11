@@ -1069,6 +1069,41 @@ static const struct
     { {'w','i','n','3','2','u','.','d','l','l',0}, wine_nx_win32u_unix_funcs },
 };
 
+/* Tables for 32-bit DLLs under WoW64 (see ws2_32_unix_stub.c). Those modules
+ * are in the 32-bit loader list only, so they are matched by the DLL name in
+ * their export directory. */
+extern const unixlib_entry_t wine_nx_ws2_32_wow64_unix_funcs[];
+extern const unixlib_entry_t wine_nx_opengl32_wow64_unix_funcs[];
+
+static const struct
+{
+    const char  *name;
+    const void  *funcs;
+} wine_nx_static_wow64_unix_libs[] =
+{
+    { "ws2_32.dll", wine_nx_ws2_32_wow64_unix_funcs },
+    { "opengl32.dll", wine_nx_opengl32_wow64_unix_funcs },
+};
+
+static const char *wine_nx_module_export_name( void *module )
+{
+    const IMAGE_DOS_HEADER *dos = module;
+    const IMAGE_NT_HEADERS32 *nt;
+    const IMAGE_DATA_DIRECTORY *dir;
+    const IMAGE_EXPORT_DIRECTORY *exports;
+
+    if (!module || dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+    nt = (const IMAGE_NT_HEADERS32 *)((const char *)module + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+    if (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+        dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    else
+        dir = &((const IMAGE_NT_HEADERS64 *)nt)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir->VirtualAddress || !dir->Size) return NULL;
+    exports = (const IMAGE_EXPORT_DIRECTORY *)((const char *)module + dir->VirtualAddress);
+    return exports->Name ? (const char *)module + exports->Name : NULL;
+}
+
 static int wine_nx_wcsicmp_ascii( const WCHAR *a, const WCHAR *b )
 {
     while (*a && *b)
@@ -1126,6 +1161,18 @@ static NTSTATUS get_builtin_unix_funcs( void *module, BOOL wow, const void **fun
         if (static_funcs)
         {
             *funcs = static_funcs;
+            return STATUS_SUCCESS;
+        }
+    }
+    else
+    {
+        const char *name = wine_nx_module_export_name( module );
+        unsigned int i;
+
+        for (i = 0; name && i < ARRAY_SIZE(wine_nx_static_wow64_unix_libs); i++)
+        {
+            if (strcasecmp( name, wine_nx_static_wow64_unix_libs[i].name )) continue;
+            *funcs = wine_nx_static_wow64_unix_libs[i].funcs;
             return STATUS_SUCCESS;
         }
     }
