@@ -17,8 +17,10 @@
 #include "config.h"
 
 #include <stdio.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -32,6 +34,8 @@ extern void *wine_nx_fb_lock( int *width, int *height, int *stride_px );
 extern void  wine_nx_fb_unlock( void );
 extern void  wine_nx_fb_present( void );
 extern int   wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons );
+extern int   wine_nx_pointer_take( int *x, int *y, unsigned int *buttons, unsigned int *pressed,
+                                   unsigned int *released );
 extern void  wine_nx_pointer_set_pos( int x, int y );
 extern void  wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 extern int   wine_nx_runtime_verbose __attribute__((weak));
@@ -59,6 +63,43 @@ struct wine_nx_surface_entry
 };
 
 static struct wine_nx_surface_entry *wine_nx_surface_entries;
+static volatile int wine_nx_input_thread_started;
+static void nxdrv_trace( const char *fmt, int a, int b, int c, int d );
+static void nxdrv_trace_hot( const char *fmt, int a, int b, int c, int d );
+
+/* Moves the drawn cursor while the program is too busy to pump messages, such
+ * as OpenTTD loading its sprites. This thread has no TEB, so it must not call
+ * into Wine: the first server call dereferences a NULL TEB. It only polls the
+ * controller and presents; ProcessEvents sends the input from a Wine thread. */
+static void *wine_nx_input_thread( void *arg )
+{
+    (void)arg;
+    for (;;)
+    {
+        unsigned int buttons;
+        int x, y;
+
+        wine_nx_pointer_poll( &x, &y, &buttons );
+        wine_nx_fb_present();
+        usleep( 16000 );
+    }
+    return NULL;
+}
+
+static void wine_nx_start_input_thread(void)
+{
+    pthread_t thread;
+
+    if (__atomic_exchange_n( &wine_nx_input_thread_started, 1, __ATOMIC_ACQ_REL )) return;
+    if (pthread_create( &thread, NULL, wine_nx_input_thread, NULL ))
+    {
+        __atomic_store_n( &wine_nx_input_thread_started, 0, __ATOMIC_RELEASE );
+        nxdrv_trace( "[NXINPUT] thread create failed", 0, 0, 0, 0 );
+        return;
+    }
+    pthread_detach( thread );
+    nxdrv_trace( "[NXINPUT] background polling started", 0, 0, 0, 0 );
+}
 
 static struct wine_nx_surface *wine_nx_surface_from_base( struct window_surface *surface )
 {
@@ -348,6 +389,12 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
     }
 
     wine_nx_fb_unlock();
+    /* Some applications (including OpenTTD's GDI backend) flush a surface
+     * from an update path that does not pass through NtUserEndPaint.  The
+     * dirty pixels are already copied above; publish that buffer here so the
+     * Switch display cannot remain on the initial white frame until another
+     * unrelated message arrives. */
+    wine_nx_fb_present();
     return TRUE;
 }
 
@@ -409,36 +456,71 @@ UINT wine_nx_drv_UpdateDisplayDevices( const struct gdi_device_manager *dm, void
  * applications useful input immediately, including non-client hit testing,
  * menus and controls.
  */
+/* The button flags that take the delivered buttons (last) to the held ones,
+ * in two steps: a button pressed and released since the last delivery clicks
+ * (down, then up), and one released and pressed again goes up, then down. */
+static void wine_nx_pointer_flags( unsigned int last, unsigned int held, unsigned int pressed,
+                                   unsigned int released, DWORD *first, DWORD *second )
+{
+    static const struct { unsigned int button; DWORD down, up; } map[] =
+    {
+        { WINE_NX_POINTER_LEFT, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP },
+        { WINE_NX_POINTER_RIGHT, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP },
+    };
+    unsigned int i;
+
+    *first = *second = 0;
+    for (i = 0; i < ARRAY_SIZE(map); i++)
+    {
+        unsigned int button = map[i].button;
+
+        if (last & button)
+        {
+            if ((held & button) && !(released & button)) continue;
+            *first |= map[i].up;
+            if (held & button) *second |= map[i].down;
+        }
+        else if ((held | pressed) & button)
+        {
+            *first |= map[i].down;
+            if (!(held & button)) *second |= map[i].up;
+        }
+    }
+}
+
+static void wine_nx_send_mouse( int x, int y, DWORD flags )
+{
+    INPUT input = {0};
+
+    input.type = INPUT_MOUSE;
+    input.mi.dx = x;
+    input.mi.dy = y;
+    input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | flags;
+    NtUserSendHardwareInput( 0, 0, &input, 0 );
+}
+
 BOOL wine_nx_drv_ProcessEvents( DWORD mask )
 {
     static unsigned int last_buttons;
-    INPUT input = {0};
-    unsigned int buttons = 0, changed;
+    unsigned int buttons, pressed, released;
+    DWORD first, second;
     BOOL moved;
     int x, y;
 
     (void)mask;
     wine_nx_fb_present();
-    moved = wine_nx_pointer_poll( &x, &y, &buttons );
-    changed = buttons ^ last_buttons;
-    if (moved || changed)
-    {
-        input.type = INPUT_MOUSE;
-        input.mi.dx = x;
-        input.mi.dy = y;
-        input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE;
-        if (moved) input.mi.dwFlags |= MOUSEEVENTF_MOVE;
-        if (changed & WINE_NX_POINTER_LEFT)
-            input.mi.dwFlags |= (buttons & WINE_NX_POINTER_LEFT) ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
-        if (changed & WINE_NX_POINTER_RIGHT)
-            input.mi.dwFlags |= (buttons & WINE_NX_POINTER_RIGHT) ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
-        NtUserSendHardwareInput( 0, 0, &input, 0 );
-        if (changed) nxdrv_trace( "[NXINPUT] buttons=%x flags=%x x=%d y=%d", buttons, input.mi.dwFlags, x, y );
-        else nxdrv_trace_hot( "[NXINPUT] move x=%d y=%d buttons=%x", x, y, buttons, 0 );
-        last_buttons = buttons;
-    }
+    /* Poll here too, then deliver everything the polls saw since the last
+     * call, including those of the background thread. */
+    wine_nx_pointer_poll( &x, &y, &buttons );
+    moved = wine_nx_pointer_take( &x, &y, &buttons, &pressed, &released );
+    wine_nx_pointer_flags( last_buttons, buttons, pressed, released, &first, &second );
+    if (moved || first) wine_nx_send_mouse( x, y, (moved ? MOUSEEVENTF_MOVE : 0) | first );
+    if (second) wine_nx_send_mouse( x, y, second );
+    if (first) nxdrv_trace( "[NXINPUT] buttons=%x flags=%x,%x x=%d", buttons, first, second, x );
+    else if (moved) nxdrv_trace_hot( "[NXINPUT] move x=%d y=%d buttons=%x", x, y, buttons, 0 );
+    last_buttons = buttons;
     wine_nx_fb_present();
-    return moved || changed;
+    return moved || first;
 }
 
 /**********************************************************************
@@ -488,6 +570,7 @@ BOOL wine_nx_drv_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surfa
     nxdrv_trace( "[NXDRV] CreateWindowSurface rect=%d,%d %dx%d", surface_rect->left, surface_rect->top,
                  width, height );
     nxdrv_trace( "[NXDRV] surface_create -> %d", *surface ? 1 : 0, 0, 0, 0 );
+    wine_nx_start_input_thread();
     return TRUE;
 }
 

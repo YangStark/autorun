@@ -7,7 +7,7 @@ import tempfile
 root = Path(__file__).resolve().parents[2]
 source = (root / 'dlls/win32u/winnx_drv.c').read_text()
 defines = source[source.index('/* Buttons reported by wine_nx_pointer_poll(). */'):source.index('struct wine_nx_surface\n')]
-events = source[source.index('BOOL wine_nx_drv_ProcessEvents('):source.index('/**********************************************************************\n *           wine_nx_drv_CreateWindow')]
+events = source[source.index('/* The button flags that take the delivered buttons'):source.index('/**********************************************************************\n *           wine_nx_drv_CreateWindow')]
 fixture = r'''
 #include <assert.h>
 #include <stdio.h>
@@ -24,13 +24,19 @@ typedef long LPARAM;
 #define MOUSEEVENTF_RIGHTDOWN 0x0008
 #define MOUSEEVENTF_RIGHTUP 0x0010
 #define MOUSEEVENTF_ABSOLUTE 0x8000
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 typedef struct { int dx, dy; DWORD mouseData, dwFlags, time; unsigned long dwExtraInfo; } MOUSEINPUT;
 typedef struct { DWORD type; MOUSEINPUT mi; } INPUT;
-static struct { int moved, x, y; unsigned int buttons; } state;
+/* What the runtime's polls saw since the last take (the background thread's included). */
+static struct { int moved, x, y; unsigned int held, pressed, released; } state;
 static INPUT sent[32];
-static int sent_count, presents, set_x = -1, set_y = -1;
+static int sent_count, presents, polls, set_x = -1, set_y = -1;
 static int wine_nx_pointer_poll(int *x, int *y, unsigned int *buttons) {
-    *x = state.x; *y = state.y; *buttons = state.buttons; return state.moved;
+    polls++; *x = state.x; *y = state.y; *buttons = state.held; return state.moved;
+}
+static int wine_nx_pointer_take(int *x, int *y, unsigned int *buttons, unsigned int *pressed, unsigned int *released) {
+    *x = state.x; *y = state.y; *buttons = state.held; *pressed = state.pressed; *released = state.released;
+    return state.moved;
 }
 static void wine_nx_pointer_set_pos(int x, int y) { set_x = x; set_y = y; }
 static void wine_nx_fb_present(void) { presents++; }
@@ -42,22 +48,36 @@ static UINT NtUserSendHardwareInput(HWND hwnd, UINT flags, const INPUT *input, L
 }
 '''
 tests = r'''
-/* Poll once with the given runtime state; return the flags sent, or -1 for none. */
-static int poll(int moved, int x, int y, unsigned int buttons) {
-    int before = sent_count;
+/* Call ProcessEvents once with what the polls saw; return the flags of the
+ * events sent (second << 32 | first), or -1 for none. */
+static long long take(int moved, int x, int y, unsigned int held, unsigned int pressed, unsigned int released) {
+    long long flags = 0;
+    int before = sent_count, i;
     BOOL ret;
-    state.moved = moved; state.x = x; state.y = y; state.buttons = buttons;
+    state.moved = moved; state.x = x; state.y = y;
+    state.held = held; state.pressed = pressed; state.released = released;
     ret = wine_nx_drv_ProcessEvents(0);
-    assert(sent_count - before <= 1);
+    assert(sent_count - before <= 2);
     assert(ret == (sent_count != before));
     if (sent_count == before) return -1;
-    assert(sent[before].mi.dx == x && sent[before].mi.dy == y);
-    return (int)sent[before].mi.dwFlags;
+    for (i = before; i < sent_count; i++) {
+        assert(sent[i].mi.dx == x && sent[i].mi.dy == y);
+        flags |= (long long)sent[i].mi.dwFlags << (32 * (i - before));
+    }
+    return flags;
+}
+/* One poll between calls: the edges follow from the previous buttons. */
+static unsigned int previous;
+static long long poll(int moved, int x, int y, unsigned int buttons) {
+    long long flags = take(moved, x, y, buttons, buttons & ~previous, previous & ~buttons);
+    previous = buttons;
+    return flags;
 }
 int main(void) {
-    enum { L = WINE_NX_POINTER_LEFT, R = WINE_NX_POINTER_RIGHT, ABS = MOUSEEVENTF_ABSOLUTE };
+    enum { L = WINE_NX_POINTER_LEFT, R = WINE_NX_POINTER_RIGHT };
+    const long long ABS = MOUSEEVENTF_ABSOLUTE;
     assert(poll(0, 640, 360, 0) == -1);
-    assert(presents == 2);  /* before and after polling */
+    assert(presents == 2 && polls == 1);  /* presents before and after; polls even with the background thread */
     assert(poll(1, 700, 360, 0) == (ABS | MOUSEEVENTF_MOVE));
     /* A clicks where the cursor is, without a spurious move. */
     assert(poll(0, 700, 360, L) == (ABS | MOUSEEVENTF_LEFTDOWN));
@@ -73,8 +93,19 @@ int main(void) {
     /* A touch elsewhere moves and presses in one event; lifting releases. */
     assert(poll(1, 100, 50, L) == (ABS | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN));
     assert(poll(0, 100, 50, 0) == (ABS | MOUSEEVENTF_LEFTUP));
+    /* A tapped between two calls (seen only by the background thread) still clicks. */
+    assert(take(0, 100, 50, 0, L, L) == (ABS | MOUSEEVENTF_LEFTDOWN | (ABS | MOUSEEVENTF_LEFTUP) << 32));
+    /* ...also while the stick moves, and for B. */
+    assert(take(1, 110, 50, 0, R, R) == (ABS | MOUSEEVENTF_MOVE | MOUSEEVENTF_RIGHTDOWN | (ABS | MOUSEEVENTF_RIGHTUP) << 32));
+    /* A held, released and pressed again between calls: up, then down. */
+    assert(take(0, 110, 50, L, L, 0) == (ABS | MOUSEEVENTF_LEFTDOWN));
+    assert(take(0, 110, 50, L, L, L) == (ABS | MOUSEEVENTF_LEFTUP | (ABS | MOUSEEVENTF_LEFTDOWN) << 32));
+    /* Nothing new: nothing sent. */
+    assert(take(0, 110, 50, L, 0, 0) == -1);
+    /* Another thread took the release: the state still catches up. */
+    assert(take(0, 110, 50, 0, 0, 0) == (ABS | MOUSEEVENTF_LEFTUP));
     assert(wine_nx_drv_SetCursorPos(12, 34) && set_x == 12 && set_y == 34);
-    puts("PASS: stick moves, A left and B right clicks, drag, touch press and SetCursorPos");
+    puts("PASS: stick moves, A left and B right clicks, drag, touch press, clicks between calls and SetCursorPos");
     return 0;
 }
 '''
