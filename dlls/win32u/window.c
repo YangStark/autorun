@@ -2165,7 +2165,8 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
 #ifdef __SWITCH__
     {
         extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
-        if (&wine_nx_runtime_trace)
+        extern int wine_nx_runtime_verbose __attribute__((weak));
+        if (&wine_nx_runtime_trace && &wine_nx_runtime_verbose && wine_nx_runtime_verbose)
         {
             char buf[256];
             snprintf( buf, sizeof(buf), "[NXSURF] hwnd=%p needs=%d win=%ld,%ld-%ld,%ld vis=%ld,%ld-%ld,%ld surf=%ld,%ld-%ld,%ld",

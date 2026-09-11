@@ -47,13 +47,19 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
 
 #ifdef __SWITCH__
 extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+extern int wine_nx_runtime_verbose __attribute__((weak));
+
+static BOOL nx_trace_enabled(void)
+{
+    return &wine_nx_runtime_trace && &wine_nx_runtime_verbose && wine_nx_runtime_verbose;
+}
 
 static void nx_trace_winproc( const char *stage, const struct win_proc_params *params,
                               NTSTATUS status, ULONG ret_len )
 {
     char buf[224];
 
-    if (!&wine_nx_runtime_trace || params->msg != WM_PAINT) return;
+    if (!nx_trace_enabled() || params->msg != WM_PAINT) return;
     snprintf( buf, sizeof(buf),
               "[NXWINPROC] %s hwnd=%p func=%p procA=%p procW=%p ansi=%u dst=%u status=%08x ret=%u",
               stage, params->hwnd, params->func, params->procA, params->procW,
@@ -66,8 +72,9 @@ static void nx_trace_mouse( const char *stage, const MSG *msg, INT hittest,
 {
     char buf[224];
 
-    if (!&wine_nx_runtime_trace) return;
-    if (msg->message != WM_LBUTTONDOWN && msg->message != WM_LBUTTONUP) return;
+    if (!nx_trace_enabled()) return;
+    if (msg->message != WM_LBUTTONDOWN && msg->message != WM_LBUTTONUP &&
+        msg->message != WM_RBUTTONDOWN && msg->message != WM_RBUTTONUP) return;
     snprintf( buf, sizeof(buf),
               "[NXMOUSE] %s hwnd=%p in=%x out=%x hit=%d pt=%ld,%ld active=%p capture=%p drop=%u",
               stage, msg->hwnd, msg->message, output_msg, hittest,

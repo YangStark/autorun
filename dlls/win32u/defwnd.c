@@ -24,6 +24,7 @@
 #pragma makedep unix
 #endif
 
+#include <stdio.h>
 #include "ntgdi_private.h"
 #include "ntuser_private.h"
 #include "wine/server.h"
@@ -531,6 +532,21 @@ static void handle_window_pos_changed( HWND hwnd, const WINDOWPOS *winpos )
     RECT rect;
 
     get_client_rect_rel( hwnd, COORDS_PARENT, &rect, get_thread_dpi() );
+#ifdef __SWITCH__
+    {
+        extern void wine_nx_runtime_trace( const char *msg );
+        extern int wine_nx_runtime_verbose __attribute__((weak));
+        char text[180];
+
+        if (&wine_nx_runtime_verbose && wine_nx_runtime_verbose)
+        {
+            snprintf( text, sizeof(text), "[NXRESIZE] hwnd=%p flags=%x client=%ld,%ld-%ld,%ld",
+                      hwnd, winpos->flags, (long)rect.left, (long)rect.top,
+                      (long)rect.right, (long)rect.bottom );
+            wine_nx_runtime_trace( text );
+        }
+    }
+#endif
     if (!(winpos->flags & SWP_NOCLIENTMOVE))
         send_message( hwnd, WM_MOVE, 0, MAKELONG( rect.left, rect.top ));
 

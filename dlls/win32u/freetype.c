@@ -123,10 +123,11 @@ extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 
 static void nxft_trace( const char *fmt, ... )
 {
+    extern int wine_nx_runtime_verbose __attribute__((weak));
     char buf[256];
     va_list args;
 
-    if (!&wine_nx_runtime_trace) return;
+    if (!&wine_nx_runtime_trace || !&wine_nx_runtime_verbose || !wine_nx_runtime_verbose) return;
     va_start( args, fmt );
     vsnprintf( buf, sizeof(buf), fmt, args );
     va_end( args );

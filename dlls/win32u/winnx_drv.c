@@ -31,8 +31,14 @@
 extern void *wine_nx_fb_lock( int *width, int *height, int *stride_px );
 extern void  wine_nx_fb_unlock( void );
 extern void  wine_nx_fb_present( void );
-extern int   wine_nx_touch_poll( int *x, int *y );
+extern int   wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons );
+extern void  wine_nx_pointer_set_pos( int x, int y );
 extern void  wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+extern int   wine_nx_runtime_verbose __attribute__((weak));
+
+/* Buttons reported by wine_nx_pointer_poll(). */
+#define WINE_NX_POINTER_LEFT  0x1
+#define WINE_NX_POINTER_RIGHT 0x2
 
 struct wine_nx_surface
 {
@@ -62,7 +68,7 @@ static struct wine_nx_surface *wine_nx_surface_from_base( struct window_surface 
 static void nxdrv_trace( const char *fmt, int a, int b, int c, int d )
 {
     char buf[160];
-    if (!&wine_nx_runtime_trace) return;
+    if (!&wine_nx_runtime_trace || !&wine_nx_runtime_verbose || !wine_nx_runtime_verbose) return;
     snprintf( buf, sizeof(buf), fmt, a, b, c, d );
     wine_nx_runtime_trace( buf );
 }
@@ -296,6 +302,7 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
                                    const BITMAPINFO *shape_info, const void *shape_bits )
 {
     struct wine_nx_surface *nx_surface = wine_nx_surface_from_base( surface );
+    struct wine_nx_surface_entry *entry = wine_nx_find_surface_entry( surface->hwnd, FALSE );
     RECT blit = *dirty;
     int sw = color_info->bmiHeader.biWidth;
     int sh = abs( color_info->bmiHeader.biHeight );
@@ -304,6 +311,10 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
     int sy, sx;
 
     (void)rect;
+
+    /* A queued paint can flush after SWP_HIDEWINDOW.  Keep the DIB contents,
+     * but do not put the closed popup back over its restored owner. */
+    if (entry && !entry->visible) return TRUE;
 
     if (!intersect_rect( &blit, &blit, &nx_surface->present_rect )) return TRUE;
     if (nx_surface->has_clip && !intersect_rect( &blit, &blit, &nx_surface->clip_rect )) return TRUE;
@@ -392,54 +403,51 @@ UINT wine_nx_drv_UpdateDisplayDevices( const struct gdi_device_manager *dm, void
 /**********************************************************************
  *           wine_nx_drv_ProcessEvents
  *
- * Expose the primary Switch touchscreen contact as an absolute mouse.  This
- * gives classic Win32 applications useful input immediately, including
- * non-client hit testing, menus and controls.
+ * Expose the Switch pointer as an absolute mouse: the right analog stick
+ * moves the cursor, A is the left button and B the right, and a touchscreen
+ * contact acts as a left press under the finger.  This gives classic Win32
+ * applications useful input immediately, including non-client hit testing,
+ * menus and controls.
  */
 BOOL wine_nx_drv_ProcessEvents( DWORD mask )
 {
-    static BOOL was_down;
-    static int last_x, last_y;
+    static unsigned int last_buttons;
     INPUT input = {0};
-    BOOL down;
-    int x = last_x, y = last_y;
+    unsigned int buttons = 0, changed;
+    BOOL moved;
+    int x, y;
 
     (void)mask;
     wine_nx_fb_present();
-    down = wine_nx_touch_poll( &x, &y );
-    if (down)
-    {
-        if (x < 0) x = 0;
-        else if (x >= WINE_NX_SCREEN_W) x = WINE_NX_SCREEN_W - 1;
-        if (y < 0) y = 0;
-        else if (y >= WINE_NX_SCREEN_H) y = WINE_NX_SCREEN_H - 1;
-    }
-
-    if (down && (!was_down || x != last_x || y != last_y))
+    moved = wine_nx_pointer_poll( &x, &y, &buttons );
+    changed = buttons ^ last_buttons;
+    if (moved || changed)
     {
         input.type = INPUT_MOUSE;
         input.mi.dx = x;
         input.mi.dy = y;
-        input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
-        if (!was_down) input.mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
+        input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE;
+        if (moved) input.mi.dwFlags |= MOUSEEVENTF_MOVE;
+        if (changed & WINE_NX_POINTER_LEFT)
+            input.mi.dwFlags |= (buttons & WINE_NX_POINTER_LEFT) ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+        if (changed & WINE_NX_POINTER_RIGHT)
+            input.mi.dwFlags |= (buttons & WINE_NX_POINTER_RIGHT) ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
         NtUserSendHardwareInput( 0, 0, &input, 0 );
-        nxdrv_trace_hot( "[NXINPUT] touch state=%d x=%d y=%d", !was_down ? 1 : 2, x, y, 0 );
-        last_x = x;
-        last_y = y;
+        if (changed) nxdrv_trace( "[NXINPUT] buttons=%x flags=%x x=%d y=%d", buttons, input.mi.dwFlags, x, y );
+        else nxdrv_trace_hot( "[NXINPUT] move x=%d y=%d buttons=%x", x, y, buttons, 0 );
+        last_buttons = buttons;
     }
-    else if (!down && was_down)
-    {
-        input.type = INPUT_MOUSE;
-        input.mi.dx = last_x;
-        input.mi.dy = last_y;
-        input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTUP;
-        NtUserSendHardwareInput( 0, 0, &input, 0 );
-        nxdrv_trace_hot( "[NXINPUT] touch up x=%d y=%d", last_x, last_y, 0, 0 );
-    }
-
-    was_down = down;
     wine_nx_fb_present();
-    return down;
+    return moved || changed;
+}
+
+/**********************************************************************
+ *           wine_nx_drv_SetCursorPos
+ */
+BOOL wine_nx_drv_SetCursorPos( INT x, INT y )
+{
+    wine_nx_pointer_set_pos( x, y );
+    return TRUE;
 }
 
 /**********************************************************************
@@ -498,7 +506,9 @@ void wine_nx_drv_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint
     nxdrv_trace( "[NXDRV] WindowPosChanged surface=%d swp=%x", surface ? 1 : 0, swp_flags, 0, 0 );
     if (swp_flags & SWP_HIDEWINDOW)
     {
+        wine_nx_note_surface_hidden( hwnd );
         wine_nx_restore_popup_owner( hwnd, owner_hint, has_old_screen_rect ? &old_screen_rect : NULL );
+        wine_nx_fb_present();
         return;
     }
     if (surface)

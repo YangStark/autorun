@@ -58,13 +58,19 @@ WINE_DEFAULT_DEBUG_CHANNEL(font);
 
 #ifdef __SWITCH__
 extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+extern int wine_nx_runtime_verbose __attribute__((weak));
+
+static BOOL nxfont_trace_enabled(void)
+{
+    return &wine_nx_runtime_trace && &wine_nx_runtime_verbose && wine_nx_runtime_verbose;
+}
 
 static void nxfont_trace( const char *fmt, ... )
 {
     char buf[256];
     va_list args;
 
-    if (!&wine_nx_runtime_trace) return;
+    if (!nxfont_trace_enabled()) return;
     va_start( args, fmt );
     vsnprintf( buf, sizeof(buf), fmt, args );
     va_end( args );
@@ -76,6 +82,7 @@ static void nxfont_trace_wpath( const char *tag, const WCHAR *path, UINT flags, 
     char pathA[180];
     unsigned int i;
 
+    if (!nxfont_trace_enabled()) return;
     for (i = 0; path && path[i] && i < sizeof(pathA) - 1; i++)
         pathA[i] = (path[i] >= 32 && path[i] < 127) ? (char)path[i] : '?';
     pathA[i] = 0;
