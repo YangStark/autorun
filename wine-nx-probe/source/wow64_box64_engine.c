@@ -21,6 +21,16 @@
 #include "x64emu_private.h"
 #include "x87emu_private.h"
 #include "x64_signals.h"
+#ifdef WINE_NX_BOX64_DYNAREC
+extern int wine_nx_box64_dynarec_init(void);
+extern void wine_nx_box64_dynarec_add_stop( uint32_t address );
+
+static inline uint64_t current_x18(void)
+{
+    register uint64_t x18 __asm__("x18");
+    return x18;
+}
+#endif
 
 struct nx_engine
 {
@@ -38,6 +48,7 @@ struct nx_engine
     ULONGLONG remaining, executed;
     NTSTATUS status;
     pthread_mutex_t *held_mutex;
+    int dynarec;    /* running under Box64's dynarec (EmuRun) rather than Run */
 };
 
 static __thread struct nx_engine *active_engine;
@@ -89,6 +100,15 @@ static void stop_engine( x64emu_t *emu, NTSTATUS status )
 BOOL wine_nx_box64_handle_fault( ULONG_PTR address )
 {
     if (!active_engine || address > 0xffffffffu) return FALSE;
+#ifdef WINE_NX_BOX64_DYNAREC
+    /* Cancel while FillBlock64's stack helper is still alive, and only when
+     * this engine owns the global translator lock. */
+    if (active_engine->held_mutex == &core_context.mutex_dyndump)
+    {
+        extern void CancelBlock64(int);
+        CancelBlock64( 0 );
+    }
+#endif
     stop_engine( &active_engine->emu, STATUS_ACCESS_VIOLATION );
     return TRUE;
 }
@@ -124,7 +144,12 @@ int wine_nx_box64_before_instruction( x64emu_t *emu, uintptr_t pc )
     if (emu->segs[_CS] != 0x23 || pc > 0xffffffffu)
         stop_engine( emu, STATUS_NOT_SUPPORTED );
     if (pc == engine->gates->syscall || pc == engine->gates->unix_call ||
-        (engine->completion && pc == engine->completion)) return 1;
+        (engine->completion && pc == engine->completion))
+    {
+        /* Box64's EmuRun would only ask for the next block again: end the run. */
+        if (engine->dynarec) stop_engine( emu, STATUS_SUCCESS );
+        return 1;
+    }
     if (!engine->remaining) stop_engine( emu, STATUS_TIMEOUT );
     CheckExec( emu, pc );
     /* Reject state families not represented by this initial adapter before
@@ -234,10 +259,13 @@ void my_cpuid( x64emu_t *emu, uint32_t leaf )
 }
 uint32_t helper_getcpu( x64emu_t *emu ) { stop_engine( emu, STATUS_NOT_SUPPORTED ); return 0; }
 
+ULONGLONG wine_nx_box64_tsc_reads;
+
 /* A monotonic nanosecond count; CPUID advertises TSC. */
 uint64_t ReadTSC( x64emu_t *emu )
 {
     (void)emu;
+    __atomic_add_fetch( &wine_nx_box64_tsc_reads, 1, __ATOMIC_RELAXED );
 #ifdef __SWITCH__
     return armTicksToNs( armGetSystemTick() );
 #else
@@ -337,6 +365,9 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
     NTSTATUS status;
     fenv_t native_fenv;
     int i;
+#ifdef WINE_NX_BOX64_DYNAREC
+    int use_dynarec;
+#endif
     if (executed) *executed = 0;
     if (!context || !gates || !host || !host->read || !gates->syscall ||
         !gates->unix_call || gates->syscall == gates->unix_call || !budget ||
@@ -352,17 +383,38 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
     for (i = 0; i < 16; ++i) engine->emu.sbiidx[i] = &engine->emu.regs[i];
     engine->emu.sbiidx[4] = &engine->emu.zero;
     reset_fpu( &engine->emu );
+#ifdef WINE_NX_BOX64_DYNAREC
+    use_dynarec = wine_nx_box64_dynarec_init();
+    /* Gates hold INT3 sentinels; the dynarec must leave them to the hook. */
+    wine_nx_box64_dynarec_add_stop( gates->syscall );
+    wine_nx_box64_dynarec_add_stop( gates->unix_call );
+    wine_nx_box64_dynarec_add_stop( completion_pc );
+#endif
     for (;;)
     {
         status = import_context( engine, context );
         if (status) break;
+#ifdef WINE_NX_BOX64_DYNAREC
+        /* Box64 maps guest R8 to x18, which holds the TEB on Switch. A 32-bit
+         * guest never uses R8, so parking the TEB there keeps x18 intact
+         * through the prolog, helper calls and the epilog. */
+        engine->emu.regs[_R8].q[0] = current_x18();
+#endif
         fegetenv( &native_fenv );
         active_engine = engine;
 #ifdef __SWITCH__
-        if (!setjmp( engine->escape )) Run( &engine->emu, 0 );
+        if (!setjmp( engine->escape ))
 #else
-        if (!sigsetjmp( engine->escape, 1 )) Run( &engine->emu, 0 );
+        if (!sigsetjmp( engine->escape, 1 ))
 #endif
+        {
+#ifdef WINE_NX_BOX64_DYNAREC
+            engine->dynarec = use_dynarec;
+            if (use_dynarec) DynaRun( &engine->emu );
+            else
+#endif
+            Run( &engine->emu, 0 );
+        }
         active_engine = previous;
         if (engine->held_mutex)
         {

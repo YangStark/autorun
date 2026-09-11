@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(wine_nx_box64_execution C)
+project(wine_nx_box64_execution C ASM)
 get_filename_component(probe "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 include("${probe}/cmake/Box64Core.cmake")
 wine_nx_add_box64_core(box64-core)
@@ -10,18 +10,34 @@ target_include_directories(box64-execution PRIVATE "${probe}/../include" "${prob
 target_compile_options(box64-execution PRIVATE -Wall -Wextra -Werror -ffunction-sections -fdata-sections)
 target_link_options(box64-execution PRIVATE -Wl,--gc-sections)
 target_link_libraries(box64-execution PRIVATE box64-core m)
+
+# The same i386 tests through Box64's ARM64 dynarec, with split code mappings.
+wine_nx_add_box64_core(box64-core-dynarec DYNAREC)
+add_executable(box64-execution-dynarec ../box64_execution.c
+    "${probe}/source/wow64_box64_bridge.c" "${probe}/source/wow64_box64_engine.c"
+    "${probe}/source/wow64_box64_dynarec.c")
+target_compile_definitions(box64-execution-dynarec PRIVATE __WINESRC__ _WIN64)
+target_include_directories(box64-execution-dynarec PRIVATE "${probe}/../include" "${probe}/source")
+target_compile_options(box64-execution-dynarec PRIVATE -Wall -Wextra -Werror -ffunction-sections -fdata-sections)
+target_link_options(box64-execution-dynarec PRIVATE -Wl,--gc-sections)
+target_link_libraries(box64-execution-dynarec PRIVATE box64-core-dynarec m)
 if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
-    target_link_libraries(box64-execution PRIVATE nx)
-    set_target_properties(box64-execution PROPERTIES SUFFIX ".elf")
     find_program(ELF2NRO elf2nro HINTS "$ENV{DEVKITPRO}/tools/bin" REQUIRED)
-    add_custom_command(TARGET box64-execution POST_BUILD
-        COMMAND "${ELF2NRO}" "$<TARGET_FILE:box64-execution>"
-            "${CMAKE_CURRENT_BINARY_DIR}/box64-execution.nro")
+    foreach(execution_target box64-execution box64-execution-dynarec)
+        target_link_libraries(${execution_target} PRIVATE nx)
+        set_target_properties(${execution_target} PROPERTIES SUFFIX ".elf")
+        add_custom_command(TARGET ${execution_target} POST_BUILD
+            COMMAND "${ELF2NRO}" "$<TARGET_FILE:${execution_target}>"
+                "${CMAKE_CURRENT_BINARY_DIR}/${execution_target}.nro")
+    endforeach()
 else()
     target_link_libraries(box64-execution PRIVATE pthread)
+    target_link_libraries(box64-execution-dynarec PRIVATE pthread)
 endif()
 if(NOT CMAKE_CROSSCOMPILING)
     enable_testing()
     add_test(NAME box64-execution COMMAND box64-execution)
     set_tests_properties(box64-execution PROPERTIES TIMEOUT 15)
+    add_test(NAME box64-execution-dynarec COMMAND box64-execution-dynarec)
+    set_tests_properties(box64-execution-dynarec PROPERTIES TIMEOUT 15)
 endif()

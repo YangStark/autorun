@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 
-project(wine_nx_probe LANGUAGES C CXX)
+project(wine_nx_probe LANGUAGES C CXX ASM)
 
 set(WINE_NX_PE_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build-wine-arm64-pe-clean"
     CACHE PATH "Wine PE build supplying generated COM headers")
@@ -589,9 +589,15 @@ add_executable(wine-nx-runtime
 set_target_properties(wine-nx-runtime PROPERTIES SUFFIX ".elf")
 
 option(WINE_NX_BOX64_INTERPRETER "Build the experimental WoW64 Box64 interpreter adapter" OFF)
-if(WINE_NX_BOX64_INTERPRETER)
+option(WINE_NX_BOX64_DYNAREC "Use experimental ARM64 dynarec in the WoW64 adapter" OFF)
+if(WINE_NX_BOX64_INTERPRETER OR WINE_NX_BOX64_DYNAREC)
     include(cmake/Box64Core.cmake)
-    wine_nx_add_box64_core(wine-nx-box64-core)
+    if(WINE_NX_BOX64_DYNAREC)
+        wine_nx_add_box64_core(wine-nx-box64-core DYNAREC)
+        target_sources(wine-nx-runtime PRIVATE source/wow64_box64_dynarec.c)
+    else()
+        wine_nx_add_box64_core(wine-nx-box64-core)
+    endif()
     target_sources(wine-nx-runtime PRIVATE source/wow64_box64_engine.c source/wow64_box64_unix.c)
     set_source_files_properties(source/wow64_box64_unix.c PROPERTIES COMPILE_DEFINITIONS WINE_UNIX_LIB)
     target_compile_definitions(wine-virtual-real PRIVATE WINE_NX_BOX64_INTERPRETER)

@@ -8,3 +8,5 @@ wine-nx-probe/build-box64-core/
 wine-nx-probe/build-wine-wow64-pe/
 wine-nx-probe/build-switch-wow64/
 .DS_Store
+
+/wine-nx-probe/build-switch-wow64-dynarec/

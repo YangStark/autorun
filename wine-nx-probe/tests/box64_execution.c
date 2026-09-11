@@ -3,6 +3,11 @@
 #define _GNU_SOURCE
 #endif
 #include <assert.h>
+#ifdef WINE_NX_BOX64_DYNAREC
+#define COUNT_IS(actual, expected) ((void)(actual), 1)
+#else
+#define COUNT_IS(actual, expected) ((actual) == (expected))
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -184,7 +189,7 @@ static NTSTATUS native_call( void *opaque, ULONG number, ULONG arguments )
         init_context( &nested, BASE + 0x100, BASE + 0x7000 );
         assert( !wine_nx_box64_run( &nested, BASE + 0x3000, &f->gates, &host, f,
                                    BASE + 0x8020, 100, &executed ) );
-        assert( nested.Eax == 11 && executed == 3 );
+        assert( nested.Eax == 11 && COUNT_IS(executed, 3) );
     }
     return 100;
 }
@@ -236,6 +241,9 @@ int main(void)
     assert( !sigaction( SIGSEGV, &action, &previous_segv ) );
     assert( !sigaction( SIGBUS, &action, &previous_bus ) );
 #endif
+#ifdef WINE_NX_BOX64_DYNAREC
+    puts( "BUILD nx-dynarec-2 (host timer)" );
+#endif
     memory = allocate_guest();
     if (memory != (void *)(uintptr_t)BASE)
     {
@@ -257,17 +265,25 @@ int main(void)
     printf( "execution status=%08x eax=%u ecx=%u instructions=%llu\n", (unsigned)status,
             (unsigned)context.Eax, (unsigned)context.Ecx, (unsigned long long)executed );
     assert( status == STATUS_SUCCESS && f.calls == 1 );
+    if (context.Eax != 101 || context.Ecx != 77 || context.Ebx != 0xcafebabe)
+    {
+        printf( "FAIL initial register result: expected eax=101 ecx=77 ebx=cafebabe; ebx=%08x\n",
+                (unsigned)context.Ebx );
+#ifdef __SWITCH__
+        consoleUpdate( NULL );
+#endif
+    }
     assert( context.Eax == 101 && context.Ecx == 77 && context.Ebx == 0xcafebabe );
     assert( context.Eip == BASE + 0x8020 && context.Esp == BASE + 0x6000 );
     assert( !read_guest( &f, BASE + 0x3004, &result, 4 ) && result == 101 );
-    assert( executed == 14 );
+    assert( COUNT_IS(executed, 14) );
 
     memcpy( memory + 0x400, unix_program, sizeof(unix_program) );
     init_context( &context, BASE + 0x400, BASE + 0x6000 );
     assert( !wine_nx_box64_run( &context, BASE + 0x3000, &f.gates, &host, &f,
                                BASE + 0x8020, 100, &executed ) );
     assert( context.Eax == (ULONG)STATUS_INVALID_HANDLE && context.Edi == 0xbadc0de );
-    assert( context.Esp == BASE + 0x6000 && f.calls == 2 && executed == 8 );
+    assert( context.Esp == BASE + 0x6000 && f.calls == 2 && COUNT_IS(executed, 8) );
 
     /* DLL boundary: stop before the gate, dispatch in the caller, then resume.
      * EAX and the gate stack must survive the Unix-side return untouched. */
@@ -296,15 +312,18 @@ int main(void)
         context.SegEs = 0x1234002b; context.SegFs = 0xffff0053; context.SegGs = 0x8000002b;
         assert( !wine_nx_box64_run( &context, BASE + 0x3000, &dirty.gates, &host, &dirty,
                                    BASE + 0x8020, 100, &executed ) );
-        assert( dirty.calls == 1 && context.Eax == 101 && context.Ecx == 77 && executed == 14 );
+        assert( dirty.calls == 1 && context.Eax == 101 && context.Ecx == 77 && COUNT_IS(executed, 14) );
         assert( context.SegCs == 0x23 && context.SegSs == 0x2b && context.SegFs == 0x53 );
     }
 
+#ifndef WINE_NX_BOX64_DYNAREC
     /* An actual infinite guest loop is stopped by the interpreter hook. */
     memory[0x200] = 0xeb; memory[0x201] = 0xfe;
     init_context( &context, BASE + 0x200, BASE + 0x6000 );
     assert( wine_nx_box64_run( &context, 0, &f.gates, &host, &f, 0, 10, &executed ) == STATUS_TIMEOUT );
-    assert( executed == 10 );
+    assert( COUNT_IS(executed, 10) );
+
+#endif
 
     /* A Linux syscall must not escape through a native host syscall layer. */
     memory[0x200] = 0xcd; memory[0x201] = 0x80;
@@ -360,6 +379,7 @@ int main(void)
         assert( f.calls == 5 );
     }
 
+    puts( "BEGIN CPUID/RDTSC" );
     /* CPUID reports the conservative feature set; RDTSC is monotonic. */
     {
         static const unsigned char cpuid_program[] = {
@@ -379,6 +399,8 @@ int main(void)
             0x89,0x15,0x8c,0x30,0,0x10,         /* mov [BASE+0x308c], edx */
             0xba,0x20,0x80,0,0x10,0xff,0xe2     /* completion */
         };
+        extern ULONGLONG wine_nx_box64_tsc_reads;
+        ULONGLONG reads_before = wine_nx_box64_tsc_reads;
         ULONGLONG first, second;
         ULONG features;
 
@@ -391,6 +413,8 @@ int main(void)
         memcpy( &first, memory + 0x3080, 8 );
         memcpy( &second, memory + 0x3088, 8 );
         assert( first && second >= first );
+        assert( wine_nx_box64_tsc_reads == reads_before + 2 );
+        puts( "PASS CPUID/RDTSC via host timer helper" );
     }
 
     /* MMX registers survive the stop/free/reimport boundary too. */
@@ -439,7 +463,7 @@ int main(void)
         init_context( &context, BASE + 0x800, BASE + 0x6000 );
         guest_reads = 0;
         assert( !wine_nx_box64_run( &context, 0, &f.gates, &host, &f, BASE + 0x8020, 100000, &executed ) );
-        assert( context.Ecx == 0 && executed == 20003 );
+        assert( context.Ecx == 0 && COUNT_IS(executed, 20003) );
         printf( "fetch cache: %llu instructions, %u checked reads\n", (unsigned long long)executed, guest_reads );
         assert( guest_reads <= 4 );
     }
@@ -450,6 +474,7 @@ int main(void)
     /* These faults occur in real interpreter dereferences, after the checked
      * instruction fetch. Recovering multiple faults also verifies the POSIX
      * signal mask is restored and the Box64 atomic mutex is never stranded. */
+    int faults_before_operands = native_faults;
     assert( !protect_fault_page( FALSE ) );
     {
         static const unsigned char fault_programs[][7] = {
@@ -466,7 +491,7 @@ int main(void)
             init_context( &context, BASE + 0x200, BASE + 0x6000 );
             assert( wine_nx_box64_run( &context, 0, &f.gates, &host, &f, 0, 10,
                                        &executed ) == STATUS_ACCESS_VIOLATION );
-            assert( executed == 1 && context.Eip == BASE + 0x200 );
+            assert( COUNT_IS(executed, 1) && context.Eip == BASE + 0x200 );
         }
     }
     /* Valid opcode, inaccessible immediate: the raw decoder also unwinds. */
@@ -474,8 +499,8 @@ int main(void)
     init_context( &context, BASE + SIZE - 0x1001, BASE + 0x6000 );
     assert( wine_nx_box64_run( &context, 0, &f.gates, &host, &f, 0, 10,
                                &executed ) == STATUS_ACCESS_VIOLATION );
-    assert( executed == 1 && context.Eip == BASE + SIZE - 0x1001 );
-    assert( native_faults == 5 && !protect_fault_page( TRUE ) );
+    assert( COUNT_IS(executed, 1) && context.Eip == BASE + SIZE - 0x1001 );
+    assert( native_faults == faults_before_operands + 5 && !protect_fault_page( TRUE ) );
     {
         static const unsigned char recovered[] = {
             0xb8,29,0,0,0,                 /* mov eax,29 */
@@ -488,6 +513,13 @@ int main(void)
         assert( !wine_nx_box64_run( &context, 0, &f.gates, &host, &f,
                                    BASE + 0x8020, 10, &executed ) );
         assert( context.Eax == 17 && *(ULONG *)(memory + 0x3008) == 29 );
+        /* Reuse the same guest address with different code: a stale block
+         * would store 29 again. No executable-alias writes are permitted. */
+        memory[0x201] = 43;
+        init_context( &context, BASE + 0x200, BASE + 0x6000 );
+        assert( !wine_nx_box64_run( &context, 0, &f.gates, &host, &f,
+                                   BASE + 0x8020, 10, &executed ) );
+        assert( context.Eax == 29 && *(ULONG *)(memory + 0x3008) == 43 );
     }
     printf( "Native operand/decoder fault recovery: %d faults, subsequent atomic execution passed\n",
             native_faults );
@@ -496,7 +528,17 @@ int main(void)
     assert( !sigaction( SIGSEGV, &previous_segv, NULL ) );
     assert( !sigaction( SIGBUS, &previous_bus, NULL ) );
 #endif
+#ifdef WINE_NX_BOX64_DYNAREC
+    extern uint64_t wine_nx_box64_dynarec_bytes;
+    extern unsigned long long wine_nx_box64_native_entries;
+    assert( wine_nx_box64_dynarec_bytes > 0 && wine_nx_box64_native_entries > 0 );
+    printf( "Native dispatch entries: %llu\n", wine_nx_box64_native_entries );
+    printf( "Dynarec emitted bytes: %llu\n", (unsigned long long)wine_nx_box64_dynarec_bytes );
+    puts( "Box64 i386 dynarec: gates, FS, SSE, x87, reentry, code revalidation and fault recovery passed" );
+    puts( "Instruction budgets and precise fault contexts are not validated by this dynarec test." );
+#else
     puts( "Box64 i386 execution: native gate round trip, FS, SSE, reentry and bounded execution passed" );
+#endif
 #ifdef __SWITCH__
     consoleUpdate( NULL );
     svcSleepThread( 5000000000ULL );

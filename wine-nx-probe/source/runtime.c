@@ -36,7 +36,11 @@ u32 __nx_exception_ignoredebug = 1;
 #define WINE_SYSTEM_DIR WINE_DRIVE_C "/windows/system32"
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
+#ifdef WINE_NX_BOX64_DYNAREC
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-11"
+#else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
+#endif
 #define MAX_RUNTIME_MODULES 64
 #define MAX_IMPORT_DEPTH 16
 
@@ -395,6 +399,15 @@ static void runtime_report_interpreter(void)
     u64 now = armGetSystemTick();
     double seconds;
 
+#ifdef WINE_NX_BOX64_DYNAREC
+    {
+        extern unsigned long long wine_nx_box64_native_entries;
+        extern uint64_t wine_nx_box64_dynarec_bytes;
+        log_line( "[DYNAREC] native_entries=%llu emitted_bytes=%llu",
+                  __atomic_load_n( &wine_nx_box64_native_entries, __ATOMIC_RELAXED ),
+                  (unsigned long long)__atomic_load_n( &wine_nx_box64_dynarec_bytes, __ATOMIC_RELAXED ) );
+    }
+#endif
     if (!&wine_nx_box64_executed_total || !&wine_nx_box64_runs_total) return;
     executed = __atomic_load_n( &wine_nx_box64_executed_total, __ATOMIC_RELAXED );
     runs = __atomic_load_n( &wine_nx_box64_runs_total, __ATOMIC_RELAXED );
