@@ -5234,7 +5234,9 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
 #ifdef __SWITCH__
     {
         extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
-        if (&wine_nx_runtime_trace && attr && attr->ObjectName)
+        extern int wine_nx_runtime_verbose __attribute__((weak));
+        if (&wine_nx_runtime_trace && &wine_nx_runtime_verbose && wine_nx_runtime_verbose &&
+            attr && attr->ObjectName)
         {
             char buf[256];
             char ascii[160];
@@ -7506,7 +7508,8 @@ NTSTATUS WINAPI NtDeviceIoControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUT
 #ifdef __SWITCH__
     {
         extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
-        if (&wine_nx_runtime_trace)
+        extern int wine_nx_runtime_verbose __attribute__((weak));
+        if (&wine_nx_runtime_trace && &wine_nx_runtime_verbose && wine_nx_runtime_verbose)
         {
             char buf[160];
             const char *devname = "?";

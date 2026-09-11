@@ -1649,7 +1649,8 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
      * field 4..15) so each call shows up identifiable in wine-nx-runtime.log. */
     {
         extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
-        if (&wine_nx_runtime_trace)
+        extern int wine_nx_runtime_verbose __attribute__((weak));
+        if (&wine_nx_runtime_trace && &wine_nx_runtime_verbose && wine_nx_runtime_verbose)
         {
             char buf[160];
             const char *name = "unknown";

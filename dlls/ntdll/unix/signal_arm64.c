@@ -30,6 +30,7 @@
 
 #include <setjmp.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -49,8 +50,15 @@ void set_process_instrumentation_callback( void *callback )
 
 NTSTATUS signal_set_full_context( CONTEXT *context )
 {
-    (void)context;
-    return STATUS_NOT_IMPLEMENTED;
+    extern void horizon_continue_context( const CONTEXT *context );
+
+    if (!context || (context->ContextFlags & CONTEXT_ARM64_FULL) != CONTEXT_ARM64_FULL)
+        return STATUS_INVALID_PARAMETER;
+    horizon_trace( "[CONTINUE] flags=%08x pc=%llx sp=%llx x18=%llx\n",
+                   context->ContextFlags, (unsigned long long)context->Pc,
+                   (unsigned long long)context->Sp, (unsigned long long)context->X18 );
+    horizon_continue_context( context );
+    return STATUS_UNSUCCESSFUL; /* The restore routine does not return. */
 }
 
 void *get_native_context( CONTEXT *context )
@@ -143,13 +151,36 @@ NTSTATUS call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context
 struct switch_callback_frame
 {
     struct switch_callback_frame *prev;
+    struct switch_callback_frame *child;
     jmp_buf                       jmp;
+    void                         *args;
     void                         *ret_ptr;
     ULONG                         ret_len;
     NTSTATUS                      status;
 };
 
 static __thread struct switch_callback_frame *switch_cb_top;
+static pthread_key_t switch_cb_key;
+static pthread_once_t switch_cb_once = PTHREAD_ONCE_INIT;
+static int switch_cb_key_error;
+
+static void switch_callback_destroy( void *ptr )
+{
+    struct switch_callback_frame *frame = ptr;
+    while (frame)
+    {
+        struct switch_callback_frame *next = frame->child;
+        free( frame->args );
+        free( frame->ret_ptr );
+        free( frame );
+        frame = next;
+    }
+}
+
+static void switch_callback_init(void)
+{
+    switch_cb_key_error = pthread_key_create( &switch_cb_key, switch_callback_destroy );
+}
 static __thread TEB *wine_nx_active_pe_teb;
 
 void wine_nx_set_active_pe_teb( TEB *teb )
@@ -184,30 +215,53 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
     TEB *teb = NtCurrentTeb();
     PEB *peb = teb ? teb->Peb : NULL;
     KERNEL_CALLBACK_PROC *table;
-    struct switch_callback_frame frame;
+    struct switch_callback_frame *frame;
 
+    if (ret_ptr) *ret_ptr = NULL;
+    if (ret_len) *ret_len = 0;
     if (!peb || !peb->KernelCallbackTable) return STATUS_NOT_IMPLEMENTED;
     wine_nx_set_active_pe_teb( teb );
     table = peb->KernelCallbackTable;
     if (!table[id]) return STATUS_NOT_IMPLEMENTED;
 
-    frame.prev    = switch_cb_top;
-    frame.ret_ptr = NULL;
-    frame.ret_len = 0;
-    frame.status  = STATUS_SUCCESS;
-    switch_cb_top = &frame;
+    pthread_once( &switch_cb_once, switch_callback_init );
+    if (switch_cb_key_error) return STATUS_NO_MEMORY;
+    frame = switch_cb_top ? switch_cb_top->child : pthread_getspecific( switch_cb_key );
+    if (!frame)
+    {
+        if (!(frame = calloc( 1, sizeof(*frame) ))) return STATUS_NO_MEMORY;
+        if (switch_cb_top) switch_cb_top->child = frame;
+        else if (pthread_setspecific( switch_cb_key, frame ))
+        {
+            free( frame );
+            return STATUS_NO_MEMORY;
+        }
+    }
+    /* WoW64 rewrites callback arguments in place. Never expose the caller's
+     * packed message buffer to that conversion. */
+    if (!(frame->args = malloc( len ? len : 1 ))) return STATUS_NO_MEMORY;
+    if (len) memcpy( frame->args, args, len );
+    frame->prev = switch_cb_top;
+    frame->ret_len = 0;
+    frame->status = STATUS_SUCCESS;
+    switch_cb_top = frame;
 
-    if (!setjmp( frame.jmp ))
+    if (!setjmp( frame->jmp ))
     {
         /* callback returned normally (no NtCallbackReturn): status is its retval */
-        frame.status = (NTSTATUS)wine_nx_call_pe_callback( (void *)table[id], args, len, teb );
+        frame->status = (NTSTATUS)wine_nx_call_pe_callback( (void *)table[id], frame->args, len, teb );
     }
     /* else: NtCallbackReturn longjmp'd here with frame.{ret_ptr,ret_len,status} set */
 
-    switch_cb_top = frame.prev;
-    if (ret_ptr) *ret_ptr = frame.ret_ptr;
-    if (ret_len) *ret_len = frame.ret_len;
-    return frame.status;
+    switch_cb_top = frame->prev;
+    free( frame->args );
+    frame->args = NULL;
+    /* Results survive caller-buffer frees and stack unwinding. Each nesting
+     * depth owns its result until the next callback at that depth; the thread
+     * key destructor reclaims every slot on thread exit. */
+    if (ret_ptr) *ret_ptr = frame->ret_len ? frame->ret_ptr : NULL;
+    if (ret_len) *ret_len = frame->ret_len;
+    return frame->status;
 }
 
 NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status )
@@ -215,7 +269,18 @@ NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status 
     struct switch_callback_frame *frame = switch_cb_top;
 
     if (!frame) return STATUS_NO_CALLBACK_ACTIVE;
-    frame->ret_ptr = ret_ptr;
+    if (ret_len)
+    {
+        void *copy = ret_ptr ? realloc( frame->ret_ptr, ret_len ) : NULL;
+        if (!copy)
+        {
+            frame->ret_len = 0;
+            frame->status = ret_ptr ? STATUS_NO_MEMORY : STATUS_INVALID_PARAMETER;
+            longjmp( frame->jmp, 1 );
+        }
+        frame->ret_ptr = copy;
+        memcpy( copy, ret_ptr, ret_len );
+    }
     frame->ret_len = ret_len;
     frame->status  = status;
     longjmp( frame->jmp, 1 );
@@ -316,6 +381,7 @@ extern SYSTEM_SERVICE_TABLE KeServiceDescriptorTable[];
 
 /* C dispatcher called from the assembly trampoline below */
 extern void wine_nx_runtime_trace( const char *msg );
+extern int wine_nx_runtime_verbose __attribute__((weak));
 
 /* Reacquire the Windows platform register after returning from Unix code.
  * Nested callbacks may unwind past a dispatcher frame, so restoring a saved
@@ -339,7 +405,8 @@ NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
     ULONG_PTR *handler;
     unsigned int arg_bytes;
     NTSTATUS result;
-    BOOL trace_syscall = !(table_idx == 1 && func_idx == 1051); /* NtUserGetMessage idle polling */
+    BOOL trace_syscall = &wine_nx_runtime_verbose && wine_nx_runtime_verbose &&
+                         !(table_idx == 1 && func_idx == 1051); /* NtUserGetMessage idle polling */
 
     if (func_idx >= table->ServiceLimit)
         return STATUS_INVALID_SYSTEM_SERVICE;
