@@ -2,3 +2,9 @@ wine-nx-probe/build-switch/
 wine-nx-probe/build-wine-arm64-pe-clean/
 wine-nx-probe/build-wine-arm64-pe-local/
 wine-nx-probe/toolchains/
+wine-nx-probe/vendor/
+wine-nx-probe/build-box64-core/
+
+wine-nx-probe/build-wine-wow64-pe/
+wine-nx-probe/build-switch-wow64/
+.DS_Store
