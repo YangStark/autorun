@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.18)
 
 project(wine_nx_probe LANGUAGES C CXX)
 
+set(WINE_NX_PE_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build-wine-arm64-pe-clean"
+    CACHE PATH "Wine PE build supplying generated COM headers")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -313,7 +316,7 @@ set(WINE_SWITCH_WIN32U_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/../dlls/win32u"
     # widl-generated COM headers (objidlbase.h etc.) produced by the PE build;
     # last so checked-in include/ and syntax/config.h still win.
-    "${CMAKE_CURRENT_SOURCE_DIR}/build-wine-arm64-pe-clean/include"
+    "${WINE_NX_PE_BUILD_DIR}/include"
     "$ENV{DEVKITPRO}/portlibs/switch/include/freetype2"
 )
 
@@ -557,6 +560,7 @@ target_link_libraries(wine-nx-ntdll-file-smoke PRIVATE nx)
 add_executable(wine-nx-runtime
     source/runtime.c
     source/runtime_platform.c
+    source/wow64_box64_bridge.c
     source/ntdll_pe_compat.c
     source/ws2_32_unix_stub.c
     $<TARGET_OBJECTS:wine-horizon-real>
@@ -583,6 +587,17 @@ add_executable(wine-nx-runtime
 )
 
 set_target_properties(wine-nx-runtime PROPERTIES SUFFIX ".elf")
+
+option(WINE_NX_BOX64_INTERPRETER "Build the experimental WoW64 Box64 interpreter adapter" OFF)
+if(WINE_NX_BOX64_INTERPRETER)
+    include(cmake/Box64Core.cmake)
+    wine_nx_add_box64_core(wine-nx-box64-core)
+    target_sources(wine-nx-runtime PRIVATE source/wow64_box64_engine.c source/wow64_box64_unix.c)
+    set_source_files_properties(source/wow64_box64_unix.c PROPERTIES COMPILE_DEFINITIONS WINE_UNIX_LIB)
+    target_compile_definitions(wine-virtual-real PRIVATE WINE_NX_BOX64_INTERPRETER)
+    target_compile_definitions(wine-nx-runtime PRIVATE WINE_NX_BOX64_INTERPRETER)
+    target_link_libraries(wine-nx-runtime PRIVATE wine-nx-box64-core)
+endif()
 
 target_compile_definitions(wine-nx-runtime PRIVATE ${WINE_SWITCH_NTDLL_DEFS})
 

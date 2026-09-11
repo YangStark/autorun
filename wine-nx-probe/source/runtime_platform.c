@@ -354,6 +354,8 @@ int fstatat( int dirfd, const char *path, struct stat *st, int flags )
     (void)flags;
     if (!(resolved = resolve_at_path( dirfd, path ))) return -1;
     ret = stat( resolved, st );
+    /* A file this process has open for writing cannot be reopened to stat it. */
+    if (ret == -1 && errno == EIO) ret = horizon_stat_open_file( resolved, st );
     free( resolved );
     return ret;
 }
