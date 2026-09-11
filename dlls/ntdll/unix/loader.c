@@ -1627,9 +1627,14 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
 };
 
 #ifdef __SWITCH__
+extern NTSTATUS wine_nx_call_static_wow64_unix( unixlib_handle_t handle, ULONG code, void *args );
+
+/* The x86 unix call gate: ntdll's table, or the static table of a 32-bit DLL
+ * such as ws2_32 or opengl32 (virtual.c). */
 NTSTATUS wine_nx_call_ntdll_wow64( unixlib_handle_t handle, ULONG code, ULONG args )
 {
-    if (handle != (unixlib_handle_t)unix_call_wow64_funcs) return STATUS_INVALID_HANDLE;
+    if (handle != (unixlib_handle_t)unix_call_wow64_funcs)
+        return wine_nx_call_static_wow64_unix( handle, code, ULongToPtr(args) );
     if (code >= ARRAY_SIZE(unix_call_wow64_funcs)) return STATUS_INVALID_PARAMETER;
     return unix_call_wow64_funcs[code]( ULongToPtr(args) );
 }

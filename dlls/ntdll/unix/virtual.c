@@ -1074,16 +1074,35 @@ static const struct
  * their export directory. */
 extern const unixlib_entry_t wine_nx_ws2_32_wow64_unix_funcs[];
 extern const unixlib_entry_t wine_nx_opengl32_wow64_unix_funcs[];
+extern const unsigned int wine_nx_ws2_32_wow64_unix_count;
+extern const unsigned int wine_nx_opengl32_wow64_unix_count;
 
 static const struct
 {
-    const char  *name;
-    const void  *funcs;
+    const char             *name;
+    const unixlib_entry_t  *funcs;
+    const unsigned int     *count;
 } wine_nx_static_wow64_unix_libs[] =
 {
-    { "ws2_32.dll", wine_nx_ws2_32_wow64_unix_funcs },
-    { "opengl32.dll", wine_nx_opengl32_wow64_unix_funcs },
+    { "ws2_32.dll", wine_nx_ws2_32_wow64_unix_funcs, &wine_nx_ws2_32_wow64_unix_count },
+    { "opengl32.dll", wine_nx_opengl32_wow64_unix_funcs, &wine_nx_opengl32_wow64_unix_count },
 };
+
+/* The x86 unix call gate passes on whatever handle a 32-bit DLL presents, so
+ * only these tables are called, and only below their sizes. Returns
+ * STATUS_INVALID_HANDLE for any other handle. */
+NTSTATUS wine_nx_call_static_wow64_unix( unixlib_handle_t handle, ULONG code, void *args )
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(wine_nx_static_wow64_unix_libs); i++)
+    {
+        if (handle != (UINT_PTR)wine_nx_static_wow64_unix_libs[i].funcs) continue;
+        if (code >= *wine_nx_static_wow64_unix_libs[i].count) return STATUS_INVALID_PARAMETER;
+        return wine_nx_static_wow64_unix_libs[i].funcs[code]( args );
+    }
+    return STATUS_INVALID_HANDLE;
+}
 
 static const char *wine_nx_module_export_name( void *module )
 {

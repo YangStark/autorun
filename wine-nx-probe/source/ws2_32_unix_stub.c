@@ -258,6 +258,10 @@ const unixlib_entry_t wine_nx_opengl32_wow64_unix_funcs[3102] =
     [3 ... 3101] = stub_not_implemented,
 };
 
+/* The x86 unix call gate calls these tables only below their sizes. */
+const unsigned int wine_nx_ws2_32_wow64_unix_count = ARRAY_SIZE(wine_nx_ws2_32_wow64_unix_funcs);
+const unsigned int wine_nx_opengl32_wow64_unix_count = ARRAY_SIZE(wine_nx_opengl32_wow64_unix_funcs);
+
 /* crypt32: 7 functions. Layout: enum unix_funcs in
  * dlls/crypt32/crypt32_private.h. process_attach must succeed for DllMain
  * to complete (it does global setup). The rest can fail until we have a
