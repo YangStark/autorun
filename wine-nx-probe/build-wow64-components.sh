@@ -35,6 +35,12 @@ i686-w64-mingw32-clang -Os -Wall -Wextra -Werror -fno-builtin -nostdlib \
 i686-w64-mingw32-clang -Os -Wall -Wextra -Werror -fno-builtin -nostdlib \
     -Wl,--entry,_start@0 -Wl,--image-base,0x10000000 -Wl,--dynamicbase \
     -o "$pe/pe32-lifecycle.exe" "$root/wine-nx-probe/tests/pe32_lifecycle.c" -lkernel32 -lntdll
+i686-w64-mingw32-clang -Os -Wall -Wextra -Werror -fno-builtin -nostdlib \
+    -Wl,--entry,_start@0 -Wl,--image-base,0x10000000 -Wl,--dynamicbase \
+    -o "$pe/pe32-timers.exe" "$root/wine-nx-probe/tests/pe32_timers.c" -luser32 -lkernel32 -lntdll
+i686-w64-mingw32-clang -Os -Wall -Wextra -Werror -fno-builtin -nostdlib \
+    -Wl,--entry,_start@0 -Wl,--image-base,0x10000000 -Wl,--dynamicbase \
+    -o "$pe/pe32-messages.exe" "$root/wine-nx-probe/tests/pe32_messages.c" -luser32 -lkernel32 -lntdll
 sh "$root/wine-nx-probe/tools/bootstrap-box64-core.sh"
 docker run --rm --platform linux/arm64 -v "$root:/work" -w /work \
     devkitpro/devkita64 sh -ec '
@@ -52,7 +58,7 @@ done
 for module in $i386_modules; do
     cp "$pe/dlls/$module/i386-windows/$module.dll" "$stage/drive_c/windows/syswow64/"
 done
-cp "$pe/pe32-smoke.exe" "$pe/pe32-functional.exe" "$pe/pe32-threads.exe" "$pe/pe32-lifecycle.exe" \
+cp "$pe/pe32-smoke.exe" "$pe/pe32-functional.exe" "$pe/pe32-threads.exe" "$pe/pe32-lifecycle.exe" "$pe/pe32-timers.exe" "$pe/pe32-messages.exe" \
     "$root/wine-nx-probe/samples/7zr-x86/7zr.exe" "$root/wine-nx-probe/samples/7zr-x86/7zr-sample.7z" \
     "$root/wine-nx-probe/samples/7zr-x86/7zr-tree.7z" \
     "$stage/drive_c/"
@@ -78,8 +84,10 @@ printf '%s\n' 'Real x86 console application: 7-Zip 26.03 7zr.exe (build nx-wow64
     '"C:\7zr.exe x C:\no-such-archive.7z -oC:\7zr-out -y" expects System ERROR: and exit code 2.' \
     'Other commands: "C:\7zr.exe a C:\wine-nx-tree.7z C:\7zr-tree -mx1" archives the tree;' \
     '"C:\7zr.exe t C:\7zr-sample.7z" tests the known archive.' \
-    'Thread lifecycle regression: target.txt = sdmc:/switch/wine/drive_c/pe32-lifecycle.exe and' \
-    'delete args.txt (expects [PE32 TEST] PASS ALL and exit_code=0x0000002a).' \
+    'Starting Wine-NX shows a menu of the programs in drive_c: choose with Up/Down and start with A;' \
+    'args.txt applies only to the program its first word names. Tests in the menu: pe32-lifecycle.exe' \
+    '(threads), pe32-timers.exe (window timers) and pe32-messages.exe (messages and clipboard) each' \
+    'expect [PE32 TEST] PASS ALL and exit_code=0x0000002a.' \
     'Log: sdmc:/switch/wine/wine-nx-runtime.log; close from HOME after it parks.' > "$stage/README.txt"
 python3 "$root/wine-nx-probe/tools/verify-wow64-package.py"
 echo "Staged WoW64 loader test in $stage"

@@ -66,6 +66,19 @@ assert all(name.lower() in {"kernel32.dll", "ntdll.dll"}
 assert "Type: HIGHLOW" in inspect(lifecycle, "--coff-basereloc")
 tls = inspect(lifecycle, "--coff-tls-directory")
 assert "AddressOfCallBacks: 0x0" not in tls and "StartAddressOfRawData" in tls, "Lifecycle test needs static TLS"
+timers = stage / "drive_c/pe32-timers.exe"
+timers_info = inspect(timers, "--coff-imports")
+assert "Arch: i386\n" in timers_info and "Type: HIGHLOW" in inspect(timers, "--coff-basereloc")
+for symbol in ("SetTimer", "KillTimer", "PeekMessageW", "DispatchMessageW", "MsgWaitForMultipleObjects", "CreateWindowExW"):
+    assert f"Symbol: {symbol} " in timers_info, f"Missing timer test import: {symbol}"
+assert {name.lower() for name in re.findall(r"^  Name: (.+)$", timers_info, re.M)} == {"user32.dll", "kernel32.dll", "ntdll.dll"}
+messages = stage / "drive_c/pe32-messages.exe"
+messages_info = inspect(messages, "--coff-imports")
+assert "Arch: i386\n" in messages_info and "Type: HIGHLOW" in inspect(messages, "--coff-basereloc")
+for symbol in ("SendMessageTimeoutW", "SendNotifyMessageW", "SendMessageCallbackW", "ReplyMessage",
+               "MsgWaitForMultipleObjects", "GetQueueStatus", "PostThreadMessageW", "OpenClipboard",
+               "SetClipboardData", "GetClipboardData", "RegisterClipboardFormatW", "RegisterWindowMessageW"):
+    assert f"Symbol: {symbol} " in messages_info, f"Missing message test import: {symbol}"
 sevenzip = stage / "drive_c/7zr.exe"
 info = inspect(sevenzip, "--coff-imports")
 assert "Arch: i386\n" in info and "Type: HIGHLOW" in inspect(sevenzip, "--coff-basereloc"), "7zr must be relocatable"

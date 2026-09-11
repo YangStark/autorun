@@ -20,6 +20,7 @@
 #include "wine/server.h"
 #include "unix_private.h"
 #include "horizon_private.h"
+#include "launcher_list.h"
 #include "pointer_cursor.h"
 #include "std_stream_lines.h"
 
@@ -38,7 +39,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-11"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-17"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -55,6 +56,9 @@ extern NTSTATUS wine_nx_loader_last_import_status(void);
 extern const char *wine_nx_loader_last_open_path(void);
 extern NTSTATUS wine_nx_loader_last_open_status(void);
 extern const char *wine_nx_loader_last_export_diag(void);
+extern int wine_nx_launcher_run( const char *drive_c, const char *runtime_dir, const char *build,
+                                 int (*machine_of)( const char *path, unsigned short *machine ),
+                                 int *verbose, char *target, size_t target_size );
 
 static FILE *log_file;
 
@@ -498,9 +502,14 @@ static void runtime_report_interpreter(void)
     {
         extern unsigned long long wine_nx_box64_native_entries;
         extern uint64_t wine_nx_box64_dynarec_bytes;
-        log_line( "[DYNAREC] native_entries=%llu emitted_bytes=%llu",
-                  __atomic_load_n( &wine_nx_box64_native_entries, __ATOMIC_RELAXED ),
-                  (unsigned long long)__atomic_load_n( &wine_nx_box64_dynarec_bytes, __ATOMIC_RELAXED ) );
+        static unsigned long long last_entries = ~0ull;
+        unsigned long long entries = __atomic_load_n( &wine_nx_box64_native_entries, __ATOMIC_RELAXED );
+
+        /* Nothing to report in the launcher or once the program has parked. */
+        if (entries != last_entries)
+            log_line( "[DYNAREC] native_entries=%llu emitted_bytes=%llu", entries,
+                      (unsigned long long)__atomic_load_n( &wine_nx_box64_dynarec_bytes, __ATOMIC_RELAXED ) );
+        last_entries = entries;
     }
 #endif
     if (!&wine_nx_box64_executed_total || !&wine_nx_box64_runs_total) return;
@@ -720,7 +729,7 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
 {
     RTL_USER_PROCESS_PARAMETERS *params;
     char nt_path[640], dll_path[1024], current_dir[512];
-    char cmdline[1024], args_buf[896];
+    char cmdline[1024], args_buf[896], args_path[512];
     size_t chars, size, i;
     WCHAR *cursor;
     const char *cmdline_str;
@@ -736,15 +745,22 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
      * If present, use it verbatim as CommandLine so curl etc. see args via
      * GetCommandLineA/W. Otherwise fall back to the dos_path alone. */
     cmdline_str = dos_path;
-    if (read_first_line( RUNTIME_DIR "/args.txt", args_buf, sizeof(args_buf) ) && args_buf[0])
+    if (target[1] != ':' && launcher_args_path( target, args_path, sizeof(args_path) ) &&
+        read_first_line( args_path, args_buf, sizeof(args_buf) ) &&
+        launcher_command_line( dos_path, args_buf, cmdline, sizeof(cmdline) ))
+    {
+        cmdline_str = cmdline;
+        log_line( "[ARGS] from %s; CommandLine='%s'", args_path, cmdline_str );
+    }
+    else if (!read_first_line( RUNTIME_DIR "/args.txt", args_buf, sizeof(args_buf) ) || !args_buf[0])
+        log_line( "[ARGS] no args.txt; CommandLine='%s'", cmdline_str );
+    else if (!launcher_args_match( args_buf, dos_path ))
+        log_line( "[ARGS] args.txt is for another program; CommandLine='%s'", cmdline_str );
+    else
     {
         snprintf( cmdline, sizeof(cmdline), "%s", args_buf );
         cmdline_str = cmdline;
         log_line( "[ARGS] CommandLine='%s'", cmdline_str );
-    }
-    else
-    {
-        log_line( "[ARGS] no args.txt; CommandLine='%s'", cmdline_str );
     }
 
     chars = strlen( current_dir ) + 1;
@@ -1187,6 +1203,11 @@ static NTSTATUS runtime_target_machine( const char *path, USHORT *machine )
     return status;
 }
 
+static int launcher_machine( const char *path, unsigned short *machine )
+{
+    return runtime_target_machine( path, machine ) != STATUS_SUCCESS;
+}
+
 #ifdef WINE_NX_BOX64_INTERPRETER
 extern NTSTATUS wine_nx_init_wow64_peb( RTL_USER_PROCESS_PARAMETERS *, void * );
 extern NTSTATUS wine_nx_prepare_wow64_ntdll( HMODULE, HMODULE );
@@ -1371,10 +1392,26 @@ int main( int argc, char **argv )
         log_flusher_running = !pthread_create( &flusher, NULL, log_flusher, NULL );
     }
 
-    if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
-    else read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );
     autorun = read_bool_file( RUNTIME_DIR "/run-entry.txt" );
     wine_nx_runtime_verbose = read_bool_file( RUNTIME_DIR "/verbose.txt" );
+    if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
+    else
+    {
+        /* Without a program on the command line, let the user choose one;
+         * target.txt only preselects the last choice. */
+        read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );
+        if (!wine_nx_launcher_run( WINE_DRIVE_C, RUNTIME_DIR, WINE_NX_RUNTIME_BUILD, launcher_machine,
+                                   &wine_nx_runtime_verbose, target, sizeof(target) ))
+        {
+            log_line( "[LAUNCHER] closed without starting a program" );
+            pthread_mutex_lock( &log_mutex );
+            if (log_file) fflush( log_file );
+            pthread_mutex_unlock( &log_mutex );
+            consoleExit( NULL );
+            return 0;
+        }
+        autorun = 1;
+    }
 
     log_line( "wine-nx-runtime: generic Wine ntdll PE loader path" );
     log_line( "[BUILD] %s", WINE_NX_RUNTIME_BUILD );

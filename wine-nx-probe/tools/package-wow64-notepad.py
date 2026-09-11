@@ -56,37 +56,39 @@ for folder in ['drive_c/windows/fonts', 'share/wine/fonts']:
 (stage / 'target.txt').write_text('sdmc:/switch/wine/drive_c/notepad.exe\n')
 (stage / 'args.txt').write_text('C:\\notepad.exe C:\\notepad-test.txt\n')
 (stage / 'drive_c/notepad-test.txt').write_bytes(b'Wine-NX x86 Notepad through the ARM64 dynarec.\r\n\r\nMove the cursor with the right stick. A is the left mouse button, B the right.\r\nOpen a menu, select text by holding A, right-click with B, and try Save As.\r\n')
-(stage / 'README.txt').write_text('''x86 Wine Notepad on the nx-wow64-dynarec-11 runtime.
-Build 11 turns verbose traces off by default: system calls, Horizon server
-requests (horizon-trace.log), fonts and window painting are no longer written to
-the SD card as they happen, which made everything slower. To turn them back on
-for a bug report, create sdmc:/switch/wine/verbose.txt containing 1.
-wine-nx-runtime.log shows "[INIT] verbose traces off" or "on".
-Mouse cursor: the right analog stick moves an arrow drawn over the screen,
-A is the left mouse button and B the right. Hold A while moving to drag or select.
-Small tilts move slowly for precise placement; a full tilt crosses the screen in
-about a second. Touching the screen still clicks and moves the cursor there.
-Build 10 adds window lists to the Horizon server. GetDlgItem lists a dialog's
-children through them; the server rejected the request, so every GetDlgItem
-returned NULL. The Font dialog then filled and hid nothing: empty Font, Style,
-Size and Script boxes, and a visible Color box that should be hidden.
-Sibling order no longer breaks at a combobox's own child windows.
-Build 9 (posted messages: Word Wrap works on hardware) and build 8 are kept.
-Expected: Format > Font... lists the installed fonts, with styles, sizes and scripts
-for the selected font, and no Color box; picking a font and OK changes the text.
-With verbose.txt, horizon-trace.log shows [HZUSER] get_window_list lines while the dialog opens.
-Build 6 fixes are kept: menu switching restores the owner and hidden popups stay hidden.
-Uses the existing Switch software display, touch input and FreeType fonts.
-The previous Notepad package was ARM64; this executable and its GUI DLLs are i386.
-Expected first milestone: Notepad frame, menus and this test document visible.
-Then exercise touch/menu input and Save As. These paths need hardware confirmation.
-Native-entry telemetry in wine-nx-runtime.log confirms dynarec execution.
-The console yields the screen to the framebuffer; logs continue on SD.
-Install by merging switch/ into the SD root. This selects Notepad in /switch/wine.
-Reinstall the 7zr or interpreter package to restore that launch configuration.
+(stage / 'README.txt').write_text('''Wine-NX x86 programs on the nx-wow64-dynarec-17 runtime.
+
+Starting Wine-NX shows a menu of the Windows programs (.exe) in
+sdmc:/switch/wine/drive_c and its folders, marked x86 or ARM64:
+  Up/Down (D-pad or left stick) choose, L/R page, A start, + quit,
+  Y turns verbose logs on or off (for bug reports).
+The menu opens on the last program started. A program's own arguments go in a file
+next to it (openttd.exe reads openttd.args.txt). Otherwise args.txt is used when its
+first word names the chosen program: it holds C:\\notepad.exe C:\\notepad-test.txt,
+so Notepad opens its test document and other programs start without arguments.
+To pick another program, close Wine-NX from HOME and start it again.
+
+Controls in programs: the right analog stick moves the mouse cursor, A is the left
+button and B the right; hold A while moving to drag or select. Touching the screen
+clicks and moves the cursor there. Menus from the menu bar take the left button (A).
+
+Try in Notepad: the blinking caret, Edit > Cut/Copy/Paste, the right-click menu (B),
+Format > Font..., Format > Word Wrap and Search > Find.
+Tests in the menu (each ends with [PE32 TEST] PASS ALL and exit_code=0x0000002a in
+wine-nx-runtime.log): pe32-messages.exe (messages between threads, message waits,
+clipboard), pe32-timers.exe (window timers), pe32-lifecycle.exe (threads).
+
+Verified on hardware: cursor and buttons, menus, Word Wrap, the Format > Font dialog
+(build 11), and in pe32-messages.exe on build 15 messages between threads,
+ReplyMessage, SendMessageCallback, GetQueueStatus, PostQuitMessage and the clipboard.
+Build 16 fixes MsgWaitForMultipleObjects returning at once after another thread's
+message had been processed. Timers and the caret await hardware confirmation.
+
+Logs: sdmc:/switch/wine/wine-nx-runtime.log, and horizon-trace.log with verbose logs.
+Install by merging switch/ into the SD root.
 ''')
 subprocess.run([sys.executable, str(verify), str(stage)], check=True)
-archive = build / 'wine-nx-notepad-dynarec-11.zip'
+archive = build / 'wine-nx-notepad-dynarec-17.zip'
 with ZipFile(archive, 'w', ZIP_DEFLATED) as z:
     for f in sorted(stage.rglob('*')):
         if f.is_file() and f.name != '.DS_Store' and f.suffix != '.log':

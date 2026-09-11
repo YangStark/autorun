@@ -559,6 +559,7 @@ target_link_libraries(wine-nx-ntdll-file-smoke PRIVATE nx)
 
 add_executable(wine-nx-runtime
     source/runtime.c
+    source/launcher.c
     source/runtime_platform.c
     source/wow64_box64_bridge.c
     source/ntdll_pe_compat.c

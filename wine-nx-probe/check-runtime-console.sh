@@ -15,4 +15,12 @@ flags="-std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-f
 "$build/pointer_cursor"
 "${CC:-clang}" $flags "$root/wine-nx-probe/tests/horizon_message_queue.c" -o "$build/message_queue"
 "$build/message_queue"
+"${CC:-clang}" $flags "$root/wine-nx-probe/tests/horizon_win_timers.c" -o "$build/win_timers"
+"$build/win_timers"
+"${CC:-clang}" $flags "$root/wine-nx-probe/tests/horizon_msg_queue.c" -o "$build/msg_queue"
+"$build/msg_queue"
+"${CC:-clang}" $flags "$root/wine-nx-probe/tests/horizon_clipboard.c" -o "$build/clipboard"
+"$build/clipboard"
+"${CC:-clang}" $flags "$root/wine-nx-probe/tests/launcher_list.c" -o "$build/launcher_list"
+"$build/launcher_list"
 python3 "$root/wine-nx-probe/tools/make-7zr-tree.py" "$build/drive_c" >/dev/null
