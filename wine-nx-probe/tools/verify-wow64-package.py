@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 root = Path(__file__).resolve().parents[2]
-stage = root / "wine-nx-probe/build-switch-wow64/sd-card/switch/wine"
+stage = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else root / "wine-nx-probe/build-switch-wow64/sd-card/switch/wine"
 readobj = root / "wine-nx-probe/toolchains/llvm-mingw-20260505-ucrt-macos-universal/bin/llvm-readobj"
 
 def inspect(path, option):
@@ -73,8 +73,19 @@ deps = re.findall(r"^Import \{\n  Name: (.+)$", info, re.M)
 syswow64 = {p.name.lower() for p in (stage / "drive_c/windows/syswow64").glob("*.dll")}
 assert all(dep.lower() in syswow64 for dep in deps), f"7zr load-time imports not staged: {deps}"
 assert (stage / "wine-nx-runtime.nro").read_bytes()[16:20] == b"NRO0"
-assert (stage / "target.txt").read_text().strip() == "sdmc:/switch/wine/drive_c/7zr.exe"
-assert (stage / "args.txt").read_text().strip().lower() == "c:\\7zr.exe b 1 -mmt2 -md18"
+target = (stage / "target.txt").read_text().strip()
+if target == "sdmc:/switch/wine/drive_c/notepad.exe":
+    info = inspect(stage / "drive_c/notepad.exe", "--coff-imports")
+    assert "Arch: i386\n" in info
+    deps = re.findall(r"^Import \{\n  Name: (.+)$", info, re.M)
+    assert deps and all(dep.lower() in syswow64 for dep in deps), deps
+    assert (stage / "args.txt").read_text().strip() == "C:\\notepad.exe C:\\notepad-test.txt"
+    assert (stage / "drive_c/notepad-test.txt").is_file()
+    for folder in ("drive_c/windows/fonts", "share/wine/fonts"):
+        assert list((stage / folder).glob("*.ttf")), folder
+else:
+    assert target == "sdmc:/switch/wine/drive_c/7zr.exe"
+    assert (stage / "args.txt").read_text().strip().lower() == "c:\\7zr.exe b 1 -mmt2 -md18"
 assert (stage / "drive_c/7zr-rename.7z").read_bytes() == (stage / "drive_c/7zr-tree.7z").read_bytes(), \
     "The rename run starts from a copy of the tree archive"
 assert not (stage / "drive_c/7zr-rename.7z.tmp").exists()

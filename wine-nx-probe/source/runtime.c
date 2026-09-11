@@ -20,6 +20,7 @@
 #include "wine/server.h"
 #include "unix_private.h"
 #include "horizon_private.h"
+#include "pointer_cursor.h"
 #include "std_stream_lines.h"
 
 u32 __nx_applet_type = AppletType_Application;
@@ -93,12 +94,12 @@ static int log_main_thread_set;
 static int wine_nx_console_active = 1;
 static Framebuffer wine_nx_fb;
 static int wine_nx_fb_ready;
-static int wine_nx_touch_ready;
 static pthread_mutex_t wine_nx_fb_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void *wine_nx_fb_pending_bits;
 static int wine_nx_fb_pending_stride;
 static int wine_nx_fb_pending_dirty;
 static int wine_nx_fb_lock_depth;
+static u64 wine_nx_fb_last_present;
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char log_file_buffer[64 * 1024];
@@ -174,6 +175,12 @@ void wine_nx_runtime_trace( const char *msg )
     log_line( "%s", msg );
 }
 
+/* Per-operation traces (system calls, server requests, fonts, window painting)
+ * are formatted and written to the SD card as they happen, which slows the
+ * whole program down. Their call sites check this first; it is set from
+ * sdmc:/switch/wine/verbose.txt containing 1. */
+int wine_nx_runtime_verbose;
+
 /***********************************************************************
  * Framebuffer platform hooks used by the win32u Switch display driver
  * (dlls/win32u/winnx_drv.c).  The driver renders into ordinary DIB memory;
@@ -181,6 +188,18 @@ void wine_nx_runtime_trace( const char *msg )
  */
 #define WINE_NX_FB_W 1280
 #define WINE_NX_FB_H 720
+
+/* The drawn cursor, guarded by wine_nx_fb_mutex. */
+static struct pointer_cursor wine_nx_cursor =
+    { .x = WINE_NX_FB_W / 2, .y = WINE_NX_FB_H / 2, .width = WINE_NX_FB_W, .height = WINE_NX_FB_H };
+static int wine_nx_cursor_moved;
+/* Controller and touchscreen state, guarded by wine_nx_pointer_mutex. */
+static pthread_mutex_t wine_nx_pointer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct pointer_cursor wine_nx_pointer =
+    { .x = WINE_NX_FB_W / 2, .y = WINE_NX_FB_H / 2, .width = WINE_NX_FB_W, .height = WINE_NX_FB_H };
+static PadState wine_nx_pad;
+static u64 wine_nx_pointer_tick;
+static int wine_nx_pointer_ready;
 
 /* Take the screen from the text console and bring up a linear framebuffer. */
 int wine_nx_fb_init(void)
@@ -239,37 +258,113 @@ void wine_nx_fb_unlock(void)
     pthread_mutex_unlock( &wine_nx_fb_mutex );
 }
 
+/* Each present converts the whole screen, so frames that only move the
+ * cursor are held to the display rate. */
+#define WINE_NX_CURSOR_FRAME_NS 16666667ull
+
 void wine_nx_fb_present(void)
 {
+    u64 now = armGetSystemTick();
+
     pthread_mutex_lock( &wine_nx_fb_mutex );
-    if (wine_nx_fb_ready && wine_nx_fb_pending_bits && wine_nx_fb_pending_dirty && !wine_nx_fb_lock_depth)
+    if (wine_nx_fb_ready && !wine_nx_fb_lock_depth &&
+        ((wine_nx_fb_pending_bits && wine_nx_fb_pending_dirty) ||
+         (wine_nx_cursor_moved && armTicksToNs( now - wine_nx_fb_last_present ) >= WINE_NX_CURSOR_FRAME_NS)))
     {
-        framebufferEnd( &wine_nx_fb );
-        wine_nx_fb_pending_bits = NULL;
-        wine_nx_fb_pending_stride = 0;
-        wine_nx_fb_pending_dirty = 0;
+        if (!wine_nx_fb_pending_bits)
+        {
+            u32 stride = 0;
+
+            wine_nx_fb_pending_bits = framebufferBegin( &wine_nx_fb, &stride );
+            wine_nx_fb_pending_stride = (int)(stride / 4);
+        }
+        if (wine_nx_fb_pending_bits)
+        {
+            pointer_cursor_paint( &wine_nx_cursor, wine_nx_fb_pending_bits, wine_nx_fb_pending_stride, 1 );
+            framebufferEnd( &wine_nx_fb );
+            pointer_cursor_paint( &wine_nx_cursor, wine_nx_fb_pending_bits, wine_nx_fb_pending_stride, 0 );
+            wine_nx_fb_pending_bits = NULL;
+            wine_nx_fb_pending_stride = 0;
+            wine_nx_fb_pending_dirty = 0;
+            wine_nx_cursor_moved = 0;
+            wine_nx_fb_last_present = now;
+        }
     }
     pthread_mutex_unlock( &wine_nx_fb_mutex );
 }
 
-/* Return the primary touchscreen contact in native 1280x720 display
- * coordinates.  Win32u turns it into the conventional mouse stream expected
- * by desktop applications; native WM_TOUCH can be layered on later. */
-int wine_nx_touch_poll( int *x, int *y )
+static void wine_nx_cursor_move( int x, int y )
 {
-    HidTouchScreenState state = {0};
+    pthread_mutex_lock( &wine_nx_fb_mutex );
+    if (x != (int)wine_nx_cursor.x || y != (int)wine_nx_cursor.y)
+    {
+        pointer_cursor_place( &wine_nx_cursor, x, y );
+        wine_nx_cursor_moved = 1;
+    }
+    pthread_mutex_unlock( &wine_nx_fb_mutex );
+}
 
-    if (!wine_nx_touch_ready)
+/* Buttons reported by wine_nx_pointer_poll(). */
+#define WINE_NX_POINTER_LEFT  0x1
+#define WINE_NX_POINTER_RIGHT 0x2
+
+/* One mouse for win32u, in native 1280x720 display coordinates: the right
+ * analog stick moves the cursor, A holds the left button and B the right,
+ * and a touchscreen contact puts the cursor under the finger with the left
+ * button held.  Returns nonzero when the position changed. */
+int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
+{
+    HidTouchScreenState touch = {0};
+    HidAnalogStickState stick;
+    unsigned int pressed = 0;
+    u64 now, held;
+    int moved;
+
+    pthread_mutex_lock( &wine_nx_pointer_mutex );
+    if (!wine_nx_pointer_ready)
     {
         hidInitializeTouchScreen();
-        wine_nx_touch_ready = 1;
-        log_line( "[NXINPUT] touchscreen ready" );
+        padConfigureInput( 1, HidNpadStyleSet_NpadStandard );
+        padInitializeDefault( &wine_nx_pad );
+        wine_nx_pointer_tick = armGetSystemTick();
+        wine_nx_pointer_ready = 1;
+        log_line( "[NXINPUT] pointer ready: touchscreen, right stick cursor, A left button, B right button" );
     }
+    padUpdate( &wine_nx_pad );
+    now = armGetSystemTick();
+    held = padGetButtons( &wine_nx_pad );
+    stick = padGetStickPos( &wine_nx_pad, 1 );
+    if (hidGetTouchScreenStates( &touch, 1 ) && touch.count > 0)
+    {
+        int old_x = (int)wine_nx_pointer.x, old_y = (int)wine_nx_pointer.y;
 
-    if (!hidGetTouchScreenStates( &state, 1 ) || state.count <= 0) return 0;
-    if (x) *x = state.touches[0].x;
-    if (y) *y = state.touches[0].y;
-    return 1;
+        pointer_cursor_place( &wine_nx_pointer, touch.touches[0].x, touch.touches[0].y );
+        moved = (int)wine_nx_pointer.x != old_x || (int)wine_nx_pointer.y != old_y;
+        pressed |= WINE_NX_POINTER_LEFT;
+    }
+    else moved = pointer_cursor_step( &wine_nx_pointer, stick.x, stick.y,
+                                      armTicksToNs( now - wine_nx_pointer_tick ) );
+    wine_nx_pointer_tick = now;
+    if (held & HidNpadButton_A) pressed |= WINE_NX_POINTER_LEFT;
+    if (held & HidNpadButton_B) pressed |= WINE_NX_POINTER_RIGHT;
+    *x = (int)wine_nx_pointer.x;
+    *y = (int)wine_nx_pointer.y;
+    *buttons = pressed;
+    pthread_mutex_unlock( &wine_nx_pointer_mutex );
+
+    wine_nx_cursor_move( *x, *y );
+    return moved;
+}
+
+/* Follow a position set by the application (SetCursorPos). */
+void wine_nx_pointer_set_pos( int x, int y )
+{
+    pthread_mutex_lock( &wine_nx_pointer_mutex );
+    pointer_cursor_place( &wine_nx_pointer, x, y );
+    x = (int)wine_nx_pointer.x;
+    y = (int)wine_nx_pointer.y;
+    pthread_mutex_unlock( &wine_nx_pointer_mutex );
+    wine_nx_cursor_move( x, y );
 }
 
 static int call_pe_entry_point( void *entry )
@@ -1279,9 +1374,11 @@ int main( int argc, char **argv )
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );
     autorun = read_bool_file( RUNTIME_DIR "/run-entry.txt" );
+    wine_nx_runtime_verbose = read_bool_file( RUNTIME_DIR "/verbose.txt" );
 
     log_line( "wine-nx-runtime: generic Wine ntdll PE loader path" );
     log_line( "[BUILD] %s", WINE_NX_RUNTIME_BUILD );
+    log_line( "[INIT] verbose traces %s (verbose.txt)", wine_nx_runtime_verbose ? "on" : "off" );
     log_line( "[TARGET] %s", target );
 
     status = runtime_target_machine( target, &target_machine );
