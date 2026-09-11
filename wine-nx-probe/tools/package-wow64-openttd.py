@@ -6,6 +6,7 @@ repository; WINE_NX_OPENTTD_INPUTS names the folder holding them (default
 ~/switch/winebox64_nx/local-inputs). Run package-wow64-notepad.py first."""
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
+import functools
 import hashlib
 import io
 import os
@@ -58,22 +59,42 @@ with ZipFile(opengfx_zip) as z:
 (game / 'openttd.cfg').write_text('[misc]\nprefer_sprite_font = true\n\n[network]\nparticipate_survey = no\n')
 (game / 'openttd.args.txt').write_text(ARGUMENTS + '\n')
 
-# The i386 import closure of openttd.exe, built from the PE tree.
-queue, seen = [game / 'openttd.exe'], set()
+# The i386 DLLs openttd.exe loads at startup, built from the PE tree: its
+# imports, theirs, and the DLLs that imported functions are forwarded to. The
+# loader loads a forward's DLL while resolving the import; without it the
+# function becomes a stub (advapi32's SystemFunction036, the CRT's and
+# bcrypt's random numbers, forwards to cryptbase).
 syswow64 = stage / 'drive_c/windows/syswow64'
-while queue:
-    info = subprocess.check_output([str(toolchain / 'llvm-readobj'), '--coff-imports', str(queue.pop())], text=True)
-    for name in re.findall(r'^Import \{\n  Name: (.+)$', info, re.M):
-        name = name.lower()
-        if name in seen:
-            continue
-        seen.add(name)
+queue, staged = [game / 'openttd.exe'], {}
+
+def readobj(option, path):
+    return subprocess.check_output([str(toolchain / 'llvm-readobj'), option, str(path)], text=True)
+
+def imports_of(path):
+    blocks = re.findall(r'^Import \{\n(.*?)^\}', readobj('--coff-imports', path), re.M | re.S)
+    return [(re.search(r'Name: (.+)', block).group(1).lower(), set(re.findall(r'Symbol: (\S+) \(', block)))
+            for block in blocks]
+
+@functools.lru_cache(maxsize=None)
+def forwards_of(path):
+    return dict(re.findall(r'^  Name: (\S+)\n  ForwardedTo: ([^.\s]+)\.', readobj('--coff-exports', path), re.M))
+
+def stage_dll(name):
+    if name not in staged:
         module = name.removesuffix('.dll')
         assert re.fullmatch(r'[a-z0-9_-]+', module), name
         target = f'dlls/{module}/i386-windows/{name}'
         subprocess.run(['make', '-C', str(pe), '-j8', target], env=env, check=True)
         shutil.copy2(pe / target, syswow64 / name)
+        staged[name] = pe / target
         queue.append(pe / target)
+    return staged[name]
+
+while queue:
+    for name, symbols in imports_of(queue.pop()):
+        forwards = forwards_of(stage_dll(name))
+        for symbol in sorted(symbols & forwards.keys()):
+            stage_dll(forwards[symbol].lower() + '.dll')
 
 readme = (stage / 'README.txt').read_text()
 (stage / 'README.txt').write_text(readme + '''
@@ -90,10 +111,11 @@ assert 'Arch: i386\n' in exe_info
 imports = {n.lower() for n in re.findall(r'^Import \{\n  Name: (.+)$', exe_info, re.M)}
 staged = {p.name.lower() for p in syswow64.glob('*.dll')}
 assert imports <= staged, f'OpenTTD imports not staged: {imports - staged}'
+assert 'cryptbase.dll' in staged, 'advapi32 forwards SystemFunction036 to cryptbase'
 assert list((game / 'baseset').rglob('opengfx.obg')), 'OpenGFX is missing'
 assert (game / 'lang/english.lng').is_file()
 
-archive = build / 'wine-nx-openttd-dynarec-17.zip'
+archive = build / 'wine-nx-openttd-dynarec-19.zip'
 with ZipFile(archive, 'w', ZIP_DEFLATED) as z:
     for f in sorted(stage.rglob('*')):
         if f.is_file() and f.name != '.DS_Store' and f.suffix != '.log':

@@ -56,7 +56,7 @@ for folder in ['drive_c/windows/fonts', 'share/wine/fonts']:
 (stage / 'target.txt').write_text('sdmc:/switch/wine/drive_c/notepad.exe\n')
 (stage / 'args.txt').write_text('C:\\notepad.exe C:\\notepad-test.txt\n')
 (stage / 'drive_c/notepad-test.txt').write_bytes(b'Wine-NX x86 Notepad through the ARM64 dynarec.\r\n\r\nMove the cursor with the right stick. A is the left mouse button, B the right.\r\nOpen a menu, select text by holding A, right-click with B, and try Save As.\r\n')
-(stage / 'README.txt').write_text('''Wine-NX x86 programs on the nx-wow64-dynarec-17 runtime.
+(stage / 'README.txt').write_text('''Wine-NX x86 programs on the nx-wow64-dynarec-19 runtime.
 
 Starting Wine-NX shows a menu of the Windows programs (.exe) in
 sdmc:/switch/wine/drive_c and its folders, marked x86 or ARM64:
@@ -79,16 +79,16 @@ wine-nx-runtime.log): pe32-messages.exe (messages between threads, message waits
 clipboard), pe32-timers.exe (window timers), pe32-lifecycle.exe (threads).
 
 Verified on hardware: cursor and buttons, menus, Word Wrap, the Format > Font dialog
-(build 11), and in pe32-messages.exe on build 15 messages between threads,
-ReplyMessage, SendMessageCallback, GetQueueStatus, PostQuitMessage and the clipboard.
-Build 16 fixes MsgWaitForMultipleObjects returning at once after another thread's
-message had been processed. Timers and the caret await hardware confirmation.
+(build 11), the launcher, and pe32-messages.exe and pe32-timers.exe passing (build 16).
+The Notepad caret, Copy/Paste and Find await hardware confirmation.
 
 Logs: sdmc:/switch/wine/wine-nx-runtime.log, and horizon-trace.log with verbose logs.
+Since build 18 the log always has Wine's error messages (err:), including those of
+32-bit DLLs such as a DLL that cannot be found; verbose logs add fixme: messages.
 Install by merging switch/ into the SD root.
 ''')
 subprocess.run([sys.executable, str(verify), str(stage)], check=True)
-archive = build / 'wine-nx-notepad-dynarec-17.zip'
+archive = build / 'wine-nx-notepad-dynarec-19.zip'
 with ZipFile(archive, 'w', ZIP_DEFLATED) as z:
     for f in sorted(stage.rglob('*')):
         if f.is_file() and f.name != '.DS_Store' and f.suffix != '.log':

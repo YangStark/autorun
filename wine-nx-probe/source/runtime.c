@@ -39,7 +39,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-17"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-19"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -739,6 +739,10 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     snprintf( nt_path, sizeof(nt_path), "\\??\\%s", dos_path );
     snprintf( dll_path, sizeof(dll_path), "%s;C:\\windows\\system32;C:\\windows;C:\\",
               current_dir );
+    /* The current directory ends in a backslash, as RtlSetCurrentDirectory_U
+     * stores it; relative paths are appended to it directly. */
+    if ((chars = strlen( current_dir )) && current_dir[chars - 1] != '\\' && chars + 1 < sizeof(current_dir))
+        memcpy( current_dir + chars, "\\", 2 );
 
     /* Read args.txt next to the target NRO (sdmc:/switch/wine/args.txt).
      * Format expected: "<argv[0]> <args...>" — a full Win32 command line.
@@ -1452,6 +1456,18 @@ int main( int argc, char **argv )
     /* Upstream's start_main_thread does this; without it the PEB (and the
      * WoW64 PEB copied from it) reports zero processors to GetSystemInfo. */
     init_cpu_info();
+    /* Upstream's dbg_init also copies the debug channels to the page after
+     * the WoW64 PEB, where the Windows-side ntdlls look them up. Left zeroed,
+     * every channel is off there, so loader errors such as a missing DLL never
+     * reach the log. Only the default entry is written: errors, and fixmes
+     * with verbose traces. dbg_init itself is not called because it moves the
+     * unix-side debug buffers into TEBs, which the runtime's threads lack. */
+    {
+        struct __wine_debug_channel *options = (void *)((char *)teb->Peb + 2 * page_size);
+
+        options[0].name[0] = 0;
+        options[0].flags = (1 << __WINE_DBCL_ERR) | (wine_nx_runtime_verbose ? 1 << __WINE_DBCL_FIXME : 0);
+    }
     {
         unsigned long long total, used;
 
