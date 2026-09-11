@@ -1,5 +1,147 @@
 # Wine-NX Probe And Runtime
 
+`nx-wow64-dynarec-17` prepares 32-bit OpenTTD 15.3. It uses the official
+`openttd-15.3-windows-win32.zip` (SHA-256 3f092edc…0e74, matching
+cdn.openttd.org) with OpenGFX 8.0. On build-16 hardware, `pe32-messages.exe` and
+`pe32-timers.exe` passed all their groups.
+- OpenTTD's i386 import closure is 27 DLLs. ws2_32 and opengl32 fail
+  `DllMain` without a unixlib table.
+  - The Switch's static unixlib tables only served 64-bit callers and matched
+    modules through the 64-bit loader list, where 32-bit DLLs do not appear.
+  - WoW64 lookups now match the DLL name in the module's export directory.
+  - `ws2_32_unix_stub.c` adds 32-bit tables that let ws2_32 and opengl32
+    load. opengl32 answers process and thread attach and detach with success.
+    Every other call reports `STATUS_NOT_IMPLEMENTED`.
+  - `tests/check_wow64_unix_tables.py` keeps the table sizes equal to Wine's
+    enums (5 and 3102 entries), since unix calls index tables without bounds
+    checks.
+- A program's own arguments can live beside it (`openttd.args.txt`), ahead of
+  `args.txt`. The launcher shows them. Paths with spaces are quoted in the
+  command line.
+- `tools/package-wow64-openttd.py` extends the Notepad package:
+  - It checks both input hashes, installs the game in `C:\openttd` with OpenGFX
+    in `baseset`, and writes `openttd.cfg`: the sprite font, and the survey
+    declined so the first start opens no modal question.
+  - Arguments select GDI video without a drawing thread, null sound and music,
+    and a 1280x720 window.
+  - It stages the import closure and writes
+    `build-switch-wow64-dynarec/wine-nx-openttd-dynarec-17.zip`.
+  - Under host Wine 11, the staged copy started with these arguments reached
+    the main menu over the title game; a screenshot from `autoexec.scr`
+    confirmed it. At runtime it loads only the import closure plus uxtheme,
+    which user32 treats as optional.
+
+`nx-wow64-dynarec-16` fixes the one group `pe32-messages.exe` failed on build-15
+hardware. The other nine passed: SendMessage to another thread,
+SendMessageTimeout, SendNotifyMessage, nested sends, ReplyMessage,
+SendMessageCallback, GetQueueStatus, thread quit and the clipboard.
+`MsgWaitForMultipleObjects` on an empty queue returned `WAIT_OBJECT_0`
+immediately instead of timing out after 100 ms. Earlier in the test, B had
+sent messages to A (the nested send and the callback result).
+`horizon_msgq_touch` set the changed bit, but `horizon_msgq_update` only
+added changed bits and never removed them, so QS_SENDMESSAGE stayed "changed"
+after A processed the messages. The wait uses QS_ALLINPUT as its changed mask
+and woke at once. As `set_queue_bits` and `clear_queue_bits` do upstream,
+touching now sets both bits, and a kind with nothing left pending clears both.
+`tests/horizon_msg_queue.c` reproduces the failure and passes with the fix.
+`[DYNAREC]` reports are also logged only when the counters change, not every
+5 seconds in the launcher or after a program parks.
+
+`nx-wow64-dynarec-15` adds a launcher. Before, the runtime started whatever
+`target.txt` named, and trying another program meant editing it on a computer.
+Starting the NRO without a program argument now shows a console menu before
+Wine initializes (`source/launcher.c`):
+- It lists the `.exe` files under `drive_c` and two folder levels below it,
+  skipping `windows`. Each is checked with the same PE header test as the
+  runtime and marked x86 or ARM64.
+- Controller: Up/Down (D-pad or stick) with key repeat, L/R to page, A to
+  start, + to quit, Y to toggle `verbose.txt`.
+- It opens on the program named in `target.txt`, and starting a program
+  rewrites that file. A program started from the menu always runs to its entry
+  point.
+- `args.txt` is used only when its first word, quoted or not, names the chosen
+  program, so each program no longer needs its own `args.txt`. A program path
+  passed as the NRO's argument still skips the menu.
+`tests/launcher_list.c` covers program names, `args.txt` matching, order,
+preselection and scrolling. Hardware confirmation is pending with
+`build-switch-wow64-dynarec/wine-nx-notepad-dynarec-15.zip`.
+
+`nx-wow64-dynarec-14` adds message queues, messages between threads, the
+clipboard and user atoms to the Horizon server. These are three gaps found by
+comparing the server requests win32u and user32 can send with the server's
+dispatch table.
+- Message queues (`horizon_msg_queue.h`, `server/queue.c`):
+  - Each thread has shared queue data. Without it, win32u asked the server
+    for every message check. It also treated hooks as installed, so every
+    window procedure call and retrieved message made failing
+    `get_msg_queue`/`start_hook_chain` round trips.
+  - Wake and changed bits cover sent and posted messages, WM_QUIT, input,
+    paints, expired timers and reply results. `get_message` clears changed
+    bits as upstream does.
+  - `set_queue_mask`, `get_queue_status` and a waitable queue object back
+    `MsgWaitForMultipleObjects`. Waits poll every millisecond, so timers and
+    paints need no event to fall due.
+  - The access time stays 0, so win32u never skips `get_message` on the bits'
+    word.
+  - win32u's `wait_message` waits in 10 ms slices on the Switch and polls the
+    display driver between them. Controller input is polled from the message
+    loop, and a truly blocking wait would otherwise freeze menus.
+- Messages between threads: `send_message` for every type, `reply_message` and
+  `get_message_reply` handle results with nesting, ReplyMessage, timeouts,
+  cancellation, SendMessageCallback results and thread exit on either side.
+- Clipboard (`horizon_clipboard.h`, `server/clipboard.c`): open rules, owner,
+  sequence numbers, synthesized text, metafile and bitmap formats, delay
+  rendering, release, viewer, listeners with WM_CLIPBOARDUPDATE, and cleanup.
+  `add_user_atom` and `get_user_atom_name` back RegisterWindowMessage and
+  RegisterClipboardFormat.
+- Session memory was also copied to an SD-card file on every update. Views now
+  copy from server memory when they register, and flushes no longer write the
+  file.
+Host tests `horizon_msg_queue.c` and `horizon_clipboard.c` run under ASan and
+UBSan. `pe32-messages.exe` exercises the same features from x86 code and exits
+42 under host Wine 11. Hardware confirmation is pending with
+`build-switch-wow64-dynarec/wine-nx-notepad-dynarec-14.zip`.
+
+`nx-wow64-dynarec-13` adds the text caret. On build-12 hardware the Notepad
+caret still did not appear. The Horizon server had no `set_caret_window` or
+`set_caret_info` handlers, and win32u's CreateCaret, SetCaretPos, ShowCaret,
+HideCaret and blink toggle all use them. Each failed before
+`display_caret` could invert the bar into the window. The handlers follow
+`server/queue.c`:
+- The caret window and rectangle live in the shared input data. The hide count
+  and on/off state stay in the server.
+- A different caret window starts at 0,0 and hidden.
+- `CARET_STATE_ON_IF_MOVED` turns the caret on only when the position changes.
+- A handle other than the caret's is refused with `STATUS_ACCESS_DENIED`.
+- Destroying the caret's window clears the caret.
+Replies carry the values from before the change, which win32u uses to erase
+and redraw. `tests/check_caret.py` runs the production helpers under a copy of
+win32u's caret sequences. It tracks inverted pixels through show, blink, moves,
+nested hide, recreation, focus change and destroy. Hardware confirmation is
+pending with `build-switch-wow64-dynarec/wine-nx-notepad-dynarec-13.zip`.
+
+`nx-wow64-dynarec-12` adds window timers to the Horizon server. The
+server had no `set_win_timer`/`kill_win_timer` handlers, so `SetTimer`,
+`KillTimer` and win32u's system timers failed. The text caret was drawn once
+and never blinked, and tooltips, scrollbar auto-repeat and animations had no
+`WM_TIMER`. `horizon_win_timers.h` follows `server/queue.c`:
+- A timer belongs to its window's thread, or to the caller's thread without a window.
+- Window timers keep their id; timers without a window reuse a known id or get
+  one counting down from 0x7fff.
+- Setting an existing timer replaces it.
+- `get_message` returns an expired timer after posted messages, WM_QUIT, input
+  and paints. The earliest one comes first, filtered by exact window and message range.
+- Removing the message reschedules the timer past the current time, so a busy
+  thread gets one message instead of a backlog.
+- Destroying a window or ending a thread drops its timers.
+The server measures time with a monotonic millisecond clock from `armGetSystemTick`.
+`tests/horizon_win_timers.c` covers caret-blink timing, peek versus remove,
+coalescing, filters, ids, replacement, kill and cleanup. `pe32-timers.exe` is a
+new x86 test that checks thread and window timers, a TIMERPROC, kill and
+replace, and coalescing after 250 ms asleep. It exits 42 under host Wine 11.
+Hardware confirmation is pending with
+`build-switch-wow64-dynarec/wine-nx-notepad-dynarec-12.zip`.
+
 `nx-wow64-dynarec-11` makes per-operation traces opt-in. A build-9 Notepad
 session wrote 72,065 runtime log lines: 64,322 `[SYSCALL]` lines (two per
 system call), 5,954 `[NXFONT]`, and hundreds of window-painting traces. Each
