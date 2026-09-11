@@ -26,3 +26,6 @@
 @ stdcall -norelay Wow64SystemServiceEx(long ptr)
 @ stub Wow64ValidateUserCallTarget
 @ stub Wow64ValidateUserCallTargetFilter
+
+# Private handshake for the native Horizon bootstrap; does not change defaults.
+@ extern -private -arch=aarch64 __wine_switch_cpu_backend

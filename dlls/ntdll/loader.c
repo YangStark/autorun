@@ -150,6 +150,10 @@ struct file_id
 
 #define HASH_MAP_SIZE 32
 static LIST_ENTRY hash_table[HASH_MAP_SIZE];
+#ifdef __WINE_PE_BUILD
+/* Switch bootstrap resolves this export; never depend on PE link offsets. */
+LIST_ENTRY *wine_nx_pe_hash_table = hash_table;
+#endif
 
 /* internal representation of loaded modules */
 typedef struct _wine_modref
@@ -4267,6 +4271,7 @@ static void wine_nx_patch_ntdll_dispatchers(void)
     void **syscall_dispatcher;
     void **unix_call_dispatcher;
     void **pe_teb;
+    LIST_ENTRY **pe_hash_table_export;
     unixlib_handle_t *unixlib_handle;
 
     if (patched) return;
@@ -4285,6 +4290,13 @@ static void wine_nx_patch_ntdll_dispatchers(void)
     unix_call_dispatcher = RtlFindExportedRoutineByName( ntdll->ldr.DllBase, "__wine_unix_call_dispatcher" );
     unixlib_handle = RtlFindExportedRoutineByName( ntdll->ldr.DllBase, "__wine_unixlib_handle" );
     pe_teb = RtlFindExportedRoutineByName( ntdll->ldr.DllBase, "wine_nx_pe_teb" );
+    pe_hash_table_export = RtlFindExportedRoutineByName( ntdll->ldr.DllBase, "wine_nx_pe_hash_table" );
+    if (!pe_hash_table_export || !*pe_hash_table_export)
+    {
+        wine_nx_trace( "[LDR] missing wine_nx_pe_hash_table; use the matching rebuilt ntdll.dll" );
+        NtTerminateProcess( NtCurrentProcess(), STATUS_INVALID_IMAGE_FORMAT );
+        return;
+    }
 
     if (!syscall_dispatcher || !unix_call_dispatcher || !unixlib_handle)
     {
@@ -4326,7 +4338,7 @@ static void wine_nx_patch_ntdll_dispatchers(void)
             __asm__ volatile(
                 "mov x16, %[func]\n\t"
                 "mov x17, %[teb]\n\t"
-                "mov x9, x18\n\t"          /* save current x18 */
+                "str x18, [sp, #-16]!\n\t"          /* save current x18 */
                 "mov x18, x17\n\t"         /* set PE TEB register */
                 "mov w0, %w[flags]\n\t"
                 "mov x1, xzr\n\t"          /* addr = NULL */
@@ -4336,7 +4348,7 @@ static void wine_nx_patch_ntdll_dispatchers(void)
                 "mov x5, xzr\n\t"          /* params = NULL */
                 "blr x16\n\t"
                 "mov %[ret], x0\n\t"
-                "mov x18, x9\n\t"          /* restore x18 */
+                "ldr x18, [sp], #16\n\t"          /* restore x18 */
                 : [ret] "=r"(real_heap)
                 : [func] "r"(real_create_heap),
                   [teb]  "r"(teb_val),
@@ -4370,16 +4382,14 @@ static void wine_nx_patch_ntdll_dispatchers(void)
      * ucrtbase's DllMain) dereferences a NULL pointer. version_init also touches the TEB
      * via x18, so it needs the same wrapper as RtlCreateHeap.
      *
-     * Preferred: lookup via the export table (requires version_init in ntdll.spec and a
-     * PE ntdll rebuild). Fallback: hardcoded offset 0x76d24 of `version_init` inside the
-     * prebuilt aarch64 ntdll.dll currently shipped. The fallback is fragile across PE
-     * ntdll rebuilds — update if `llvm-objdump -t ntdll.dll | grep version_init` differs. */
+     * Resolve the export from the matching rebuilt PE ntdll. */
     {
         void *version_init_fn = RtlFindExportedRoutineByName( ntdll->ldr.DllBase, "version_init" );
         if (!version_init_fn)
         {
-            version_init_fn = (char *)ntdll->ldr.DllBase + 0x76d24;
-            wine_nx_trace( "[LDR] version_init export missing; falling back to hardcoded offset %p", version_init_fn );
+            wine_nx_trace( "[LDR] version_init export missing; use the matching rebuilt ntdll.dll" );
+            NtTerminateProcess( NtCurrentProcess(), STATUS_INVALID_IMAGE_FORMAT );
+            return;
         }
         if (version_init_fn)
         {
@@ -4388,10 +4398,10 @@ static void wine_nx_patch_ntdll_dispatchers(void)
             __asm__ volatile(
                 "mov x16, %[func]\n\t"
                 "mov x17, %[teb]\n\t"
-                "mov x9, x18\n\t"
+                "str x18, [sp, #-16]!\n\t"
                 "mov x18, x17\n\t"
                 "blr x16\n\t"
-                "mov x18, x9\n\t"
+                "ldr x18, [sp], #16\n\t"
                 :
                 : [func] "r"(version_init_fn), [teb] "r"(teb_val)
                 : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
@@ -4418,10 +4428,10 @@ static void wine_nx_patch_ntdll_dispatchers(void)
             __asm__ volatile(
                 "mov x16, %[func]\n\t"
                 "mov x17, %[teb]\n\t"
-                "mov x9, x18\n\t"
+                "str x18, [sp, #-16]!\n\t"
                 "mov x18, x17\n\t"
                 "blr x16\n\t"
-                "mov x18, x9\n\t"
+                "ldr x18, [sp], #16\n\t"
                 :
                 : [func] "r"(locale_init_fn), [teb] "r"(teb_val)
                 : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
@@ -4447,11 +4457,9 @@ static void wine_nx_patch_ntdll_dispatchers(void)
      * ntdll_pe_compat.c uses DJB2, which would index different buckets and
      * leave lookups missing.
      *
-     * Offset 0xc2410 is the .data offset of `hash_table` symbol in the
-     * prebuilt aarch64 ntdll.dll — verify with `llvm-objdump -t | grep hash_table`
-     * if PE ntdll is ever rebuilt. */
+     * The table pointer is exported by the matching PE ntdll. */
     {
-        LIST_ENTRY *pe_hash_table = (LIST_ENTRY *)((char *)ntdll->ldr.DllBase + 0xc2410);
+        LIST_ENTRY *pe_hash_table = *pe_hash_table_export;
         PEB *peb_local = NtCurrentTeb()->Peb;
         LIST_ENTRY *head, *cursor;
         unsigned int i, inserted = 0;
@@ -4506,6 +4514,14 @@ static WINE_MODREF *wine_nx_build_main_module( const UNICODE_STRING *nt_name )
     void *module = NtCurrentTeb()->Peb->ImageBaseAddress;
 
     NtQueryInformationProcess( GetCurrentProcess(), ProcessImageInformation, &info, sizeof(info), NULL );
+    if (info.Machine == IMAGE_FILE_MACHINE_I386)
+    {
+        /* The native loader records the guest image without rewriting PE32
+         * headers or binding its imports using ARM64 thunks. */
+        wm = alloc_module( module, nt_name, FALSE );
+        if (wm) wm->ldr.LoadCount = -1;
+        return wm;
+    }
     if (!convert_to_pe64( module, &info )) return NULL;
 
     status = build_module( NULL, nt_name, &module, &info, NULL, LDR_DONT_RESOLVE_REFS, FALSE,
@@ -4536,7 +4552,7 @@ NTSTATUS wine_nx_loader_bootstrap( const UNICODE_STRING *main_nt_name )
     RtlInitializeBitMap( &tls_bitmap, peb->TlsBitmapBits, sizeof(peb->TlsBitmapBits) * 8 );
     RtlInitializeBitMap( &tls_expansion_bitmap, peb->TlsExpansionBitmapBits,
                          sizeof(peb->TlsExpansionBitmapBits) * 8 );
-    RtlSetBits( peb->TlsBitmap, 0, 1 );
+    RtlSetBits( peb->TlsBitmap, 0, NtCurrentTeb()->WowTebOffset ? WOW64_TLS_MAX_NUMBER : 1 );
     RtlSetBits( peb->TlsBitmap, NTDLL_TLS_ERRNO, 1 );
 
     if (!(tls_dirs = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY, tls_module_count * sizeof(*tls_dirs) )))
@@ -4551,6 +4567,65 @@ NTSTATUS wine_nx_loader_bootstrap( const UNICODE_STRING *main_nt_name )
 
     wine_nx_loader_ready = TRUE;
     return STATUS_SUCCESS;
+}
+
+/* Load only native modules here. The x86 ntdll loader owns guest imports/TLS. */
+NTSTATUS wine_nx_loader_prepare_wow64( HMODULE *native_ntdll, void **initialize )
+{
+    static const WCHAR *names[] = { L"ntdll.dll", L"wow64.dll", L"wow64win.dll", L"winebox64.dll" };
+    WINE_MODREF *loaded[ARRAY_SIZE(names)];
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG *cpu_backend;
+    unsigned int i;
+    if (!wine_nx_loader_ready || !NtCurrentTeb()->WowTebOffset) return STATUS_INVALID_PARAMETER;
+    RtlEnterCriticalSection( &loader_section );
+    for (i = 0; i < ARRAY_SIZE(names); i++)
+    {
+        wine_nx_trace( "[WOW64] loading native module %u", i );
+        status = load_dll( NULL, names[i], 0, &loaded[i], FALSE );
+        wine_nx_trace( "[WOW64] native module %u status=%08x", i, (unsigned)status );
+        if (status) break;
+    }
+    if (!status)
+    {
+        node_ntdll = loaded[0]->ldr.DdagNode;
+        wine_nx_patch_ntdll_dispatchers();
+        status = alloc_thread_tls();
+        for (i = 0; !status && i < ARRAY_SIZE(names); i++)
+            status = process_attach( loaded[i]->ldr.DdagNode, (void *)1 );
+        *native_ntdll = loaded[0]->ldr.DllBase;
+        *initialize = RtlFindExportedRoutineByName( loaded[1]->ldr.DllBase, "Wow64LdrpInitialize" );
+        if (!*initialize) status = STATUS_PROCEDURE_NOT_FOUND;
+        /* The PE ntdll's own init_wow64() is bypassed, so fill in the rest of
+         * what it resolves in that image (not this runtime copy of the loader).
+         * Its RtlWow64SuspendThread calls pWow64SuspendLocalThread unconditionally. */
+        {
+            void **suspend = RtlFindExportedRoutineByName( loaded[0]->ldr.DllBase, "pWow64SuspendLocalThread" );
+            void **prepare = RtlFindExportedRoutineByName( loaded[0]->ldr.DllBase, "pWow64PrepareForException" );
+            void *suspend_fn = RtlFindExportedRoutineByName( loaded[1]->ldr.DllBase, "Wow64SuspendLocalThread" );
+            void *prepare_fn = RtlFindExportedRoutineByName( loaded[1]->ldr.DllBase, "Wow64PrepareForException" );
+
+            if (!suspend || !prepare || !suspend_fn || !prepare_fn)
+            {
+                wine_nx_trace( "[WOW64] missing WoW64 hooks; use the matching rebuilt ntdll.dll/wow64.dll" );
+                status = STATUS_PROCEDURE_NOT_FOUND;
+            }
+            else
+            {
+                *suspend = suspend_fn;
+                *prepare = prepare_fn;
+            }
+        }
+        cpu_backend = RtlFindExportedRoutineByName( loaded[1]->ldr.DllBase, "__wine_switch_cpu_backend" );
+        if (!cpu_backend) status = STATUS_PROCEDURE_NOT_FOUND;
+        if (!status)
+        {
+            *cpu_backend = IMAGE_FILE_MACHINE_I386;
+            wine_nx_trace( "[WOW64] selected winebox64.dll through native bootstrap" );
+        }
+    }
+    RtlLeaveCriticalSection( &loader_section );
+    return status;
 }
 
 NTSTATUS wine_nx_loader_fixup_main_imports(void)

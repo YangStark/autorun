@@ -745,6 +745,12 @@ static HMODULE load_64bit_module( const WCHAR *name )
 /**********************************************************************
  *           get_cpu_dll_name
  */
+#ifdef __aarch64__
+/* Explicit Switch bootstrap selection. Zero preserves Wine's normal registry
+ * lookup/default; the native Switch loader sets this before process_init. */
+ULONG __wine_switch_cpu_backend;
+#endif
+
 static const WCHAR *get_cpu_dll_name(void)
 {
     static ULONG buffer[32];
@@ -758,6 +764,11 @@ static const WCHAR *get_cpu_dll_name(void)
     switch (current_machine)
     {
     case IMAGE_FILE_MACHINE_I386:
+#ifdef __aarch64__
+        if (native_machine == IMAGE_FILE_MACHINE_ARM64 &&
+            __wine_switch_cpu_backend == IMAGE_FILE_MACHINE_I386)
+            return L"winebox64.dll";
+#endif
         RtlInitUnicodeString( &nameW, L"\\Registry\\Machine\\Software\\Microsoft\\Wow64\\x86" );
         ret = (native_machine == IMAGE_FILE_MACHINE_ARM64 ? L"libwow64fex.dll" : L"wow64cpu.dll");
         break;
