@@ -251,16 +251,22 @@ SIZE_T kernel_stack_size __attribute__((weak)) = 1024 * 1024;
 BOOL simulate_writecopy __attribute__((weak)) = FALSE;
 SYSTEM_SERVICE_TABLE KeServiceDescriptorTable[4] __attribute__((weak));
 
+/* Serialize seek-based positioned I/O and preserve the caller's cursor.
+ * Ordinary read/write on a shared descriptor still require caller coordination. */
+static pthread_mutex_t positioned_io_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 ssize_t pread( int fd, void *buffer, size_t size, off_t offset ) __attribute__((weak));
 ssize_t pread( int fd, void *buffer, size_t size, off_t offset )
 {
-    static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
     ssize_t total = 0;
+    off_t saved;
+    int saved_errno;
 
-    pthread_mutex_lock( &mutex );
-    if (lseek( fd, offset, SEEK_SET ) == (off_t)-1)
+    pthread_mutex_lock( &positioned_io_mutex );
+    saved = lseek( fd, 0, SEEK_CUR );
+    if (saved == (off_t)-1 || lseek( fd, offset, SEEK_SET ) == (off_t)-1)
     {
-        pthread_mutex_unlock( &mutex );
+        pthread_mutex_unlock( &positioned_io_mutex );
         return -1;
     }
 
@@ -280,20 +286,27 @@ ssize_t pread( int fd, void *buffer, size_t size, off_t offset )
         break;
     }
 
-    pthread_mutex_unlock( &mutex );
+    saved_errno = errno;
+    if (lseek( fd, saved, SEEK_SET ) == (off_t)-1)
+        total = -1;
+    else
+        errno = saved_errno;
+    pthread_mutex_unlock( &positioned_io_mutex );
     return total;
 }
 
 ssize_t pwrite( int fd, const void *buffer, size_t size, off_t offset ) __attribute__((weak));
 ssize_t pwrite( int fd, const void *buffer, size_t size, off_t offset )
 {
-    static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
     ssize_t total = 0;
+    off_t saved;
+    int saved_errno;
 
-    pthread_mutex_lock( &mutex );
-    if (lseek( fd, offset, SEEK_SET ) == (off_t)-1)
+    pthread_mutex_lock( &positioned_io_mutex );
+    saved = lseek( fd, 0, SEEK_CUR );
+    if (saved == (off_t)-1 || lseek( fd, offset, SEEK_SET ) == (off_t)-1)
     {
-        pthread_mutex_unlock( &mutex );
+        pthread_mutex_unlock( &positioned_io_mutex );
         return -1;
     }
 
@@ -318,7 +331,12 @@ ssize_t pwrite( int fd, const void *buffer, size_t size, off_t offset )
         break;
     }
 
-    pthread_mutex_unlock( &mutex );
+    saved_errno = errno;
+    if (lseek( fd, saved, SEEK_SET ) == (off_t)-1)
+        total = -1;
+    else
+        errno = saved_errno;
+    pthread_mutex_unlock( &positioned_io_mutex );
     return total;
 }
 

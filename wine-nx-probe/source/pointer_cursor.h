@@ -58,6 +58,29 @@ static inline int pointer_cursor_step( struct pointer_cursor *c, int stick_x, in
     return (int)c->x != old_x || (int)c->y != old_y;
 }
 
+/* Buttons seen by the polls since the last take: the latest state, and every
+ * button that went down or up in between. Polls can outpace the message loop
+ * that takes them, and a click shorter than that gap must not be lost. */
+struct pointer_buttons
+{
+    unsigned int held, pressed, released;
+};
+
+static inline void pointer_buttons_update( struct pointer_buttons *b, unsigned int held )
+{
+    b->pressed |= held & ~b->held;
+    b->released |= b->held & ~held;
+    b->held = held;
+}
+
+static inline struct pointer_buttons pointer_buttons_take( struct pointer_buttons *b )
+{
+    struct pointer_buttons taken = *b;
+
+    b->pressed = b->released = 0;
+    return taken;
+}
+
 /* The classic Windows arrow: B outline, W fill, '.' transparent. */
 static const char pointer_cursor_shape[POINTER_CURSOR_H][POINTER_CURSOR_W + 1] =
 {

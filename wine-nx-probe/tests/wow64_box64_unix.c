@@ -12,6 +12,17 @@ static unsigned int run_calls, unix_calls, read_calls;
 static BOOL partial_read;
 static NTSTATUS read_status;
 static I386_CONTEXT context;
+static NTSTATUS run_status = STATUS_TIMEOUT;
+#ifdef __SWITCH__
+int wine_nx_runtime_verbose;
+static unsigned int trace_calls, error_calls;
+void wine_nx_runtime_trace( const char *message )
+{
+    if (!strncmp( message, "[BOX64RUN]", 10 )) ++trace_calls;
+    else if (!strncmp( message, "[BOX64] status=", 15 )) ++error_calls;
+    else assert( 0 );
+}
+#endif
 
 NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *address, void *buffer,
                                      SIZE_T size, SIZE_T *read )
@@ -36,6 +47,7 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *ctx, ULONG fs_base,
     assert( host->read && !host->syscall && !host->unix_call && !opaque );
     assert( !completion && budget == 123 );
     ++run_calls;
+    if (run_calls > 1) return run_status;
     /* Guest reads cannot wrap into native address space or accept short copies. */
     assert( host->read( opaque, 0xffffffff, buffer, sizeof(buffer) ) == STATUS_ACCESS_VIOLATION );
     assert( !read_calls );
@@ -86,6 +98,30 @@ int main(void)
     p.gates.unix_call = 0x10001010;
     p.budget = 123;
     assert( run( &p ) == STATUS_TIMEOUT && p.executed == 7 && run_calls == 1 );
+#ifdef __SWITCH__
+    /* Quiet execution must not read instructions just to format diagnostics,
+     * nor consume the bounded verbose trace allowance. */
+    assert( !trace_calls && !error_calls );
+    context.Eip = 0x10000000;
+    read_status = STATUS_SUCCESS;
+    read_calls = 0;
+    for (unsigned int i = 0; i < 800; ++i) assert( run( &p ) == STATUS_TIMEOUT );
+    assert( !read_calls && !trace_calls );
+    wine_nx_runtime_verbose = 1;
+    assert( run( &p ) == STATUS_TIMEOUT );
+    assert( read_calls == 1 && trace_calls == 2 );
+    wine_nx_runtime_verbose = 0;
+    assert( run( &p ) == STATUS_TIMEOUT );
+    assert( read_calls == 1 && trace_calls == 2 );
+    wine_nx_runtime_verbose = 1;
+    for (unsigned int i = 0; i < 800; ++i) assert( run( &p ) == STATUS_TIMEOUT );
+    assert( read_calls == 768 && trace_calls == 1536 );
+    wine_nx_runtime_verbose = 0;
+    run_status = STATUS_ACCESS_VIOLATION;
+    assert( run( &p ) == STATUS_ACCESS_VIOLATION );
+    assert( error_calls == 1 && trace_calls == 1536 && read_calls == 768 );
+    puts( "WoW64 tracing: quiet reads/logs suppressed, verbose toggle/cap and quiet errors passed" );
+#endif
 
     assert( call_unix( NULL ) == STATUS_INVALID_PARAMETER );
     --u.version;

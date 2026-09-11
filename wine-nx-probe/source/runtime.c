@@ -39,7 +39,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-19"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-30"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -104,6 +104,7 @@ static int wine_nx_fb_pending_stride;
 static int wine_nx_fb_pending_dirty;
 static int wine_nx_fb_lock_depth;
 static u64 wine_nx_fb_last_present;
+static unsigned int wine_nx_fb_frames; /* frames queued to the display, for [PROGRESS] */
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char log_file_buffer[64 * 1024];
@@ -204,6 +205,9 @@ static struct pointer_cursor wine_nx_pointer =
 static PadState wine_nx_pad;
 static u64 wine_nx_pointer_tick;
 static int wine_nx_pointer_ready;
+/* What the polls saw since the last wine_nx_pointer_take(). */
+static struct pointer_buttons wine_nx_pointer_buttons;
+static int wine_nx_pointer_moved;
 
 /* Take the screen from the text console and bring up a linear framebuffer. */
 int wine_nx_fb_init(void)
@@ -292,6 +296,7 @@ void wine_nx_fb_present(void)
             wine_nx_fb_pending_dirty = 0;
             wine_nx_cursor_moved = 0;
             wine_nx_fb_last_present = now;
+            __atomic_add_fetch( &wine_nx_fb_frames, 1, __ATOMIC_RELAXED );
         }
     }
     pthread_mutex_unlock( &wine_nx_fb_mutex );
@@ -332,7 +337,8 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
         padInitializeDefault( &wine_nx_pad );
         wine_nx_pointer_tick = armGetSystemTick();
         wine_nx_pointer_ready = 1;
-        log_line( "[NXINPUT] pointer ready: touchscreen, right stick cursor, A left button, B right button" );
+        if (wine_nx_runtime_verbose)
+            log_line( "[NXINPUT] pointer ready: touchscreen, right stick cursor, A left button, B right button" );
     }
     padUpdate( &wine_nx_pad );
     now = armGetSystemTick();
@@ -354,9 +360,34 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
     *x = (int)wine_nx_pointer.x;
     *y = (int)wine_nx_pointer.y;
     *buttons = pressed;
+    pointer_buttons_update( &wine_nx_pointer_buttons, pressed );
+    wine_nx_pointer_moved |= moved;
     pthread_mutex_unlock( &wine_nx_pointer_mutex );
 
     wine_nx_cursor_move( *x, *y );
+    return moved;
+}
+
+/* Hand over what the polls saw since the previous take: the position, whether
+ * it changed, the buttons held now, and those pressed or released in between.
+ * The display driver polls from a background thread, which has no TEB and
+ * must not call into Wine, and delivers the input from a Wine thread. */
+int wine_nx_pointer_take( int *x, int *y, unsigned int *buttons, unsigned int *pressed, unsigned int *released )
+{
+    struct pointer_buttons taken;
+    int moved;
+
+    pthread_mutex_lock( &wine_nx_pointer_mutex );
+    *x = (int)wine_nx_pointer.x;
+    *y = (int)wine_nx_pointer.y;
+    taken = pointer_buttons_take( &wine_nx_pointer_buttons );
+    moved = wine_nx_pointer_moved;
+    wine_nx_pointer_moved = 0;
+    pthread_mutex_unlock( &wine_nx_pointer_mutex );
+
+    *buttons = taken.held;
+    *pressed = taken.pressed;
+    *released = taken.released;
     return moved;
 }
 
@@ -497,6 +528,35 @@ static void runtime_report_interpreter(void)
     ULONGLONG executed, runs;
     u64 now = armGetSystemTick();
     double seconds;
+
+    if (!wine_nx_runtime_verbose)
+    {
+        /* Without verbose traces a white screen says nothing about whether a
+         * program is still loading, computing or drawing. Every 10 seconds, if
+         * anything changed: file reads, frames shown and dynarec entries. */
+        extern unsigned int wine_nx_file_reads __attribute__((weak));
+        static unsigned int calls, last_reads = ~0u, last_frames = ~0u;
+        static u64 start;
+        unsigned int reads = &wine_nx_file_reads ? __atomic_load_n( &wine_nx_file_reads, __ATOMIC_RELAXED ) : 0;
+        unsigned int frames = __atomic_load_n( &wine_nx_fb_frames, __ATOMIC_RELAXED );
+
+        if (!start) start = now;
+        if (++calls % 2 || (reads == last_reads && frames == last_frames)) return;
+        last_reads = reads;
+        last_frames = frames;
+#ifdef WINE_NX_BOX64_DYNAREC
+        {
+            extern unsigned long long wine_nx_box64_native_entries;
+            log_line( "[PROGRESS] %llus reads=%u frames=%u native_entries=%llu",
+                      (unsigned long long)(armTicksToNs( now - start ) / 1000000000ull), reads, frames,
+                      __atomic_load_n( &wine_nx_box64_native_entries, __ATOMIC_RELAXED ) );
+        }
+#else
+        log_line( "[PROGRESS] %llus reads=%u frames=%u",
+                  (unsigned long long)(armTicksToNs( now - start ) / 1000000000ull), reads, frames );
+#endif
+        return;
+    }
 
 #ifdef WINE_NX_BOX64_DYNAREC
     {

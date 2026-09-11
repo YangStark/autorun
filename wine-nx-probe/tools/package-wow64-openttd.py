@@ -115,7 +115,7 @@ assert 'cryptbase.dll' in staged, 'advapi32 forwards SystemFunction036 to cryptb
 assert list((game / 'baseset').rglob('opengfx.obg')), 'OpenGFX is missing'
 assert (game / 'lang/english.lng').is_file()
 
-archive = build / 'wine-nx-openttd-dynarec-19.zip'
+archive = build / 'wine-nx-openttd-dynarec-30.zip'
 with ZipFile(archive, 'w', ZIP_DEFLATED) as z:
     for f in sorted(stage.rglob('*')):
         if f.is_file() and f.name != '.DS_Store' and f.suffix != '.log':

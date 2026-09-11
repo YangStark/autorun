@@ -41,6 +41,12 @@ i686-w64-mingw32-clang -Os -Wall -Wextra -Werror -fno-builtin -nostdlib \
 i686-w64-mingw32-clang -Os -Wall -Wextra -Werror -fno-builtin -nostdlib \
     -Wl,--entry,_start@0 -Wl,--image-base,0x10000000 -Wl,--dynamicbase \
     -o "$pe/pe32-messages.exe" "$root/wine-nx-probe/tests/pe32_messages.c" -luser32 -lkernel32 -lntdll
+i686-w64-mingw32-windres -I "$root" \
+    "$root/wine-nx-probe/tests/pe32_video_startup.rc" "$pe/pe32-video-startup.res.o"
+i686-w64-mingw32-clang -Os -Wall -Wextra -Werror -fno-builtin -nostdlib \
+    -Wl,--entry,_start@0 -Wl,--image-base,0x10000000 -Wl,--dynamicbase \
+    -o "$pe/pe32-video-startup.exe" "$root/wine-nx-probe/tests/pe32_video_startup.c" \
+    "$pe/pe32-video-startup.res.o" -luser32 -lkernel32 -lntdll
 sh "$root/wine-nx-probe/tools/bootstrap-box64-core.sh"
 docker run --rm --platform linux/arm64 -v "$root:/work" -w /work \
     devkitpro/devkita64 sh -ec '
@@ -58,7 +64,7 @@ done
 for module in $i386_modules; do
     cp "$pe/dlls/$module/i386-windows/$module.dll" "$stage/drive_c/windows/syswow64/"
 done
-cp "$pe/pe32-smoke.exe" "$pe/pe32-functional.exe" "$pe/pe32-threads.exe" "$pe/pe32-lifecycle.exe" "$pe/pe32-timers.exe" "$pe/pe32-messages.exe" \
+cp "$pe/pe32-smoke.exe" "$pe/pe32-functional.exe" "$pe/pe32-threads.exe" "$pe/pe32-lifecycle.exe" "$pe/pe32-timers.exe" "$pe/pe32-messages.exe" "$pe/pe32-video-startup.exe" \
     "$root/wine-nx-probe/samples/7zr-x86/7zr.exe" "$root/wine-nx-probe/samples/7zr-x86/7zr-sample.7z" \
     "$root/wine-nx-probe/samples/7zr-x86/7zr-tree.7z" \
     "$stage/drive_c/"

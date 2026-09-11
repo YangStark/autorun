@@ -121,8 +121,45 @@ static void test_paint_restores_pixels(void)
     assert( !memcmp( bits, before, sizeof(bits) ) );
 }
 
+static void test_buttons_between_takes(void)
+{
+    enum { L = 1, R = 2 };
+    struct pointer_buttons b = {0}, t;
+
+    /* Nothing happens: nothing to deliver. */
+    pointer_buttons_update( &b, 0 );
+    t = pointer_buttons_take( &b );
+    assert( !t.held && !t.pressed && !t.released );
+
+    /* A held across several polls is one press. */
+    pointer_buttons_update( &b, L );
+    pointer_buttons_update( &b, L );
+    t = pointer_buttons_take( &b );
+    assert( t.held == L && t.pressed == L && !t.released );
+    pointer_buttons_update( &b, L );
+    t = pointer_buttons_take( &b );
+    assert( t.held == L && !t.pressed && !t.released );
+
+    /* A released and pressed again before the take: both edges survive. */
+    pointer_buttons_update( &b, 0 );
+    pointer_buttons_update( &b, L );
+    t = pointer_buttons_take( &b );
+    assert( t.held == L && t.pressed == L && t.released == L );
+
+    /* A quick tap of B between two takes: pressed and released, not held. */
+    pointer_buttons_update( &b, L | R );
+    pointer_buttons_update( &b, L );
+    t = pointer_buttons_take( &b );
+    assert( t.held == L && t.pressed == R && t.released == R );
+
+    /* Take clears the edges but keeps the state. */
+    t = pointer_buttons_take( &b );
+    assert( t.held == L && !t.pressed && !t.released );
+}
+
 int main(void)
 {
+    test_buttons_between_takes();
     test_dead_zone_ignores_drift();
     test_full_tilt_speed_and_axes();
     test_diagonal_is_not_faster();
@@ -130,6 +167,7 @@ int main(void)
     test_slow_tilt_accumulates_subpixels();
     test_stall_and_edges();
     test_paint_restores_pixels();
-    puts( "pointer cursor: dead zone, speed curve, time scaling, edges and sprite restore passed" );
+    puts( "pointer cursor: buttons between takes, dead zone, speed curve, time scaling, edges and sprite "
+          "restore passed" );
     return 0;
 }
