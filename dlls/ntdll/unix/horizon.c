@@ -51,8 +51,11 @@
 
 #endif /* HORIZON_STANDALONE_SYNTAX */
 
+#include "horizon_clipboard.h"
 #include "horizon_file_access.h"
 #include "horizon_message_queue.h"
+#include "horizon_msg_queue.h"
+#include "horizon_win_timers.h"
 #include "horizon_threads.h"
 
 #include <errno.h>
@@ -271,11 +274,21 @@ struct horizon_fd_queue
 #define HORIZON_REQ_GET_TIMER_INFO 105
 #define HORIZON_REQ_ADD_ATOM 108
 #define HORIZON_REQ_FIND_ATOM 110
+#define HORIZON_REQ_ADD_USER_ATOM 112
+#define HORIZON_REQ_GET_USER_ATOM_NAME 113
+#define HORIZON_REQ_GET_MSG_QUEUE_HANDLE 114
+#define HORIZON_REQ_GET_MSG_QUEUE 115
+#define HORIZON_REQ_SET_QUEUE_MASK 117
+#define HORIZON_REQ_GET_QUEUE_STATUS 118
 #define HORIZON_REQ_SEND_MESSAGE 120
 #define HORIZON_REQ_POST_QUIT_MESSAGE 121
 #define HORIZON_REQ_SEND_HARDWARE_MESSAGE 122
 #define HORIZON_REQ_GET_MESSAGE 124
+#define HORIZON_REQ_REPLY_MESSAGE 125
 #define HORIZON_REQ_ACCEPT_HARDWARE_MESSAGE 126
+#define HORIZON_REQ_GET_MESSAGE_REPLY 127
+#define HORIZON_REQ_SET_WIN_TIMER 128
+#define HORIZON_REQ_KILL_WIN_TIMER 129
 #define HORIZON_REQ_CREATE_WINDOW 144
 #define HORIZON_REQ_DESTROY_WINDOW 145
 #define HORIZON_REQ_GET_DESKTOP_WINDOW 146
@@ -318,7 +331,21 @@ struct horizon_fd_queue
 #define HORIZON_REQ_SET_FOCUS_WINDOW 195
 #define HORIZON_REQ_SET_ACTIVE_WINDOW 196
 #define HORIZON_REQ_SET_CAPTURE_WINDOW 197
+#define HORIZON_REQ_SET_CARET_WINDOW 198
+#define HORIZON_REQ_SET_CARET_INFO 199
 #define HORIZON_REQ_CREATE_CLASS 205
+#define HORIZON_REQ_OPEN_CLIPBOARD 209
+#define HORIZON_REQ_CLOSE_CLIPBOARD 210
+#define HORIZON_REQ_EMPTY_CLIPBOARD 211
+#define HORIZON_REQ_SET_CLIPBOARD_DATA 212
+#define HORIZON_REQ_GET_CLIPBOARD_DATA 213
+#define HORIZON_REQ_GET_CLIPBOARD_FORMATS 214
+#define HORIZON_REQ_ENUM_CLIPBOARD_FORMATS 215
+#define HORIZON_REQ_RELEASE_CLIPBOARD 216
+#define HORIZON_REQ_GET_CLIPBOARD_INFO 217
+#define HORIZON_REQ_SET_CLIPBOARD_VIEWER 218
+#define HORIZON_REQ_ADD_CLIPBOARD_LISTENER 219
+#define HORIZON_REQ_REMOVE_CLIPBOARD_LISTENER 220
 #define HORIZON_REQ_DESTROY_CLASS 206
 #define HORIZON_REQ_ALLOC_USER_HANDLE 280
 #define HORIZON_REQ_FREE_USER_HANDLE 281
@@ -463,6 +490,7 @@ unsigned int horizon_set_process_machine( unsigned short machine )
 #define HORIZON_MSG_HARDWARE 7
 #define HORIZON_PM_REMOVE 0x0001
 #define HORIZON_QS_POSTMESSAGE 0x0008
+#define HORIZON_QS_TIMER 0x0010
 #define HORIZON_QS_ALLINPUT 0x04ff
 #define HORIZON_INPUT_MOUSE 0
 #define HORIZON_IMDT_MOUSE 0x02
@@ -473,6 +501,13 @@ unsigned int horizon_set_process_machine( unsigned short machine )
 #define HORIZON_MOUSEEVENTF_RIGHTDOWN 0x0008
 #define HORIZON_MOUSEEVENTF_RIGHTUP 0x0010
 #define HORIZON_MOUSEEVENTF_ABSOLUTE 0x8000
+#define HORIZON_SET_CARET_POS 0x01
+#define HORIZON_SET_CARET_HIDE 0x02
+#define HORIZON_SET_CARET_STATE 0x04
+#define HORIZON_CARET_STATE_OFF 0
+#define HORIZON_CARET_STATE_ON 1
+#define HORIZON_CARET_STATE_TOGGLE 2
+#define HORIZON_CARET_STATE_ON_IF_MOVED 3
 #define HORIZON_CAPTURE_MENU 0x01
 #define HORIZON_CAPTURE_MOVESIZE 0x02
 #define HORIZON_SET_CURSOR_HANDLE 0x01
@@ -530,7 +565,8 @@ enum horizon_server_object_type
     HORIZON_SERVER_OBJECT_THREAD,
     HORIZON_SERVER_OBJECT_SOCK,
     HORIZON_SERVER_OBJECT_WINSTATION,
-    HORIZON_SERVER_OBJECT_DESKTOP
+    HORIZON_SERVER_OBJECT_DESKTOP,
+    HORIZON_SERVER_OBJECT_MSG_QUEUE
 };
 
 struct horizon_server_request_header
@@ -1573,6 +1609,166 @@ struct horizon_post_quit_message_request
     int exit_code;
 };
 
+struct horizon_set_win_timer_request
+{
+    struct horizon_server_request_header header;
+    unsigned int win;
+    unsigned int msg;
+    unsigned int rate;
+    unsigned long long id;
+    unsigned long long lparam;
+};
+
+struct horizon_set_win_timer_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned long long id;
+};
+
+struct horizon_kill_win_timer_request
+{
+    struct horizon_server_request_header header;
+    unsigned int win;
+    unsigned long long id;
+    unsigned int msg;
+    char pad[4];
+};
+
+struct horizon_get_msg_queue_handle_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int handle;
+    unsigned int idle_event;
+};
+
+struct horizon_get_msg_queue_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned long long locator_id;      /* struct obj_locator */
+    unsigned long long locator_offset;
+};
+
+struct horizon_set_queue_mask_request
+{
+    struct horizon_server_request_header header;
+    unsigned int wake_mask;
+    unsigned int changed_mask;
+    int poll_events;
+};
+
+struct horizon_get_queue_status_request
+{
+    struct horizon_server_request_header header;
+    unsigned int clear_bits;
+};
+
+struct horizon_queue_bits_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int wake_bits;
+    unsigned int changed_bits;
+};
+
+struct horizon_reply_message_request
+{
+    struct horizon_server_request_header header;
+    int remove;
+    unsigned long long result;
+};
+
+struct horizon_get_message_reply_request
+{
+    struct horizon_server_request_header header;
+    int cancel;
+};
+
+struct horizon_get_message_reply_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned long long result;
+};
+
+struct horizon_get_user_atom_name_request
+{
+    struct horizon_server_request_header header;
+    unsigned int atom;
+};
+
+struct horizon_get_user_atom_name_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int total;
+    char pad[4];
+};
+
+/* open_clipboard, release_clipboard and the listener requests: one window. */
+struct horizon_clipboard_window_request
+{
+    struct horizon_server_request_header header;
+    unsigned int window;
+};
+
+/* One or two values: open_clipboard (owner), close and release_clipboard
+ * (viewer, owner), set_clipboard_data (seqno), get_clipboard_formats (count),
+ * enum_clipboard_formats (format), set_clipboard_viewer (old viewer, owner). */
+struct horizon_clipboard_pair_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int first;
+    unsigned int second;
+};
+
+struct horizon_set_clipboard_data_request
+{
+    struct horizon_server_request_header header;
+    unsigned int format;
+    unsigned int lcid;
+    char pad[4];
+};
+
+struct horizon_get_clipboard_data_request
+{
+    struct horizon_server_request_header header;
+    unsigned int format;
+    int render;
+    int cached;
+    unsigned int seqno;
+    char pad[4];
+};
+
+struct horizon_get_clipboard_data_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int from;
+    unsigned int owner;
+    unsigned int seqno;
+    unsigned int total;
+};
+
+/* get_clipboard_formats (format) and enum_clipboard_formats (previous). */
+struct horizon_clipboard_format_request
+{
+    struct horizon_server_request_header header;
+    unsigned int format;
+};
+
+struct horizon_get_clipboard_info_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int window;
+    unsigned int owner;
+    unsigned int viewer;
+    unsigned int seqno;
+};
+
+struct horizon_set_clipboard_viewer_request
+{
+    struct horizon_server_request_header header;
+    unsigned int viewer;
+    unsigned int previous;
+    char pad[4];
+};
+
 struct horizon_get_message_request
 {
     struct horizon_server_request_header header;
@@ -1728,6 +1924,46 @@ struct horizon_set_capture_window_reply
     struct horizon_server_reply_header header;
     unsigned int previous;
     unsigned int full_handle;
+};
+
+struct horizon_set_caret_window_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+    int width;
+    int height;
+};
+
+struct horizon_set_caret_window_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int previous;
+    struct horizon_rectangle old_rect;
+    int old_hide;
+    int old_state;
+    char pad[4];
+};
+
+struct horizon_set_caret_info_request
+{
+    struct horizon_server_request_header header;
+    unsigned int flags;
+    unsigned int handle;
+    int x;
+    int y;
+    int hide;
+    int state;
+    char pad[4];
+};
+
+struct horizon_set_caret_info_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int full_handle;
+    struct horizon_rectangle old_rect;
+    int old_hide;
+    int old_state;
+    char pad[4];
 };
 
 struct horizon_set_cursor_request
@@ -2057,9 +2293,23 @@ struct horizon_window_shm
     unsigned int dpi_context;
 };
 
+/* queue_shm_t. Its access time stays 0, so win32u always asks get_message
+ * instead of trusting the bits to skip it; hooks are not supported. */
+struct horizon_queue_shm
+{
+    long long access_time;
+    unsigned int wake_mask;
+    unsigned int wake_bits;
+    unsigned int changed_mask;
+    unsigned int changed_bits;
+    unsigned int internal_bits;
+    int hooks_count[16];
+};
+
 union horizon_object_shm
 {
     struct horizon_desktop_shm desktop;
+    struct horizon_queue_shm queue;
     struct horizon_input_shm input;
     struct horizon_class_shm class;
     struct horizon_window_shm window;
@@ -2177,9 +2427,6 @@ struct horizon_server_connection
     /* Thread object of the client; the connection holds one reference until
      * the client's request pipe closes, which is when the thread terminates. */
     struct horizon_server_object *thread;
-    /* PostQuitMessage state; only this connection's server thread uses it. */
-    int quit_message;
-    int exit_code;
 };
 
 struct horizon_server_object
@@ -2227,6 +2474,7 @@ struct horizon_server_object
     unsigned int desktop_msg_window;
     struct horizon_obj_locator desktop_locator;
     int std_stream;                 /* 1 stdout, 2 stderr: writes are echoed to the log */
+    unsigned int queue_tid;         /* message queue object: its thread, 0 once the thread ended */
 };
 
 struct horizon_server_handle_entry
@@ -2265,6 +2513,10 @@ static struct horizon_input_message **horizon_input_messages_tail = &horizon_inp
 static unsigned int horizon_next_input_message_id = 1;
 static unsigned int horizon_mouse_buttons;
 static struct horizon_message_queue horizon_posted_messages = { NULL, &horizon_posted_messages.head };
+static struct horizon_win_timers horizon_timers;
+static struct horizon_msgqs horizon_msg_queues;
+static struct horizon_clipboard horizon_clipboard;
+static void horizon_server_clipboard_notify_locked(void);
 
 static int horizon_pipe_open_r( struct _reent *r, void *fdptr, const char *path, int flags, int mode );
 static int horizon_pipe_close_r( struct _reent *r, void *fdptr );
@@ -3100,32 +3352,6 @@ static unsigned int horizon_server_read_exact_at( int fd, unsigned long long off
     return HORIZON_STATUS_SUCCESS;
 }
 
-static unsigned int horizon_server_write_exact_at( int fd, unsigned long long offset,
-                                                   const void *buffer, size_t size )
-{
-    const unsigned char *ptr = buffer;
-
-    if (lseek( fd, (off_t)offset, SEEK_SET ) == (off_t)-1)
-        return horizon_server_errno_status( errno );
-
-    while (size)
-    {
-        ssize_t ret = write( fd, ptr, size );
-
-        if (ret > 0)
-        {
-            ptr += ret;
-            size -= ret;
-            continue;
-        }
-        if (!ret) return HORIZON_STATUS_UNSUCCESSFUL;
-        if (errno == EINTR) continue;
-        return horizon_server_errno_status( errno );
-    }
-
-    return HORIZON_STATUS_SUCCESS;
-}
-
 static unsigned short horizon_get_le16( const unsigned char *ptr )
 {
     return ptr[0] | ((unsigned short)ptr[1] << 8);
@@ -3569,13 +3795,13 @@ static unsigned int horizon_server_flush_session_range_locked( unsigned long lon
                                                                unsigned long long size )
 {
     struct horizon_session_view *view;
-    unsigned int status;
 
     if (!size) return HORIZON_STATUS_SUCCESS;
     if (offset + size > HORIZON_SESSION_MAPPING_SIZE) return HORIZON_STATUS_INVALID_PARAMETER;
-    status = horizon_server_write_exact_at( horizon_session_fd, offset, horizon_session_data + offset, size );
-    if (status) return status;
-
+    /* Horizon cannot share the mapping, so each client view gets a copy. The
+     * backing file is not updated: views are filled from memory when they
+     * register (horizon_server_note_session_view_locked), and writing the SD
+     * card on every cursor move or queue change was slow. */
     for (view = horizon_session_views; view; view = view->next)
     {
         unsigned long long start = offset > view->offset ? offset : view->offset;
@@ -3654,6 +3880,183 @@ static unsigned int horizon_server_flush_input_locked(void)
         offsetof( struct horizon_shared_object, shm ) + sizeof(struct horizon_input_shm) );
 }
 
+/* The caret window and rectangle are shared input data. Its hide count and
+ * on/off state stay in the server, as in server/queue.c. */
+static int horizon_caret_hide;
+static int horizon_caret_state;
+
+/* CreateCaret and DestroyCaret: a new caret window starts at 0,0, hidden. */
+static void horizon_server_set_caret_window_locked( struct horizon_input_shm *input, unsigned int win,
+                                                    int width, int height )
+{
+    if (!win || win != input->caret) memset( &input->caret_rect, 0, sizeof(input->caret_rect) );
+    input->caret = win;
+    input->caret_rect.right = input->caret_rect.left + width;
+    input->caret_rect.bottom = input->caret_rect.top + height;
+    horizon_caret_hide = 1;
+    horizon_caret_state = 0;
+}
+
+/* SetCaretPos, ShowCaret, HideCaret and the blink timer. The caller reports
+ * the values from before the change; win32u draws the caret from them. */
+static unsigned int horizon_server_set_caret_info_locked( struct horizon_input_shm *input, unsigned int flags,
+                                                          unsigned int handle, int x, int y, int hide,
+                                                          int state )
+{
+    struct horizon_rectangle old = input->caret_rect;
+
+    if (handle && handle != input->caret) return HORIZON_STATUS_ACCESS_DENIED;
+    if (flags & HORIZON_SET_CARET_POS)
+    {
+        input->caret_rect.right += x - old.left;
+        input->caret_rect.bottom += y - old.top;
+        input->caret_rect.left = x;
+        input->caret_rect.top = y;
+    }
+    if (flags & HORIZON_SET_CARET_HIDE)
+    {
+        horizon_caret_hide += hide;
+        if (horizon_caret_hide < 0) horizon_caret_hide = 0;
+    }
+    if (flags & HORIZON_SET_CARET_STATE)
+    {
+        switch (state)
+        {
+        case HORIZON_CARET_STATE_OFF: horizon_caret_state = 0; break;
+        case HORIZON_CARET_STATE_ON: horizon_caret_state = 1; break;
+        case HORIZON_CARET_STATE_TOGGLE: horizon_caret_state = !horizon_caret_state; break;
+        case HORIZON_CARET_STATE_ON_IF_MOVED:
+            if (x != old.left || y != old.top) horizon_caret_state = 1;
+            break;
+        }
+    }
+    return HORIZON_STATUS_SUCCESS;
+}
+
+static unsigned long long horizon_server_timer_clock(void)
+{
+    return armTicksToNs( armGetSystemTick() ) / 1000000ull;
+}
+
+/* Shared queue data of ended threads, for reuse. */
+static struct horizon_obj_locator horizon_free_queue_shm[32];
+static unsigned int horizon_free_queue_shm_count;
+
+/* The thread's message queue, created with its shared data and waitable
+ * object on first use. */
+static struct horizon_msgq *horizon_server_queue_locked( unsigned int tid )
+{
+    struct horizon_obj_locator locator;
+    struct horizon_shared_object *shared;
+    struct horizon_server_object *sync;
+    struct horizon_msgq *queue;
+    int created;
+
+    if (!(queue = horizon_msgq_get( &horizon_msg_queues, tid, &created )) || !created) return queue;
+    if (horizon_free_queue_shm_count &&
+        (shared = horizon_server_shared_object_locked( horizon_free_queue_shm[horizon_free_queue_shm_count - 1] )))
+    {
+        locator = horizon_free_queue_shm[--horizon_free_queue_shm_count];
+        memset( &shared->shm.queue, 0, sizeof(shared->shm.queue) );
+        shared->id = locator.id = ++horizon_session_next_id;
+        horizon_server_flush_session_range_locked(
+            locator.offset, offsetof( struct horizon_shared_object, shm ) + sizeof(struct horizon_queue_shm) );
+    }
+    else if (horizon_server_alloc_shared_object_locked( sizeof(struct horizon_queue_shm), &locator ))
+    {
+        horizon_msgq_destroy( &horizon_msg_queues, queue );
+        return NULL;
+    }
+    if (!(sync = calloc( 1, sizeof(*sync) )))
+    {
+        if (horizon_free_queue_shm_count < ARRAY_SIZE(horizon_free_queue_shm))
+            horizon_free_queue_shm[horizon_free_queue_shm_count++] = locator;
+        horizon_msgq_destroy( &horizon_msg_queues, queue );
+        return NULL;
+    }
+    sync->type = HORIZON_SERVER_OBJECT_MSG_QUEUE;
+    sync->refs = 1;
+    sync->file_fd = -1;
+    sync->queue_tid = tid;
+    queue->sync = sync;
+    queue->shm_id = locator.id;
+    queue->shm_offset = locator.offset;
+    return queue;
+}
+
+/* Recompute the wake bits from what is pending for the thread and publish
+ * them, with the wait masks, in the shared queue data. */
+static void horizon_server_refresh_queue_locked( struct horizon_msgq *queue, unsigned long long now )
+{
+    struct horizon_obj_locator locator = { queue->shm_id, queue->shm_offset };
+    struct horizon_input_message *input;
+    struct horizon_user_window *window;
+    struct horizon_shared_object *shared;
+    struct horizon_queue_shm *shm;
+    unsigned int external = 0;
+
+    if (horizon_message_queue_find( &horizon_posted_messages, queue->tid, 0, 0, 0, NULL, NULL ))
+        external |= HORIZON_MSGQ_QS_POSTMESSAGE | HORIZON_MSGQ_QS_ALLPOSTMESSAGE;
+    for (input = horizon_input_messages; input; input = input->next)
+        if (input->tid == queue->tid)
+            external |= input->msg == HORIZON_WM_MOUSEMOVE ? HORIZON_MSGQ_QS_MOUSEMOVE : HORIZON_MSGQ_QS_MOUSEBUTTON;
+    for (window = horizon_windows; window; window = window->next)
+    {
+        if (window->tid != queue->tid || !(window->style & HORIZON_WS_VISIBLE)) continue;
+        if (!window->has_update_rect && !window->has_internal_paint) continue;
+        external |= HORIZON_MSGQ_QS_PAINT;
+        break;
+    }
+    if (horizon_win_timers_expired( &horizon_timers, queue->tid, 0, 0, 0, now, 0 ))
+        external |= HORIZON_MSGQ_QS_TIMER;
+    horizon_msgq_update( queue, external );
+
+    if (!(shared = horizon_server_shared_object_locked( locator )) || shared->id != queue->shm_id) return;
+    shm = &shared->shm.queue;
+    if (shm->wake_bits == queue->wake_bits && shm->changed_bits == queue->changed_bits &&
+        shm->wake_mask == queue->wake_mask && shm->changed_mask == queue->changed_mask)
+        return;
+    shm->wake_bits = queue->wake_bits;
+    shm->changed_bits = queue->changed_bits;
+    shm->wake_mask = queue->wake_mask;
+    shm->changed_mask = queue->changed_mask;
+    horizon_server_flush_session_range_locked(
+        queue->shm_offset, offsetof( struct horizon_shared_object, shm ) + sizeof(struct horizon_queue_shm) );
+}
+
+/* Time out sent messages, then refresh every queue: a reply or timeout wakes
+ * another thread's queue, and timers and paints need no event to fall due. */
+static void horizon_server_refresh_queues_locked(void)
+{
+    unsigned long long now = horizon_server_timer_clock();
+    struct horizon_msgq *queue;
+
+    horizon_msgq_expire( &horizon_msg_queues, now );
+    for (queue = horizon_msg_queues.head; queue; queue = queue->next)
+        horizon_server_refresh_queue_locked( queue, now );
+}
+
+static void horizon_server_destroy_queue_locked( unsigned int tid )
+{
+    struct horizon_msgq *queue = horizon_msgq_find( &horizon_msg_queues, tid );
+    struct horizon_server_object *sync;
+
+    if (!queue) return;
+    sync = queue->sync;
+    if (horizon_free_queue_shm_count < ARRAY_SIZE(horizon_free_queue_shm))
+    {
+        struct horizon_obj_locator locator = { queue->shm_id, queue->shm_offset };
+        horizon_free_queue_shm[horizon_free_queue_shm_count++] = locator;
+    }
+    horizon_msgq_destroy( &horizon_msg_queues, queue );
+    if (sync)
+    {
+        sync->queue_tid = 0;
+        if (!--sync->refs) horizon_server_free_object( sync );
+    }
+    horizon_server_refresh_queues_locked();
+}
+
 static unsigned int horizon_server_note_session_view_locked( unsigned long long base,
                                                              unsigned long long offset,
                                                              unsigned long long size )
@@ -3668,6 +4071,7 @@ static unsigned int horizon_server_note_session_view_locked( unsigned long long 
         view->offset = offset;
         view->size = size;
         horizon_mprotect( (void *)(ULONG_PTR)base, size, PROT_READ | PROT_WRITE );
+        memcpy( (void *)(ULONG_PTR)base, horizon_session_data + offset, size );
         return HORIZON_STATUS_SUCCESS;
     }
     if (!(view = calloc( 1, sizeof(*view) ))) return HORIZON_STATUS_NO_MEMORY;
@@ -3677,6 +4081,8 @@ static unsigned int horizon_server_note_session_view_locked( unsigned long long 
     view->next = horizon_session_views;
     horizon_session_views = view;
     horizon_mprotect( (void *)(ULONG_PTR)base, size, PROT_READ | PROT_WRITE );
+    /* The client filled the view from the backing file, which is not kept current. */
+    memcpy( (void *)(ULONG_PTR)base, horizon_session_data + offset, size );
     return HORIZON_STATUS_SUCCESS;
 }
 
@@ -3857,6 +4263,11 @@ static int horizon_server_object_is_signaled( const struct horizon_server_object
         return object->signaled;
     case HORIZON_SERVER_OBJECT_THREAD:
         return object->thread.terminated;
+    case HORIZON_SERVER_OBJECT_MSG_QUEUE:
+    {
+        struct horizon_msgq *queue = horizon_msgq_find( &horizon_msg_queues, object->queue_tid );
+        return queue && horizon_msgq_signaled( queue );
+    }
     case HORIZON_SERVER_OBJECT_PROCESS:
     case HORIZON_SERVER_OBJECT_RESERVE:
     case HORIZON_SERVER_OBJECT_KEYED_EVENT:
@@ -3943,6 +4354,9 @@ static void horizon_server_end_thread_locked( struct horizon_server_connection *
     if (horizon_thread_mark_terminated( &thread->thread, horizon_server_now() ))
         horizon_server_running_threads--;
     horizon_message_queue_drop( &horizon_posted_messages, thread->thread.tid, 0 );
+    horizon_win_timers_drop( &horizon_timers, thread->thread.tid, 0 );
+    if (horizon_clip_thread_ended( &horizon_clipboard, thread->thread.tid )) horizon_server_clipboard_notify_locked();
+    horizon_server_destroy_queue_locked( thread->thread.tid );
     for (entry = horizon_server_handles; entry; entry = entry->next)
         if (entry->object->type == HORIZON_SERVER_OBJECT_MUTEX)
             horizon_mutex_abandon( &entry->object->mutex, thread->thread.tid );
@@ -3993,6 +4407,7 @@ static unsigned int horizon_server_wait_object_locked( unsigned int handle, int 
     }
     if (!(entry = horizon_server_find_handle_locked( handle ))) return HORIZON_STATUS_INVALID_HANDLE;
     object = entry->object;
+    if (object->type == HORIZON_SERVER_OBJECT_MSG_QUEUE) horizon_server_refresh_queues_locked();
     if (!horizon_server_object_is_signaled( object )) return HORIZON_STATUS_TIMEOUT;
     if (consume && horizon_server_consume_signal( object )) return HORIZON_STATUS_ABANDONED_WAIT_0;
     return HORIZON_STATUS_SUCCESS;
@@ -4832,6 +5247,7 @@ static int horizon_server_handle_destroy_window( struct horizon_server_connectio
 {
     const struct horizon_destroy_window_request *request = (const void *)message;
     struct horizon_user_window **ptr;
+    struct horizon_input_shm *input;
     unsigned int status = HORIZON_STATUS_INVALID_HANDLE;
 
     pthread_mutex_lock( &horizon_server_objects_mutex );
@@ -4843,6 +5259,13 @@ static int horizon_server_handle_destroy_window( struct horizon_server_connectio
         if (request->handle && window->handle != request->handle) continue;
         *ptr = window->next;
         horizon_message_queue_drop( &horizon_posted_messages, window->tid, window->handle );
+        horizon_win_timers_drop( &horizon_timers, window->tid, window->handle );
+        if (horizon_clip_window_destroyed( &horizon_clipboard, window->handle )) horizon_server_clipboard_notify_locked();
+        if ((input = horizon_server_input_shared_locked()) && input->caret == window->handle)
+        {
+            horizon_server_set_caret_window_locked( input, 0, 0, 0 );
+            horizon_server_flush_input_locked();
+        }
         while ((property = window->properties))
         {
             window->properties = property->next;
@@ -4853,6 +5276,7 @@ static int horizon_server_handle_destroy_window( struct horizon_server_connectio
         if (request->handle) break;
     }
     if (!request->handle) status = HORIZON_STATUS_SUCCESS;
+    horizon_server_refresh_queues_locked();
     pthread_mutex_unlock( &horizon_server_objects_mutex );
     return horizon_server_write_status( connection->reply_fd, status );
 }
@@ -5627,6 +6051,18 @@ static int horizon_server_handle_send_hardware_message( struct horizon_server_co
         input->keystate_serial++;
         desktop->keystate_serial++;
 done:
+        if (target)
+        {
+            struct horizon_msgq *queue = horizon_server_queue_locked( target->tid );
+
+            if (queue)
+            {
+                horizon_msgq_touch( queue, (flags & HORIZON_MOUSEEVENTF_MOVE) ? HORIZON_MSGQ_QS_MOUSEMOVE : 0 );
+                horizon_msgq_touch( queue, (flags & ~(HORIZON_MOUSEEVENTF_MOVE | HORIZON_MOUSEEVENTF_ABSOLUTE))
+                                           ? HORIZON_MSGQ_QS_MOUSEBUTTON : 0 );
+            }
+            horizon_server_refresh_queues_locked();
+        }
         reply.new_x = desktop->cursor.x;
         reply.new_y = desktop->cursor.y;
         horizon_server_flush_input_locked();
@@ -5660,6 +6096,7 @@ static int horizon_server_handle_accept_hardware_message( struct horizon_server_
         free( queued );
         break;
     }
+    horizon_server_refresh_queues_locked();
     pthread_mutex_unlock( &horizon_server_objects_mutex );
     return horizon_server_write_status( connection->reply_fd, HORIZON_STATUS_SUCCESS );
 }
@@ -5747,6 +6184,66 @@ static int horizon_server_handle_set_capture_window( struct horizon_server_conne
         horizon_server_flush_input_locked();
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_set_caret_window( struct horizon_server_connection *connection,
+                                                   const unsigned char *message )
+{
+    const struct horizon_set_caret_window_request *request = (const void *)message;
+    struct horizon_set_caret_window_reply reply;
+    struct horizon_input_shm *input;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (request->handle && !horizon_server_find_window_locked( request->handle ))
+        reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else if (!(input = horizon_server_input_shared_locked()))
+        reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else
+    {
+        reply.previous = input->caret;
+        reply.old_rect = input->caret_rect;
+        reply.old_hide = horizon_caret_hide;
+        reply.old_state = horizon_caret_state;
+        horizon_server_set_caret_window_locked( input, request->handle, request->width, request->height );
+        horizon_server_flush_input_locked();
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
+    horizon_trace( "[HZCARET] window hwnd=%08x size=%dx%d previous=%08x err=%08x\n",
+                   request->handle, request->width, request->height, reply.previous, reply.header.error );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_set_caret_info( struct horizon_server_connection *connection,
+                                                 const unsigned char *message )
+{
+    const struct horizon_set_caret_info_request *request = (const void *)message;
+    struct horizon_set_caret_info_reply reply;
+    struct horizon_input_shm *input;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(input = horizon_server_input_shared_locked()))
+        reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else
+    {
+        reply.full_handle = input->caret;
+        reply.old_rect = input->caret_rect;
+        reply.old_hide = horizon_caret_hide;
+        reply.old_state = horizon_caret_state;
+        reply.header.error = horizon_server_set_caret_info_locked( input, request->flags, request->handle,
+                                                                   request->x, request->y, request->hide,
+                                                                   request->state );
+        if (!reply.header.error && (request->flags & HORIZON_SET_CARET_POS)) horizon_server_flush_input_locked();
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
+    horizon_trace( "[HZCARET] info flags=%x hwnd=%08x pos=%d,%d hide=%d state=%d -> caret=%08x "
+                   "hide=%d state=%d err=%08x\n", request->flags, request->handle, request->x, request->y,
+                   request->hide, request->state, reply.full_handle, horizon_caret_hide, horizon_caret_state,
+                   reply.header.error );
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
 }
 
@@ -6228,15 +6725,219 @@ static void horizon_server_message_defaults_locked( int *x, int *y, unsigned int
     *y = desktop->cursor.y;
 }
 
-/* PostMessage and PostThreadMessage. Messages sent to another thread
- * (SendMessage, SendNotifyMessage, SendMessageCallback) wait for a reply and
- * are not supported yet; a thread sending to its own windows never gets here. */
+/* WM_CLIPBOARDUPDATE to every listener after the clipboard changed. */
+static void horizon_server_clipboard_notify_locked(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < horizon_clipboard.listen_count; i++)
+    {
+        struct horizon_user_window *window = horizon_server_find_window_locked( horizon_clipboard.listeners[i] );
+        struct horizon_posted_message posted;
+        struct horizon_msgq *queue;
+
+        if (!window || !window->tid || !(queue = horizon_server_queue_locked( window->tid ))) continue;
+        memset( &posted, 0, sizeof(posted) );
+        posted.tid = window->tid;
+        posted.win = window->handle;
+        posted.msg = 0x031d;  /* WM_CLIPBOARDUPDATE */
+        horizon_server_message_defaults_locked( &posted.x, &posted.y, &posted.time );
+        if (!horizon_message_queue_post( &horizon_posted_messages, &posted ))
+            horizon_msgq_touch( queue, HORIZON_MSGQ_QS_POSTMESSAGE | HORIZON_MSGQ_QS_ALLPOSTMESSAGE );
+    }
+    horizon_server_refresh_queues_locked();
+}
+
+/* RegisterWindowMessage and RegisterClipboardFormat. The process has one atom
+ * table; user atoms share it with classes and global atoms. */
+static int horizon_server_handle_add_user_atom( struct horizon_server_connection *connection,
+                                                const unsigned char *data, unsigned int data_size )
+{
+    struct horizon_atom_reply reply;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    reply.header.error = horizon_server_add_atom_locked( data, data_size, 0, &reply.atom );
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_get_user_atom_name( struct horizon_server_connection *connection,
+                                                     const unsigned char *message )
+{
+    const struct horizon_get_user_atom_name_request *request = (const void *)message;
+    struct horizon_get_user_atom_name_reply reply;
+    struct horizon_atom_entry *entry;
+    unsigned char name[HORIZON_MAX_ATOM_LEN * sizeof(unsigned short)];
+    unsigned int size = 0;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    for (entry = horizon_atoms; entry; entry = entry->next) if (entry->atom == request->atom) break;
+    if (!entry) reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else
+    {
+        reply.total = entry->name_len;
+        size = entry->name_len < request->header.reply_size ? entry->name_len : request->header.reply_size;
+        if (size > sizeof(name)) size = sizeof(name);
+        memcpy( name, entry->name, size );
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    reply.header.reply_size = size;
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), name, size );
+}
+
+static int horizon_server_handle_clipboard( struct horizon_server_connection *connection, int req,
+                                            const unsigned char *message, const unsigned char *data,
+                                            unsigned int data_size )
+{
+    const struct horizon_clipboard_window_request *window_request = (const void *)message;
+    struct horizon_clipboard_pair_reply reply;
+    struct horizon_clip_data_reply clip_data;
+    struct horizon_clipboard *clip = &horizon_clipboard;
+    unsigned int status = HORIZON_STATUS_SUCCESS, *formats = NULL, count = 0, max, notify = 0;
+    const void *reply_data = NULL;
+    unsigned int reply_data_size = 0;
+    unsigned char *copy = NULL;
+    int ret;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    switch (req)
+    {
+    case HORIZON_REQ_OPEN_CLIPBOARD:
+        if (window_request->window && !horizon_server_find_window_locked( window_request->window ))
+            status = 0xc0010578u;  /* ERROR_INVALID_WINDOW_HANDLE */
+        else status = horizon_clip_open( clip, connection->tid, window_request->window, &reply.first );
+        break;
+    case HORIZON_REQ_CLOSE_CLIPBOARD:
+        if (clip->open_tid != connection->tid) status = HORIZON_CLIP_STATUS_NOT_OPEN;
+        else notify = horizon_clip_close_locked( clip, &reply.first );
+        reply.second = clip->owner;
+        break;
+    case HORIZON_REQ_EMPTY_CLIPBOARD:
+        status = horizon_clip_empty( clip, connection->tid );
+        break;
+    case HORIZON_REQ_SET_CLIPBOARD_DATA:
+    {
+        const struct horizon_set_clipboard_data_request *request = (const void *)message;
+        status = horizon_clip_set_data( clip, connection->tid, request->format, request->lcid, data, data_size,
+                                        &reply.first );
+        break;
+    }
+    case HORIZON_REQ_GET_CLIPBOARD_DATA:
+    {
+        const struct horizon_get_clipboard_data_request *request = (const void *)message;
+        struct horizon_get_clipboard_data_reply data_reply;
+
+        status = horizon_clip_get_data( clip, connection->tid, request->format, request->render, request->cached,
+                                        request->seqno, request->header.reply_size, &clip_data );
+        if (clip_data.data && (copy = malloc( clip_data.total )))
+        {
+            memcpy( copy, clip_data.data, clip_data.total );
+            reply_data = copy;
+            reply_data_size = clip_data.total;
+        }
+        else if (clip_data.data) status = HORIZON_STATUS_NO_MEMORY;
+        pthread_mutex_unlock( &horizon_server_objects_mutex );
+        memset( &data_reply, 0, sizeof(data_reply) );
+        data_reply.header.error = status;
+        data_reply.from = clip_data.from;
+        data_reply.owner = clip_data.owner;
+        data_reply.seqno = clip_data.seqno;
+        data_reply.total = clip_data.total;
+        data_reply.header.reply_size = reply_data_size;
+        horizon_trace( "[HZCLIP] get_data tid=%04x format=%x render=%d total=%u from=%x err=%08x\n",
+                       connection->tid, request->format, request->render, clip_data.total, clip_data.from, status );
+        ret = horizon_server_write_reply( connection->reply_fd, &data_reply, sizeof(data_reply),
+                                          reply_data, reply_data_size );
+        free( copy );
+        return ret;
+    }
+    case HORIZON_REQ_GET_CLIPBOARD_FORMATS:
+    {
+        const struct horizon_clipboard_format_request *request = (const void *)message;
+
+        max = request->header.reply_size / sizeof(*formats);
+        if (!request->format && max && !(formats = malloc( max * sizeof(*formats) ))) status = HORIZON_STATUS_NO_MEMORY;
+        else status = horizon_clip_formats( clip, request->format, formats, max, &count );
+        reply.first = count;
+        if (!status && !request->format)
+        {
+            reply_data = formats;
+            reply_data_size = count * sizeof(*formats);
+        }
+        break;
+    }
+    case HORIZON_REQ_ENUM_CLIPBOARD_FORMATS:
+    {
+        const struct horizon_clipboard_format_request *request = (const void *)message;
+        status = horizon_clip_enum( clip, connection->tid, request->format, &reply.first );
+        break;
+    }
+    case HORIZON_REQ_RELEASE_CLIPBOARD:
+        if (!horizon_server_find_window_locked( window_request->window )) status = 0xc0010578u;
+        else if (clip->owner != window_request->window) status = HORIZON_CLIP_STATUS_INVALID_OWNER;
+        else
+        {
+            notify = horizon_clip_release_locked( clip, &reply.first );
+            reply.second = clip->owner;
+        }
+        break;
+    case HORIZON_REQ_GET_CLIPBOARD_INFO:
+    {
+        struct horizon_get_clipboard_info_reply info;
+
+        memset( &info, 0, sizeof(info) );
+        info.window = clip->open_win;
+        info.owner = clip->owner;
+        info.viewer = clip->viewer;
+        info.seqno = clip->seqno;
+        pthread_mutex_unlock( &horizon_server_objects_mutex );
+        return horizon_server_write_reply( connection->reply_fd, &info, sizeof(info), NULL, 0 );
+    }
+    case HORIZON_REQ_SET_CLIPBOARD_VIEWER:
+    {
+        const struct horizon_set_clipboard_viewer_request *request = (const void *)message;
+
+        if ((request->viewer && !horizon_server_find_window_locked( request->viewer )) ||
+            (request->previous && !horizon_server_find_window_locked( request->previous )))
+            status = 0xc0010578u;
+        else status = horizon_clip_set_viewer( clip, request->viewer, request->previous, &reply.first, &reply.second );
+        break;
+    }
+    case HORIZON_REQ_ADD_CLIPBOARD_LISTENER:
+    case HORIZON_REQ_REMOVE_CLIPBOARD_LISTENER:
+        if (!horizon_server_find_window_locked( window_request->window )) status = 0xc0010578u;
+        else if (req == HORIZON_REQ_ADD_CLIPBOARD_LISTENER)
+            status = horizon_clip_add_listener( clip, window_request->window );
+        else if (!horizon_clip_remove_listener( clip, window_request->window ))
+            status = HORIZON_CLIP_STATUS_INVALID_PARAMETER;
+        break;
+    }
+    if (notify) horizon_server_clipboard_notify_locked();
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
+    horizon_trace( "[HZCLIP] req=%d tid=%04x values=%x,%x size=%u err=%08x\n",
+                   req, connection->tid, reply.first, reply.second, data_size, status );
+    reply.header.error = status;
+    reply.header.reply_size = reply_data_size;
+    ret = horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), reply_data, reply_data_size );
+    free( formats );
+    return ret;
+}
+
+/* PostMessage and PostThreadMessage, and messages sent to another thread's
+ * window (SendMessage, SendMessageTimeout, SendNotifyMessage,
+ * SendMessageCallback). A thread sending to its own windows never gets here. */
 static int horizon_server_handle_send_message( struct horizon_server_connection *connection,
-                                               const unsigned char *message )
+                                               const unsigned char *message,
+                                               const unsigned char *data, unsigned int data_size )
 {
     const struct horizon_send_message_request *request = (const void *)message;
     struct horizon_posted_message posted;
     struct horizon_server_object *thread;
+    struct horizon_msgq *sender, *receiver = NULL;
     unsigned int status = HORIZON_STATUS_SUCCESS;
 
     memset( &posted, 0, sizeof(posted) );
@@ -6244,8 +6945,10 @@ static int horizon_server_handle_send_message( struct horizon_server_connection 
     for (thread = horizon_server_threads; thread; thread = thread->thread_next)
         if (thread->thread.tid == request->id && !thread->thread.terminated) break;
     if (!thread) status = HORIZON_STATUS_INVALID_CID;
-    else if (request->type != HORIZON_MSG_POSTED) status = HORIZON_STATUS_NOT_IMPLEMENTED;
-    else
+    else if (!(receiver = horizon_server_queue_locked( request->id )) ||
+             !(sender = horizon_server_queue_locked( connection->tid )))
+        status = HORIZON_STATUS_NO_MEMORY;
+    else if (request->type == HORIZON_MSG_POSTED)
     {
         posted.tid = request->id;
         posted.win = request->win;
@@ -6254,12 +6957,31 @@ static int horizon_server_handle_send_message( struct horizon_server_connection 
         posted.lparam = request->lparam;
         horizon_server_message_defaults_locked( &posted.x, &posted.y, &posted.time );
         if (horizon_message_queue_post( &horizon_posted_messages, &posted )) status = HORIZON_STATUS_NO_MEMORY;
+        else horizon_msgq_touch( receiver, HORIZON_MSGQ_QS_POSTMESSAGE | HORIZON_MSGQ_QS_ALLPOSTMESSAGE );
     }
+    else
+    {
+        struct horizon_msgq_sent fields;
+        unsigned long long now = horizon_server_timer_clock();
+        int has_deadline = request->timeout != 0x7fffffffffffffffLL;
+
+        memset( &fields, 0, sizeof(fields) );
+        fields.type = request->type;
+        fields.win = request->win;
+        fields.msg = request->msg;
+        fields.wparam = request->wparam;
+        fields.lparam = request->lparam;
+        horizon_server_message_defaults_locked( &fields.x, &fields.y, &fields.time );
+        /* Timeouts are relative (negative, 100 ns) from win32u. */
+        status = horizon_msgq_send( sender, receiver, &fields, data, data_size, has_deadline,
+                                    now + (request->timeout < 0 ? (unsigned long long)-request->timeout / 10000 : 0) );
+    }
+    if (receiver) horizon_server_refresh_queues_locked();
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
-    horizon_trace( "[HZMSG] post type=%d from=%04x to=%04x hwnd=%08x msg=%x wp=%llx lp=%llx err=%08x\n",
-                   request->type, connection->tid, request->id, request->win, request->msg,
-                   request->wparam, request->lparam, status );
+    horizon_trace( "[HZMSG] %s type=%d from=%04x to=%04x hwnd=%08x msg=%x wp=%llx lp=%llx size=%u err=%08x\n",
+                   request->type == HORIZON_MSG_POSTED ? "post" : "send", request->type, connection->tid,
+                   request->id, request->win, request->msg, request->wparam, request->lparam, data_size, status );
     return horizon_server_write_status( connection->reply_fd, status );
 }
 
@@ -6267,11 +6989,209 @@ static int horizon_server_handle_post_quit_message( struct horizon_server_connec
                                                     const unsigned char *message )
 {
     const struct horizon_post_quit_message_request *request = (const void *)message;
+    unsigned int status = HORIZON_STATUS_SUCCESS;
+    struct horizon_msgq *queue;
 
-    connection->quit_message = 1;
-    connection->exit_code = request->exit_code;
-    horizon_trace( "[HZMSG] post_quit tid=%04x exit_code=%d\n", connection->tid, request->exit_code );
-    return horizon_server_write_status( connection->reply_fd, HORIZON_STATUS_SUCCESS );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(queue = horizon_server_queue_locked( connection->tid ))) status = HORIZON_STATUS_NO_MEMORY;
+    else
+    {
+        horizon_msgq_post_quit( queue, request->exit_code );
+        horizon_server_refresh_queue_locked( queue, horizon_server_timer_clock() );
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    horizon_trace( "[HZMSG] post_quit tid=%04x exit_code=%d err=%08x\n", connection->tid, request->exit_code, status );
+    return horizon_server_write_status( connection->reply_fd, status );
+}
+
+static int horizon_server_handle_get_msg_queue( struct horizon_server_connection *connection )
+{
+    struct horizon_get_msg_queue_reply reply;
+    struct horizon_msgq *queue;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(queue = horizon_server_queue_locked( connection->tid ))) reply.header.error = HORIZON_STATUS_NO_MEMORY;
+    else
+    {
+        reply.locator_id = queue->shm_id;
+        reply.locator_offset = queue->shm_offset;
+        horizon_server_refresh_queue_locked( queue, horizon_server_timer_clock() );
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+/* The handle win32u waits on (MsgWaitForMultipleObjects, WaitMessage and
+ * waiting for a SendMessage reply); it is signaled while the queue's wake
+ * bits match the masks from get_message or set_queue_mask. */
+static int horizon_server_handle_get_msg_queue_handle( struct horizon_server_connection *connection )
+{
+    struct horizon_get_msg_queue_handle_reply reply;
+    struct horizon_server_handle_entry *entry;
+    struct horizon_msgq *queue;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(queue = horizon_server_queue_locked( connection->tid )) ||
+        !(entry = horizon_server_create_handle_for_object_locked( queue->sync )))
+        reply.header.error = HORIZON_STATUS_NO_MEMORY;
+    else reply.handle = entry->handle;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_set_queue_mask( struct horizon_server_connection *connection,
+                                                 const unsigned char *message )
+{
+    const struct horizon_set_queue_mask_request *request = (const void *)message;
+    struct horizon_queue_bits_reply reply;
+    struct horizon_msgq *queue;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(queue = horizon_server_queue_locked( connection->tid ))) reply.header.error = HORIZON_STATUS_NO_MEMORY;
+    else
+    {
+        queue->wake_mask = request->wake_mask;
+        queue->changed_mask = request->changed_mask;
+        horizon_server_refresh_queues_locked();
+        reply.wake_bits = queue->wake_bits;
+        reply.changed_bits = queue->changed_bits;
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_get_queue_status( struct horizon_server_connection *connection,
+                                                   const unsigned char *message )
+{
+    const struct horizon_get_queue_status_request *request = (const void *)message;
+    struct horizon_queue_bits_reply reply;
+    struct horizon_msgq *queue;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if ((queue = horizon_server_queue_locked( connection->tid )))
+    {
+        horizon_server_refresh_queues_locked();
+        reply.wake_bits = queue->wake_bits;
+        reply.changed_bits = queue->changed_bits;
+        queue->changed_bits &= ~request->clear_bits;
+        horizon_server_refresh_queue_locked( queue, horizon_server_timer_clock() );
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+/* The receiving thread's window procedure returned (remove) or ReplyMessage. */
+static int horizon_server_handle_reply_message( struct horizon_server_connection *connection,
+                                                const unsigned char *message,
+                                                const unsigned char *data, unsigned int data_size )
+{
+    const struct horizon_reply_message_request *request = (const void *)message;
+    unsigned int status = HORIZON_STATUS_SUCCESS;
+    struct horizon_msgq *queue;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(queue = horizon_msgq_find( &horizon_msg_queues, connection->tid ))) status = HORIZON_STATUS_ACCESS_DENIED;
+    else
+    {
+        horizon_msgq_reply( queue, request->result, 0, request->remove, data, data_size );
+        horizon_server_refresh_queues_locked();
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    horizon_trace( "[HZMSG] reply tid=%04x result=%llx remove=%d size=%u err=%08x\n",
+                   connection->tid, request->result, request->remove, data_size, status );
+    return horizon_server_write_status( connection->reply_fd, status );
+}
+
+/* The sending thread collects its result, or gives up on it (cancel). */
+static int horizon_server_handle_get_message_reply( struct horizon_server_connection *connection,
+                                                    const unsigned char *message )
+{
+    const struct horizon_get_message_reply_request *request = (const void *)message;
+    struct horizon_get_message_reply_reply reply;
+    struct horizon_msgq *queue;
+    unsigned char *data = NULL;
+    unsigned int data_size = 0;
+    int ret;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(queue = horizon_msgq_find( &horizon_msg_queues, connection->tid )))
+        reply.header.error = HORIZON_STATUS_ACCESS_DENIED;
+    else
+    {
+        reply.header.error = horizon_msgq_get_reply( queue, request->cancel, &reply.result, &data, &data_size );
+        horizon_server_refresh_queues_locked();
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
+    if (data_size > request->header.reply_size) data_size = request->header.reply_size;
+    reply.header.reply_size = data_size;
+    horizon_trace( "[HZMSG] get_reply tid=%04x result=%llx size=%u err=%08x\n",
+                   connection->tid, reply.result, data_size, reply.header.error );
+    ret = horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), data, data_size );
+    free( data );
+    return ret;
+}
+
+/* SetTimer and SetSystemTimer. A window timer belongs to that window's thread. */
+static int horizon_server_handle_set_win_timer( struct horizon_server_connection *connection,
+                                                const unsigned char *message )
+{
+    const struct horizon_set_win_timer_request *request = (const void *)message;
+    struct horizon_set_win_timer_reply reply;
+    struct horizon_user_window *window = NULL;
+    unsigned int tid = connection->tid;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (request->win && (!(window = horizon_server_find_window_locked( request->win )) || !window->tid))
+        reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else
+    {
+        if (window) tid = window->tid;
+        switch (horizon_win_timers_set( &horizon_timers, tid, request->win, request->msg, request->id,
+                                        request->rate, request->lparam, horizon_server_timer_clock(),
+                                        &reply.id ))
+        {
+        case 0: break;
+        case HORIZON_WIN_TIMERS_NO_IDS: reply.header.error = 0xc0010486u; break; /* ERROR_NO_MORE_USER_HANDLES */
+        default: reply.header.error = HORIZON_STATUS_NO_MEMORY; break;
+        }
+        horizon_server_refresh_queues_locked();
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
+    horizon_trace( "[HZMSG] set_timer tid=%04x hwnd=%08x msg=%x id=%llx rate=%u -> id=%llx err=%08x\n",
+                   tid, request->win, request->msg, request->id, request->rate, reply.id, reply.header.error );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_kill_win_timer( struct horizon_server_connection *connection,
+                                                 const unsigned char *message )
+{
+    const struct horizon_kill_win_timer_request *request = (const void *)message;
+    struct horizon_user_window *window = NULL;
+    unsigned int status = HORIZON_STATUS_SUCCESS, tid = connection->tid;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (request->win && (!(window = horizon_server_find_window_locked( request->win )) || !window->tid))
+        status = HORIZON_STATUS_INVALID_HANDLE;
+    else
+    {
+        if (window) tid = window->tid;
+        if (horizon_win_timers_kill( &horizon_timers, tid, request->win, request->msg, request->id ))
+            status = HORIZON_STATUS_INVALID_PARAMETER;
+        horizon_server_refresh_queues_locked();
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
+    horizon_trace( "[HZMSG] kill_timer tid=%04x hwnd=%08x msg=%x id=%llx err=%08x\n",
+                   tid, request->win, request->msg, request->id, status );
+    return horizon_server_write_status( connection->reply_fd, status );
 }
 
 static int horizon_server_posted_window_is_descendant( void *ctx, unsigned int child, unsigned int ancestor )
@@ -6288,10 +7208,13 @@ static int horizon_server_handle_get_message( struct horizon_server_connection *
     struct horizon_hardware_msg_data hardware;
     struct horizon_input_message *queued;
     struct horizon_posted_message **posted = NULL;
+    struct horizon_win_timer *timer = NULL;
+    struct horizon_msgq_sent *sent = NULL;
+    struct horizon_msgq *queue = NULL;
     struct horizon_user_window *window, *parent;
     const void *reply_data = NULL;
     unsigned int reply_data_size = 0, filter = request->flags >> 16;
-    int paint_requested, found = 0;
+    int paint_requested, found = 0, ret;
 
     memset( &reply, 0, sizeof(reply) );
     memset( &hardware, 0, sizeof(hardware) );
@@ -6301,8 +7224,42 @@ static int horizon_server_handle_get_message( struct horizon_server_connection *
     if (!filter) filter = HORIZON_QS_ALLINPUT;
 
     pthread_mutex_lock( &horizon_server_objects_mutex );
-    /* As in server/queue.c: posted messages first, then WM_QUIT once none
-     * match, then hardware input and paints. */
+    if (!request->internal) queue = horizon_server_queue_locked( connection->tid );
+    /* As in server/queue.c: messages sent by other threads first, whatever the
+     * filter; then posted messages, WM_QUIT once none match, hardware input,
+     * paints and timers. */
+    if (queue && queue->sent)
+    {
+        reply.type = queue->sent->type;
+        reply.win = queue->sent->win;
+        reply.msg = queue->sent->msg;
+        reply.wparam = queue->sent->wparam;
+        reply.lparam = queue->sent->lparam;
+        reply.x = queue->sent->x;
+        reply.y = queue->sent->y;
+        reply.time = queue->sent->time;
+        reply.total = queue->sent->data_size;
+        if (queue->sent->data_size > request->header.reply_size)
+            reply.header.error = HORIZON_STATUS_BUFFER_OVERFLOW;
+        else
+        {
+            sent = horizon_msgq_receive( queue );
+            reply.header.reply_size = sent->data_size;
+            horizon_server_refresh_queues_locked();
+        }
+        pthread_mutex_unlock( &horizon_server_objects_mutex );
+        horizon_trace( "[HZMSG] receive tid=%04x type=%d hwnd=%08x msg=%x size=%u err=%08x\n",
+                       connection->tid, reply.type, reply.win, reply.msg, reply.total, reply.header.error );
+        ret = horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply),
+                                          sent ? sent->data : NULL, sent ? sent->data_size : 0 );
+        if (sent)
+        {
+            free( sent->data );
+            free( sent );
+        }
+        return ret;
+    }
+    if (queue) horizon_msgq_begin_get( queue, filter, request->get_first, request->get_last );
     if (!request->internal && (filter & HORIZON_QS_POSTMESSAGE))
     {
         if ((posted = horizon_message_queue_find( &horizon_posted_messages, connection->tid, request->get_win,
@@ -6321,13 +7278,13 @@ static int horizon_server_handle_get_message( struct horizon_server_connection *
                 horizon_message_queue_remove( &horizon_posted_messages, posted );
             found = 1;
         }
-        else if (connection->quit_message)
+        else if (queue && queue->quit_message)
         {
             reply.msg = HORIZON_MESSAGE_QUEUE_WM_QUIT;
-            reply.wparam = (long long)connection->exit_code;
+            reply.wparam = (long long)queue->exit_code;
             reply.type = HORIZON_MSG_POSTED;
             horizon_server_message_defaults_locked( &reply.x, &reply.y, &reply.time );
-            if (request->flags & HORIZON_PM_REMOVE) connection->quit_message = 0;
+            if (request->flags & HORIZON_PM_REMOVE) queue->quit_message = 0;
             found = 1;
         }
     }
@@ -6384,6 +7341,30 @@ static int horizon_server_handle_get_message( struct horizon_server_connection *
             break;
         }
     }
+    if (!found && !request->internal && (filter & HORIZON_QS_TIMER) &&
+        (timer = horizon_win_timers_expired( &horizon_timers, connection->tid, request->get_win,
+                                             request->get_first, request->get_last,
+                                             horizon_server_timer_clock(),
+                                             request->flags & HORIZON_PM_REMOVE )))
+    {
+        reply.win = timer->win;
+        reply.msg = timer->msg;
+        reply.wparam = timer->id;
+        reply.lparam = timer->lparam;
+        reply.type = HORIZON_MSG_POSTED;
+        horizon_server_message_defaults_locked( &reply.x, &reply.y, &reply.time );
+        found = 1;
+    }
+    if (queue)
+    {
+        /* Nothing matched: a wait on the queue handle uses these masks. */
+        if (!found)
+        {
+            queue->wake_mask = request->wake_mask;
+            queue->changed_mask = request->changed_mask;
+        }
+        horizon_server_refresh_queues_locked();
+    }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
     if (!found) return horizon_server_write_status( connection->reply_fd, HORIZON_STATUS_PENDING );
@@ -6394,7 +7375,7 @@ static int horizon_server_handle_get_message( struct horizon_server_connection *
         return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply),
                                            reply_data, reply_data_size );
     }
-    if (posted || reply.msg == HORIZON_MESSAGE_QUEUE_WM_QUIT)
+    if (posted || timer || reply.msg == HORIZON_MESSAGE_QUEUE_WM_QUIT)
         horizon_trace( "[HZMSG] get tid=%04x hwnd=%08x msg=%x wp=%llx flags=%x range=%x-%x\n",
                        connection->tid, reply.win, reply.msg, reply.wparam, request->flags,
                        request->get_first, request->get_last );
@@ -9069,10 +10050,55 @@ static void *horizon_server_thread( void *param )
             status = horizon_server_handle_atom( connection, request_data, header->request_size, 0 );
             break;
         case HORIZON_REQ_SEND_MESSAGE:
-            status = horizon_server_handle_send_message( connection, message );
+            status = horizon_server_handle_send_message( connection, message, request_data, header->request_size );
+            break;
+        case HORIZON_REQ_ADD_USER_ATOM:
+            status = horizon_server_handle_add_user_atom( connection, request_data, header->request_size );
+            break;
+        case HORIZON_REQ_GET_USER_ATOM_NAME:
+            status = horizon_server_handle_get_user_atom_name( connection, message );
+            break;
+        case HORIZON_REQ_OPEN_CLIPBOARD:
+        case HORIZON_REQ_CLOSE_CLIPBOARD:
+        case HORIZON_REQ_EMPTY_CLIPBOARD:
+        case HORIZON_REQ_SET_CLIPBOARD_DATA:
+        case HORIZON_REQ_GET_CLIPBOARD_DATA:
+        case HORIZON_REQ_GET_CLIPBOARD_FORMATS:
+        case HORIZON_REQ_ENUM_CLIPBOARD_FORMATS:
+        case HORIZON_REQ_RELEASE_CLIPBOARD:
+        case HORIZON_REQ_GET_CLIPBOARD_INFO:
+        case HORIZON_REQ_SET_CLIPBOARD_VIEWER:
+        case HORIZON_REQ_ADD_CLIPBOARD_LISTENER:
+        case HORIZON_REQ_REMOVE_CLIPBOARD_LISTENER:
+            status = horizon_server_handle_clipboard( connection, header->req, message, request_data,
+                                                      header->request_size );
+            break;
+        case HORIZON_REQ_REPLY_MESSAGE:
+            status = horizon_server_handle_reply_message( connection, message, request_data, header->request_size );
+            break;
+        case HORIZON_REQ_GET_MESSAGE_REPLY:
+            status = horizon_server_handle_get_message_reply( connection, message );
+            break;
+        case HORIZON_REQ_GET_MSG_QUEUE:
+            status = horizon_server_handle_get_msg_queue( connection );
+            break;
+        case HORIZON_REQ_GET_MSG_QUEUE_HANDLE:
+            status = horizon_server_handle_get_msg_queue_handle( connection );
+            break;
+        case HORIZON_REQ_SET_QUEUE_MASK:
+            status = horizon_server_handle_set_queue_mask( connection, message );
+            break;
+        case HORIZON_REQ_GET_QUEUE_STATUS:
+            status = horizon_server_handle_get_queue_status( connection, message );
             break;
         case HORIZON_REQ_POST_QUIT_MESSAGE:
             status = horizon_server_handle_post_quit_message( connection, message );
+            break;
+        case HORIZON_REQ_SET_WIN_TIMER:
+            status = horizon_server_handle_set_win_timer( connection, message );
+            break;
+        case HORIZON_REQ_KILL_WIN_TIMER:
+            status = horizon_server_handle_kill_win_timer( connection, message );
             break;
         case HORIZON_REQ_SEND_HARDWARE_MESSAGE:
             status = horizon_server_handle_send_hardware_message( connection, message );
@@ -9327,6 +10353,12 @@ static void *horizon_server_thread( void *param )
             break;
         case HORIZON_REQ_SET_CAPTURE_WINDOW:
             status = horizon_server_handle_set_capture_window( connection, message );
+            break;
+        case HORIZON_REQ_SET_CARET_WINDOW:
+            status = horizon_server_handle_set_caret_window( connection, message );
+            break;
+        case HORIZON_REQ_SET_CARET_INFO:
+            status = horizon_server_handle_set_caret_info( connection, message );
             break;
         case HORIZON_REQ_CREATE_CLASS:
             status = horizon_server_handle_create_class( connection, message, request_data,
