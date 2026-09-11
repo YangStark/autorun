@@ -1,5 +1,43 @@
 # Wine-NX Probe And Runtime
 
+`nx-wow64-dynarec-19` gets OpenTTD past DLL initialization, based on what
+build 18 logged on hardware. All imports loaded, and then:
+```
+err:module:find_forwarded_export module not found for forward 'cryptbase.SystemFunction036' used by L"C:\\windows\\system32\\advapi32.dll"
+err:opengl:DllMain Failed to load unixlib, status 0xc0000008
+err:module:loader_init "OPENGL32.dll" failed to initialize, aborting
+```
+- opengl32's WoW64 table from build 17 was found, but its first call,
+  `process_attach`, returned `STATUS_INVALID_HANDLE`. The x86 unix call gate
+  (`wine_nx_call_ntdll_wow64`) accepted only ntdll's table. It now also calls
+  the static tables of 32-bit DLLs through `wine_nx_call_static_wow64_unix`, each
+  below its size, and still refuses any other handle, since the guest supplies
+  it. `tests/check_wow64_unix_tables.py` compiles both functions against small
+  tables; it fails on the build-18 gate at opengl32's `process_attach`.
+- advapi32 forwards `SystemFunction036` (RtlGenRandom) to cryptbase, which was
+  not staged, so the CRT's `rand_s` and bcrypt's `BCryptGenRandom` would reach a
+  stub that raises an exception. The OpenTTD packager now also stages the DLLs
+  that imported functions are forwarded to. For OpenTTD this adds cryptbase.dll,
+  28 DLLs in all.
+
+`nx-wow64-dynarec-18` makes Wine's error messages from Windows-side code reach
+the log. On build-17 hardware, OpenTTD exited during x86 process startup with
+`0xc0000135` (`STATUS_DLL_NOT_FOUND`) after 19 dynarec entries. Every static
+import of `openttd.exe` resolves among the DLLs on the SD card, and the loader
+names the missing library in an `err:` line, but no such line was logged:
+- The Windows-side ntdlls read their debug channels from the page after the
+  WoW64 PEB, which upstream's `dbg_init` fills. The runtime never called it,
+  so every channel there was off, errors included. The runtime now writes the
+  default entry: errors, plus fixmes with verbose traces. `dbg_init` itself
+  would move the unix-side debug buffers into TEBs, which the runtime's own
+  threads lack.
+- x86 debug output goes through `wow64_wine_dbg_write`, which wrote to unix
+  fd 2, where nothing reads on the Switch. It now goes to the runtime log like
+  the 64-bit output.
+- A program in a folder got `C:\openttd` as its current directory. It now ends
+  in a backslash, as `RtlSetCurrentDirectory_U` stores it; relative paths are
+  appended to it directly.
+
 `nx-wow64-dynarec-17` prepares 32-bit OpenTTD 15.3. It uses the official
 `openttd-15.3-windows-win32.zip` (SHA-256 3f092edc…0e74, matching
 cdn.openttd.org) with OpenGFX 8.0. On build-16 hardware, `pe32-messages.exe` and
