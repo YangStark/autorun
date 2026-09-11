@@ -275,6 +275,23 @@ const char * __cdecl __wine_dbg_strdup( const char *str )
     return memcpy( info->strings + pos, str, n );
 }
 
+#ifdef __SWITCH__
+/* Nothing reads stderr on the Switch; debug output goes to the runtime log. */
+static int wine_nx_dbg_write( const char *str, unsigned int str_len )
+{
+    extern void wine_nx_runtime_trace( const char *msg );
+    char buf[1024];
+    size_t len = str_len;
+
+    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    memcpy( buf, str, len );
+    while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) len--;
+    buf[len] = 0;
+    wine_nx_runtime_trace( buf );
+    return str_len;
+}
+#endif
+
 /***********************************************************************
  *		unixcall_wine_dbg_write
  */
@@ -283,16 +300,7 @@ NTSTATUS unixcall_wine_dbg_write( void *args )
     struct wine_dbg_write_params *params = args;
 
 #ifdef __SWITCH__
-    extern void wine_nx_runtime_trace( const char *msg );
-    char buf[1024];
-    size_t len = params->len;
-
-    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
-    memcpy( buf, params->str, len );
-    while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) len--;
-    buf[len] = 0;
-    wine_nx_runtime_trace( buf );
-    return params->len;
+    return wine_nx_dbg_write( params->str, params->len );
 #else
     return write( 2, params->str, params->len );
 #endif
@@ -364,7 +372,11 @@ NTSTATUS wow64_wine_dbg_write( void *args )
         unsigned int len;
     } const *params32 = args;
 
+#ifdef __SWITCH__
+    return wine_nx_dbg_write( ULongToPtr(params32->str), params32->len );
+#else
     return write( 2, ULongToPtr(params32->str), params32->len );
+#endif
 }
 #endif
 
