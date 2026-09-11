@@ -125,6 +125,10 @@
 #include "wine/list.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#ifdef __SWITCH__
+# include "horizon_private.h"
+# include "horizon_file_access.h"
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(file);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
@@ -334,6 +338,10 @@ static inline void ignore_file( const char *name )
     assert( ignored_files_count < MAX_IGNORED_FILES );
     if (!stat( name, &st ))
     {
+#ifdef __SWITCH__
+        /* libnx reports no file identity; ignoring 0/0 would hide every file. */
+        if (!st.st_dev && !st.st_ino) return;
+#endif
         ignored_files[ignored_files_count].dev = st.st_dev;
         ignored_files[ignored_files_count].ino = st.st_ino;
         ignored_files_count++;
@@ -1725,6 +1733,9 @@ static BOOL fd_is_mount_point( int fd, const struct stat *st )
 
 
 static unsigned int server_get_unix_name( HANDLE handle, char **unix_name );
+#ifdef __SWITCH__
+static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG *reparse_tag );
+#endif
 
 
 /* get the stat info and file attributes for a file (by file descriptor) */
@@ -1735,6 +1746,22 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
     char attr_data[65];
     int attr_len, ret;
 
+#ifdef __SWITCH__
+    /* Horizon directory handles have no descriptor; examine them by name. */
+    if (fd == -1)
+    {
+        char *unix_name;
+
+        if (server_get_unix_name( handle, &unix_name ))
+        {
+            errno = EBADF;
+            return -1;
+        }
+        ret = get_file_info( unix_name, st, attr, reparse_tag );
+        free( unix_name );
+        return ret;
+    }
+#endif
     *attr = 0;
     ret = fstat( fd, st );
     if (ret == -1) return ret;
@@ -1812,8 +1839,14 @@ static BOOL is_wine_file( HANDLE handle )
 static NTSTATUS fd_set_file_info( int fd, HANDLE handle, UINT attr, BOOL force_set_xattr )
 {
     struct stat st;
+#ifdef __SWITCH__
+    mode_t old_mode;
+#endif
 
     if (fstat( fd, &st ) == -1) return errno_to_status( errno );
+#ifdef __SWITCH__
+    old_mode = st.st_mode;
+#endif
     if (attr & FILE_ATTRIBUTE_READONLY)
     {
         if (S_ISDIR( st.st_mode))
@@ -1834,7 +1867,12 @@ static NTSTATUS fd_set_file_info( int fd, HANDLE handle, UINT attr, BOOL force_s
             st.st_mode |= (0600 | ((st.st_mode & 044) >> 1)) & (~start_umask);
         }
     }
+#ifdef __SWITCH__
+    /* libnx has no chmod: only a real change (read-only) reports that failure. */
+    if (st.st_mode != old_mode && fchmod( fd, st.st_mode ) == -1) return errno_to_status( errno );
+#else
     if (fchmod( fd, st.st_mode ) == -1) return errno_to_status( errno );
+#endif
 
     /* if the file has multiple names, we can't be sure that it is safe to not
        set the extended attribute, since any of the names could start with a dot */
@@ -1859,6 +1897,9 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
 
     *attr = 0;
     ret = lstat( path, st );
+#ifdef __SWITCH__
+    if (ret == -1 && errno == EIO) ret = horizon_stat_open_file( path, st );
+#endif
     if (ret == -1) return ret;
     if (reparse_tag) *reparse_tag = 0;
     if (S_ISLNK( st->st_mode ))
@@ -1872,7 +1913,13 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
             if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_LX_SYMLINK;
         }
     }
-    else if (S_ISDIR( st->st_mode ) && (parent_path = malloc( len + 4 )))
+    else if (S_ISDIR( st->st_mode ) &&
+#ifdef __SWITCH__
+             /* libnx reports inode 0 for every file, so each directory would
+              * match its parent and look like a mount point. */
+             st->st_ino &&
+#endif
+             (parent_path = malloc( len + 4 )))
     {
         struct stat parent_st;
 
@@ -1966,6 +2013,23 @@ static NTSTATUS set_file_times( int fd, const LARGE_INTEGER *mtime, const LARGE_
 #if defined(HAVE_FUTIMES) || defined(HAVE_FUTIMESAT)
     struct timeval tv[2];
     struct stat st;
+#endif
+
+#ifdef __SWITCH__
+    {
+        /* Horizon's file systems keep their own timestamps and have no call to
+         * change them. Failing would break extractors and installers, which
+         * expect SetFileTime to work on a local disk. */
+        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+        static LONG reported;
+
+        (void)fd;
+        (void)mtime;
+        (void)atime;
+        if (&wine_nx_runtime_trace && !InterlockedExchange( &reported, 1 ))
+            wine_nx_runtime_trace( "[FILE] file times cannot be stored on Horizon; SetFileTime succeeds without effect" );
+        return STATUS_SUCCESS;
+    }
 #endif
 
     if (set_file_times_precise( fd, mtime, atime, &status ))
@@ -2931,6 +2995,7 @@ static unsigned int get_cached_dir_data( HANDLE handle, struct dir_data **data_r
     return status;
 }
 
+#ifndef __SWITCH__
 static NTSTATUS server_query_directory_file( HANDLE handle, IO_STATUS_BLOCK *io, void *buffer, ULONG length,
                                              FILE_INFORMATION_CLASS info_class, BOOLEAN single_entry,
                                              BOOLEAN restart_scan, const UNICODE_STRING *mask )
@@ -2945,9 +3010,6 @@ static NTSTATUS server_query_directory_file( HANDLE handle, IO_STATUS_BLOCK *io,
     {
         req->handle = wine_server_obj_handle( handle );;
         req->restart_scan = restart_scan;
-#ifdef __SWITCH__
-        if (mask && mask->Length) wine_server_add_data( req, mask->Buffer, mask->Length );
-#endif
         wine_server_set_reply( req, entries, length );
         status = wine_server_call( req );
         total_len = reply->total_len;
@@ -3027,6 +3089,95 @@ static NTSTATUS server_query_directory_file( HANDLE handle, IO_STATUS_BLOCK *io,
     return status;
 }
 
+#else  /* __SWITCH__ */
+
+static char *horizon_dir_entry_unix_name( const char *dir, const WCHAR *name, unsigned int name_chars )
+{
+    char *utf8, *path;
+    int len;
+
+    if (!(utf8 = malloc( name_chars * 3 + 1 ))) return NULL;
+    len = ntdll_wcstoumbs( name, name_chars, utf8, name_chars * 3, FALSE );
+    utf8[max( len, 0 )] = 0;
+    path = horizon_dir_entry_path( dir, utf8 );
+    free( utf8 );
+    return path;
+}
+
+/* The in-process Horizon server returns one matching name per call. Fill the
+ * entry as the unix directory path does, from the file's attributes, and skip
+ * names that disappear before they can be examined. */
+static NTSTATUS horizon_query_directory_file( HANDLE handle, IO_STATUS_BLOCK *io, void *buffer, ULONG length,
+                                              FILE_INFORMATION_CLASS info_class, BOOLEAN restart_scan,
+                                              const UNICODE_STRING *mask )
+{
+    static const WCHAR empty_name[1];
+    const ULONG entry_size = sizeof(struct directory_file_entry) + (MAX_DIR_ENTRY_LEN + 1) * sizeof(WCHAR);
+    union file_directory_info *last_info = NULL;
+    struct directory_file_entry *entry;
+    struct dir_data_names names;
+    struct dir_data data;
+    char *dir_name = NULL;
+    NTSTATUS status;
+
+    if (!(entry = malloc( entry_size ))) return STATUS_NO_MEMORY;
+    io->Information = 0;
+    while (!last_info)
+    {
+        unsigned int name_chars;
+        WCHAR *long_name;
+        char *unix_name;
+
+        SERVER_START_REQ( query_directory_file )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            req->restart_scan = restart_scan;
+            if (mask && mask->Length) wine_server_add_data( req, mask->Buffer, mask->Length );
+            wine_server_set_reply( req, entry, entry_size );
+            status = wine_server_call( req );
+            if (status == STATUS_OBJECT_TYPE_MISMATCH) status = STATUS_BAD_DEVICE_TYPE;
+        }
+        SERVER_END_REQ;
+        if (status) break;
+        /* A later round continues the same scan. */
+        restart_scan = FALSE;
+        mask = NULL;
+
+        if (!dir_name && (status = server_get_unix_name( handle, &dir_name ))) break;
+        name_chars = min( entry->name_len, MAX_DIR_ENTRY_LEN * sizeof(WCHAR) ) / sizeof(WCHAR);
+        if (!(long_name = malloc( (name_chars + 1) * sizeof(WCHAR) )))
+        {
+            status = STATUS_NO_MEMORY;
+            break;
+        }
+        memcpy( long_name, entry + 1, name_chars * sizeof(WCHAR) );
+        long_name[name_chars] = 0;
+        if (!(unix_name = horizon_dir_entry_unix_name( dir_name, long_name, name_chars )))
+        {
+            free( long_name );
+            status = STATUS_NO_MEMORY;
+            break;
+        }
+
+        memset( &data, 0, sizeof(data) );
+        names.long_name = long_name;
+        names.short_name = empty_name;
+        names.unix_name = unix_name;
+        data.names = &names;
+        data.size = data.count = 1;
+        status = get_dir_data_entry( &data, buffer, io, length, info_class, &last_info );
+        free( unix_name );
+        free( long_name );
+        if (status && status != STATUS_BUFFER_OVERFLOW) break;
+    }
+    free( dir_name );
+    free( entry );
+    if (status && status != STATUS_BUFFER_OVERFLOW) io->Information = 0;
+    io->Status = status;
+    return status;
+}
+#endif
+
 /******************************************************************************
  *              NtQueryDirectoryFile   (NTDLL.@)
  */
@@ -3079,7 +3230,11 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
     if ((status = server_get_unix_fd( handle, FILE_LIST_DIRECTORY, &fd, &needs_close, &type, NULL )))
     {
         if (status == STATUS_BAD_DEVICE_TYPE)
+#ifdef __SWITCH__
+            return horizon_query_directory_file( handle, io, buffer, length, info_class, restart_scan, mask );
+#else
             return server_query_directory_file( handle, io, buffer, length, info_class, single_entry, restart_scan, mask);
+#endif
         return status;
     }
 
@@ -5474,7 +5629,14 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, &options )))
     {
         if (status != STATUS_BAD_DEVICE_TYPE) return io->Status = status;
+#ifdef __SWITCH__
+        /* A Horizon directory: fd_get_file_info examines it by unix name. */
+        fd = -1;
+        options = 0;
+        status = STATUS_SUCCESS;
+#else
         return server_get_file_info( handle, io, ptr, len, class );
+#endif
     }
 
     switch (class)
@@ -5503,7 +5665,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     case FilePositionInformation:
         {
             FILE_POSITION_INFORMATION *info = ptr;
-            off_t res = lseek( fd, 0, SEEK_CUR );
+            off_t res = fd == -1 ? 0 : lseek( fd, 0, SEEK_CUR );
             if (res == (off_t)-1) status = errno_to_status( errno );
             else info->CurrentByteOffset.QuadPart = res;
         }
@@ -5540,7 +5702,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                 info->StandardInformation.DeletePending = FALSE; /* FIXME */
                 info->EaInformation.EaSize = 0;
                 info->AccessInformation.AccessFlags = 0;  /* FIXME */
-                info->PositionInformation.CurrentByteOffset.QuadPart = lseek( fd, 0, SEEK_CUR );
+                info->PositionInformation.CurrentByteOffset.QuadPart = fd == -1 ? 0 : lseek( fd, 0, SEEK_CUR );
                 info->ModeInformation.Mode = 0;  /* FIXME */
                 info->AlignmentInformation.AlignmentRequirement = 1;  /* FIXME */
                 status = server_get_name_info( handle, &info->NameInformation, &name_len );
@@ -5645,7 +5807,14 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             char *unix_name;
 
             if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
+            {
+#ifdef __SWITCH__
+                /* A Horizon directory stores nothing this could change: its
+                 * times cannot be set and READONLY is ignored for directories. */
+                if ((NTSTATUS)status == STATUS_BAD_DEVICE_TYPE) status = STATUS_SUCCESS;
+#endif
                 return io->Status = status;
+            }
 
             if (server_get_unix_name( handle, &unix_name )) unix_name = NULL;
 
@@ -7220,6 +7389,10 @@ err:
 
     if (status == STATUS_SUCCESS)
     {
+#ifdef __SWITCH__
+        /* Standard output and error are files here; copy them into the log. */
+        horizon_echo_std_write( handle, buffer, total );
+#endif
         set_sync_iosb( io, status, total, options );
         TRACE("= SUCCESS (%u)\n", total);
         if (event) NtSetEvent( event, NULL );

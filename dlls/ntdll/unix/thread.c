@@ -1176,7 +1176,11 @@ static void start_thread( TEB *teb )
     pthread_setspecific( teb_key, teb );
     server_init_thread( thread_data->start, &suspend );
 #ifdef __SWITCH__
-    horizon_pin_current_thread( get_current_thread_affinity() );
+    {
+        /* Default affinity (all cores) keeps round-robin placement. */
+        ULONG_PTR affinity = get_current_thread_affinity();
+        horizon_pin_current_thread( affinity == get_system_affinity_mask() ? 0 : affinity );
+    }
 #endif
     signal_start_thread( thread_data->start, thread_data->param, suspend, teb );
 }
@@ -1396,16 +1400,8 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     unsigned int status;
 
 #ifdef __SWITCH__
-    {
-        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
-        if (&wine_nx_runtime_trace)
-        {
-            char buf[160];
-            snprintf( buf, sizeof(buf), "[THREAD] NtCreateThreadEx start=%p param=%p flags=0x%x stack_reserve=0x%lx",
-                      start, param, (unsigned)flags, (unsigned long)stack_reserve );
-            wine_nx_runtime_trace( buf );
-        }
-    }
+    /* Reclamation is judged against the state before the first thread. */
+    horizon_lifecycle_baseline();
 #endif
 
     if (flags & ~supported_flags)
@@ -1534,9 +1530,20 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     {
         int pthread_err = pthread_create( &pthread_id, &pthread_attr, (void * (*)(void *))start_thread, teb );
 #ifdef __SWITCH__
+        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+        char buf[192];
+
         if (pthread_err)
             horizon_trace( "[THREAD] pthread_create failed err=%d stack=%p size=%lx\n",
                            pthread_err, thread_data->kernel_stack, (unsigned long)kernel_stack_size );
+        else __atomic_add_fetch( &horizon_lifecycle.worker_pthreads, 1, __ATOMIC_RELAXED );
+        if (&wine_nx_runtime_trace)
+        {
+            snprintf( buf, sizeof(buf), "[THREAD] NtCreateThreadEx tid=%u start=%p param=%p flags=0x%x "
+                      "stack_reserve=0x%lx err=%d", tid, start, param, (unsigned)flags,
+                      (unsigned long)stack_reserve, pthread_err );
+            wine_nx_runtime_trace( buf );
+        }
 #endif
         if (pthread_err)
         {
@@ -1596,12 +1603,22 @@ static DECLSPEC_NORETURN void exit_thread( int status )
     {
         struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
 
+        /* The main thread has no pthread_id and is never joined or freed. On
+         * Horizon this join is what releases the previous thread's kernel
+         * thread, libnx stack and stack mapping (pthread_detach is ENOSYS). */
         if (thread_data->pthread_id)
         {
             pthread_join( thread_data->pthread_id, NULL );
             virtual_free_teb( teb );
+#ifdef __SWITCH__
+            __atomic_sub_fetch( &horizon_lifecycle.worker_pthreads, 1, __ATOMIC_RELAXED );
+#endif
         }
     }
+#ifdef __SWITCH__
+    __atomic_add_fetch( &horizon_lifecycle.thread_exits, 1, __ATOMIC_RELAXED );
+    horizon_lifecycle_report( "exit", HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ), status );
+#endif
     pthread_exit_wrapper( status );
 }
 

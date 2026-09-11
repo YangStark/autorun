@@ -1958,6 +1958,15 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
     }
 }
 
+#ifdef __SWITCH__
+NTSTATUS wine_nx_init_wow64_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
+{
+    if (main_image_info.Machine != IMAGE_FILE_MACHINE_I386) return STATUS_INVALID_IMAGE_FORMAT;
+    init_peb( params, module );
+    return wow_peb && wow_peb->ProcessParameters ? STATUS_SUCCESS : STATUS_NO_MEMORY;
+}
+#endif
+
 
 /*************************************************************************
  *		build_initial_params

@@ -635,6 +635,12 @@ static void init_cpu_model(void)
         }
         fclose( f );
     }
+#elif defined(__SWITCH__)
+    /* No /proc/cpuinfo on Horizon. The Switch's Tegra X1 (and X1+) application
+     * cores are Cortex-A57; r1p1 is the original X1's revision. */
+    part = 0xd07;
+    variant = 1;
+    revision = 1;
 #endif
     cpu_level = part;
     cpu_revision = (variant << 8) | revision;
@@ -2886,6 +2892,13 @@ static void get_performance_info( SYSTEM_PERFORMANCE_INFORMATION *info )
         }
 #endif
     }
+#elif defined(__SWITCH__)
+    {
+        unsigned long long used;
+
+        horizon_get_memory_info( &totalram, &used );
+        freeram = totalram - used;
+    }
 #endif
 
     /* Titan Quest refuses to run if TotalPageFile <= TotalPhys */
@@ -4383,6 +4396,11 @@ NTSTATUS WINAPI NtQuerySystemInformationEx( SYSTEM_INFORMATION_CLASS class,
         process = *(HANDLE *)query;
         if (process)
         {
+#ifdef __SWITCH__
+            if (process == NtCurrentProcess()) machine = main_image_info.Machine;
+            else
+#endif
+            {
             SERVER_START_REQ( get_process_info )
             {
                 req->handle = wine_server_obj_handle( process );
@@ -4390,6 +4408,7 @@ NTSTATUS WINAPI NtQuerySystemInformationEx( SYSTEM_INFORMATION_CLASS class,
             }
             SERVER_END_REQ;
             if (ret) return ret;
+            }
         }
 
         len = (supported_machines_count + 1) * sizeof(*machines);
@@ -4970,7 +4989,32 @@ NTSTATUS WINAPI NtUnloadDriver( const UNICODE_STRING *name )
  */
 NTSTATUS WINAPI NtDisplayString( UNICODE_STRING *string )
 {
+#ifdef __SWITCH__
+    extern void wine_nx_runtime_trace( const char * ) __attribute__((weak));
+    char line[241];
+    unsigned int offset = 0, length, n, i;
+    UNICODE_STRING input;
+    NTSTATUS status;
+    status = NtReadVirtualMemory( NtCurrentProcess(), string, &input, sizeof(input), NULL );
+    if (status) return status;
+    if ((input.Length & 1) || (input.Length && !input.Buffer)) return STATUS_INVALID_PARAMETER;
+    length = input.Length / sizeof(WCHAR);
+    while (offset < length)
+    {
+        WCHAR chunk[240];
+        n = min( length - offset, ARRAY_SIZE(chunk) );
+        status = NtReadVirtualMemory( NtCurrentProcess(), input.Buffer + offset, chunk,
+                                      n * sizeof(WCHAR), NULL );
+        if (status) return status;
+        /* The Switch diagnostic console is ASCII; retain readable output. */
+        for (i = 0; i < n; i++) line[i] = chunk[i] >= 32 && chunk[i] < 127 ? chunk[i] : '?';
+        line[n] = 0;
+        if (wine_nx_runtime_trace) wine_nx_runtime_trace( line );
+        offset += n;
+    }
+#else
     ERR( "%s\n", debugstr_us(string) );
+#endif
     return STATUS_SUCCESS;
 }
 

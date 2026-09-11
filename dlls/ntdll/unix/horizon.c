@@ -51,6 +51,9 @@
 
 #endif /* HORIZON_STANDALONE_SYNTAX */
 
+#include "horizon_file_access.h"
+#include "horizon_threads.h"
+
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -187,6 +190,10 @@ struct horizon_fd_queue
 #define HORIZON_REQ_INIT_PROCESS_DONE 4
 #define HORIZON_REQ_INIT_FIRST_THREAD 5
 #define HORIZON_REQ_INIT_THREAD 6
+#define HORIZON_REQ_TERMINATE_THREAD 8
+#define HORIZON_REQ_GET_THREAD_INFO 14
+#define HORIZON_REQ_GET_THREAD_TIMES 15
+#define HORIZON_REQ_SET_THREAD_INFO 16
 #define HORIZON_REQ_SUSPEND_THREAD 17
 #define HORIZON_REQ_RESUME_THREAD 18
 #define HORIZON_REQ_CLOSE_HANDLE 21
@@ -214,11 +221,15 @@ struct horizon_fd_queue
 #define HORIZON_REQ_OPEN_SEMAPHORE 43
 #define HORIZON_REQ_CREATE_FILE 44
 #define HORIZON_REQ_OPEN_FILE_OBJECT 45
+#define HORIZON_REQ_GET_HANDLE_UNIX_NAME 47
 #define HORIZON_REQ_GET_HANDLE_FD 48
 #define HORIZON_REQ_RECV_SOCKET 55
 #define HORIZON_REQ_SEND_SOCKET 56
 #define HORIZON_REQ_SOCKET_GET_EVENTS 57
 #define HORIZON_REQ_QUERY_DIRECTORY_FILE 244
+#define HORIZON_REQ_SET_FD_DISP_INFO 275
+#define HORIZON_REQ_SET_FD_NAME_INFO 276
+#define HORIZON_REQ_SET_FD_EOF_INFO 277
 #define HORIZON_REQ_SET_ASYNC_DIRECT_RESULT 137
 #define HORIZON_REQ_IOCTL 140
 #define HORIZON_REQ_CREATE_MAPPING 63
@@ -318,6 +329,9 @@ struct horizon_fd_queue
 #define HORIZON_STATUS_OBJECT_TYPE_MISMATCH 0xc0000024u
 #define HORIZON_STATUS_OBJECT_NAME_NOT_FOUND 0xc0000034u
 #define HORIZON_STATUS_OBJECT_NAME_COLLISION 0xc0000035u
+#define HORIZON_STATUS_FILE_IS_A_DIRECTORY 0xc00000bau
+#define HORIZON_STATUS_DIRECTORY_NOT_EMPTY 0xc0000101u
+#define HORIZON_STATUS_OBJECT_PATH_SYNTAX_BAD 0xc000003bu
 #define HORIZON_STATUS_OBJECT_PATH_NOT_FOUND 0xc000003au
 #define HORIZON_STATUS_MUTANT_NOT_OWNED 0xc0000046u
 #define HORIZON_STATUS_SEMAPHORE_LIMIT_EXCEEDED 0xc0000047u
@@ -326,7 +340,26 @@ struct horizon_fd_queue
 #define HORIZON_STATUS_INFO_LENGTH_MISMATCH 0xc0000004u
 #define HORIZON_STATUS_NO_MORE_FILES 0x80000006u
 #define HORIZON_STATUS_NOT_SAME_OBJECT 0xc00001acu
+#define HORIZON_STATUS_INVALID_CID 0xc000000bu
+#define HORIZON_STATUS_ABANDONED_WAIT_0 0x00000080u
+#define HORIZON_CURRENT_THREAD_HANDLE 0xfffffffeu
+#define HORIZON_CURRENT_PROCESS_HANDLE 0xffffffffu
+#define HORIZON_THREAD_CREATE_SUSPENDED 0x00000001u
+#define HORIZON_SET_THREAD_INFO_PRIORITY 0x01u
+#define HORIZON_SET_THREAD_INFO_BASE_PRIORITY 0x02u
+#define HORIZON_SET_THREAD_INFO_AFFINITY 0x04u
+#define HORIZON_SET_THREAD_INFO_ENTRYPOINT 0x10u
 #define HORIZON_IMAGE_FILE_MACHINE_ARM64 0xaa64
+#define HORIZON_IMAGE_FILE_MACHINE_I386 0x014c
+static unsigned short horizon_process_machine = HORIZON_IMAGE_FILE_MACHINE_ARM64;
+unsigned int horizon_set_process_machine( unsigned short machine )
+{
+    if (machine != HORIZON_IMAGE_FILE_MACHINE_ARM64 && machine != HORIZON_IMAGE_FILE_MACHINE_I386)
+        return 0xc000007b; /* STATUS_INVALID_IMAGE_FORMAT */
+    horizon_process_machine = machine;
+    return 0;
+}
+
 #define HORIZON_IMAGE_NT_OPTIONAL_HDR64_MAGIC 0x20b
 #define HORIZON_IMAGE_FILE_DLL 0x2000
 #define HORIZON_IMAGE_SCN_CNT_CODE 0x00000020
@@ -520,6 +553,106 @@ struct horizon_init_thread_reply
     char pad[4];
 };
 
+struct horizon_init_process_done_request
+{
+    struct horizon_server_request_header header;
+    char pad[4];
+    unsigned long long teb;
+    unsigned long long peb;
+    unsigned long long ldt_copy;
+};
+
+struct horizon_terminate_thread_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+    int exit_code;
+    char pad[4];
+};
+
+struct horizon_terminate_thread_reply
+{
+    struct horizon_server_reply_header header;
+    int self;
+    char pad[4];
+};
+
+struct horizon_get_thread_info_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+    unsigned int access;
+    char pad[4];
+};
+
+struct horizon_get_thread_info_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int pid;
+    unsigned int tid;
+    unsigned long long teb;
+    unsigned long long entry_point;
+    unsigned long long affinity;
+    int exit_code;
+    int priority;
+    int base_priority;
+    int suspend_count;
+    unsigned int flags;
+    unsigned int desc_len;
+};
+
+struct horizon_get_thread_times_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+};
+
+struct horizon_get_thread_times_reply
+{
+    struct horizon_server_reply_header header;
+    long long creation_time;
+    long long exit_time;
+    int unix_pid;
+    int unix_tid;
+};
+
+struct horizon_set_thread_info_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+    int priority;
+    int base_priority;
+    unsigned long long affinity;
+    unsigned long long entry_point;
+    unsigned int token;
+    int disable_boost;
+    unsigned int mask;
+    char pad[4];
+};
+
+struct horizon_open_thread_request
+{
+    struct horizon_server_request_header header;
+    unsigned int tid;
+    unsigned int access;
+    unsigned int attributes;
+};
+
+struct horizon_suspend_thread_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+    unsigned int waited_handle;
+    char pad[4];
+};
+
+struct horizon_suspend_thread_reply
+{
+    struct horizon_server_reply_header header;
+    int count;
+    unsigned int wait_handle;
+};
+
 struct horizon_close_handle_request
 {
     struct horizon_server_request_header header;
@@ -677,6 +810,45 @@ struct horizon_create_file_reply
 {
     struct horizon_server_reply_header header;
     unsigned int handle;
+    char pad[4];
+};
+
+struct horizon_set_fd_disp_info_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+    unsigned int flags;
+    char pad[4];
+};
+
+struct horizon_set_fd_name_info_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+    unsigned int rootdir;
+    unsigned int namelen;
+    int link;
+    unsigned int flags;
+    /* VARARG(name,unicode_str,namelen); VARARG(filename,string); */
+};
+
+struct horizon_set_fd_eof_info_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+    unsigned long long eof;
+};
+
+struct horizon_get_handle_unix_name_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+};
+
+struct horizon_get_handle_unix_name_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int name_len;
     char pad[4];
 };
 
@@ -1918,6 +2090,8 @@ struct horizon_session_view
     struct horizon_session_view *next;
 };
 
+struct horizon_server_object;
+
 struct horizon_server_connection
 {
     int request_fd;
@@ -1925,6 +2099,9 @@ struct horizon_server_connection
     int wait_fd;
     unsigned int pid;
     unsigned int tid;
+    /* Thread object of the client; the connection holds one reference until
+     * the client's request pipe closes, which is when the thread terminates. */
+    struct horizon_server_object *thread;
 };
 
 struct horizon_server_object
@@ -1936,7 +2113,9 @@ struct horizon_server_object
     int signaled;
     unsigned int count;
     unsigned int max;
-    int owned;
+    struct horizon_mutex_state mutex;
+    struct horizon_thread_state thread;
+    struct horizon_server_object *thread_next;
     unsigned int rootdir;
     unsigned int name_len;
     unsigned char *name;
@@ -1946,8 +2125,10 @@ struct horizon_server_object
     char *file_name;
     unsigned int file_access;
     unsigned int file_options;
+    int file_delete;                /* FileDispositionInformation asked for deletion at last close */
     int file_is_dir;
     unsigned int dir_enum_index;
+    int dir_queried;                /* a directory query has run on this handle */
     char *dir_mask;
     int sock_nonblocking;
     unsigned int sock_event_handle; /* event signaled by the poller (WSAEventSelect) */
@@ -1967,6 +2148,7 @@ struct horizon_server_object
     unsigned int desktop_top_window;
     unsigned int desktop_msg_window;
     struct horizon_obj_locator desktop_locator;
+    int std_stream;                 /* 1 stdout, 2 stderr: writes are echoed to the log */
 };
 
 struct horizon_server_handle_entry
@@ -1979,6 +2161,13 @@ struct horizon_server_handle_entry
 static LONG horizon_server_next_handle = 0x100;
 static pthread_mutex_t horizon_server_objects_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct horizon_server_handle_entry *horizon_server_handles;
+/* Every thread object, running or terminated, while referenced (open_thread). */
+static struct horizon_server_object *horizon_server_threads;
+static unsigned int horizon_server_running_threads;
+/* Each client connection is served by its own pthread. */
+static __thread struct horizon_server_connection *horizon_server_current;
+static struct horizon_zombie_list horizon_server_zombies = { PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0 };
+struct horizon_lifecycle_counters horizon_lifecycle;
 static unsigned int horizon_process_winstation;
 static unsigned int horizon_thread_desktop;
 static unsigned int horizon_input_desktop;
@@ -2147,6 +2336,18 @@ unsigned int horizon_get_processor_count(void)
     return count ? count : 1;
 }
 
+/* There is no sysinfo or /proc/meminfo on Horizon. The memory this process may
+ * use is the meaningful "physical memory" for Windows programs, which size
+ * caches, dictionaries and thread counts from GlobalMemoryStatusEx. */
+void horizon_get_memory_info( unsigned long long *total, unsigned long long *used )
+{
+    u64 value;
+
+    *total = R_SUCCEEDED( svcGetInfo( &value, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0 ) ) ? value : 0;
+    *used = R_SUCCEEDED( svcGetInfo( &value, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0 ) ) ? value : 0;
+    if (*used > *total) *used = *total;
+}
+
 void horizon_pin_current_thread( ULONG_PTR requested_mask )
 {
     ULONG_PTR system_mask = horizon_get_system_affinity_mask();
@@ -2194,6 +2395,7 @@ static void horizon_pipe_destroy( struct horizon_pipe *pipe )
     pthread_cond_destroy( &pipe->can_read );
     pthread_mutex_destroy( &pipe->mutex );
     free( pipe );
+    __atomic_sub_fetch( &horizon_lifecycle.pipes, 1, __ATOMIC_RELAXED );
 }
 
 static void horizon_pipe_release( struct horizon_pipe *pipe )
@@ -2370,6 +2572,7 @@ int horizon_pipe( int fd[2] )
     pthread_mutex_init( &pipe->mutex, NULL );
     pthread_cond_init( &pipe->can_read, NULL );
     pthread_cond_init( &pipe->can_write, NULL );
+    __atomic_add_fetch( &horizon_lifecycle.pipes, 1, __ATOMIC_RELAXED );
     pipe->refs = 2;
     pipe->read_open = 1;
     pipe->write_open = 1;
@@ -2587,9 +2790,22 @@ static struct horizon_server_handle_entry *horizon_server_create_handle_for_obje
     return entry;
 }
 
+/* Callers hold horizon_server_objects_mutex. */
 static void horizon_server_free_object( struct horizon_server_object *object )
 {
     if (!object) return;
+    if (object->type == HORIZON_SERVER_OBJECT_THREAD)
+    {
+        struct horizon_server_object **ptr;
+
+        for (ptr = &horizon_server_threads; *ptr; ptr = &(*ptr)->thread_next)
+        {
+            if (*ptr != object) continue;
+            *ptr = object->thread_next;
+            __atomic_sub_fetch( &horizon_lifecycle.thread_objects, 1, __ATOMIC_RELAXED );
+            break;
+        }
+    }
     if (object->file_fd != -1) close( object->file_fd );
     free( object->file_name );
     free( object->dir_mask );
@@ -2597,11 +2813,14 @@ static void horizon_server_free_object( struct horizon_server_object *object )
     free( object );
 }
 
+static unsigned int horizon_server_errno_status( int error );
+
 static unsigned int horizon_server_close_object_handle( unsigned int handle )
 {
     struct horizon_server_handle_entry **ptr;
     struct horizon_server_handle_entry *entry;
     struct horizon_server_object *object;
+    unsigned int status = HORIZON_STATUS_SUCCESS;
 
     if (!handle) return HORIZON_STATUS_INVALID_HANDLE;
 
@@ -2613,10 +2832,34 @@ static unsigned int horizon_server_close_object_handle( unsigned int handle )
         entry = *ptr;
         object = entry->object;
         *ptr = entry->next;
-        if (object && object->refs && !--object->refs) horizon_server_free_object( object );
+        if (object && object->refs && !--object->refs)
+        {
+            /* DeleteFileW opens with DELETE_ON_CLOSE, then closes. Defer until
+             * the last duplicate handle releases this file object. */
+            if (object->type == HORIZON_SERVER_OBJECT_FILE &&
+                ((object->file_options & 0x00001000u) || object->file_delete) && object->file_name)
+            {
+                int ret, error;
+                /* Horizon's filesystem cannot delete an open file. Release
+                 * this object's descriptor before removing its path. */
+                if (object->file_fd != -1)
+                {
+                    ret = close( object->file_fd );
+                    object->file_fd = -1;
+                    if (ret == -1) status = horizon_server_errno_status( errno );
+                }
+                ret = object->file_is_dir ? rmdir( object->file_name ) : unlink( object->file_name );
+                error = ret == -1 ? errno : 0;
+                if (error && error != ENOENT) status = horizon_server_errno_status( error );
+                horizon_trace( "[HZFILE] delete result=%d errno=%d", ret, error );
+                horizon_trace( "[HZFILE] delete-on-close path=%s status=%08x",
+                               object->file_name, status );
+            }
+            horizon_server_free_object( object );
+        }
         free( entry );
         pthread_mutex_unlock( &horizon_server_objects_mutex );
-        return HORIZON_STATUS_SUCCESS;
+        return status;
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
     return HORIZON_STATUS_INVALID_HANDLE;
@@ -2634,15 +2877,29 @@ static unsigned int horizon_server_duplicate_object_handle( unsigned int handle,
     if (!duplicate) return HORIZON_STATUS_NO_MEMORY;
 
     pthread_mutex_lock( &horizon_server_objects_mutex );
-    if (!(entry = horizon_server_find_handle_locked( handle )))
+    if (handle == HORIZON_CURRENT_PROCESS_HANDLE)
+    {
+        /* Process objects carry no state yet; a fresh one is equivalent. */
+        if ((entry = horizon_server_create_handle_locked( HORIZON_SERVER_OBJECT_PROCESS )))
+            *new_handle = entry->handle;
+        pthread_mutex_unlock( &horizon_server_objects_mutex );
+        free( duplicate );
+        return entry ? HORIZON_STATUS_SUCCESS : HORIZON_STATUS_NO_MEMORY;
+    }
+    if (handle == HORIZON_CURRENT_THREAD_HANDLE && horizon_server_current &&
+        horizon_server_current->thread)
+    {
+        duplicate->object = horizon_server_current->thread;
+    }
+    else if (!(entry = horizon_server_find_handle_locked( handle )))
     {
         pthread_mutex_unlock( &horizon_server_objects_mutex );
         free( duplicate );
         return HORIZON_STATUS_INVALID_HANDLE;
     }
+    else duplicate->object = entry->object;
 
     duplicate->handle = horizon_server_alloc_handle();
-    duplicate->object = entry->object;
     duplicate->object->refs++;
     duplicate->next = horizon_server_handles;
     horizon_server_handles = duplicate;
@@ -2846,9 +3103,10 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     opt_size = horizon_get_le16( nt + 20 );
     characteristics = horizon_get_le16( nt + 22 );
 
-    if (machine != HORIZON_IMAGE_FILE_MACHINE_ARM64)
+    if (machine != HORIZON_IMAGE_FILE_MACHINE_ARM64 &&
+        !(machine == HORIZON_IMAGE_FILE_MACHINE_I386 && horizon_process_machine == machine))
         return HORIZON_STATUS_INVALID_IMAGE_FORMAT;
-    if (!section_count || section_count > 128 || opt_size < 112)
+    if (!section_count || section_count > 128 || opt_size < (machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? 96 : 112))
         return HORIZON_STATUS_INVALID_IMAGE_FORMAT;
     if (opt_size > 4096 || section_count > (0x10000 - opt_size) / 40)
         return HORIZON_STATUS_INVALID_IMAGE_FORMAT;
@@ -2862,7 +3120,7 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     status = horizon_server_read_exact_at( fd, pe_offset + sizeof(nt), headers, headers_size );
     if (status) goto done;
 
-    if (horizon_get_le16( headers ) != HORIZON_IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    if (horizon_get_le16( headers ) != (machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? 0x10b : HORIZON_IMAGE_NT_OPTIONAL_HDR64_MAGIC))
     {
         status = HORIZON_STATUS_INVALID_IMAGE_FORMAT;
         goto done;
@@ -2879,9 +3137,9 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
         goto done;
     }
 
-    info->base = horizon_get_le64( headers + 24 );
-    info->stack_size = horizon_get_le64( headers + 72 );
-    info->stack_commit = horizon_get_le64( headers + 80 );
+    info->base = machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? horizon_get_le32( headers + 28 ) : horizon_get_le64( headers + 24 );
+    info->stack_size = machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? horizon_get_le32( headers + 72 ) : horizon_get_le64( headers + 72 );
+    info->stack_commit = machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? horizon_get_le32( headers + 76 ) : horizon_get_le64( headers + 80 );
     info->entry_point = horizon_get_le32( headers + 16 );
     info->map_size = size_of_image;
     info->alignment = section_alignment;
@@ -2894,7 +3152,7 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     info->image_charact = characteristics;
     info->dll_charact = dll_charact;
     info->machine = machine;
-    info->loader_flags = horizon_get_le32( headers + 104 );
+    info->loader_flags = horizon_get_le32( headers + (machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? 88 : 104) );
     info->header_size = size_of_headers;
     info->header_map_size = horizon_round_up_u32( size_of_headers, 0x1000 );
     info->file_size = st.st_size > 0xffffffffll ? 0xffffffffu : (unsigned int)st.st_size;
@@ -2934,14 +3192,7 @@ static void horizon_server_write_utf16_name( unsigned char *dst, const char *nam
 static unsigned int horizon_server_file_open_flags( const struct horizon_create_file_request *request,
                                                     int *flags )
 {
-    int wants_read = request->access & FILE_READ_DATA;
-    int wants_write = request->access & (FILE_WRITE_DATA | FILE_APPEND_DATA);
-
-    if (wants_read && wants_write) *flags = O_RDWR;
-    else if (wants_write) *flags = O_WRONLY;
-    else *flags = O_RDONLY;
-
-    if (request->access & FILE_APPEND_DATA) *flags |= O_APPEND;
+    *flags = horizon_file_access_mode( request->access );
 
     switch (request->create)
     {
@@ -3505,6 +3756,12 @@ static unsigned int horizon_server_find_typed_object_locked( unsigned int handle
     return HORIZON_STATUS_SUCCESS;
 }
 
+/* Identity of the client served by the calling server thread (mutex owner). */
+static unsigned int horizon_server_current_tid(void)
+{
+    return horizon_server_current ? horizon_server_current->tid : 0;
+}
+
 static int horizon_server_object_is_signaled( const struct horizon_server_object *object )
 {
     switch (object->type)
@@ -3512,13 +3769,14 @@ static int horizon_server_object_is_signaled( const struct horizon_server_object
     case HORIZON_SERVER_OBJECT_EVENT:
         return object->signaled;
     case HORIZON_SERVER_OBJECT_MUTEX:
-        return !object->owned;
+        return horizon_mutex_signaled( &object->mutex, horizon_server_current_tid() );
     case HORIZON_SERVER_OBJECT_SEMAPHORE:
         return object->count > 0;
     case HORIZON_SERVER_OBJECT_TIMER:
         return object->signaled;
-    case HORIZON_SERVER_OBJECT_PROCESS:
     case HORIZON_SERVER_OBJECT_THREAD:
+        return object->thread.terminated;
+    case HORIZON_SERVER_OBJECT_PROCESS:
     case HORIZON_SERVER_OBJECT_RESERVE:
     case HORIZON_SERVER_OBJECT_KEYED_EVENT:
         return 1;
@@ -3527,7 +3785,8 @@ static int horizon_server_object_is_signaled( const struct horizon_server_object
     }
 }
 
-static void horizon_server_consume_signal( struct horizon_server_object *object )
+/* Returns 1 when the wait acquired an abandoned mutex. */
+static int horizon_server_consume_signal( struct horizon_server_object *object )
 {
     switch (object->type)
     {
@@ -3535,9 +3794,7 @@ static void horizon_server_consume_signal( struct horizon_server_object *object 
         if (!object->manual_reset) object->signaled = 0;
         break;
     case HORIZON_SERVER_OBJECT_MUTEX:
-        object->owned = 1;
-        object->count = 1;
-        break;
+        return horizon_mutex_acquire( &object->mutex, horizon_server_current_tid() );
     case HORIZON_SERVER_OBJECT_SEMAPHORE:
         if (object->count) object->count--;
         break;
@@ -3547,6 +3804,67 @@ static void horizon_server_consume_signal( struct horizon_server_object *object 
     default:
         break;
     }
+    return 0;
+}
+
+/* Resolve a thread handle, including the current-thread pseudo-handle. */
+static struct horizon_server_object *horizon_server_get_thread_locked( unsigned int handle,
+                                                                       unsigned int *status )
+{
+    struct horizon_server_object *object = NULL;
+
+    if (handle == HORIZON_CURRENT_THREAD_HANDLE)
+    {
+        object = horizon_server_current ? horizon_server_current->thread : NULL;
+        *status = object ? HORIZON_STATUS_SUCCESS : HORIZON_STATUS_INVALID_HANDLE;
+        return object;
+    }
+    *status = horizon_server_find_typed_object_locked( handle, HORIZON_SERVER_OBJECT_THREAD, &object );
+    return *status == HORIZON_STATUS_SUCCESS ? object : NULL;
+}
+
+static long long horizon_server_now(void)
+{
+    LARGE_INTEGER now;
+
+    NtQuerySystemTime( &now );
+    return now.QuadPart;
+}
+
+/* A new thread object with no handles; the caller adds the references. */
+static struct horizon_server_object *horizon_server_alloc_thread_locked( unsigned int tid, unsigned int pid )
+{
+    struct horizon_server_object *object = calloc( 1, sizeof(*object) );
+
+    if (!object) return NULL;
+    object->type = HORIZON_SERVER_OBJECT_THREAD;
+    object->id = tid;
+    object->file_fd = -1;
+    horizon_thread_init( &object->thread, tid, pid, horizon_get_system_affinity_mask(),
+                         horizon_server_now() );
+    object->thread_next = horizon_server_threads;
+    horizon_server_threads = object;
+    horizon_server_running_threads++;
+    __atomic_add_fetch( &horizon_lifecycle.thread_objects, 1, __ATOMIC_RELAXED );
+    return object;
+}
+
+/* The client's request pipe closed: it can no longer run Windows code. Mark it
+ * terminated (waiters wake), abandon its mutexes and drop the connection's
+ * reference. Callers hold horizon_server_objects_mutex. */
+static void horizon_server_end_thread_locked( struct horizon_server_connection *connection )
+{
+    struct horizon_server_object *thread = connection->thread;
+    struct horizon_server_handle_entry *entry;
+
+    if (!thread) return;
+    connection->thread = NULL;
+    if (horizon_thread_mark_terminated( &thread->thread, horizon_server_now() ))
+        horizon_server_running_threads--;
+    for (entry = horizon_server_handles; entry; entry = entry->next)
+        if (entry->object->type == HORIZON_SERVER_OBJECT_MUTEX)
+            horizon_mutex_abandon( &entry->object->mutex, thread->thread.tid );
+    if (!--thread->refs) horizon_server_free_object( thread );
 }
 
 static unsigned int horizon_server_signal_object_locked( unsigned int handle )
@@ -3564,9 +3882,10 @@ static unsigned int horizon_server_signal_object_locked( unsigned int handle )
         object->signaled = 1;
         return HORIZON_STATUS_SUCCESS;
     case HORIZON_SERVER_OBJECT_MUTEX:
-        if (!object->owned || !object->count) return HORIZON_STATUS_MUTANT_NOT_OWNED;
-        if (!--object->count) object->owned = 0;
-        return HORIZON_STATUS_SUCCESS;
+    {
+        unsigned int previous;
+        return horizon_mutex_release( &object->mutex, horizon_server_current_tid(), &previous );
+    }
     case HORIZON_SERVER_OBJECT_SEMAPHORE:
         if (object->count == object->max) return HORIZON_STATUS_SEMAPHORE_LIMIT_EXCEEDED;
         object->count++;
@@ -3576,14 +3895,24 @@ static unsigned int horizon_server_signal_object_locked( unsigned int handle )
     }
 }
 
+/* Returns SUCCESS, ABANDONED_WAIT_0 (inherited an abandoned mutex), TIMEOUT
+ * (not signaled) or an error. */
 static unsigned int horizon_server_wait_object_locked( unsigned int handle, int consume )
 {
     struct horizon_server_handle_entry *entry;
+    struct horizon_server_object *object;
+    unsigned int status;
 
     if (!handle) return HORIZON_STATUS_INVALID_HANDLE;
+    if (handle == HORIZON_CURRENT_THREAD_HANDLE)
+    {
+        /* The calling thread cannot terminate while it waits on itself. */
+        return horizon_server_get_thread_locked( handle, &status ) ? HORIZON_STATUS_TIMEOUT : status;
+    }
     if (!(entry = horizon_server_find_handle_locked( handle ))) return HORIZON_STATUS_INVALID_HANDLE;
-    if (!horizon_server_object_is_signaled( entry->object )) return HORIZON_STATUS_TIMEOUT;
-    if (consume) horizon_server_consume_signal( entry->object );
+    object = entry->object;
+    if (!horizon_server_object_is_signaled( object )) return HORIZON_STATUS_TIMEOUT;
+    if (consume && horizon_server_consume_signal( object )) return HORIZON_STATUS_ABANDONED_WAIT_0;
     return HORIZON_STATUS_SUCCESS;
 }
 
@@ -3592,7 +3921,8 @@ static int horizon_server_handle_init_first_thread( struct horizon_server_connec
 {
     const struct horizon_init_first_thread_request *request = (const void *)message;
     struct horizon_init_first_thread_reply reply;
-    unsigned short machine = HORIZON_IMAGE_FILE_MACHINE_ARM64;
+    unsigned short machines[] = { HORIZON_IMAGE_FILE_MACHINE_ARM64, HORIZON_IMAGE_FILE_MACHINE_I386 };
+    unsigned int machine_size = horizon_process_machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? sizeof(machines) : sizeof(machines[0]);
     unsigned int handle;
     int reply_fd, wait_fd;
 
@@ -3603,21 +3933,36 @@ static int horizon_server_handle_init_first_thread( struct horizon_server_connec
 
     memset( &reply, 0, sizeof(reply) );
     reply.header.error = HORIZON_STATUS_SUCCESS;
-    reply.header.reply_size = sizeof(machine);
+    reply.header.reply_size = machine_size;
     reply.pid = request->unix_pid > 0 ? request->unix_pid : 1;
-    reply.tid = request->unix_tid > 0 ? request->unix_tid : 1;
+    /* Windows thread ids come from one counter: 4 here, then 8, 12, ... in
+     * new_thread. A kernel-derived id could equal a later worker's id or share
+     * its NtWaitForAlertByThreadId slot ((tid >> 2) - 1) and lose wakeups. */
+    reply.tid = 4;
     reply.session_id = 1;
     connection->pid = reply.pid;
     connection->tid = reply.tid;
 
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!connection->thread &&
+        (connection->thread = horizon_server_alloc_thread_locked( reply.tid, reply.pid )))
+    {
+        connection->thread->refs = 1;
+        connection->thread->thread.started = 1;
+        __atomic_add_fetch( &horizon_lifecycle.connections, 1, __ATOMIC_RELAXED );
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
     TRACE( "Horizon server init_first_thread pid %u tid %u reply fd %d/%d wait fd %d/%d.\n",
            reply.pid, reply.tid, reply_fd, request->reply_fd, wait_fd, request->wait_fd );
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply),
-                                       &machine, sizeof(machine) );
+                                       machines, machine_size );
 }
 
-static int horizon_server_handle_init_process_done( struct horizon_server_connection *connection )
+static int horizon_server_handle_init_process_done( struct horizon_server_connection *connection,
+                                                   const unsigned char *message )
 {
+    const struct horizon_init_process_done_request *request = (const void *)message;
     struct horizon_init_process_done_reply reply;
 
     if (connection->reply_fd == -1)
@@ -3625,6 +3970,10 @@ static int horizon_server_handle_init_process_done( struct horizon_server_connec
         errno = EPIPE;
         return -1;
     }
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (connection->thread) connection->thread->thread.teb = request->teb;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
 
     memset( &reply, 0, sizeof(reply) );
     reply.header.error = HORIZON_STATUS_SUCCESS;
@@ -3648,6 +3997,29 @@ static int horizon_server_handle_init_thread( struct horizon_server_connection *
     connection->wait_fd = wait_fd;
     if (!connection->pid) connection->pid = getpid();
     if (!connection->tid) connection->tid = request->unix_tid > 0 ? request->unix_tid : 1;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (connection->thread)
+    {
+        connection->thread->thread.teb = request->teb;
+        connection->thread->thread.entry = request->entry;
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
+    /* CREATE_SUSPENDED: hold the reply until resume_thread opens the start
+     * gate, so no Windows code runs first. Wine's kernelbase creates every
+     * thread suspended and resumes it after NtCreateThreadEx returns. */
+    for (;;)
+    {
+        int may_start;
+
+        pthread_mutex_lock( &horizon_server_objects_mutex );
+        may_start = !connection->thread || horizon_thread_may_start( &connection->thread->thread );
+        if (may_start && connection->thread) connection->thread->thread.started = 1;
+        pthread_mutex_unlock( &horizon_server_objects_mutex );
+        if (may_start) break;
+        usleep( 1000 );
+    }
 
     memset( &reply, 0, sizeof(reply) );
     reply.header.error = HORIZON_STATUS_SUCCESS;
@@ -5798,7 +6170,11 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
     int fd = -1;
 
     memset( &reply, 0, sizeof(reply) );
-    reply.header.error = horizon_server_object_attributes_size( data, data_size, &attr_size );
+    /* DELETE_ON_CLOSE requires DELETE access, not merely a writable fd. */
+    if ((request->options & 0x00001000u) &&
+        !(horizon_file_map_access( request->access ) & 0x00010000u))
+        reply.header.error = HORIZON_STATUS_ACCESS_DENIED;
+    else reply.header.error = horizon_server_object_attributes_size( data, data_size, &attr_size );
     if (!reply.header.error)
     {
         filename_size = data_size - attr_size;
@@ -5819,7 +6195,11 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
     {
         DIR *dir;
 
-        if (!(dir = opendir( filename ))) reply.header.error = horizon_server_errno_status( errno );
+        /* CreateDirectoryW: create first, as wineserver's open_fd does. An
+         * existing directory is fine unless the disposition was FILE_CREATE. */
+        if ((flags & O_CREAT) && mkdir( filename, 0777 ) == -1 && (errno != EEXIST || (flags & O_EXCL)))
+            reply.header.error = horizon_server_errno_status( errno );
+        else if (!(dir = opendir( filename ))) reply.header.error = horizon_server_errno_status( errno );
         else
         {
             closedir( dir );
@@ -5829,7 +6209,24 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
     else if (!reply.header.error)
     {
         fd = open( filename, flags, 0666 );
-        if (fd == -1) reply.header.error = horizon_server_errno_status( errno );
+        if (fd == -1)
+        {
+            int open_errno = errno;
+            DIR *dir;
+
+            /* libnx cannot open() a directory, but NT opens an existing one
+             * without FILE_DIRECTORY_FILE (CreateFileW with backup semantics). */
+            if (open_errno != EEXIST && (dir = opendir( filename )))
+            {
+                closedir( dir );
+                if (!(reply.header.error = horizon_directory_open_status( request->options, flags )))
+                {
+                    is_dir = 1;
+                    if (!(stored_name = strdup( filename ))) reply.header.error = HORIZON_STATUS_NO_MEMORY;
+                }
+            }
+            else reply.header.error = horizon_server_errno_status( open_errno );
+        }
         else if (!(stored_name = strdup( filename ))) reply.header.error = HORIZON_STATUS_NO_MEMORY;
     }
 
@@ -5840,7 +6237,7 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
         {
             entry->object->file_fd = fd;
             entry->object->file_name = stored_name;
-            entry->object->file_access = request->access;
+            entry->object->file_access = horizon_file_map_access( request->access );
             entry->object->file_options = request->options;
             entry->object->file_is_dir = is_dir;
             reply.handle = entry->handle;
@@ -5858,6 +6255,226 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
     free( stored_name );
     free( filename );
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+/* SetEndOfFile: extractors pre-size their output files this way. libnx maps
+ * ftruncate to fsFileSetSize, which grows as well as shrinks, so wineserver's
+ * write-a-byte-then-truncate growth path is not needed. */
+static int horizon_server_handle_set_fd_eof_info( struct horizon_server_connection *connection,
+                                                  const unsigned char *message )
+{
+    const struct horizon_set_fd_eof_info_request *request = (const void *)message;
+    struct horizon_server_handle_entry *entry;
+    unsigned int status = HORIZON_STATUS_SUCCESS;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    entry = horizon_server_find_handle_locked( request->handle );
+    if (!entry) status = HORIZON_STATUS_INVALID_HANDLE;
+    else if (entry->object->type != HORIZON_SERVER_OBJECT_FILE) status = HORIZON_STATUS_OBJECT_TYPE_MISMATCH;
+    else if (entry->object->file_is_dir) status = HORIZON_STATUS_FILE_IS_A_DIRECTORY;
+    else if (entry->object->file_fd == -1) status = HORIZON_STATUS_INVALID_HANDLE;
+    else if (request->eof > 0x7fffffffffffffffull) status = HORIZON_STATUS_INVALID_PARAMETER;
+    else if (ftruncate( entry->object->file_fd, (off_t)request->eof ) == -1)
+        status = horizon_server_errno_status( errno );
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_status( connection->reply_fd, status );
+}
+
+/* Only an empty directory can be marked for deletion. */
+static int horizon_server_dir_is_empty( const char *path )
+{
+    struct dirent *de;
+    DIR *dir;
+    int empty = 1;
+
+    if (!(dir = opendir( path ))) return -1;
+    while ((de = readdir( dir )))
+    {
+        if (strcmp( de->d_name, "." ) && strcmp( de->d_name, ".." ))
+        {
+            empty = 0;
+            break;
+        }
+    }
+    closedir( dir );
+    return empty;
+}
+
+/* FileDispositionInformation(Ex), e.g. SetFileInformationByHandle(FileDispositionInfo):
+ * the file is removed when the object's last handle closes, like DELETE_ON_CLOSE. */
+static int horizon_server_handle_set_fd_disp_info( struct horizon_server_connection *connection,
+                                                   const unsigned char *message )
+{
+    const struct horizon_set_fd_disp_info_request *request = (const void *)message;
+    struct horizon_server_handle_entry *entry;
+    struct horizon_server_object *object = NULL;
+    unsigned int status = HORIZON_STATUS_SUCCESS;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(entry = horizon_server_find_handle_locked( request->handle ))) status = HORIZON_STATUS_INVALID_HANDLE;
+    else if (entry->object->type != HORIZON_SERVER_OBJECT_FILE || !entry->object->file_name)
+        status = HORIZON_STATUS_OBJECT_TYPE_MISMATCH;
+    else if (!((object = entry->object)->file_access & 0x00010000u)) status = HORIZON_STATUS_ACCESS_DENIED;
+    else if ((request->flags & 0x00000001u) && object->file_is_dir)
+    {
+        switch (horizon_server_dir_is_empty( object->file_name ))
+        {
+        case -1: status = horizon_server_errno_status( errno ); break;
+        case 0: status = HORIZON_STATUS_DIRECTORY_NOT_EMPTY; break;
+        }
+    }
+    if (!status) object->file_delete = horizon_disposition_update( &object->file_options, request->flags );
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_status( connection->reply_fd, status );
+}
+
+/* The SD card refuses to rename a file that is open (FS result 0xe02, EIO in libnx). */
+static unsigned int horizon_server_rename_errno_status( int error )
+{
+    if (error == EIO && fsdevGetLastResult() == 0xe02) return HORIZON_STATUS_SHARING_VIOLATION;
+    return horizon_server_errno_status( error );
+}
+
+/* FileRenameInformation: MoveFileExW, and 7-Zip replacing an archive with its
+ * temporary copy. The client resolved the target's unix name. Horizon cannot
+ * rename an open file, so this handle's descriptor is released for the rename
+ * and reopened under the new name; another open handle makes it fail. */
+static int horizon_server_handle_set_fd_name_info( struct horizon_server_connection *connection,
+                                                   const unsigned char *message,
+                                                   const unsigned char *data, unsigned int data_size )
+{
+    const struct horizon_set_fd_name_info_request *request = (const void *)message;
+    enum horizon_rename_action action = HORIZON_RENAME_MOVE;
+    struct horizon_server_handle_entry *entry;
+    struct horizon_server_object *object = NULL;
+    unsigned int status = HORIZON_STATUS_SUCCESS, name_size = 0;
+    char *target = NULL, *joined, *new_name;
+    struct stat st;
+
+    if (request->namelen > data_size) status = HORIZON_STATUS_INVALID_PARAMETER;
+    else if (!(name_size = data_size - request->namelen)) status = HORIZON_STATUS_OBJECT_PATH_SYNTAX_BAD;
+    else if (request->link) status = HORIZON_STATUS_NOT_SUPPORTED; /* FAT has no hard links */
+    else if (!(target = malloc( name_size + 1 ))) status = HORIZON_STATUS_NO_MEMORY;
+    else
+    {
+        memcpy( target, data + request->namelen, name_size );
+        target[name_size] = 0;
+    }
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!status)
+    {
+        if (!(entry = horizon_server_find_handle_locked( request->handle ))) status = HORIZON_STATUS_INVALID_HANDLE;
+        else if (entry->object->type != HORIZON_SERVER_OBJECT_FILE || !entry->object->file_name)
+            status = HORIZON_STATUS_OBJECT_TYPE_MISMATCH;
+        else object = entry->object;
+    }
+    /* A name relative to a root directory handle. */
+    if (!status && request->rootdir && !strchr( target, ':' ))
+    {
+        if (!(entry = horizon_server_find_handle_locked( request->rootdir )) ||
+            entry->object->type != HORIZON_SERVER_OBJECT_FILE || !entry->object->file_is_dir ||
+            !entry->object->file_name)
+            status = HORIZON_STATUS_INVALID_HANDLE;
+        else if (!(joined = horizon_dir_entry_path( entry->object->file_name, target )))
+            status = HORIZON_STATUS_NO_MEMORY;
+        else
+        {
+            free( target );
+            target = joined;
+        }
+    }
+    if (!status)
+    {
+        int exists = 0, target_is_dir = 0, target_open = 0;
+
+        for (entry = horizon_server_handles; entry && !status; entry = entry->next)
+        {
+            const struct horizon_server_object *other = entry->object;
+
+            if (other == object || other->type != HORIZON_SERVER_OBJECT_FILE ||
+                !other->file_name || other->file_fd == -1)
+                continue;
+            if (horizon_unix_path_equal( other->file_name, object->file_name ))
+                status = HORIZON_STATUS_SHARING_VIOLATION;
+            else if (horizon_unix_path_equal( other->file_name, target ))
+                target_open = 1;
+        }
+        if (!status)
+        {
+            if (!stat( target, &st ))
+            {
+                exists = 1;
+                target_is_dir = S_ISDIR( st.st_mode );
+            }
+            else if (errno == EIO) exists = target_open = 1; /* open for writing somewhere */
+            status = horizon_rename_check( exists, horizon_unix_path_equal( object->file_name, target ),
+                                           target_is_dir, target_open, request->flags, &action );
+        }
+    }
+    if (!status && action != HORIZON_RENAME_NOTHING)
+    {
+        off_t position = 0;
+        int reopen = object->file_fd != -1;
+
+        if (reopen)
+        {
+            position = lseek( object->file_fd, 0, SEEK_CUR );
+            close( object->file_fd );
+            object->file_fd = -1;
+        }
+        if (action == HORIZON_RENAME_REPLACE && unlink( target ) == -1 && errno != ENOENT)
+            status = horizon_server_errno_status( errno );
+        else if (rename( object->file_name, target ) == -1)
+            status = horizon_server_rename_errno_status( errno );
+        else if (!(new_name = strdup( target ))) status = HORIZON_STATUS_NO_MEMORY;
+        else
+        {
+            free( object->file_name );
+            object->file_name = new_name;
+        }
+        if (reopen)
+        {
+            /* The same access without creation flags, at the same position. */
+            object->file_fd = open( object->file_name, horizon_file_access_mode( object->file_access ) );
+            if (object->file_fd != -1 && position > 0) lseek( object->file_fd, position, SEEK_SET );
+        }
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    horizon_trace( "[HZFILE] rename handle=%08x target=%s flags=%x action=%d status=%08x\n",
+                   request->handle, target ? target : "<none>", request->flags, (int)action, status );
+    free( target );
+    return horizon_server_write_status( connection->reply_fd, status );
+}
+
+/* Directory listings stat each entry below the directory's unix name. */
+static int horizon_server_handle_get_handle_unix_name( struct horizon_server_connection *connection,
+                                                       const unsigned char *message )
+{
+    const struct horizon_get_handle_unix_name_request *request = (const void *)message;
+    struct horizon_get_handle_unix_name_reply reply;
+    struct horizon_server_handle_entry *entry;
+    char *name = NULL;
+    int ret;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    entry = horizon_server_find_handle_locked( request->handle );
+    if (!entry) reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else if (entry->object->type != HORIZON_SERVER_OBJECT_FILE || !entry->object->file_name)
+        reply.header.error = HORIZON_STATUS_OBJECT_TYPE_MISMATCH;
+    else
+    {
+        reply.name_len = strlen( entry->object->file_name );
+        if (reply.name_len > request->header.reply_size) reply.header.error = HORIZON_STATUS_BUFFER_OVERFLOW;
+        else if (!(name = strdup( entry->object->file_name ))) reply.header.error = HORIZON_STATUS_NO_MEMORY;
+        else reply.header.reply_size = reply.name_len;
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    ret = horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), name,
+                                      name ? reply.name_len : 0 );
+    free( name );
+    return ret;
 }
 
 static int horizon_server_handle_get_handle_fd( struct horizon_server_connection *connection,
@@ -6032,7 +6649,7 @@ static int horizon_server_handle_query_directory_file( struct horizon_server_con
             }
             if (!name)
             {
-                reply.header.error = HORIZON_STATUS_NO_MORE_FILES;
+                reply.header.error = horizon_dir_scan_end_status( !object->dir_queried );
                 break;
             }
         }
@@ -6066,6 +6683,7 @@ static int horizon_server_handle_query_directory_file( struct horizon_server_con
 
     if (object)
     {
+        object->dir_queried = 1;
         trace_index = object->dir_enum_index;
         if (object->dir_mask) snprintf( trace_mask, sizeof(trace_mask), "%s", object->dir_mask );
     }
@@ -6082,14 +6700,17 @@ static int horizon_server_handle_query_directory_file( struct horizon_server_con
 }
 
 /***********************************************************************
- * Thread bridge: REQ_new_thread / REQ_resume_thread / REQ_suspend_thread
+ * Thread bridge: thread objects and their lifecycle
  *
- * NtCreateThreadEx queues the thread's request pipe fd, then sends
- * new_thread.  We adopt the fd as a brand new server connection (each
- * Wine thread talks to the server over its own pipe) and hand back a
- * THREAD handle + tid.  init_thread on the new connection already
- * replies suspend=0, so CREATE_SUSPENDED is intentionally ignored;
- * resume_thread just acks with the expected previous suspend count.
+ * NtCreateThreadEx queues the new thread's request pipe fd, then sends
+ * new_thread.  We adopt the fd as a new server connection served by its own
+ * pthread and return a handle to a thread object that the connection also
+ * references.  The object becomes signaled when that connection sees the
+ * request pipe close, which exit_thread does after the thread has finished
+ * all Windows code (LdrShutdownThread, TLS callbacks, stack frames).
+ * CREATE_SUSPENDED holds init_thread at a start gate until resume_thread.
+ * Suspending a thread that already runs and terminating another thread need
+ * an interpreter-safe stop point; both report STATUS_NOT_SUPPORTED.
  */
 
 static void *horizon_server_thread( void *param );
@@ -6102,11 +6723,14 @@ static int horizon_server_handle_new_thread( struct horizon_server_connection *c
     const struct horizon_new_thread_request *request = (const void *)message;
     struct horizon_new_thread_reply reply;
     struct horizon_server_connection *thread_connection = NULL;
-    struct horizon_server_handle_entry *entry;
+    struct horizon_server_handle_entry *entry = NULL;
+    struct horizon_server_object *object = NULL;
     unsigned int fd_handle;
     pthread_t thread;
     int request_fd = horizon_server_take_client_fd( &fd_handle );
 
+    /* Connection threads are joined here and when another connection ends. */
+    horizon_zombie_reap( &horizon_server_zombies );
     memset( &reply, 0, sizeof(reply) );
 
     if (!(thread_connection = calloc( 1, sizeof(*thread_connection) )))
@@ -6122,11 +6746,24 @@ static int horizon_server_handle_new_thread( struct horizon_server_connection *c
     thread_connection->tid = __sync_add_and_fetch( &horizon_server_next_tid, 4 );
 
     pthread_mutex_lock( &horizon_server_objects_mutex );
-    entry = horizon_server_create_handle_locked( HORIZON_SERVER_OBJECT_THREAD );
-    if (entry) reply.handle = entry->handle;
+    if ((object = horizon_server_alloc_thread_locked( thread_connection->tid, connection->pid )) &&
+        (entry = horizon_server_create_handle_for_object_locked( object )))
+    {
+        object->refs++; /* the connection's reference, dropped when its pipe closes */
+        object->thread.suspend = (request->flags & HORIZON_THREAD_CREATE_SUSPENDED) ? 1 : 0;
+        thread_connection->thread = object;
+        reply.handle = entry->handle;
+        __atomic_add_fetch( &horizon_lifecycle.connections, 1, __ATOMIC_RELAXED );
+    }
+    else if (object)
+    {
+        horizon_server_running_threads--;
+        horizon_server_free_object( object );
+        object = NULL;
+    }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
-    if (!entry)
+    if (!object)
     {
         close( request_fd );
         free( thread_connection );
@@ -6136,17 +6773,23 @@ static int horizon_server_handle_new_thread( struct horizon_server_connection *c
 
     if ((errno = pthread_create( &thread, NULL, horizon_server_thread, thread_connection )))
     {
+        horizon_trace( "[server] new_thread tid=%u: connection thread failed errno=%d",
+                       thread_connection->tid, errno );
+        pthread_mutex_lock( &horizon_server_objects_mutex );
+        horizon_server_end_thread_locked( thread_connection );
+        __atomic_sub_fetch( &horizon_lifecycle.connections, 1, __ATOMIC_RELAXED );
+        pthread_mutex_unlock( &horizon_server_objects_mutex );
+        horizon_server_close_object_handle( reply.handle );
         close( request_fd );
         free( thread_connection );
         reply.handle = 0;
         reply.header.error = HORIZON_STATUS_NO_MEMORY;
         return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
     }
-    pthread_detach( thread );
+    /* No pthread_detach: libnx returns ENOSYS. The connection thread queues
+     * itself on horizon_server_zombies when it ends. */
 
     reply.tid = thread_connection->tid;
-    horizon_trace( "[server] new_thread flags=%#x request_fd=%d -> handle=%08x tid=%u\n",
-                   request->flags, request_fd, reply.handle, reply.tid );
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
 }
 
@@ -6155,15 +6798,171 @@ static int horizon_server_handle_resume_thread( struct horizon_server_connection
 {
     const struct horizon_resume_thread_request *request = (const void *)message;
     struct horizon_resume_thread_reply reply;
-    struct horizon_server_handle_entry *entry;
+    struct horizon_server_object *object;
+    unsigned int status;
 
     memset( &reply, 0, sizeof(reply) );
     pthread_mutex_lock( &horizon_server_objects_mutex );
-    entry = horizon_server_find_handle_locked( request->handle );
-    if (!entry || entry->object->type != HORIZON_SERVER_OBJECT_THREAD)
-        reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
-    else
-        reply.count = 1; /* threads never actually suspend; pretend one resume did it */
+    if ((object = horizon_server_get_thread_locked( request->handle, &status )))
+        status = horizon_thread_resume( &object->thread, &reply.count );
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    reply.header.error = status;
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_suspend_thread( struct horizon_server_connection *connection,
+                                                 const unsigned char *message )
+{
+    const struct horizon_suspend_thread_request *request = (const void *)message;
+    struct horizon_suspend_thread_reply reply;
+    struct horizon_server_object *object;
+    unsigned int status, tid = 0;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if ((object = horizon_server_get_thread_locked( request->handle, &status )))
+    {
+        status = horizon_thread_suspend( &object->thread, &reply.count );
+        tid = object->thread.tid;
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    if (status == HORIZON_THREADS_STATUS_NOT_SUPPORTED)
+        horizon_trace( "[server] suspend_thread tid=%u refused: thread already running", tid );
+    reply.header.error = status;
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_terminate_thread( struct horizon_server_connection *connection,
+                                                   const unsigned char *message )
+{
+    const struct horizon_terminate_thread_request *request = (const void *)message;
+    struct horizon_terminate_thread_reply reply;
+    struct horizon_server_object *object;
+    unsigned int status, tid = 0;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if ((object = horizon_server_get_thread_locked( request->handle, &status )))
+    {
+        if (object == connection->thread)
+        {
+            /* The client exits itself; the object signals when its pipe closes. */
+            horizon_thread_set_exit_code( &object->thread, request->exit_code );
+            reply.self = 1;
+        }
+        else if (!object->thread.terminated)
+        {
+            status = HORIZON_STATUS_NOT_SUPPORTED;
+            tid = object->thread.tid;
+        }
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    if (status == HORIZON_STATUS_NOT_SUPPORTED)
+        horizon_trace( "[server] terminate_thread tid=%u from tid=%u refused: remote termination unsupported",
+                       tid, connection->tid );
+    reply.header.error = status;
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_get_thread_info( struct horizon_server_connection *connection,
+                                                  const unsigned char *message )
+{
+    const struct horizon_get_thread_info_request *request = (const void *)message;
+    struct horizon_get_thread_info_reply reply;
+    struct horizon_server_object *object;
+    unsigned int status;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if ((object = horizon_server_get_thread_locked( request->handle, &status )))
+    {
+        const struct horizon_thread_state *thread = &object->thread;
+
+        reply.pid = thread->pid;
+        reply.tid = thread->tid;
+        reply.teb = thread->teb;
+        reply.entry_point = thread->entry;
+        reply.affinity = thread->affinity;
+        reply.exit_code = horizon_thread_exit_status( thread );
+        reply.priority = thread->priority;
+        reply.base_priority = thread->base_priority;
+        reply.suspend_count = thread->suspend;
+        reply.flags = horizon_thread_info_flags( thread, horizon_server_running_threads );
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    reply.header.error = status;
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_get_thread_times( struct horizon_server_connection *connection,
+                                                   const unsigned char *message )
+{
+    const struct horizon_get_thread_times_request *request = (const void *)message;
+    struct horizon_get_thread_times_reply reply;
+    struct horizon_server_object *object;
+    unsigned int status;
+
+    memset( &reply, 0, sizeof(reply) );
+    reply.unix_pid = reply.unix_tid = -1; /* no per-thread CPU times on Horizon */
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if ((object = horizon_server_get_thread_locked( request->handle, &status )))
+    {
+        reply.creation_time = object->thread.creation_time;
+        reply.exit_time = object->thread.terminated ? object->thread.exit_time : 0;
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    reply.header.error = status;
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_set_thread_info( struct horizon_server_connection *connection,
+                                                  const unsigned char *message )
+{
+    const struct horizon_set_thread_info_request *request = (const void *)message;
+    struct horizon_server_object *object;
+    unsigned int status;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if ((object = horizon_server_get_thread_locked( request->handle, &status )))
+    {
+        struct horizon_thread_state *thread = &object->thread;
+
+        if (request->mask & HORIZON_SET_THREAD_INFO_AFFINITY)
+        {
+            unsigned long long affinity = request->affinity & horizon_get_system_affinity_mask();
+
+            if (affinity) thread->affinity = affinity;
+            else status = HORIZON_STATUS_INVALID_PARAMETER;
+        }
+        if (!status)
+        {
+            if (request->mask & HORIZON_SET_THREAD_INFO_PRIORITY) thread->priority = request->priority;
+            if (request->mask & HORIZON_SET_THREAD_INFO_BASE_PRIORITY)
+                thread->base_priority = request->base_priority;
+            if (request->mask & HORIZON_SET_THREAD_INFO_ENTRYPOINT) thread->entry = request->entry_point;
+            /* Descriptions, tokens, debugger hiding and boost have no Horizon effect. */
+        }
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_status( connection->reply_fd, status );
+}
+
+static int horizon_server_handle_open_thread( struct horizon_server_connection *connection,
+                                              const unsigned char *message )
+{
+    const struct horizon_open_thread_request *request = (const void *)message;
+    struct horizon_open_process_reply reply;
+    struct horizon_server_handle_entry *entry;
+    struct horizon_server_object *object;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    for (object = horizon_server_threads; object; object = object->thread_next)
+        if (object->thread.tid == request->tid) break;
+    if (!object) reply.header.error = HORIZON_STATUS_INVALID_CID;
+    else if (!(entry = horizon_server_create_handle_for_object_locked( object )))
+        reply.header.error = HORIZON_STATUS_NO_MEMORY;
+    else reply.handle = entry->handle;
     pthread_mutex_unlock( &horizon_server_objects_mutex );
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
 }
@@ -6945,6 +7744,152 @@ void horizon_trace( const char *fmt, ... )
     pthread_mutex_unlock( &lock );
 }
 
+/* Address arbitration (4.0.0+) is Horizon's futex: WaitIfEqual compares and
+ * sleeps atomically with respect to SignalToAddress. */
+int horizon_futex_wait( const int *addr, int value, long long timeout_ns )
+{
+    Result rc = svcWaitForAddress( (void *)addr, ArbitrationType_WaitIfEqual, value,
+                                   timeout_ns < 0 ? -1 : timeout_ns );
+
+    if (R_SUCCEEDED(rc)) return 0;
+    if (R_MODULE(rc) == Module_Kernel && R_DESCRIPTION(rc) == KernelError_TimedOut) errno = ETIMEDOUT;
+    else if (R_MODULE(rc) == Module_Kernel && R_DESCRIPTION(rc) == KernelError_InvalidState) errno = EAGAIN;
+    else errno = EINVAL;
+    return -1;
+}
+
+void horizon_futex_wake( const int *addr, int count )
+{
+    svcSignalToAddress( (void *)addr, SignalType_Signal, 0, count );
+}
+
+/* Monotonic time since boot in 100 ns units (KUSER_SHARED_DATA InterruptTime). */
+unsigned long long horizon_interrupt_time(void)
+{
+    return armTicksToNs( armGetSystemTick() ) / 100;
+}
+
+/* Horizon has no console: the runtime points the standard handles at files
+ * and tags their objects here, so duplicated handles are echoed too. */
+void horizon_mark_std_stream( HANDLE handle, int stream )
+{
+    struct horizon_server_handle_entry *entry;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if ((entry = horizon_server_find_handle_locked( HandleToULong( handle ) )) &&
+        entry->object->type == HORIZON_SERVER_OBJECT_FILE)
+        entry->object->std_stream = stream;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+}
+
+/* Called by NtWriteFile after a successful write. Re-reading the files from
+ * the SD card while they were open for writing captured nothing on hardware. */
+void horizon_echo_std_write( HANDLE handle, const void *data, size_t size )
+{
+    extern void wine_nx_runtime_std_write( int stream, const char *data, size_t size ) __attribute__((weak));
+    struct horizon_server_handle_entry *entry;
+    int stream = 0;
+
+    if (!&wine_nx_runtime_std_write || !size) return;
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if ((entry = horizon_server_find_handle_locked( HandleToULong( handle ) )))
+        stream = entry->object->std_stream;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    if (stream) wine_nx_runtime_std_write( stream, data, size );
+}
+
+/* The SD card will not open a file a second time while it is open for
+ * writing, so stat() of such a file fails with EIO (seen on hardware for the
+ * runtime's stdout.txt). Answer from a descriptor this process already holds.
+ * On failure errno is left as the caller's stat() set it. */
+int horizon_stat_open_file( const char *path, struct stat *st )
+{
+    struct horizon_server_handle_entry *entry;
+    int saved_errno = errno, ret = -1;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    for (entry = horizon_server_handles; entry && ret; entry = entry->next)
+    {
+        const struct horizon_server_object *object = entry->object;
+
+        if (object->type != HORIZON_SERVER_OBJECT_FILE || object->file_is_dir ||
+            object->file_fd == -1 || !object->file_name)
+            continue;
+        if (horizon_unix_path_equal( object->file_name, path )) ret = fstat( object->file_fd, st );
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    if (ret) errno = saved_errno;
+    return ret;
+}
+
+/* Present only in runtimes linked with the Box64 interpreter. */
+extern LONG wine_nx_box64_live_engines __attribute__((weak));
+
+static struct horizon_lifecycle_counters horizon_lifecycle_base;
+static int horizon_lifecycle_have_base;
+
+/* Taken before the first thread is created, after process initialization. */
+void horizon_lifecycle_baseline(void)
+{
+    if (horizon_lifecycle_have_base) return;
+    horizon_lifecycle_base.connections = __atomic_load_n( &horizon_lifecycle.connections, __ATOMIC_ACQUIRE );
+    horizon_lifecycle_base.thread_objects = __atomic_load_n( &horizon_lifecycle.thread_objects, __ATOMIC_ACQUIRE );
+    horizon_lifecycle_base.pipes = __atomic_load_n( &horizon_lifecycle.pipes, __ATOMIC_ACQUIRE );
+    horizon_lifecycle_base.tebs = __atomic_load_n( &horizon_lifecycle.tebs, __ATOMIC_ACQUIRE );
+    horizon_lifecycle_base.worker_pthreads = __atomic_load_n( &horizon_lifecycle.worker_pthreads, __ATOMIC_ACQUIRE );
+    horizon_lifecycle_have_base = 1;
+    horizon_lifecycle_report( "baseline", 0, 0 );
+}
+
+/* One line per event; "final" also judges reclamation against the baseline.
+ * One exited thread may legitimately linger: exit_thread frees the previous
+ * thread's TEB and joins its pthread, and a connection thread is joined by
+ * the next one to end or by the next new_thread. */
+void horizon_lifecycle_report( const char *tag, unsigned int tid, int code )
+{
+    extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+    const struct horizon_lifecycle_counters *base = &horizon_lifecycle_base;
+    struct horizon_lifecycle_counters now;
+    unsigned int running, zombies;
+    unsigned long long reaped;
+    LONG engines = &wine_nx_box64_live_engines ?
+                   __atomic_load_n( &wine_nx_box64_live_engines, __ATOMIC_ACQUIRE ) : -1;
+    char buf[384];
+
+    if (!&wine_nx_runtime_trace) return;
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    running = horizon_server_running_threads;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    pthread_mutex_lock( &horizon_server_zombies.lock );
+    zombies = horizon_server_zombies.pending;
+    reaped = horizon_server_zombies.reaped;
+    pthread_mutex_unlock( &horizon_server_zombies.lock );
+    now.connections = __atomic_load_n( &horizon_lifecycle.connections, __ATOMIC_ACQUIRE );
+    now.thread_objects = __atomic_load_n( &horizon_lifecycle.thread_objects, __ATOMIC_ACQUIRE );
+    now.pipes = __atomic_load_n( &horizon_lifecycle.pipes, __ATOMIC_ACQUIRE );
+    now.tebs = __atomic_load_n( &horizon_lifecycle.tebs, __ATOMIC_ACQUIRE );
+    now.worker_pthreads = __atomic_load_n( &horizon_lifecycle.worker_pthreads, __ATOMIC_ACQUIRE );
+    now.thread_exits = __atomic_load_n( &horizon_lifecycle.thread_exits, __ATOMIC_ACQUIRE );
+
+    snprintf( buf, sizeof(buf), "[LIFECYCLE] %s tid=%u code=%08x running=%u objects=%d connections=%d "
+              "zombies=%u reaped=%llu pipes=%d tebs=%d pthreads=%d exits=%d engines=%d",
+              tag, tid, (unsigned int)code, running, (int)now.thread_objects, (int)now.connections,
+              zombies, reaped, (int)now.pipes, (int)now.tebs, (int)now.worker_pthreads,
+              (int)now.thread_exits, (int)engines );
+    wine_nx_runtime_trace( buf );
+
+    if (strcmp( tag, "final" ) || !horizon_lifecycle_have_base) return;
+    snprintf( buf, sizeof(buf), "[LIFECYCLE] verdict=%s exits=%d reaped=%llu (need running=1 "
+              "objects=%d connections=%d pipes=%d tebs<=%d pthreads<=%d zombies<=1 engines<=0)",
+              running == 1 && now.thread_objects == base->thread_objects &&
+              now.connections == base->connections && now.pipes == base->pipes &&
+              now.tebs <= base->tebs + 1 && now.worker_pthreads <= base->worker_pthreads + 1 &&
+              zombies <= 1 && engines <= 0 ? "PASS" : "FAIL",
+              (int)now.thread_exits, reaped, (int)base->thread_objects, (int)base->connections,
+              (int)base->pipes, (int)base->tebs + 1, (int)base->worker_pthreads + 1 );
+    wine_nx_runtime_trace( buf );
+}
+
 void horizon_get_address_space_limits( void **start, void **limit )
 {
     u64 base = 0, size = 0;
@@ -7329,11 +8274,8 @@ static int horizon_server_handle_create_mutex( struct horizon_server_connection 
             HORIZON_SERVER_OBJECT_MUTEX, &name, &entry );
         if (entry)
         {
-            if (reply.header.error == HORIZON_STATUS_SUCCESS)
-            {
-                entry->object->owned = !!request->owned;
-                entry->object->count = request->owned ? 1 : 0;
-            }
+            if (reply.header.error == HORIZON_STATUS_SUCCESS && request->owned)
+                horizon_mutex_acquire( &entry->object->mutex, connection->tid );
             reply.handle = entry->handle;
         }
         pthread_mutex_unlock( &horizon_server_objects_mutex );
@@ -7353,14 +8295,7 @@ static int horizon_server_handle_release_mutex( struct horizon_server_connection
     pthread_mutex_lock( &horizon_server_objects_mutex );
     status = horizon_server_find_typed_object_locked( request->handle, HORIZON_SERVER_OBJECT_MUTEX, &object );
     if (status == HORIZON_STATUS_SUCCESS)
-    {
-        if (!object->owned || !object->count) status = HORIZON_STATUS_MUTANT_NOT_OWNED;
-        else
-        {
-            reply.prev_count = object->count;
-            if (!--object->count) object->owned = 0;
-        }
-    }
+        status = horizon_mutex_release( &object->mutex, connection->tid, &reply.prev_count );
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
     reply.header.error = status;
@@ -7380,9 +8315,9 @@ static int horizon_server_handle_query_mutex( struct horizon_server_connection *
     status = horizon_server_find_typed_object_locked( request->handle, HORIZON_SERVER_OBJECT_MUTEX, &object );
     if (status == HORIZON_STATUS_SUCCESS)
     {
-        reply.count = object->count;
-        reply.owned = object->owned;
-        reply.abandoned = 0;
+        reply.count = object->mutex.count;
+        reply.owned = object->mutex.count && object->mutex.owner == connection->tid;
+        reply.abandoned = object->mutex.abandoned;
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
@@ -7599,16 +8534,20 @@ static unsigned int horizon_server_select_wait( const struct horizon_select_wait
         }
         if (status == HORIZON_STATUS_SUCCESS)
             for (i = 0; i < count; i++)
-                horizon_server_wait_object_locked( op->handles[i], TRUE );
+                if (horizon_server_wait_object_locked( op->handles[i], TRUE ) == HORIZON_STATUS_ABANDONED_WAIT_0)
+                    status = HORIZON_STATUS_ABANDONED_WAIT_0;
     }
     else
     {
         for (i = 0; i < count; i++)
         {
             status = horizon_server_wait_object_locked( op->handles[i], TRUE );
-            if (status == HORIZON_STATUS_SUCCESS || status == HORIZON_STATUS_INVALID_HANDLE ||
-                status == HORIZON_STATUS_OBJECT_TYPE_MISMATCH)
+            if (status == HORIZON_STATUS_SUCCESS || status == HORIZON_STATUS_ABANDONED_WAIT_0)
+            {
+                status += i;
                 break;
+            }
+            if (status != HORIZON_STATUS_TIMEOUT) break;
         }
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
@@ -7616,14 +8555,14 @@ static unsigned int horizon_server_select_wait( const struct horizon_select_wait
 }
 
 static unsigned int horizon_server_select_signal_and_wait( const struct horizon_select_signal_and_wait_op *op,
-                                                           unsigned int size )
+                                                           unsigned int size, int initial )
 {
     unsigned int status;
 
     if (size < sizeof(*op)) return HORIZON_STATUS_INVALID_PARAMETER;
 
     pthread_mutex_lock( &horizon_server_objects_mutex );
-    status = horizon_server_signal_object_locked( op->signal );
+    status = initial ? horizon_server_signal_object_locked( op->signal ) : HORIZON_STATUS_SUCCESS;
     if (status == HORIZON_STATUS_SUCCESS)
         status = horizon_server_wait_object_locked( op->wait, TRUE );
     pthread_mutex_unlock( &horizon_server_objects_mutex );
@@ -7631,7 +8570,7 @@ static unsigned int horizon_server_select_signal_and_wait( const struct horizon_
 }
 
 static unsigned int horizon_server_select_status( const struct horizon_select_request *request,
-                                                  const unsigned char *data, unsigned int data_size )
+                                                  const unsigned char *data, unsigned int data_size, int initial )
 {
     const unsigned char *select_data = NULL;
     int op;
@@ -7656,7 +8595,7 @@ static unsigned int horizon_server_select_status( const struct horizon_select_re
                                            request->size, TRUE );
     case HORIZON_SELECT_SIGNAL_AND_WAIT:
         return horizon_server_select_signal_and_wait(
-            (const struct horizon_select_signal_and_wait_op *)select_data, request->size );
+            (const struct horizon_select_signal_and_wait_op *)select_data, request->size, initial );
     case HORIZON_SELECT_KEYED_EVENT_WAIT:
     case HORIZON_SELECT_KEYED_EVENT_RELEASE:
         return HORIZON_STATUS_SUCCESS;
@@ -7673,7 +8612,31 @@ static int horizon_server_handle_select( struct horizon_server_connection *conne
     struct horizon_select_reply reply;
 
     memset( &reply, 0, sizeof(reply) );
-    reply.header.error = horizon_server_select_status( request, data, data_size );
+    /* Each client has its own server connection/thread. Poll outside the object
+     * lock so other clients can signal objects while this request is pending.
+     * Negative server deadlines are absolute performance-counter ticks (100ns),
+     * positive deadlines use NT wall-clock time; INT64_MAX means infinite.
+     * Signal-and-wait must perform its signal only on the first attempt. */
+    for (int initial = 1;; initial = 0)
+    {
+        LARGE_INTEGER now;
+        reply.header.error = horizon_server_select_status( request, data, data_size, initial );
+        if (reply.header.error != HORIZON_STATUS_TIMEOUT || !request->timeout) break;
+        if (request->timeout != 0x7fffffffffffffffLL)
+        {
+            if (request->timeout < 0)
+            {
+                NtQueryPerformanceCounter( &now, NULL );
+                if (now.QuadPart > -(request->timeout + 1)) break;
+            }
+            else
+            {
+                NtQuerySystemTime( &now );
+                if (now.QuadPart >= request->timeout) break;
+            }
+        }
+        usleep( 1000 );
+    }
     reply.signaled = 1;
 
     TRACE( "Horizon server select size %u timeout %lld status %08x.\n",
@@ -7685,7 +8648,9 @@ static void *horizon_server_thread( void *param )
 {
     struct horizon_server_connection *connection = param;
     unsigned char message[HORIZON_SERVER_FIXED_MESSAGE_SIZE];
+    struct horizon_zombie *zombie;
 
+    horizon_server_current = connection;
     for (;;)
     {
         struct horizon_server_request_header *header = (void *)message;
@@ -7716,7 +8681,7 @@ static void *horizon_server_thread( void *param )
             status = horizon_server_handle_init_first_thread( connection, message );
             break;
         case HORIZON_REQ_INIT_PROCESS_DONE:
-            status = horizon_server_handle_init_process_done( connection );
+            status = horizon_server_handle_init_process_done( connection, message );
             break;
         case HORIZON_REQ_INIT_THREAD:
             status = horizon_server_handle_init_thread( connection, message );
@@ -7725,8 +8690,22 @@ static void *horizon_server_thread( void *param )
             status = horizon_server_handle_new_thread( connection, message );
             break;
         case HORIZON_REQ_SUSPEND_THREAD:
+            status = horizon_server_handle_suspend_thread( connection, message );
+            break;
         case HORIZON_REQ_RESUME_THREAD:
             status = horizon_server_handle_resume_thread( connection, message );
+            break;
+        case HORIZON_REQ_TERMINATE_THREAD:
+            status = horizon_server_handle_terminate_thread( connection, message );
+            break;
+        case HORIZON_REQ_GET_THREAD_INFO:
+            status = horizon_server_handle_get_thread_info( connection, message );
+            break;
+        case HORIZON_REQ_GET_THREAD_TIMES:
+            status = horizon_server_handle_get_thread_times( connection, message );
+            break;
+        case HORIZON_REQ_SET_THREAD_INFO:
+            status = horizon_server_handle_set_thread_info( connection, message );
             break;
         case HORIZON_REQ_OPEN_FILE_OBJECT:
             status = horizon_server_handle_open_file_object( connection, message, request_data,
@@ -7768,7 +8747,7 @@ static void *horizon_server_thread( void *param )
             status = horizon_server_handle_open_object( connection, HORIZON_SERVER_OBJECT_PROCESS );
             break;
         case HORIZON_REQ_OPEN_THREAD:
-            status = horizon_server_handle_open_object( connection, HORIZON_SERVER_OBJECT_THREAD );
+            status = horizon_server_handle_open_thread( connection, message );
             break;
         case HORIZON_REQ_ADD_ATOM:
             status = horizon_server_handle_atom( connection, request_data, header->request_size, 1 );
@@ -7843,6 +8822,19 @@ static void *horizon_server_thread( void *param )
             break;
         case HORIZON_REQ_CREATE_FILE:
             status = horizon_server_handle_create_file( connection, message, request_data, header->request_size );
+            break;
+        case HORIZON_REQ_GET_HANDLE_UNIX_NAME:
+            status = horizon_server_handle_get_handle_unix_name( connection, message );
+            break;
+        case HORIZON_REQ_SET_FD_EOF_INFO:
+            status = horizon_server_handle_set_fd_eof_info( connection, message );
+            break;
+        case HORIZON_REQ_SET_FD_DISP_INFO:
+            status = horizon_server_handle_set_fd_disp_info( connection, message );
+            break;
+        case HORIZON_REQ_SET_FD_NAME_INFO:
+            status = horizon_server_handle_set_fd_name_info( connection, message, request_data,
+                                                             header->request_size );
             break;
         case HORIZON_REQ_GET_HANDLE_FD:
             status = horizon_server_handle_get_handle_fd( connection, message );
@@ -8038,10 +9030,24 @@ static void *horizon_server_thread( void *param )
     }
 
 done:
+    /* The client closed its request pipe last in exit_thread: every Windows
+     * frame is gone. Close our ends before signaling so a joiner observes
+     * released pipes, then queue this pthread to be joined by another one. */
     if (connection->request_fd != -1) close( connection->request_fd );
     if (connection->reply_fd != -1) close( connection->reply_fd );
     if (connection->wait_fd != -1) close( connection->wait_fd );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (connection->thread)
+    {
+        horizon_server_end_thread_locked( connection );
+        __atomic_sub_fetch( &horizon_lifecycle.connections, 1, __ATOMIC_RELAXED );
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    horizon_server_current = NULL;
     free( connection );
+    horizon_zombie_reap( &horizon_server_zombies );
+    if ((zombie = malloc( sizeof(*zombie) )))
+        horizon_zombie_push( &horizon_server_zombies, zombie, pthread_self() );
     return NULL;
 }
 
@@ -8137,6 +9143,12 @@ __attribute__((weak)) NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void
     return STATUS_ACCESS_VIOLATION;
 }
 
+/* Optional interpreter boundary, present only in Box64-enabled runtime builds.
+ * libnx invokes this handler after svcReturnFromException, on its exception
+ * stack, so unwinding to an active user-mode setjmp does not strand a kernel
+ * exception. Native Wine faults retain the existing handling path. */
+extern BOOL wine_nx_box64_handle_fault( ULONG_PTR address ) __attribute__((weak));
+
 void __libnx_exception_handler( ThreadExceptionDump *ctx )
 {
     EXCEPTION_RECORD rec = { 0 };
@@ -8170,6 +9182,12 @@ void __libnx_exception_handler( ThreadExceptionDump *ctx )
     status = virtual_handle_fault( &rec, (void *)ctx->sp.x );
     if (status)
     {
+        unsigned int exception_class = esr >> 26;
+        /* ESR.FnV invalidates FAR. Never consume instruction aborts or faults
+         * outside the active interpreter's 32-bit guest address space. */
+        if ((exception_class == 0x24 || exception_class == 0x25) && !(esr & (1u << 10)) &&
+            wine_nx_box64_handle_fault)
+            wine_nx_box64_handle_fault( (ULONG_PTR)ctx->far.x );
         snprintf( buf, sizeof(buf), "[EXC] unhandled status=0x%08x; parking thread", (unsigned)status );
         wine_nx_runtime_trace( buf );
         /* Park rather than returning: libnx's exception_returnentry would

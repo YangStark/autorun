@@ -70,6 +70,7 @@
 #include "winioctl.h"
 #include "ddk/ntddk.h"
 #include "unix_private.h"
+#include "horizon_private.h"
 #include "wine/condrv.h"
 #include "wine/server.h"
 #include "wine/debug.h"
@@ -983,9 +984,13 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
     if (handle == GetCurrentProcess() || handle == NULL)
     {
         extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+        extern void wine_nx_runtime_dump_std_streams(void) __attribute__((weak));
         if (&wine_nx_runtime_trace)
         {
             char buf[96];
+            if (&wine_nx_runtime_dump_std_streams) wine_nx_runtime_dump_std_streams();
+            horizon_lifecycle_report( "final", HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ),
+                                      exit_code );
             snprintf( buf, sizeof(buf), "[EXIT] NtTerminateProcess(self) exit_code=0x%08x", (unsigned)exit_code );
             wine_nx_runtime_trace( buf );
             wine_nx_runtime_trace( "[EXIT] parked after self-terminate; close from HOME" );
@@ -1673,7 +1678,14 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
             if (info)
             {
                 struct pe_image_info pe_info;
-
+#ifdef __SWITCH__
+                if (handle == NtCurrentProcess())
+                {
+                    memcpy( info, &main_image_info, sizeof(main_image_info) );
+                    ret = STATUS_SUCCESS;
+                    break;
+                }
+#endif
                 SERVER_START_REQ( get_process_info )
                 {
                     req->handle = wine_server_obj_handle( handle );

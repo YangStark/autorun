@@ -15,8 +15,10 @@
 #ifdef __SWITCH__
 #include <stddef.h>
 
+extern unsigned int horizon_set_process_machine( unsigned short machine );
 extern ULONG_PTR horizon_get_system_affinity_mask(void);
 extern unsigned int horizon_get_processor_count(void);
+extern void horizon_get_memory_info( unsigned long long *total, unsigned long long *used );
 extern void horizon_get_address_space_limits( void **start, void **limit );
 extern void horizon_trace( const char *fmt, ... );
 extern void horizon_pin_current_thread( ULONG_PTR requested_mask );
@@ -29,6 +31,30 @@ extern unsigned int horizon_server_protocol_version(void);
 extern int horizon_server_connect(void);
 extern void horizon_server_send_fd( int fd );
 extern int horizon_server_receive_fd( unsigned int *handle );
+
+/* Horizon address arbitration used as a futex; timeout_ns < 0 waits forever. */
+extern int horizon_futex_wait( const int *addr, int value, long long timeout_ns );
+extern void horizon_futex_wake( const int *addr, int count );
+extern unsigned long long horizon_interrupt_time(void);
+extern void wine_nx_start_user_shared_data_clock(void);
+extern void horizon_mark_std_stream( HANDLE handle, int stream );
+extern void horizon_echo_std_write( HANDLE handle, const void *data, size_t size );
+struct stat;
+extern int horizon_stat_open_file( const char *path, struct stat *st );
+
+/* Live resources that each Wine thread owns; updated atomically. */
+struct horizon_lifecycle_counters
+{
+    LONG connections;      /* server connections (one per live client thread) */
+    LONG thread_objects;   /* server thread objects, including terminated ones */
+    LONG pipes;            /* in-process pipes */
+    LONG tebs;             /* TEBs handed out by virtual_alloc_teb */
+    LONG worker_pthreads;  /* NtCreateThreadEx pthreads not yet joined */
+    LONG thread_exits;
+};
+extern struct horizon_lifecycle_counters horizon_lifecycle;
+extern void horizon_lifecycle_baseline(void);
+extern void horizon_lifecycle_report( const char *tag, unsigned int tid, int code );
 #endif
 
 #endif /* __NTDLL_UNIX_HORIZON_PRIVATE_H */

@@ -39,6 +39,8 @@
 #include "winnt.h"
 #include "winternl.h"
 #include "unix_private.h"
+#include "horizon_wow64.h"
+#include "horizon_private.h"
 
 void set_process_instrumentation_callback( void *callback )
 {
@@ -78,18 +80,24 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
 
 NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
 {
-    (void)handle;
-    (void)ctx;
-    (void)size;
-    return STATUS_NOT_IMPLEMENTED;
+    WOW64_CPURESERVED *cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
+    if (size != sizeof(I386_CONTEXT)) return STATUS_INFO_LENGTH_MISMATCH;
+    /* Remote threads require suspension and a synchronized emulator snapshot. */
+    if (handle != GetCurrentThread()) return STATUS_NOT_IMPLEMENTED;
+    if (!cpu) return STATUS_INVALID_PARAMETER;
+    return horizon_transfer_i386_context( cpu,
+                                          get_cpu_area( IMAGE_FILE_MACHINE_I386 ),
+                                          (I386_CONTEXT *)ctx, TRUE );
 }
 
 NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
 {
-    (void)handle;
-    (void)ctx;
-    (void)size;
-    return STATUS_NOT_IMPLEMENTED;
+    WOW64_CPURESERVED *cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
+    if (size != sizeof(I386_CONTEXT)) return STATUS_INFO_LENGTH_MISMATCH;
+    if (handle != GetCurrentThread()) return STATUS_NOT_IMPLEMENTED;
+    if (!cpu) return STATUS_INVALID_PARAMETER;
+    return horizon_transfer_i386_context( cpu,
+                                          get_cpu_area( IMAGE_FILE_MACHINE_I386 ), ctx, FALSE );
 }
 
 NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,
@@ -240,8 +248,18 @@ void signal_init_process(void)
 {
 }
 
+/* Installed by the opt-in runtime after native WoW64 initialization. */
+void (*wine_nx_wow64_thread_start)( PRTL_THREAD_START_ROUTINE, void *, BOOL, TEB * );
+
 void DECLSPEC_NORETURN signal_start_thread( PRTL_THREAD_START_ROUTINE entry, void *arg, BOOL suspend, TEB *teb )
 {
+    if (get_wow_teb( teb ))
+    {
+        if (wine_nx_wow64_thread_start) wine_nx_wow64_thread_start( entry, arg, suspend, teb );
+        /* Never branch to guest bytes using the ARM64 instruction set. */
+        horizon_trace( "[THREAD] WoW64 startup failed or unavailable; parking" );
+        for (;;) sleep( 3600 );
+    }
     (void)suspend;
     wine_nx_set_active_pe_teb( teb );
     /* PE code expects x18 = TEB for the whole time it runs (same dance as
@@ -265,17 +283,13 @@ void DECLSPEC_NORETURN signal_start_thread( PRTL_THREAD_START_ROUTINE entry, voi
             : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
               "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
               "x16", "x17", "x20", "x30", "memory", "cc" );
-        {
-            extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
-            if (&wine_nx_runtime_trace)
-            {
-                char buf[96];
-                snprintf( buf, sizeof(buf), "[THREAD] thread proc returned %#lx; parking", (unsigned long)ret );
-                wine_nx_runtime_trace( buf );
-            }
-        }
+        /* This path calls the procedure directly, without LdrInitializeThunk,
+         * so there is no DLL detach to run. Exit so waiters on the handle see
+         * the thread finish with its return value as the exit code. */
+        NtTerminateThread( GetCurrentThread(), (LONG)ret );
+        horizon_trace( "[THREAD] native thread exit failed; parking" );
     }
-    for (;;) sleep( 3600 ); /* thread exit not implemented yet; park quietly */
+    for (;;) sleep( 3600 );
 }
 
 /*
@@ -333,6 +347,8 @@ NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
     handler = (ULONG_PTR *)table->ServiceTable[func_idx];
     if (!handler)
         return STATUS_INVALID_SYSTEM_SERVICE;
+    /* winebox64 reads each x86 syscall's stack arguments through this. */
+    if ((void *)handler == (void *)NtReadVirtualMemory) trace_syscall = FALSE;
 
     arg_bytes = table->ArgumentTable ? table->ArgumentTable[func_idx] : 0;
 

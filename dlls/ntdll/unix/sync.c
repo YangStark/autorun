@@ -210,6 +210,27 @@ static inline int futex_wake_one( const LONG *addr )
     return __ulock_wake( UL_COMPARE_AND_WAIT, (void *)addr, 0 );
 }
 
+#elif defined(__SWITCH__)
+
+#define USE_FUTEX
+
+#include "horizon_private.h"
+#include "horizon_threads.h"
+
+C_ASSERT( sizeof(LONG) == sizeof(int) );
+
+static inline int futex_wait( const LONG *addr, int val, struct timespec *timeout )
+{
+    long long ns = timeout ? timeout->tv_sec * 1000000000LL + timeout->tv_nsec : -1;
+    return horizon_futex_wait( (const int *)addr, val, ns );
+}
+
+static inline int futex_wake_one( const LONG *addr )
+{
+    horizon_futex_wake( (const int *)addr, 1 );
+    return 0;
+}
+
 #endif /* __APPLE__ */
 
 /* create a struct security_descriptor and contained information in one contiguous piece of memory */
@@ -2720,14 +2741,17 @@ NTSTATUS WINAPI NtOpenKeyedEvent( HANDLE *handle, ACCESS_MASK access, const OBJE
 /******************************************************************************
  *              NtWaitForKeyedEvent (NTDLL.@)
  */
+#ifdef __SWITCH__
+static NTSTATUS keyed_event_rendezvous( HANDLE handle, const void *key, BOOL release,
+                                        const LARGE_INTEGER *timeout );
+#endif
+
 NTSTATUS WINAPI NtWaitForKeyedEvent( HANDLE handle, const void *key,
                                      BOOLEAN alertable, const LARGE_INTEGER *timeout )
 {
 #ifdef __SWITCH__
-    (void)handle; (void)alertable;
-    if ((ULONG_PTR)key & 1) return STATUS_INVALID_PARAMETER_1;
-    if (timeout && timeout->QuadPart == 0) return STATUS_TIMEOUT;
-    return STATUS_SUCCESS;
+    (void)alertable;
+    return keyed_event_rendezvous( handle, key, FALSE, timeout );
 #else
     union select_op select_op;
     UINT flags = SELECT_INTERRUPTIBLE;
@@ -2752,9 +2776,8 @@ NTSTATUS WINAPI NtReleaseKeyedEvent( HANDLE handle, const void *key,
                                      BOOLEAN alertable, const LARGE_INTEGER *timeout )
 {
 #ifdef __SWITCH__
-    (void)handle; (void)alertable;
-    if ((ULONG_PTR)key & 1) return STATUS_INVALID_PARAMETER_1;
-    return STATUS_SUCCESS;
+    (void)alertable;
+    return keyed_event_rendezvous( handle, key, TRUE, timeout );
 #else
     union select_op select_op;
     UINT flags = SELECT_INTERRUPTIBLE;
@@ -3514,10 +3537,18 @@ static union tid_alert_entry *get_tid_alert_entry( HANDLE tid )
     if (!tid_alert_blocks[block_idx])
     {
         static const size_t size = TID_ALERT_BLOCK_SIZE * sizeof(union tid_alert_entry);
+#ifdef __SWITCH__
+        /* Plain heap memory for address arbitration. */
+        void *ptr = calloc( 1, size );
+        if (!ptr) return NULL;
+        if (InterlockedCompareExchangePointer( (void **)&tid_alert_blocks[block_idx], ptr, NULL ))
+            free( ptr ); /* someone beat us to it */
+#else
         void *ptr = anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
         if (ptr == MAP_FAILED) return NULL;
         if (InterlockedCompareExchangePointer( (void **)&tid_alert_blocks[block_idx], ptr, NULL ))
             munmap( ptr, size ); /* someone beat us to it */
+#endif
     }
 
     entry = &tid_alert_blocks[block_idx][idx % TID_ALERT_BLOCK_SIZE];
@@ -3656,16 +3687,9 @@ static LONGLONG update_timeout( ULONGLONG end )
  */
 NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEGER *timeout )
 {
-#ifdef __SWITCH__
-    /* On the Switch we are effectively single-threaded.  The event-based
-     * fallback (NtCreateEvent + NtWaitForSingleObject) would deadlock
-     * because the Wine server runs in-process.  Return STATUS_ALERTED
-     * immediately; the caller's spin/retry loop will re-check whatever
-     * condition it was waiting on and proceed when it's met. */
-    (void)address;
-    if (timeout && timeout->QuadPart == 0) return STATUS_TIMEOUT;
-    return STATUS_ALERTED;
-#else
+    /* On Horizon the futex path uses address arbitration. Returning early
+     * instead would turn every contended critical section, SRW lock and
+     * condition variable into a busy spin that can starve the lock owner. */
     union tid_alert_entry *entry = get_tid_alert_entry( NtCurrentTeb()->ClientId.UniqueThread );
     BOOL waited = FALSE;
 
@@ -3759,8 +3783,43 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
         return status;
     }
 #endif
-#endif /* __SWITCH__ */
 }
+
+
+#ifdef __SWITCH__
+/* Keyed events are process-local, so they rendezvous here instead of in the
+ * server: a wait pairs with one release of the same key and handle, and each
+ * side blocks until its peer arrives. RtlRunOnce queues waiters on their own
+ * stacks and depends on them staying blocked until released. Alertable waits
+ * are not interrupted (no user APC delivery on Horizon). */
+static pthread_mutex_t keyed_event_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct horizon_keyed_waiter *keyed_event_queue;
+
+static long long keyed_event_now_ns(void)
+{
+    return (long long)monotonic_counter() * 100;
+}
+
+static NTSTATUS keyed_event_rendezvous( HANDLE handle, const void *key, BOOL release,
+                                        const LARGE_INTEGER *timeout )
+{
+    struct horizon_keyed_waiter self = { 0 };
+    long long timeout_ns = -1;
+
+    if ((ULONG_PTR)key & 1) return STATUS_INVALID_PARAMETER_1;
+    self.object = (ULONG_PTR)(handle ? handle : keyed_event);
+    self.key = (ULONG_PTR)key;
+    self.release = release;
+    if (timeout && timeout->QuadPart != TIMEOUT_INFINITE)
+    {
+        LONGLONG left = timeout->QuadPart <= 0 ? -timeout->QuadPart : update_timeout( timeout->QuadPart );
+        timeout_ns = left * 100;
+    }
+    return horizon_keyed_rendezvous( &keyed_event_lock, &keyed_event_queue, &self, timeout_ns,
+                                     keyed_event_now_ns, horizon_futex_wait, horizon_futex_wake )
+           ? STATUS_TIMEOUT : STATUS_SUCCESS;
+}
+#endif
 
 
 /***********************************************************************

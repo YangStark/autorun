@@ -29,6 +29,12 @@ typedef uint64_t DWORD64;
 typedef int32_t LONG;
 typedef int BOOL;
 typedef int NTSTATUS;
+typedef void *HANDLE;
+
+static inline unsigned long HandleToULong( const void *handle )
+{
+    return (unsigned long)(ULONG_PTR)handle;
+}
 
 typedef struct _EXCEPTION_RECORD
 {
@@ -82,6 +88,15 @@ static inline NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack 
     (void)stack;
     return STATUS_ACCESS_VIOLATION;
 }
+
+/* Server wait deadlines and thread times use NT time. */
+typedef union
+{
+    struct { uint32_t LowPart; int32_t HighPart; } u;
+    long long QuadPart;
+} LARGE_INTEGER;
+extern NTSTATUS NtQuerySystemTime( LARGE_INTEGER *time );
+extern NTSTATUS NtQueryPerformanceCounter( LARGE_INTEGER *counter, LARGE_INTEGER *frequency );
 
 #include "horizon_mman.h"
 #include "horizon_private.h"

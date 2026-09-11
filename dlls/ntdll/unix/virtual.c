@@ -1051,6 +1051,9 @@ static void load_steam_overlay(const char *unix_lib_path)
 extern const unixlib_entry_t wine_nx_ws2_32_unix_funcs[];
 extern const unixlib_entry_t wine_nx_crypt32_unix_funcs[];
 extern const unixlib_entry_t wine_nx_win32u_unix_funcs[];
+#ifdef WINE_NX_BOX64_INTERPRETER
+extern const unixlib_entry_t wine_nx_winebox64_unix_funcs[];
+#endif
 
 static const struct
 {
@@ -1058,6 +1061,9 @@ static const struct
     const void  *funcs;
 } wine_nx_static_unix_libs[] =
 {
+#ifdef WINE_NX_BOX64_INTERPRETER
+    { {'w','i','n','e','b','o','x','6','4','.','d','l','l',0}, wine_nx_winebox64_unix_funcs },
+#endif
     { {'w','s','2','_','3','2','.','d','l','l',0}, wine_nx_ws2_32_unix_funcs },
     { {'c','r','y','p','t','3','2','.','d','l','l',0}, wine_nx_crypt32_unix_funcs },
     { {'w','i','n','3','2','u','.','d','l','l',0}, wine_nx_win32u_unix_funcs },
@@ -4212,7 +4218,14 @@ ULONG_PTR get_system_affinity_mask(void)
  */
 void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
 {
-#if defined(HAVE_SYSINFO) \
+#if defined(__SWITCH__)
+    unsigned long long total, used;
+
+    /* newlib's sysconf has no _SC_PHYS_PAGES value: GlobalMemoryStatusEx saw 0 MB. */
+    horizon_get_memory_info( &total, &used );
+    (void)used;
+    info->MmHighestPhysicalPage = max( 2, total / page_size );
+#elif defined(HAVE_SYSINFO) \
     && defined(HAVE_STRUCT_SYSINFO_TOTALRAM) && defined(HAVE_STRUCT_SYSINFO_MEM_UNIT)
     struct sysinfo sinfo;
 
@@ -4534,8 +4547,15 @@ TEB *virtual_alloc_first_teb(void)
     SIZE_T total = 32 * block_size;
 
     /* reserve space for shared user data */
+#ifdef __SWITCH__
+    /* No server section backs it on Horizon; this process keeps its clock
+     * current (wine_nx_start_user_shared_data_clock), so it stays writable. */
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&user_shared_data, 0, &data_size,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+#else
     status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&user_shared_data, 0, &data_size,
                                       MEM_RESERVE | MEM_COMMIT, PAGE_READONLY );
+#endif
     if (status)
     {
         ERR( "wine: failed to map the shared user data: %08x\n", status );
@@ -4600,6 +4620,9 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
         *(void **)ptr = next_free_teb;
         next_free_teb = ptr;
     }
+#ifdef __SWITCH__
+    else __atomic_add_fetch( &horizon_lifecycle.tebs, 1, __ATOMIC_RELAXED );
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
     return status;
 }
@@ -4646,6 +4669,9 @@ void virtual_free_teb( TEB *teb )
     if (!is_win64) ptr = (char *)ptr - teb_offset;
     *(void **)ptr = next_free_teb;
     next_free_teb = ptr;
+#ifdef __SWITCH__
+    __atomic_sub_fetch( &horizon_lifecycle.tebs, 1, __ATOMIC_RELAXED );
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
 }
 
@@ -4975,6 +5001,66 @@ done:
 
 static const WCHAR shared_data_nameW[] = {'\\','K','e','r','n','e','l','O','b','j','e','c','t','s',
                                           '\\','_','_','w','i','n','e','_','u','s','e','r','_','s','h','a','r','e','d','_','d','a','t','a',0};
+
+#ifdef __SWITCH__
+/* Same store order as wineserver: readers retry until High1Time == High2Time. */
+static void usd_store_time( volatile KSYSTEM_TIME *time, ULONGLONG value )
+{
+    __atomic_store_n( &time->High2Time, (LONG)(value >> 32), __ATOMIC_RELEASE );
+    __atomic_store_n( &time->LowPart, (ULONG)value, __ATOMIC_RELEASE );
+    __atomic_store_n( &time->High1Time, (LONG)(value >> 32), __ATOMIC_RELEASE );
+}
+
+static void usd_update_time(void)
+{
+    KUSER_SHARED_DATA *data = (KUSER_SHARED_DATA *)user_shared_data;
+    ULONGLONG interrupt_time = horizon_interrupt_time(), tick_count = interrupt_time / 10000;
+    LARGE_INTEGER now;
+
+    NtQuerySystemTime( &now );
+    usd_store_time( &data->SystemTime, now.QuadPart );
+    usd_store_time( &data->InterruptTime, interrupt_time );
+    usd_store_time( &data->TickCount, tick_count );
+    __atomic_store_n( &data->TickCountQuad, tick_count, __ATOMIC_RELEASE );
+}
+
+static void *usd_clock_thread( void *arg )
+{
+    (void)arg;
+    for (;;)
+    {
+        usleep( 1000 );
+        usd_update_time();
+    }
+    return NULL;
+}
+
+/***********************************************************************
+ *           wine_nx_start_user_shared_data_clock
+ *
+ * wineserver keeps KUSER_SHARED_DATA's clock current; the in-process
+ * Horizon server does not, so GetTickCount, GetTickCount64 and
+ * QueryInterruptTime read zero forever without this thread.
+ */
+void wine_nx_start_user_shared_data_clock(void)
+{
+    KUSER_SHARED_DATA *data = (KUSER_SHARED_DATA *)user_shared_data;
+    SYSTEM_BASIC_INFORMATION info;
+    pthread_t thread;
+
+    virtual_get_system_info( &info, FALSE );
+    data->TickCountMultiplier   = 1 << 24;
+    data->LargePageMinimum      = 2 * 1024 * 1024;
+    data->NumberOfPhysicalPages = info.MmNumberOfPhysicalPages;
+    data->NXSupportPolicy       = NX_SUPPORT_POLICY_OPTIN;
+    data->ActiveProcessorCount  = horizon_get_processor_count(); /* before the PEB is filled */
+    data->ActiveGroupCount      = 1;
+    data->NativeProcessorArchitecture = PROCESSOR_ARCHITECTURE_ARM64;
+    usd_update_time();
+    if (pthread_create( &thread, NULL, usd_clock_thread, NULL ))
+        ERR( "failed to start the shared user data clock\n" );
+}
+#endif
 
 /***********************************************************************
  *           virtual_map_user_shared_data

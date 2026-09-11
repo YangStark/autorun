@@ -1626,6 +1626,15 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     wow64_compat_wine_nt_to_unix_file_name,
 };
 
+#ifdef __SWITCH__
+NTSTATUS wine_nx_call_ntdll_wow64( unixlib_handle_t handle, ULONG code, ULONG args )
+{
+    if (handle != (unixlib_handle_t)unix_call_wow64_funcs) return STATUS_INVALID_HANDLE;
+    if (code >= ARRAY_SIZE(unix_call_wow64_funcs)) return STATUS_INVALID_PARAMETER;
+    return unix_call_wow64_funcs[code]( ULongToPtr(args) );
+}
+#endif
+
 #endif  /* _WIN64 */
 
 
@@ -2153,6 +2162,30 @@ static void load_ntdll_wow64_functions( HMODULE module )
     memcpy( (void *)(ULONG_PTR)pLdrSystemDllInitBlock->pLdrSystemDllInitBlock,
             pLdrSystemDllInitBlock, sizeof(*pLdrSystemDllInitBlock) );
 }
+
+#ifdef __SWITCH__
+NTSTATUS wine_nx_prepare_wow64_ntdll( HMODULE native, HMODULE guest )
+{
+    const IMAGE_EXPORT_DIRECTORY *exports;
+    static const char *native_names[] = { "LdrInitializeThunk", "LdrSystemDllInitBlock",
+        "__wine_syscall_dispatcher", "__wine_unix_call_dispatcher", "__wine_unixlib_handle" };
+    static const char *guest_names[] = { "LdrInitializeThunk", "LdrSystemDllInitBlock",
+        "RtlUserThreadStart", "__wine_syscall_dispatcher", "__wine_unix_call_dispatcher",
+        "__wine_unixlib_handle" };
+    unsigned int i;
+    exports = get_module_data_dir( native, IMAGE_DIRECTORY_ENTRY_EXPORT, NULL );
+    if (!exports) return STATUS_INVALID_IMAGE_FORMAT;
+    for (i = 0; i < ARRAY_SIZE(native_names); i++)
+        if (!find_named_export( native, exports, native_names[i] )) return STATUS_PROCEDURE_NOT_FOUND;
+    exports = get_module_data_dir( guest, IMAGE_DIRECTORY_ENTRY_EXPORT, NULL );
+    if (!exports) return STATUS_INVALID_IMAGE_FORMAT;
+    for (i = 0; i < ARRAY_SIZE(guest_names); i++)
+        if (!find_named_export( guest, exports, guest_names[i] )) return STATUS_PROCEDURE_NOT_FOUND;
+    load_ntdll_functions( native );
+    load_ntdll_wow64_functions( guest );
+    return STATUS_SUCCESS;
+}
+#endif
 
 
 /***********************************************************************
