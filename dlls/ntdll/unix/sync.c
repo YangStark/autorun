@@ -98,6 +98,10 @@ static const char *debugstr_timeout( const LARGE_INTEGER *timeout )
 
 
 /* return a monotonic time counter, in Win32 ticks */
+#ifdef __SWITCH__
+extern unsigned long long horizon_interrupt_time(void);
+#endif
+
 static inline ULONGLONG monotonic_counter(void)
 {
     struct timeval now;
@@ -106,6 +110,12 @@ static inline ULONGLONG monotonic_counter(void)
 
     if (!timebase.denom) mach_timebase_info( &timebase );
     return mach_continuous_time() * timebase.numer / timebase.denom / 100;
+#elif defined(__SWITCH__)
+    /* Time since boot, as on Windows. The gettimeofday() fallback below counts
+     * from 1601 unless the server reports its start time, which the Horizon
+     * server does not: MSVC's steady_clock multiplies the counter by 100 and
+     * overflowed, so OpenTTD never drew and slept for the maximum time. */
+    return horizon_interrupt_time();
 #elif defined(HAVE_CLOCK_GETTIME)
     struct timespec ts;
 #ifdef CLOCK_BOOTTIME
@@ -2476,6 +2486,13 @@ NTSTATUS WINAPI NtYieldExecution(void)
 }
 
 
+#ifdef __SWITCH__
+/* libnx's select() is a poll request to the BSD socket service, which has only
+ * a few sessions: a sleeping thread could wait there forever (OpenTTD's game
+ * loop never woke from its first Sleep). NtDelayExecution sleeps the thread. */
+extern void svcSleepThread( int64_t nano );
+#endif
+
 /******************************************************************
  *		NtDelayExecution (NTDLL.@)
  */
@@ -2501,7 +2518,11 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
 
     if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE)  /* sleep forever */
     {
+#ifdef __SWITCH__
+        for (;;) svcSleepThread( 1000000000LL );
+#else
         for (;;) select( 0, NULL, NULL, NULL, NULL );
+#endif
     }
     else
     {
@@ -2521,13 +2542,20 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
 
         for (;;)
         {
+#ifndef __SWITCH__
             struct timeval tv;
+#endif
             NtQuerySystemTime( &now );
             diff = (when - now.QuadPart + 9) / 10;
             if (diff <= 0) break;
+#ifdef __SWITCH__
+            /* diff is in microseconds; wake at least hourly to recheck. */
+            svcSleepThread( (diff < 3600000000LL ? diff : 3600000000LL) * 1000 );
+#else
             tv.tv_sec  = diff / 1000000;
             tv.tv_usec = diff % 1000000;
             if (select( 0, NULL, NULL, NULL, &tv ) != -1) break;
+#endif
         }
     }
     return STATUS_SUCCESS;
