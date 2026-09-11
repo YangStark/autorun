@@ -6897,6 +6897,11 @@ static NTSTATUS cancel_async_file_read( HANDLE handle, IO_STATUS_BLOCK *io )
     return count ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }
 
+#ifdef __SWITCH__
+/* Completed reads, reported by the runtime's [PROGRESS] line. */
+unsigned int wine_nx_file_reads;
+#endif
+
 /******************************************************************************
  *              NtReadFile   (NTDLL.@)
  */
@@ -7087,6 +7092,27 @@ err:
     if (status == STATUS_SUCCESS || (status == STATUS_END_OF_FILE && (!async_read || type == FD_TYPE_FILE)))
     {
         set_sync_iosb( io, status, total, options );
+#ifdef __SWITCH__
+        {
+            extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+            extern int wine_nx_runtime_verbose __attribute__((weak));
+            static unsigned int read_traces;
+
+            __atomic_add_fetch( &wine_nx_file_reads, 1, __ATOMIC_RELAXED );
+            if (&wine_nx_runtime_trace && &wine_nx_runtime_verbose && wine_nx_runtime_verbose &&
+                __atomic_fetch_add( &read_traces, 1, __ATOMIC_RELAXED ) < 256)
+            {
+                unsigned int header[2] = {0};
+                char msg[256];
+                memcpy( header, buffer, min( total, sizeof(header) ) );
+                snprintf( msg, sizeof(msg),
+                          "[NXREAD] handle=%p requested=%u returned=%u status=%08x options=%x offset=%lld header=%08x/%08x",
+                          handle, length, total, status, options,
+                          offset ? (long long)offset->QuadPart : -2LL, header[0], header[1] );
+                wine_nx_runtime_trace( msg );
+            }
+        }
+#endif
         TRACE("= SUCCESS (%u)\n", total);
         if (event) NtSetEvent( event, NULL );
         if (apc && (!status || async_read)) NtQueueApcThread( GetCurrentThread(), (PNTAPCFUNC)apc,

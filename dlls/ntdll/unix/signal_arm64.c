@@ -185,6 +185,8 @@ static __thread TEB *wine_nx_active_pe_teb;
 
 void wine_nx_set_active_pe_teb( TEB *teb )
 {
+    extern void horizon_bind_native_stack( TEB *teb );
+    horizon_bind_native_stack( teb );
     wine_nx_active_pe_teb = teb;
 }
 

@@ -68,6 +68,27 @@
 
 #include <sys/iosupport.h>
 
+/* PE entry points and callbacks currently execute on the libnx host stack.
+ * Keep the native TIB truthful; the WoW64 guest stack and allocation ownership
+ * remain in their original fields. */
+void horizon_bind_native_stack( TEB *teb )
+{
+    Thread *thread = threadGetSelf();
+    ULONG_PTR current = (ULONG_PTR)&thread;
+    ULONG_PTR low, high;
+
+    if (!teb || !thread) return;
+    low = (ULONG_PTR)thread->stack_mirror;
+    high = low + thread->stack_sz;
+    if (!low || high <= low || current < low || current >= high) return;
+    if ((ULONG_PTR)teb->Tib.StackLimit == low && (ULONG_PTR)teb->Tib.StackBase == high) return;
+    horizon_trace( "[NXSTACK] native TEB=%p stack=%p-%p -> %p-%p current=%p\n",
+                   teb, teb->Tib.StackLimit, teb->Tib.StackBase,
+                   (void *)low, (void *)high, (void *)current );
+    teb->Tib.StackLimit = (void *)low;
+    teb->Tib.StackBase = (void *)high;
+}
+
 WINE_DEFAULT_DEBUG_CHANNEL(horizon);
 
 #ifndef SERVER_PROTOCOL_VERSION
