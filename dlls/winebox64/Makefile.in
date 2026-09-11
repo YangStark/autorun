@@ -1,0 +1,4 @@
+MODULE = winebox64.dll
+IMPORTS = wow64 ntdll
+EXTRADLLFLAGS = -nodefaultlibs
+SOURCES = cpu.c gate.c
