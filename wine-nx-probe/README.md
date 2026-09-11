@@ -1,5 +1,124 @@
 # Wine-NX Probe And Runtime
 
+`nx-wow64-dynarec-30` fixes OpenTTD's white screen and idle hang.
+Build 29 hardware showed the same end as build 28: five
+`NtQueryPerformanceCounter` calls, then an `NtDelayExecution` that never
+returned, even with `svcSleepThread`. The sleep was not the problem; its length
+was.
+- On the Switch, `monotonic_counter()` fell back to `gettimeofday()` minus
+  `server_start_time`. The Horizon server never reports that start time, so
+  `QueryPerformanceCounter` counted 100 ns ticks since 1601, about 1.3e17.
+- MSVC's `steady_clock::now()` returns that counter times 100 at Wine's 10 MHz
+  frequency, which overflows to a negative time.
+- OpenTTD's loop compares `now >= next_draw_tick` against time points that start
+  at 0. That was never true, so it never drew, and it slept until the next tick,
+  about 158 years away, clamped to a `Sleep` of about 49 days.
+- The counter now counts from boot, like Windows, using `horizon_interrupt_time()`
+  (`armGetSystemTick`), which also drives the shared data `InterruptTime`.
+- `tests/check_qpc_base.py` compiles `monotonic_counter()` as the Switch build at
+  3 days of uptime in 2026 and checks MSVC's arithmetic and OpenTTD's first draw
+  tick. `--baseline` restores the old counter and fails.
+
+On hardware, build 30 shows OpenTTD's title screen. Its `[PROGRESS]` lines put
+the white screen at about 70 seconds:
+- 5 s: the window is created (163 reads).
+- 5–45 s: graphics loading, 29,314 reads at about 1,000 per second, with three
+  bursts of short-lived CRT worker threads.
+- 55–75 s: the first frames (17 by 75 s).
+- 85–95 s: 182 frames, while dynarec entries rose from 107,399 to 203,330 as
+  drawing code was translated for the first time.
+- 145–155 s: about 43 frames per second.
+Next targets: fewer SD-card requests for OpenTTD's one-seek-per-sprite reads, and
+translation time on first execution.
+
+`nx-wow64-dynarec-29` replaced the select()-based `Sleep()` (below), but the
+hang remained; the entry's cause was wrong. The change stays: sleeping should not
+depend on the BSD socket service. The original entry follows.
+
+`nx-wow64-dynarec-29` fixes `Sleep()` never returning, which left OpenTTD on a
+white screen with an idle CPU. In a longer build-28 verbose run, OpenTTD
+finished loading:
+- It read the base graphics, the title game and the AI folders, then started
+  and joined 17 worker threads.
+- Its game loop called `NtQueryPerformanceCounter`, then `NtDelayExecution`, and
+  that call never logged `done`. Nothing else ran.
+
+Wine's `NtDelayExecution` sleeps with `select( 0, NULL, NULL, NULL, &tv )`. On
+libnx that is `bsdPoll` with no descriptors, a request to the BSD socket
+service, which has only a few sessions. On the Switch it now calls
+`svcSleepThread`, rechecking the time at least hourly, as the winebox64_nx
+runtime does for Wine's descriptor-less `pselect6`. The built
+`NtDelayExecution` calls `svcSleepThread` and no longer calls `select`. Notepad
+never slept this way; it waits in message waits.
+
+Build 29 also reports progress without verbose logs. An earlier build-28 run,
+with verbose logs on, was stopped after about 105 seconds (21 reports, 5 s
+apart) while still loading:
+- It read the base graphics (up to 6,141 reads in one interval), then the title
+  game `opntitle.dat`, scanned `ai`, and was reloading GRF sprites with one seek
+  per read.
+- Only two requests failed: an AFD ioctl from network setup (0x120354) and a
+  console ioctl. Nothing was blocked.
+- Build 27 moved every periodic report behind verbose logs, so a run without
+  them shows nothing while the screen is white. Every 10 seconds, when something
+  changed, the runtime now logs `[PROGRESS] <seconds>s reads=<n> frames=<n>
+  native_entries=<n>`. Reads are completed `NtReadFile` calls, and frames are
+  frames queued to the display. Reads that stop with frames rising means
+  drawing; neither rising means waiting or computing.
+
+`nx-wow64-dynarec-28` fixes the cursor not moving at all in OpenTTD on build 27.
+Build 27's display driver started a background thread that polled the controller
+and sent the input with `NtUserSendHardwareInput`. That thread is a plain libnx
+pthread without a TEB. At the first stick movement, the server call dereferenced
+the NULL TEB (`[EXC] ... far=0x384`, in `server_call_unlocked`, `ldr w19,
+[x0, #900]` after `NtCurrentTeb`), and the thread was parked before it presented
+the moved cursor. `ProcessEvents` skipped polling while that thread was
+marked as started, so nothing read the controller again.
+- The background thread now only polls and presents, with no Wine calls. The
+  cursor keeps moving while a program is too busy to pump messages, such as
+  OpenTTD loading its sprites.
+- `ProcessEvents` always polls as well and sends the input from a Wine thread.
+  The runtime remembers every button pressed or released between two calls
+  (`pointer_buttons` in `pointer_cursor.h`, `wine_nx_pointer_take`). A click
+  made while the program was busy is delivered as down, then up.
+- Tests: `tests/pointer_cursor.c` covers the button edges between takes, and
+  `tests/check_pointer_events.py` runs the driver's event translation,
+  including clicks between calls. The fixture had stopped compiling in build 27.
+
+The same build-27 run, with verbose logs, was still loading GRF files after
+more than 80 seconds: 154 opens and 9,248 reads, each syscall written to the
+SD card twice. Judge OpenTTD's loading time with verbose logs off.
+
+`nx-wow64-dynarec-21` fixes positioned I/O moving the ordinary file cursor.
+Build 20 hardware shows no invalid-frame unwind errors and confirms native
+stack rebinding. Its language reads return 4096 bytes, but their first words
+match byte 23 of the original language files rather than the LANG header.
+Wine's is_device_placeholder() reads 23 bytes with pread(), and the Horizon
+shim implemented that with seek/read without restoring position. pread and
+pwrite now save/restore position under a shared mutex; ordinary concurrent
+read/write on the same descriptor still need caller coordination.
+`tests/check_positioned_io.py` checks the actual shims: the 23-byte probe then
+ordinary header read, nonzero cursors, EOF, short/zero reads and error paths.
+Its --baseline mode reproduces the skipped header. Hardware confirmation of
+OpenTTD advancing past language initialization is pending in build 21.
+
+`nx-wow64-dynarec-20` addresses the native unwind stack mismatch seen in
+OpenTTD build 19. ARM64 PE entry points and callbacks run on libnx's thread
+stack, but the native TIB still described the separately allocated Wine stack.
+Before PE entry/callbacks, native bounds now come from threadGetSelf()'s
+stack_mirror/stack_sz, only if they contain the current native frame. Guest
+stack bounds, CPU-reserved storage and allocation ownership are unchanged.
+`tests/check_native_stack.py` covers these invariants and invalid ranges;
+hardware confirmation of RtlUnwindEx remains pending.
+
+The language failure remains under investigation. All 66 staged language packs
+and openttd.exe match the original 15.3 archive byte-for-byte; their header
+version is 0x2ad109ab. Build-19 logs show successful file opens and reads but
+do not expose returned byte counts or data. The first logged native unwind
+failure follows the language scan during GUI calls, so causality is unproven.
+Build 20 logs the first 256 native read completions as NXREAD in verbose mode,
+including length and first eight bytes, and enables OpenTTD misc debug level 3.
+
 `nx-wow64-dynarec-19` gets OpenTTD past DLL initialization, based on what
 build 18 logged on hardware. All imports loaded, and then:
 ```
@@ -440,3 +559,23 @@ static string in wow64_box64_engine.c; native-entry telemetry establishes
 that this run used the dynarec. These benchmark results do not establish a
 speedup without a matching interpreter measurement. Real archive creation,
 integrity testing and extraction remain separate dynarec validation steps.
+
+### ARM64 WoW64 callback return (build 24)
+
+The build-23 hardware trace for `pe32-video-startup.exe` still stopped after
+Box64 run #305 returned to the syscall gate with EAX=5 (`NtCallbackReturn`).
+Selecting `_setjmpex(buf, NULL)` in wow64.dll was insufficient: unlike Wine's
+x86-64 implementation, ARM64 ntdll's `longjmp` always called `RtlUnwind`.
+Build 24 adds the missing NULL-frame register restore to ARM64 ntdll, while
+retaining the unwind path for non-NULL frames.
+
+`python3 wine-nx-probe/tests/check_arm64_longjmp.py` executes the actual ARM64
+assembly and longjmp function on an ARM64 host. Nested returns, stack and FP
+state restoration, return values and routing of normal frames pass at O0/O2;
+removing the new branch reproduces the build-23 failure in the same test.
+This host regression does not establish that OpenTTD starts on Switch.
+
+Install the build-24 package including `drive_c/windows/system32/ntdll.dll`,
+`drive_c/windows/system32/wow64.dll` and the NRO. Run `pe32-video-startup.exe`
+first: the next hardware checkpoint is `after application LoadIconW`, followed
+by the cursor, class and window checks and `[VIDEO TEST] PASS ALL`.
