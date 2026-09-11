@@ -366,6 +366,21 @@ wine-nx-probe/samples/curl-arm64
 
 ## Next Milestones
 
+### Experimental x86 Execution
+
+The native ARM64 Wine / Box64 WoW64 integration is tracked in
+[the CPU interface document](documentation/wow64-box64-interface.md).
+The pinned interpreter now runs an i386 sequence through the native transition
+bridge in an ARM64 Linux test, and the same smoke test builds as a Switch NRO:
+
+```sh
+sh wine-nx-probe/check-box64-execution.sh
+```
+
+This is an execution-core milestone. PE32 loading, a selectable CPU DLL and
+game compatibility are not enabled yet; the ARM64 Wine runtime remains the
+default. The document lists the tested behavior and remaining state/fault work.
+
 1. Presentation performance
 
 Replace or bypass the expensive linear framebuffer path. Preferred direction:
@@ -404,3 +419,52 @@ Fallback or lower-level options:
 After Notepad is smoother, the next useful test targets should be small
 non-network GUI apps that exercise dialogs, common controls, edit controls, and
 file browsing without requiring a browser engine or GPU API first.
+
+The experimental ARM64 CPU DLL is now in `dlls/winebox64`. With an ARM64/i386
+Wine PE build configured as described in
+[the interface notes](documentation/wow64-box64-interface.md), run
+`sh wine-nx-probe/build-wow64-components.sh` to build and stage its components.
+The original interpreter gate test passed on Switch hardware. The new package
+autoruns a minimal PE32 through Wine’s WoW64 startup; that full path is still
+unverified on hardware. Success is a logged exit code of `0x0000002a`.
+
+The minimal PE32 test subsequently passed on Switch hardware with exit `0x2a`,
+followed by the functional test (time, file I/O, heaps, dynamic TLS) and the
+two-worker thread test (`nx-wow64-threads-2`).
+
+The current package runs a real x86 console application, 7-Zip's `7zr.exe`,
+testing a known archive. On Switch hardware (`nx-wow64-console-2`) it ran to
+completion with exit code 0, 7-Zip's no-error result, at about 4.2 million x86
+instructions per second. That build's log did not capture the program's text.
+Build `nx-wow64-console-3` copies every write to stdout/stderr into the log as
+`[STDOUT]`/`[STDERR]` lines, and `[BOX64]` lines report interpreter speed. On
+hardware it showed 7zr's full output, including `Everything is Ok`, but reported
+the archive as 0 bytes: directory listings carried names only. Build
+`nx-wow64-console-4` filled in sizes, times and attributes and ran `7zr a` on a
+staged folder tree; 7zr created its archive but could not open the folder itself.
+Build `nx-wow64-console-5` opens directories the way NT does and stops reporting
+every directory as a mount point; on hardware `7zr a` then archived the whole tree
+(`3 folders, 3 files, 325691 bytes`, `Everything is Ok`, exit 0). Build
+`nx-wow64-console-6` added directory creation, file times and attributes for
+`7zr x`. Its hardware run hit 7-Zip's error path instead and showed that x86
+exception dispatch could not resume in the interpreter. Build
+`nx-wow64-console-7` fixed that (16-bit selectors, Eax after `NtContinue`); on
+hardware 7-Zip's error path then threw and caught its C++ exception and exited
+with code 2, exactly as on Windows. Build `nx-wow64-console-8` added
+`SetEndOfFile` to the Horizon server; on hardware `7zr x` then extracted a
+staged archive (3 folders, 3 files, every CRC matching). Build
+`nx-wow64-console-9` added rename and delete dispositions to the Horizon server;
+on hardware `7zr rn` then rewrote an archive in place. The staged package now
+runs the two-thread 7-Zip benchmark (`7zr b 1 -mmt2 -md18`). Its first hardware run
+showed x86 programs being told the CPU was ARM with zero processors; build
+`nx-wow64-console-10` reports the emulated x86 processor and the real core count. The thread-lifecycle test below passed first and stays
+staged as a regression target.
+
+The lifecycle test is `pe32-lifecycle.exe` (build `nx-wow64-lifecycle-2`).
+It covers the complete x86 thread lifecycle: workers that return or call
+`ExitThread`, joins that wait for the real end, exit codes, CREATE_SUSPENDED,
+static and dynamic TLS, and 48 rounds of synchronized workers. Success is
+`[PE32 TEST] PASS ALL`, `[LIFECYCLE] verdict=PASS` (thread stacks, TEBs, server
+objects, pipes and interpreter engines back at baseline) and exit `0x2a`. It
+passed on Switch hardware: 202 x86 threads created, joined and reclaimed; see the
+[interface notes](documentation/wow64-box64-interface.md) for details.
