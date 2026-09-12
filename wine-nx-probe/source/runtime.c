@@ -39,7 +39,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-34"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-45"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -187,6 +187,10 @@ void wine_nx_runtime_trace( const char *msg )
  * sdmc:/switch/wine/verbose.txt containing 1. */
 int wine_nx_runtime_verbose;
 
+/* libdrm_nouveau's switch for CPU-cacheable pinned GPU memory, cleared by
+ * sdmc:/switch/wine/gl-uncached.txt containing 1. */
+extern int wine_nx_nouveau_pin_cached __attribute__((weak));
+
 /***********************************************************************
  * Framebuffer platform hooks used by the win32u Switch display driver
  * (dlls/win32u/winnx_drv.c).  The driver renders into ordinary DIB memory;
@@ -200,6 +204,7 @@ static struct pointer_cursor wine_nx_cursor =
     { .x = WINE_NX_FB_W / 2, .y = WINE_NX_FB_H / 2, .width = WINE_NX_FB_W, .height = WINE_NX_FB_H };
 static int wine_nx_cursor_moved;
 static int wine_nx_cursor_visible = 1;  /* 0 while the program hides the mouse cursor */
+static int wine_nx_gl_window;  /* an OpenGL window surface owns the screen's NWindow */
 /* Controller and touchscreen state, guarded by wine_nx_pointer_mutex. */
 static pthread_mutex_t wine_nx_pointer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct pointer_cursor wine_nx_pointer =
@@ -216,6 +221,7 @@ int wine_nx_fb_init(void)
 {
     Result rc;
     if (wine_nx_fb_ready) return 0;
+    if (wine_nx_gl_window) return -1;  /* an OpenGL surface has the screen */
     log_line( "[NXFB] fb_init: taking screen from console" );
     if (wine_nx_console_active)
     {
@@ -241,8 +247,12 @@ void *wine_nx_fb_lock( int *width, int *height, int *stride_px )
     u32 stride = 0;
     void *bits = NULL;
 
-    if (!wine_nx_fb_ready && wine_nx_fb_init()) return NULL;
     pthread_mutex_lock( &wine_nx_fb_mutex );
+    if (!wine_nx_fb_ready && wine_nx_fb_init())
+    {
+        pthread_mutex_unlock( &wine_nx_fb_mutex );
+        return NULL;
+    }
     if (!wine_nx_fb_pending_bits)
     {
         wine_nx_fb_pending_bits = framebufferBegin( &wine_nx_fb, &stride );
@@ -266,6 +276,49 @@ void wine_nx_fb_unlock(void)
     wine_nx_fb_pending_dirty = 1;
     if (wine_nx_fb_lock_depth > 0) wine_nx_fb_lock_depth--;
     pthread_mutex_unlock( &wine_nx_fb_mutex );
+}
+
+/* An OpenGL window surface takes the screen. libnx's framebuffer and EGL cannot
+ * both queue buffers to the default NWindow, so the framebuffer is closed while
+ * the surface exists; GDI keeps drawing into window surfaces, and the next
+ * flush after the surface is gone opens the framebuffer again. Returns NULL
+ * while another surface has the screen or the framebuffer is being drawn. */
+void *wine_nx_gl_acquire_window(void)
+{
+    NWindow *window = NULL;
+
+    pthread_mutex_lock( &wine_nx_fb_mutex );
+    if (!wine_nx_gl_window && !wine_nx_fb_lock_depth)
+    {
+        if (wine_nx_fb_ready)
+        {
+            framebufferClose( &wine_nx_fb );
+            wine_nx_fb_ready = 0;
+            wine_nx_fb_pending_bits = NULL;
+            wine_nx_fb_pending_stride = 0;
+            wine_nx_fb_pending_dirty = 0;
+        }
+        else if (wine_nx_console_active)
+        {
+            consoleExit( NULL );
+            wine_nx_console_active = 0;
+        }
+        window = nwindowGetDefault();
+        nwindowSetDimensions( window, WINE_NX_FB_W, WINE_NX_FB_H );
+        wine_nx_gl_window = 1;
+    }
+    pthread_mutex_unlock( &wine_nx_fb_mutex );
+    log_line( "[NXGL] %s", window ? "screen handed to an OpenGL surface" : "screen busy; OpenGL surface refused" );
+    return window;
+}
+
+/* The OpenGL surface is destroyed; the framebuffer may take the screen back. */
+void wine_nx_gl_release_window(void)
+{
+    pthread_mutex_lock( &wine_nx_fb_mutex );
+    wine_nx_gl_window = 0;
+    pthread_mutex_unlock( &wine_nx_fb_mutex );
+    log_line( "[NXGL] screen returned to the framebuffer" );
 }
 
 /* Each present converts the whole screen, so frames that only move the
@@ -556,16 +609,33 @@ static void runtime_report_interpreter(void)
         extern unsigned int wine_nx_file_reads __attribute__((weak));
         extern unsigned long long wine_nx_file_read_100ns __attribute__((weak));
         extern unsigned int wine_nx_syscalls __attribute__((weak));
+        extern unsigned int wine_nx_audio_underruns __attribute__((weak));
         extern unsigned int wine_nx_sd_reads, wine_nx_sd_hits;
         extern unsigned long long wine_nx_sd_read_ns;
+        extern unsigned int wine_nx_gl_swaps __attribute__((weak)), wine_nx_gl_calls __attribute__((weak));
+        extern unsigned int wine_nx_gl_persistent_failures __attribute__((weak));
+        extern unsigned long long wine_nx_gl_swap_time __attribute__((weak)), wine_nx_gl_call_time __attribute__((weak));
+        extern unsigned long long wine_nx_gl_copy_bytes __attribute__((weak));
+        extern void wine_nx_gl_profile( char *buffer, size_t size ) __attribute__((weak));
+        extern unsigned long long wine_nx_nouveau_fence_wait_ns __attribute__((weak));
+        extern unsigned int wine_nx_nouveau_tex_direct __attribute__((weak)), wine_nx_nouveau_tex_staging __attribute__((weak));
+        extern unsigned int wine_nx_nouveau_buf_readback __attribute__((weak)), wine_nx_nouveau_fence_waits __attribute__((weak));
+        extern unsigned int wine_nx_nouveau_pinned_buffers __attribute__((weak));
+        extern unsigned int wine_nx_nouveau_wrap_result __attribute__((weak));
+        extern unsigned int wine_nx_nouveau_bo_new __attribute__((weak)), wine_nx_nouveau_bo_reused __attribute__((weak));
+        extern unsigned long long wine_nx_nouveau_bo_new_ns __attribute__((weak));
+        extern unsigned int wine_nx_nouveau_cache_cleans __attribute__((weak));
+        extern unsigned long long wine_nx_nouveau_cache_clean_ns __attribute__((weak));
+        extern int wine_nx_gl_pinned_memory __attribute__((weak));
         static unsigned int calls, last_reads = ~0u, last_frames = ~0u;
         static u64 start;
         unsigned int reads = &wine_nx_file_reads ? __atomic_load_n( &wine_nx_file_reads, __ATOMIC_RELAXED ) : 0;
-        unsigned int frames = __atomic_load_n( &wine_nx_fb_frames, __ATOMIC_RELAXED );
+        unsigned int gl_frames = &wine_nx_gl_swaps ? __atomic_load_n( &wine_nx_gl_swaps, __ATOMIC_RELAXED ) : 0;
+        unsigned int frames = __atomic_load_n( &wine_nx_fb_frames, __ATOMIC_RELAXED ) + gl_frames;
         unsigned long long read_ms = &wine_nx_file_read_100ns
                                      ? __atomic_load_n( &wine_nx_file_read_100ns, __ATOMIC_RELAXED ) / 10000 : 0;
         unsigned int syscalls = &wine_nx_syscalls ? __atomic_load_n( &wine_nx_syscalls, __ATOMIC_RELAXED ) : 0;
-        char native[80] = "";
+        char native[80] = "", gl[384] = "", audio[32] = "";
 
         if (!start) start = now;
         if (++calls % 2 || (reads == last_reads && frames == last_frames)) return;
@@ -580,11 +650,51 @@ static void runtime_report_interpreter(void)
                       __atomic_load_n( &wine_nx_box64_block_tests, __ATOMIC_RELAXED ) );
         }
 #endif
+        /* OpenGL: frames swapped and the time in eglSwapBuffers, calls into opengl32's unix
+         * side and their time, megabytes copied to 32-bit buffer mappings, persistent
+         * mappings refused, whether pinned memory works (1) or was refused (-1), and
+         * the slowest opengl32 functions of the last 10 seconds. */
+        if (gl_frames || (&wine_nx_gl_calls && wine_nx_gl_calls))
+        {
+            int len = snprintf( gl, sizeof(gl), " gl_frames=%u swap_ms=%llu gl_calls=%u gl_ms=%llu copy_mb=%llu persistent_fail=%u pinned=%d",
+                                gl_frames, __atomic_load_n( &wine_nx_gl_swap_time, __ATOMIC_RELAXED ) / 10000,
+                                __atomic_load_n( &wine_nx_gl_calls, __ATOMIC_RELAXED ),
+                                __atomic_load_n( &wine_nx_gl_call_time, __ATOMIC_RELAXED ) / 10000,
+                                (&wine_nx_gl_copy_bytes ? __atomic_load_n( &wine_nx_gl_copy_bytes, __ATOMIC_RELAXED ) : 0) >> 20,
+                                &wine_nx_gl_persistent_failures ? wine_nx_gl_persistent_failures : 0,
+                                &wine_nx_gl_pinned_memory ? wine_nx_gl_pinned_memory : 0 );
+            /* Mesa's nouveau: texture transfers mapped in place or through staging
+             * buffers, buffer reads through a GPU copy, waits for the GPU with their
+             * time, pinned buffers created and nvservices' last refusal to pin. */
+            if (&wine_nx_nouveau_tex_direct && len > 0 && len < (int)sizeof(gl))
+                len += snprintf( gl + len, sizeof(gl) - len,
+                                 " tex_direct=%u tex_staging=%u buf_readback=%u fence_waits=%u fence_ms=%llu pinned_bufs=%u pin_rc=%#x",
+                                 wine_nx_nouveau_tex_direct, wine_nx_nouveau_tex_staging,
+                                 wine_nx_nouveau_buf_readback, wine_nx_nouveau_fence_waits,
+                                 wine_nx_nouveau_fence_wait_ns / 1000000,
+                                 &wine_nx_nouveau_pinned_buffers ? wine_nx_nouveau_pinned_buffers : 0,
+                                 &wine_nx_nouveau_wrap_result ? wine_nx_nouveau_wrap_result : 0 );
+            /* Buffer objects created for the GPU, taken from the reuse cache instead,
+             * and the time creating them (each costs a heap block and nvservices calls). */
+            if (&wine_nx_nouveau_bo_new && len > 0 && len < (int)sizeof(gl))
+                len += snprintf( gl + len, sizeof(gl) - len,
+                                 " bo_new=%u bo_reuse=%u bo_ms=%llu pin_cached=%d cleans=%u clean_ms=%llu",
+                                 wine_nx_nouveau_bo_new, wine_nx_nouveau_bo_reused,
+                                 wine_nx_nouveau_bo_new_ns / 1000000,
+                                 &wine_nx_nouveau_pin_cached ? wine_nx_nouveau_pin_cached : 0,
+                                 &wine_nx_nouveau_cache_cleans ? wine_nx_nouveau_cache_cleans : 0,
+                                 &wine_nx_nouveau_cache_clean_ns ? wine_nx_nouveau_cache_clean_ns / 1000000 : 0 );
+            if (&wine_nx_gl_profile && len > 0 && len < (int)sizeof(gl)) wine_nx_gl_profile( gl + len, sizeof(gl) - len );
+        }
+        /* Gaps in playback: audout ran out of queued frames. */
+        if (&wine_nx_audio_underruns && wine_nx_audio_underruns)
+            snprintf( audio, sizeof(audio), " audio_under=%u",
+                      __atomic_load_n( &wine_nx_audio_underruns, __ATOMIC_RELAXED ) );
         log_line( "[PROGRESS] %llus reads=%u read_ms=%llu sd_reads=%u sd_ms=%llu cache_hits=%u syscalls=%u "
-                  "frames=%u%s", (unsigned long long)(armTicksToNs( now - start ) / 1000000000ull), reads, read_ms,
+                  "frames=%u%s%s%s", (unsigned long long)(armTicksToNs( now - start ) / 1000000000ull), reads, read_ms,
                   __atomic_load_n( &wine_nx_sd_reads, __ATOMIC_RELAXED ),
                   __atomic_load_n( &wine_nx_sd_read_ns, __ATOMIC_RELAXED ) / 1000000,
-                  __atomic_load_n( &wine_nx_sd_hits, __ATOMIC_RELAXED ), syscalls, frames, native );
+                  __atomic_load_n( &wine_nx_sd_hits, __ATOMIC_RELAXED ), syscalls, frames, native, gl, audio );
         return;
     }
 
@@ -1489,6 +1599,10 @@ int main( int argc, char **argv )
 
     autorun = read_bool_file( RUNTIME_DIR "/run-entry.txt" );
     wine_nx_runtime_verbose = read_bool_file( RUNTIME_DIR "/verbose.txt" );
+    /* Pinned GPU buffers are CPU-cacheable unless gl-uncached.txt asks for the
+     * old mapping, which is there to compare the two. */
+    if (&wine_nx_nouveau_pin_cached && read_bool_file( RUNTIME_DIR "/gl-uncached.txt" ))
+        wine_nx_nouveau_pin_cached = 0;
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else
     {
