@@ -1,0 +1,342 @@
+--- a/include/c11/threads.h
++++ b/include/c11/threads.h
+@@ -46,6 +46,10 @@
+ #ifndef HAVE_TIMESPEC_GET
+ #include <sys/time.h>
+ 
++#ifdef __SWITCH__
++/* devkitA64's newlib declares a non-static timespec_get: keep this fallback apart. */
++#define timespec_get mesa_timespec_get
++#endif
+ static inline int
+ timespec_get(struct timespec *ts, int base)
+ {
+--- a/src/gallium/drivers/nouveau/nouveau_buffer.c
++++ b/src/gallium/drivers/nouveau/nouveau_buffer.c
+@@ -116,6 +116,17 @@
+ {
+    struct nv04_resource *res = nv04_resource(presource);
+ 
++#ifdef __SWITCH__
++   /* Pinned memory returns to the application right after this: let the GPU
++    * finish with it so the bo goes now instead of after the next flush. */
++   if (res->status & NOUVEAU_BUFFER_STATUS_PINNED) {
++      if (res->fence)
++         nouveau_fence_wait(res->fence, NULL);
++      if (res->fence_wr)
++         nouveau_fence_wait(res->fence_wr, NULL);
++   }
++#endif
++
+    nouveau_buffer_release_gpu_storage(res);
+ 
+    if (res->data && !(res->status & NOUVEAU_BUFFER_STATUS_USER_MEMORY))
+@@ -165,12 +176,20 @@
+  * buffer. Also updates buf->data if present.
+  *
+  * Maybe just migrate to GART right away if we actually need to do this. */
++#ifdef __SWITCH__
++/* Buffer reads through a GPU copy to a staging area, for Wine-NX's [PROGRESS]. */
++unsigned int wine_nx_nouveau_buf_readback;
++#endif
++
+ static bool
+ nouveau_transfer_read(struct nouveau_context *nv, struct nouveau_transfer *tx)
+ {
+    struct nv04_resource *buf = nv04_resource(tx->base.resource);
+    const unsigned base = tx->base.box.x;
+    const unsigned size = tx->base.box.width;
++#ifdef __SWITCH__
++   wine_nx_nouveau_buf_readback++;
++#endif
+ 
+    NOUVEAU_DRV_STAT(nv->screen, buf_read_bytes_staging_vid, size);
+ 
+@@ -729,7 +748,61 @@
+ 
+    return &buffer->base;
+ }
++
++#ifdef __SWITCH__
++/* Wine-NX's libdrm_nouveau maps the application's pages for the GPU in place. */
++int nouveau_bo_wrap_user(struct nouveau_device *dev, uint32_t flags, void *ptr,
++                         uint64_t size, struct nouveau_bo **pbo);
+ 
++/* Pinned buffers created, for Wine-NX's [PROGRESS]. */
++unsigned int wine_nx_nouveau_pinned_buffers;
++
++/* GL_AMD_pinned_memory: a GART buffer whose storage is the caller's memory, so
++ * the CPU and the GPU see the same bytes without copies. */
++struct pipe_resource *
++nouveau_buffer_create_from_user(struct pipe_screen *pscreen,
++                                const struct pipe_resource *templ,
++                                void *user_memory)
++{
++   struct nouveau_screen *screen = nouveau_screen(pscreen);
++   uintptr_t page = (uintptr_t)user_memory & ~(uintptr_t)0xfff;
++   unsigned offset = (uintptr_t)user_memory - page;
++   struct nv04_resource *buffer;
++
++   buffer = CALLOC_STRUCT(nv04_resource);
++   if (!buffer)
++      return NULL;
++
++   buffer->base = *templ;
++   buffer->vtbl = &nouveau_buffer_vtbl;
++   pipe_reference_init(&buffer->base.reference, 1);
++   buffer->base.screen = pscreen;
++   /* The storage cannot move: invalidation must not reallocate it. */
++   buffer->base.flags |= PIPE_RESOURCE_FLAG_MAP_PERSISTENT;
++   /* GL_AMD_pinned_memory hides the real target, so allow what a pixel buffer
++    * needs: the GPU samples it to upload textures (try_pbo_upload). */
++   buffer->base.bind |= PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET;
++
++   if (nouveau_bo_wrap_user(screen->device, NOUVEAU_BO_GART | NOUVEAU_BO_MAP,
++                            (void *)page, align(offset + templ->width0, 0x1000),
++                            &buffer->bo)) {
++      FREE(buffer);
++      return NULL;
++   }
++   buffer->domain = NOUVEAU_BO_GART;
++   buffer->offset = offset;
++   buffer->address = buffer->bo->offset + offset;
++   buffer->status = NOUVEAU_BUFFER_STATUS_PINNED;
++
++   util_range_init(&buffer->valid_buffer_range);
++   util_range_add(&buffer->base, &buffer->valid_buffer_range, 0, templ->width0);
++
++   NOUVEAU_DRV_STAT(screen, buf_obj_current_count, 1);
++   wine_nx_nouveau_pinned_buffers++;
++   return &buffer->base;
++}
++#endif
++
+ static inline bool
+ nouveau_buffer_data_fetch(struct nouveau_context *nv, struct nv04_resource *buf,
+                           struct nouveau_bo *bo, unsigned offset, unsigned size)
+--- a/src/gallium/drivers/nouveau/nouveau_buffer.h
++++ b/src/gallium/drivers/nouveau/nouveau_buffer.h
+@@ -19,6 +19,10 @@
+ #define NOUVEAU_BUFFER_STATUS_GPU_WRITING (1 << 1)
+ #define NOUVEAU_BUFFER_STATUS_DIRTY       (1 << 2)
+ #define NOUVEAU_BUFFER_STATUS_USER_MEMORY (1 << 7)
++#ifdef __SWITCH__
++/* PINNED: the bo maps the application's memory in place (GL_AMD_pinned_memory) */
++#define NOUVEAU_BUFFER_STATUS_PINNED      (1 << 6)
++#endif
+ 
+ #define NOUVEAU_BUFFER_STATUS_REALLOC_MASK NOUVEAU_BUFFER_STATUS_USER_MEMORY
+ 
+@@ -95,6 +99,13 @@
+ nouveau_user_buffer_create(struct pipe_screen *screen, void *ptr,
+                            unsigned bytes, unsigned usage);
+ 
++#ifdef __SWITCH__
++struct pipe_resource *
++nouveau_buffer_create_from_user(struct pipe_screen *pscreen,
++                                const struct pipe_resource *templ,
++                                void *user_memory);
++#endif
++
+ bool
+ nouveau_user_buffer_upload(struct nouveau_context *, struct nv04_resource *,
+                            unsigned base, unsigned size);
+--- a/src/gallium/drivers/nouveau/nouveau_fence.c
++++ b/src/gallium/drivers/nouveau/nouveau_fence.c
+@@ -25,10 +25,17 @@
+ #include "nouveau_fence.h"
+ #include "util/os_time.h"
+ 
+-#ifdef PIPE_OS_UNIX
++#if defined(PIPE_OS_UNIX) || defined(__SWITCH__)
+ #include <sched.h>
+ #endif
++#ifdef __SWITCH__
++#include <unistd.h>
+ 
++/* Waits for the GPU and their time, for the Wine-NX runtime's [PROGRESS] line. */
++unsigned int wine_nx_nouveau_fence_waits;
++uint64_t wine_nx_nouveau_fence_wait_ns;
++#endif
++
+ bool
+ nouveau_fence_new(struct nouveau_screen *screen, struct nouveau_fence **fence)
+ {
+@@ -193,7 +200,12 @@
+    struct nouveau_screen *screen = fence->screen;
+    uint32_t spins = 0;
+    int64_t start = 0;
++#ifdef __SWITCH__
++   int64_t wine_nx_start = os_time_get_nano();
+ 
++   wine_nx_nouveau_fence_waits++;
++#endif
++
+    if (debug && debug->debug_message)
+       start = os_time_get_nano();
+ 
+@@ -206,15 +218,24 @@
+             pipe_debug_message(debug, PERF_INFO,
+                                "stalled %.3f ms waiting for fence",
+                                (os_time_get_nano() - start) / 1000000.f);
++#ifdef __SWITCH__
++         wine_nx_nouveau_fence_wait_ns += os_time_get_nano() - wine_nx_start;
++#endif
+          return true;
+       }
+       if (!spins)
+          NOUVEAU_DRV_STAT(screen, any_non_kernel_fence_sync_count, 1);
+       spins++;
+-#ifdef PIPE_OS_UNIX
++#if defined(PIPE_OS_UNIX) || defined(__SWITCH__)
+       if (!(spins % 8)) /* donate a few cycles */
+          sched_yield();
+ #endif
++#ifdef __SWITCH__
++      /* The GPU's progress is only seen by polling its sequence number: after
++       * a short spin, sleep between polls instead of holding a CPU core. */
++      if (spins > 64)
++         usleep(500);
++#endif
+ 
+       nouveau_fence_update(screen, false);
+    } while (spins < NOUVEAU_FENCE_MAX_SPINS);
+--- a/src/gallium/drivers/nouveau/nvc0/nvc0_resource.c
++++ b/src/gallium/drivers/nouveau/nvc0/nvc0_resource.c
+@@ -98,6 +98,18 @@
+    return nvc0_miptree_surface_new(pipe, pres, templ);
+ }
+ 
++#ifdef __SWITCH__
++static struct pipe_resource *
++nvc0_resource_from_user_memory(struct pipe_screen *screen,
++                               const struct pipe_resource *templ,
++                               void *user_memory)
++{
++   if (templ->target != PIPE_BUFFER)
++      return NULL;
++   return nouveau_buffer_create_from_user(screen, templ, user_memory);
++}
++#endif
++
+ void
+ nvc0_init_resource_functions(struct pipe_context *pcontext)
+ {
+@@ -120,4 +132,7 @@
+    pscreen->resource_from_handle = nvc0_resource_from_handle;
+    pscreen->resource_get_handle = u_resource_get_handle_vtbl;
+    pscreen->resource_destroy = u_resource_destroy_vtbl;
++#ifdef __SWITCH__
++   pscreen->resource_from_user_memory = nvc0_resource_from_user_memory;
++#endif
+ }
+--- a/src/gallium/drivers/nouveau/nvc0/nvc0_screen.c
++++ b/src/gallium/drivers/nouveau/nvc0/nvc0_screen.c
+@@ -296,7 +296,13 @@
+    case PIPE_CAP_DRAW_INFO_START_WITH_USER_INDICES:
+       return 1;
+    case PIPE_CAP_PREFER_BLIT_BASED_TEXTURE_TRANSFER:
++#ifdef __SWITCH__
++      /* Wine-NX: the Switch has no VRAM domain, but its CPU path maps staging
++       * buffers uncached, so GPU copies beat CPU ones all the same. */
++      return 1;
++#else
+       return nouveau_screen(pscreen)->vram_domain & NOUVEAU_BO_VRAM ? 1 : 0;
++#endif
+    case PIPE_CAP_FBFETCH:
+       return class_3d >= NVE4_3D_CLASS ? 1 : 0; /* needs testing on fermi */
+    case PIPE_CAP_SEAMLESS_CUBE_MAP_PER_TEXTURE:
+@@ -324,6 +330,13 @@
+    case PIPE_CAP_INT64_DIVMOD:
+       return screen->prefer_nir ? 1 : 0;
+ 
++#ifdef __SWITCH__
++   /* Wine-NX: GL_AMD_pinned_memory gives 32-bit Windows programs persistent
++    * buffer mappings (nouveau_buffer_create_from_user). */
++   case PIPE_CAP_RESOURCE_FROM_USER_MEMORY:
++      return 1;
++#endif
++
+    /* unsupported caps */
+    case PIPE_CAP_DEPTH_CLIP_DISABLE_SEPARATE:
+    case PIPE_CAP_TGSI_FS_COORD_ORIGIN_LOWER_LEFT:
+@@ -336,7 +349,9 @@
+    case PIPE_CAP_FAKE_SW_MSAA:
+    case PIPE_CAP_TGSI_VS_WINDOW_SPACE_POSITION:
+    case PIPE_CAP_VERTEXID_NOBASE:
++#ifndef __SWITCH__
+    case PIPE_CAP_RESOURCE_FROM_USER_MEMORY:
++#endif
+    case PIPE_CAP_TGSI_FS_POSITION_IS_SYSVAL:
+    case PIPE_CAP_TGSI_FS_POINT_IS_SYSVAL:
+    case PIPE_CAP_GENERATE_MIPMAP:
+--- a/src/gallium/drivers/nouveau/nvc0/nvc0_transfer.c
++++ b/src/gallium/drivers/nouveau/nvc0/nvc0_transfer.c
+@@ -342,14 +342,31 @@
+    nouveau_bufctx_reset(bctx, 0);
+ }
+ 
++
++#ifdef __SWITCH__
++#include "util/os_time.h"
++
++/* Texture transfers mapped in place and through a staging buffer, and the time
++ * in-place maps wait for the GPU, for the Wine-NX runtime's [PROGRESS] line. */
++unsigned int wine_nx_nouveau_tex_direct, wine_nx_nouveau_tex_staging;
++uint64_t wine_nx_nouveau_tex_sync_ns;
++#endif
+ 
+ static inline bool
+ nvc0_mt_transfer_can_map_directly(struct nv50_miptree *mt)
+ {
+    if (mt->base.domain == NOUVEAU_BO_VRAM)
+       return false;
++#ifdef __SWITCH__
++   /* The Switch's GPU uses system memory, so single-sample textures are mapped
++    * in place. A staging buffer would cost every transfer a GPU allocation, a
++    * copy on the GPU and a free (40 ms for a 1280x720 glTexSubImage2D). */
++   if (mt->base.base.nr_samples > 1)
++      return false;
++#else
+    if (mt->base.base.usage != PIPE_USAGE_STAGING)
+       return false;
++#endif
+    return !nouveau_bo_memtype(mt->base.bo);
+ }
+ 
+@@ -383,9 +400,15 @@
+    unsigned flags = 0;
+ 
+    if (nvc0_mt_transfer_can_map_directly(mt)) {
++#ifdef __SWITCH__
++      int64_t wine_nx_start = os_time_get_nano();
++#endif
+       ret = !nvc0_mt_sync(nvc0, mt, usage);
+       if (!ret)
+          ret = nouveau_bo_map(mt->base.bo, 0, NULL);
++#ifdef __SWITCH__
++      wine_nx_nouveau_tex_sync_ns += os_time_get_nano() - wine_nx_start;
++#endif
+       if (ret &&
+           (usage & PIPE_TRANSFER_MAP_DIRECTLY))
+          return NULL;
+@@ -415,6 +438,9 @@
+    tx->nlayers = box->depth;
+ 
+    if (usage & PIPE_TRANSFER_MAP_DIRECTLY) {
++#ifdef __SWITCH__
++      wine_nx_nouveau_tex_direct++;
++#endif
+       tx->base.stride = mt->level[level].pitch;
+       tx->base.layer_stride = mt->layer_stride;
+       uint32_t offset = box->y * tx->base.stride +
+@@ -434,6 +460,9 @@
+ 
+    size = tx->base.layer_stride;
+ 
++#ifdef __SWITCH__
++   wine_nx_nouveau_tex_staging++;
++#endif
+    ret = nouveau_bo_new(dev, NOUVEAU_BO_GART | NOUVEAU_BO_MAP, 0,
+                         size * tx->nlayers, NULL, &tx->rect[1].bo);
+    if (ret) {
