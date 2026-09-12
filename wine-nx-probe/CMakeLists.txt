@@ -363,6 +363,7 @@ add_library(wine-win32u-real OBJECT
     ../dlls/win32u/window.c
     ../dlls/win32u/winstation.c
     ../dlls/win32u/winnx_drv.c
+    ../dlls/win32u/winnx_opengl.c
     # dibdrv: the software DIB rasterizer — the actual pixel engine that draws
     # into memory bitmaps / window surfaces. Core of the software window path.
     ../dlls/win32u/dibdrv/bitblt.c
@@ -376,6 +377,7 @@ target_compile_definitions(wine-win32u-real PRIVATE
     ${WINE_SWITCH_NTDLL_DEFS}
     HAVE_FT2BUILD_H=1
     SONAME_LIBFREETYPE="libfreetype.a"
+    SONAME_LIBEGL="libEGL.a"
 )
 
 target_compile_options(wine-win32u-real PRIVATE
@@ -388,6 +390,35 @@ target_compile_options(wine-win32u-real PRIVATE
 )
 
 target_include_directories(wine-win32u-real PRIVATE ${WINE_SWITCH_WIN32U_INCLUDES})
+
+# opengl32's unix side: wgl and the GL thunks over win32u's EGL functions, with
+# its unixlib tables renamed for virtual.c's static table lookup.
+add_library(wine-opengl32-unix-real OBJECT
+    ../dlls/opengl32/unix_thunks.c
+    ../dlls/opengl32/unix_wgl.c
+    source/opengl32_unix.c
+)
+
+target_compile_definitions(wine-opengl32-unix-real PRIVATE
+    ${WINE_SWITCH_NTDLL_DEFS}
+    _OPENGL32_
+    __wine_unix_call_funcs=wine_nx_opengl32_unix_funcs
+    __wine_unix_call_wow64_funcs=wine_nx_opengl32_wow64_unix_funcs
+)
+
+target_compile_options(wine-opengl32-unix-real PRIVATE
+    -std=gnu11
+    -Wall
+    -Wextra
+    -Werror=implicit-function-declaration
+    -ffunction-sections
+    -fdata-sections
+)
+
+target_include_directories(wine-opengl32-unix-real PRIVATE
+    ${WINE_SWITCH_WIN32U_INCLUDES}
+    "${CMAKE_CURRENT_SOURCE_DIR}/../dlls/opengl32"
+)
 
 add_executable(wine-nx-probe
     source/main.cpp
@@ -587,6 +618,7 @@ add_executable(wine-nx-runtime
     $<TARGET_OBJECTS:wine-cdrom-real>
     $<TARGET_OBJECTS:wine-tape-real>
     $<TARGET_OBJECTS:wine-win32u-real>
+    $<TARGET_OBJECTS:wine-opengl32-unix-real>
 )
 
 set_target_properties(wine-nx-runtime PROPERTIES SUFFIX ".elf")
@@ -631,8 +663,23 @@ find_library(SWITCH_HARFBUZZ harfbuzz HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib
 find_library(SWITCH_PNG png HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_BZ2 bz2 HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_Z z HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+# devkitPro's Mesa for OpenGL through EGL on the GPU (nouveau over nvservices);
+# its nouveau compiler is C++.
+find_library(SWITCH_EGL EGL HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+find_library(SWITCH_GLAPI glapi HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+find_library(SWITCH_DRM_NOUVEAU drm_nouveau HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+# build-switch-mesa.sh builds switch-mesa with Wine-NX's nouveau changes; this
+# links it instead of devkitPro's package.
+set(WINE_NX_MESA_LIB_DIR "" CACHE PATH "Folder with libEGL.a, libglapi.a and libdrm_nouveau.a from build-switch-mesa.sh")
+if(WINE_NX_MESA_LIB_DIR)
+    set(SWITCH_EGL "${WINE_NX_MESA_LIB_DIR}/libEGL.a")
+    set(SWITCH_GLAPI "${WINE_NX_MESA_LIB_DIR}/libglapi.a")
+    # Its libdrm_nouveau maps application memory for GL_AMD_pinned_memory.
+    set(SWITCH_DRM_NOUVEAU "${WINE_NX_MESA_LIB_DIR}/libdrm_nouveau.a")
+endif()
 target_link_libraries(wine-nx-runtime PRIVATE
-    ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_HARFBUZZ} nx m)
+    ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_HARFBUZZ}
+    ${SWITCH_EGL} ${SWITCH_GLAPI} ${SWITCH_DRM_NOUVEAU} stdc++ nx m)
 
 find_program(NACPTOOL nacptool HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")
 find_program(ELF2NRO elf2nro HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")

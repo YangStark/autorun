@@ -1029,12 +1029,14 @@ static void load_display_driver(void)
             extern BOOL wine_nx_drv_SetCursorPos( INT, INT );
             extern void wine_nx_drv_SetCursor( HWND, HCURSOR );
             extern UINT wine_nx_drv_UpdateDisplayDevices( const struct gdi_device_manager *, void * );
+            extern UINT wine_nx_drv_OpenGLInit( UINT, const struct opengl_funcs *, const struct opengl_driver_funcs ** );
             null_user_driver.pCreateWindow         = wine_nx_drv_CreateWindow;
             null_user_driver.pCreateWindowSurface  = wine_nx_drv_CreateWindowSurface;
             null_user_driver.pWindowPosChanged     = wine_nx_drv_WindowPosChanged;
             null_user_driver.pProcessEvents        = wine_nx_drv_ProcessEvents;
             null_user_driver.pSetCursorPos         = wine_nx_drv_SetCursorPos;
             null_user_driver.pSetCursor            = wine_nx_drv_SetCursor;
+            null_user_driver.pOpenGLInit           = wine_nx_drv_OpenGLInit;
             /* NB: pUpdateDisplayDevices is intentionally NOT overridden — the
              * device-manager + registry enumeration path crashes on the
              * Switch's minimal registry. The virtual screen size is forced

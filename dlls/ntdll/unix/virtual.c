@@ -1051,6 +1051,7 @@ static void load_steam_overlay(const char *unix_lib_path)
 extern const unixlib_entry_t wine_nx_ws2_32_unix_funcs[];
 extern const unixlib_entry_t wine_nx_crypt32_unix_funcs[];
 extern const unixlib_entry_t wine_nx_win32u_unix_funcs[];
+extern const unixlib_entry_t wine_nx_opengl32_unix_funcs[];
 #ifdef WINE_NX_BOX64_INTERPRETER
 extern const unixlib_entry_t wine_nx_winebox64_unix_funcs[];
 #endif
@@ -1067,6 +1068,7 @@ static const struct
     { {'w','s','2','_','3','2','.','d','l','l',0}, wine_nx_ws2_32_unix_funcs },
     { {'c','r','y','p','t','3','2','.','d','l','l',0}, wine_nx_crypt32_unix_funcs },
     { {'w','i','n','3','2','u','.','d','l','l',0}, wine_nx_win32u_unix_funcs },
+    { {'o','p','e','n','g','l','3','2','.','d','l','l',0}, wine_nx_opengl32_unix_funcs },
 };
 
 /* Tables for 32-bit DLLs under WoW64 (see ws2_32_unix_stub.c). Those modules
@@ -1094,6 +1096,18 @@ static const struct
 /* The x86 unix call gate passes on whatever handle a 32-bit DLL presents, so
  * only these tables are called, and only below their sizes. Returns
  * STATUS_INVALID_HANDLE for any other handle. */
+/* Time in each opengl32 unix function called from x86 code, for the runtime's
+ * [PROGRESS] line: which GL calls a slow OpenGL program spends its time in. */
+extern unsigned long long horizon_interrupt_time(void);
+struct wine_nx_gl_profile_entry
+{
+    unsigned long long time;  /* 100 ns */
+    unsigned int calls;
+};
+static struct wine_nx_gl_profile_entry wine_nx_gl_profile_entries[4096];
+unsigned int wine_nx_gl_calls;
+unsigned long long wine_nx_gl_call_time;  /* 100 ns */
+
 NTSTATUS wine_nx_call_static_wow64_unix( unixlib_handle_t handle, ULONG code, void *args )
 {
     unsigned int i;
@@ -1102,9 +1116,57 @@ NTSTATUS wine_nx_call_static_wow64_unix( unixlib_handle_t handle, ULONG code, vo
     {
         if (handle != (UINT_PTR)wine_nx_static_wow64_unix_libs[i].funcs) continue;
         if (code >= *wine_nx_static_wow64_unix_libs[i].count) return STATUS_INVALID_PARAMETER;
+        if (wine_nx_static_wow64_unix_libs[i].funcs == wine_nx_opengl32_wow64_unix_funcs &&
+            code < ARRAY_SIZE(wine_nx_gl_profile_entries))
+        {
+            unsigned long long start = horizon_interrupt_time(), time;
+            NTSTATUS status = wine_nx_static_wow64_unix_libs[i].funcs[code]( args );
+
+            time = horizon_interrupt_time() - start;
+            __atomic_add_fetch( &wine_nx_gl_profile_entries[code].time, time, __ATOMIC_RELAXED );
+            __atomic_add_fetch( &wine_nx_gl_profile_entries[code].calls, 1, __ATOMIC_RELAXED );
+            __atomic_add_fetch( &wine_nx_gl_call_time, time, __ATOMIC_RELAXED );
+            __atomic_add_fetch( &wine_nx_gl_calls, 1, __ATOMIC_RELAXED );
+            return status;
+        }
         return wine_nx_static_wow64_unix_libs[i].funcs[code]( args );
     }
     return STATUS_INVALID_HANDLE;
+}
+
+/* The four opengl32 unix functions (enum unix_funcs codes) that took the most
+ * time since the previous call, as " gl_top=code:ms/calls,...". */
+void wine_nx_gl_profile( char *buffer, size_t size )
+{
+    static struct wine_nx_gl_profile_entry last[ARRAY_SIZE(wine_nx_gl_profile_entries)];
+    unsigned long long top_time[4] = {0};
+    unsigned int top_code[4] = {0}, top_calls[4] = {0}, i, j;
+    size_t len;
+
+    for (i = 0; i < ARRAY_SIZE(last); i++)
+    {
+        struct wine_nx_gl_profile_entry now = wine_nx_gl_profile_entries[i];
+        unsigned long long time = now.time - last[i].time;
+        unsigned int calls = now.calls - last[i].calls;
+
+        last[i] = now;
+        for (j = 0; j < 4; j++)
+        {
+            if (time <= top_time[j]) continue;
+            memmove( top_time + j + 1, top_time + j, (3 - j) * sizeof(*top_time) );
+            memmove( top_code + j + 1, top_code + j, (3 - j) * sizeof(*top_code) );
+            memmove( top_calls + j + 1, top_calls + j, (3 - j) * sizeof(*top_calls) );
+            top_time[j] = time;
+            top_code[j] = i;
+            top_calls[j] = calls;
+            break;
+        }
+    }
+    len = snprintf( buffer, size, " gl_top=" );
+    for (j = 0; j < 4 && top_time[j] && len < size; j++)
+        len += snprintf( buffer + len, size - len, "%s%u:%llu/%u", j ? "," : "", top_code[j],
+                         top_time[j] / 10000, top_calls[j] );
+    if (!top_time[0]) buffer[0] = 0;
 }
 
 static const char *wine_nx_module_export_name( void *module )

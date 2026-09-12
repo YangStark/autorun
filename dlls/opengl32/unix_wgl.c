@@ -25,6 +25,7 @@
 #include "config.h"
 
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
 
@@ -1557,6 +1558,73 @@ static void fs_hack_setup_gamma_shader( struct wgl_context *ctx, const struct op
     funcs->p_glUseProgram( prev_program );
 }
 
+#ifdef __SWITCH__
+/* 1 once GL_AMD_pinned_memory mapped a 32-bit page for the GPU, -1 when it
+ * refused one and persistent maps stay hidden; reported by [PROGRESS]. */
+int wine_nx_gl_pinned_memory;
+/* Also reported by [PROGRESS]: bytes copied between GL buffer mappings above
+ * 4 GB and their 32-bit copies, and persistent mappings refused. */
+unsigned long long wine_nx_gl_copy_bytes;
+unsigned int wine_nx_gl_persistent_failures;
+
+/* The driver fills in the table at startup with what it resolved then; Wine
+ * resolves the rest when a program first asks for one (wrap_wglGetProcAddress),
+ * so a slot being NULL here does not mean the driver lacks the function. */
+#define NX_GL_PROC( funcs, func ) \
+    ((funcs)->p_##func ? (void *)(funcs)->p_##func : (void *)(funcs)->p_wglGetProcAddress( #func ))
+
+extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+
+/* The Switch's Mesa pins pages through nvservices, which could refuse the pages
+ * Wine allocates for 32-bit programs: try one before exposing persistent maps. */
+static BOOL pinned_memory_works( const struct opengl_funcs *funcs )
+{
+    PFN_glDeleteBuffers delete_buffers = NX_GL_PROC( funcs, glDeleteBuffers );
+    PFN_glGenBuffers gen_buffers = NX_GL_PROC( funcs, glGenBuffers );
+    PFN_glBindBuffer bind_buffer = NX_GL_PROC( funcs, glBindBuffer );
+    PFN_glBufferData buffer_data = NX_GL_PROC( funcs, glBufferData );
+    SIZE_T size = 0x1000;
+    void *ptr = NULL;
+    char message[128];
+    GLenum error;
+    GLuint name;
+    int i;
+
+    if (wine_nx_gl_pinned_memory) return wine_nx_gl_pinned_memory > 0;
+
+    if (!gen_buffers || !bind_buffer || !buffer_data || !delete_buffers || !funcs->p_glGetError)
+    {
+        ERR( "no pinned memory: glGenBuffers %p, glBindBuffer %p, glBufferData %p, glDeleteBuffers %p\n",
+             gen_buffers, bind_buffer, buffer_data, delete_buffers );
+        wine_nx_gl_pinned_memory = -2;  /* the driver is missing buffer functions */
+        return FALSE;
+    }
+    if (NtAllocateVirtualMemory( GetCurrentProcess(), &ptr, zero_bits, &size, MEM_COMMIT, PAGE_READWRITE ))
+        return FALSE;
+
+    for (i = 0; i < 16 && funcs->p_glGetError(); i++) continue;
+    gen_buffers( 1, &name );
+    bind_buffer( GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, name );
+    buffer_data( GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, size, ptr, GL_DYNAMIC_COPY );
+    error = funcs->p_glGetError();
+    bind_buffer( GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, 0 );
+    delete_buffers( 1, &name );
+
+    /* The page goes back only once the buffer that maps it is gone. */
+    size = 0;
+    NtFreeVirtualMemory( GetCurrentProcess(), &ptr, &size, MEM_RELEASE );
+    wine_nx_gl_pinned_memory = error == GL_NO_ERROR ? 1 : -1;
+    if (error) ERR( "GL_AMD_pinned_memory refused a 32-bit page, error %#x\n", error );
+    if (&wine_nx_runtime_trace)
+    {
+        snprintf( message, sizeof(message), "[NXGL] pinned memory %s (error %#x)",
+                  error ? "refused" : "works", error );
+        wine_nx_runtime_trace( message );
+    }
+    return error == GL_NO_ERROR;
+}
+#endif
+
 static void make_context_current( TEB *teb, const struct opengl_funcs *funcs, HDC draw_hdc, HDC read_hdc,
                                   HGLRC hglrc, struct context *ctx )
 {
@@ -1659,7 +1727,12 @@ static void make_context_current( TEB *teb, const struct opengl_funcs *funcs, HD
     ctx->extension_count = count;
 
     if (is_win64 && ctx->buffers && !initialize_vk_device( teb, ctx )
+#ifdef __SWITCH__
+        && !(ctx->use_pinned_memory = is_extension_supported( ctx, "GL_AMD_pinned_memory" )
+                                      && pinned_memory_works( funcs )))
+#else
         && !(ctx->use_pinned_memory = is_extension_supported( ctx, "GL_AMD_pinned_memory" )))
+#endif
     {
         if (ctx->major_version > 4 || (ctx->major_version == 4 && ctx->minor_version > 3))
         {
@@ -2932,6 +3005,20 @@ static struct buffer *create_buffer_storage( TEB *teb, GLenum target, GLuint nam
          * to support it. */
         funcs->p_glBindBuffer( GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, buffer_name );
         funcs->p_glBufferData( GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, size, buffer->vm_ptr, GL_DYNAMIC_COPY );
+#ifdef __SWITCH__
+        {
+            /* The driver can still refuse pages it accepted for the smaller probe
+             * (pinned_memory_works): the buffer would then be one the GPU cannot
+             * see, so say so in the log instead of drawing nothing. */
+            GLenum error = funcs->p_glGetError();
+
+            if (error != GL_NO_ERROR)
+            {
+                ERR( "pinning %zu bytes at %p failed, error %#x\n", size, buffer->vm_ptr, error );
+                __atomic_add_fetch( &wine_nx_gl_persistent_failures, 1, __ATOMIC_RELAXED );
+            }
+        }
+#endif
         rb_put( &ctx->buffers->map, &buffer->name, &buffer->entry );
         TRACE( "created buffer %p with pinned memory %p\n", buffer, buffer->vm_ptr );
         return buffer;
@@ -3077,6 +3164,9 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
     if (access & GL_MAP_PERSISTENT_BIT)
     {
         FIXME( "GL_MAP_PERSISTENT_BIT not supported!\n" );
+#ifdef __SWITCH__
+        __atomic_add_fetch( &wine_nx_gl_persistent_failures, 1, __ATOMIC_RELAXED );
+#endif
         goto unmap;
     }
 
@@ -3092,6 +3182,9 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
         TRACE( "Copying %#zx from buffer at %p to wow64 buffer %p\n", length, buffer->host_ptr,
                buffer->map_ptr );
         memcpy( buffer->map_ptr, buffer->host_ptr, length );
+#ifdef __SWITCH__
+        __atomic_add_fetch( &wine_nx_gl_copy_bytes, length, __ATOMIC_RELAXED );
+#endif
     }
     TRACE( "returning copy buffer %p\n", buffer->map_ptr );
     return buffer->map_ptr;
@@ -3330,6 +3423,9 @@ static BOOL wow64_unmap_buffer( TEB *teb, struct buffer *buffer )
         TRACE( "Copying %#zx from wow64 buffer %p to buffer %p\n", buffer->copy_length,
                buffer->map_ptr, buffer->host_ptr );
         memcpy( buffer->host_ptr, buffer->map_ptr, buffer->copy_length );
+#ifdef __SWITCH__
+        __atomic_add_fetch( &wine_nx_gl_copy_bytes, buffer->copy_length, __ATOMIC_RELAXED );
+#endif
         buffer->copy_length = 0;
     }
 

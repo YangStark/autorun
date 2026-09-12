@@ -1391,11 +1391,27 @@ static const struct opengl_driver_funcs egldrv_funcs =
     .p_make_current = egldrv_make_current,
 };
 
+#ifdef __SWITCH__
+/* devkitPro's Mesa (libEGL, glapi and drm_nouveau) is linked into the Switch
+ * runtime, which has no dynamic linker. */
+extern __eglMustCastToProperFunctionPointerType eglGetProcAddress( const char *procname );
+extern const char *eglQueryString( EGLDisplay dpy, EGLint name );
+#endif
+
 static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
 {
     struct opengl_funcs *funcs = &display_funcs;
     const char *extensions, *env;
 
+#ifdef __SWITCH__
+    /* EGL is the only OpenGL on the Switch, so it does not wait for WINE_USE_EGL. */
+    static int static_egl;
+
+    (void)env;
+    funcs->egl_handle = &static_egl;
+    funcs->p_eglGetProcAddress = eglGetProcAddress;
+    funcs->p_eglQueryString = eglQueryString;
+#else
     if (!(env = getenv( "WINE_USE_EGL" )) || !atoi( env ))
     {
         WARN( "EGL support is disabled.\n" );
@@ -1417,6 +1433,7 @@ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
     LOAD_FUNCPTR( eglGetProcAddress );
     LOAD_FUNCPTR( eglQueryString );
 #undef LOAD_FUNCPTR
+#endif
 
     if (!(extensions = funcs->p_eglQueryString( EGL_NO_DISPLAY, EGL_EXTENSIONS )))
     {
@@ -1449,7 +1466,9 @@ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
     return TRUE;
 
 failed:
+#ifndef __SWITCH__
     dlclose( funcs->egl_handle );
+#endif
     funcs->egl_handle = NULL;
     return FALSE;
 }
