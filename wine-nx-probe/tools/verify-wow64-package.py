@@ -108,6 +108,23 @@ elif target == "sdmc:/switch/wine/drive_c/pe32-audio.exe":
     driver = stage / "drive_c/windows/syswow64/winenxaudio.drv"
     assert "Name: WineNXAudioDriver" in inspect(driver, "--coff-exports")
     assert b"winenxaudio.drv\0" in driver.read_bytes(), "Static unixlib lookup requires the module name"
+elif target == "sdmc:/switch/wine/drive_c/pe32-opengl.exe":
+    opengl = stage / "drive_c/pe32-opengl.exe"
+    info = inspect(opengl, "--coff-imports")
+    assert "Arch: i386\n" in info and "Type: HIGHLOW" in inspect(opengl, "--coff-basereloc")
+    for symbol in ("wglCreateContext", "wglMakeCurrent", "glClear", "glReadPixels", "SetPixelFormat",
+                   "SwapBuffers", "NtDisplayString"):
+        assert f"Symbol: {symbol} " in info, symbol
+    deps = re.findall(r"^Import \{\n  Name: (.+)$", info, re.M)
+    assert all(dep.lower() in syswow64 for dep in deps), deps
+elif target == "sdmc:/switch/wine/drive_c/openttd/openttd.exe":
+    game = stage / "drive_c/openttd"
+    info = inspect(game / "openttd.exe", "--coff-imports")
+    assert "Arch: i386\n" in info
+    deps = re.findall(r"^Import \{\n  Name: (.+)$", info, re.M)
+    assert deps and all(dep.lower() in syswow64 for dep in deps), deps
+    assert list((game / "baseset").rglob("opengfx.obg")), "OpenGFX is missing"
+    assert (game / "openttd.args.txt").read_text().startswith("-v "), "OpenTTD needs a video driver"
 else:
     assert target == "sdmc:/switch/wine/drive_c/7zr.exe"
     assert (stage / "args.txt").read_text().strip().lower() == "c:\\7zr.exe b 1 -mmt2 -md18"

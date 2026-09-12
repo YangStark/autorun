@@ -33,10 +33,11 @@ OPENTTD_SHA256 = '3f092edc8f381c3d2d3a59458703899da6f876345b3850a3c76c0dffe68f0e
 OPENGFX_SHA256 = '43a0c1dabf39cb865394f3a6cc36d4da5c10ecfaaf55652043104806810903be'
 OPENSFX_SHA256 = 'e0a218b7dd9438e701503b0f84c25a97c1c11b7c2f025323fb19d6db16ef3759'
 OPENMSX_SHA256 = '92e293ae89f13ad679f43185e83fb81fb8cad47fe63f4af3d3d9f955130460f5'
-# GDI video without a drawing thread, sound effects through the win32 (winmm) sound driver, no
-# music, the Switch's screen size, and the configuration next to the game. -s and -m name drivers;
-# OpenTTD picks the OpenSFX base set it finds by itself.
-ARGUMENTS = r'-v win32:no_threads -s win32 -m null -r 1280x720 -c C:\openttd\openttd.cfg'
+# OpenGL video (Mesa on the Switch GPU) without a drawing thread, sound effects through the win32
+# (winmm) sound driver, no music, the Switch's screen size, and the configuration next to the game.
+# -v, -s and -m name drivers; OpenTTD picks the OpenSFX base set it finds by itself. Changing the
+# video driver to win32 in openttd.args.txt goes back to the GDI path.
+ARGUMENTS = r'-v win32-opengl:no_threads -s win32 -m null -r 1280x720 -c C:\openttd\openttd.cfg'
 
 for path, digest in ((openttd_zip, OPENTTD_SHA256), (opengfx_zip, OPENGFX_SHA256), (opensfx_zip, OPENSFX_SHA256), (openmsx_zip, OPENMSX_SHA256)):
     assert path.is_file(), f'Missing input: {path}'
@@ -114,10 +115,11 @@ while queue:
 readme = (stage / 'README.txt').read_text()
 (stage / 'README.txt').write_text(readme + '''
 OpenTTD 15.3 (32-bit, with OpenGFX 8.0 and OpenSFX 1.0.3) is in C:\\openttd. Choose
-C:\\openttd\\openttd.exe in the menu. openttd.args.txt next to it selects GDI video without a
-drawing thread, sound effects through the win32 sound driver, no music, a 1280x720 window and
-C:\\openttd\\openttd.cfg (sprite font). Networking
-and OpenGL are unavailable: their DLLs load, but report every call as unsupported.
+C:\\openttd\\openttd.exe in the menu. openttd.args.txt next to it selects OpenGL video
+without a drawing thread, sound effects through the win32 sound driver, no music, a 1280x720 window
+and C:\\openttd\\openttd.cfg (sprite font). OpenGL runs on the Switch GPU through Mesa; putting
+-v win32:no_threads in that file goes back to GDI drawing. Networking is unavailable: its DLLs load,
+but report every call as unsupported.
 Expected first milestone: the OpenTTD main menu with the title game running behind it.
 ''')
 
@@ -131,7 +133,7 @@ assert 'cryptbase.dll' in staged, 'advapi32 forwards SystemFunction036 to cryptb
 assert list((game / 'baseset').rglob('opengfx.obg')), 'OpenGFX is missing'
 assert (game / 'lang/english.lng').is_file()
 
-archive = build / 'wine-nx-openttd-dynarec-33.zip'
+archive = build / 'wine-nx-openttd-dynarec-41.zip'
 with ZipFile(archive, 'w', ZIP_DEFLATED) as z:
     for f in sorted(stage.rglob('*')):
         if f.is_file() and f.name != '.DS_Store' and f.suffix != '.log':
