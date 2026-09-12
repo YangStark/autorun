@@ -75,15 +75,15 @@ Choose C:\\pe32-audio.exe in the launcher. Expected: a quiet half-second tone
 on the left followed by a half-second tone on the right, then [AUDIO TEST]
 PASS with process exit 42. API completion alone does not prove audible output.
 
-Initial scope: one render client, stereo 48 kHz 16-bit PCM, event callbacks,
-volume, stop and reset. Other app formats depend on Wine's shared-mode
-conversion. No microphone, MIDI synthesis or multi-client mixing yet.
-Registry changes are held only for this launch, with boot registration of the
-audio driver and MMDeviceEnumerator. No existing user registry is persisted.
+Scope: one render client with stereo 48 kHz 16-bit output, event callbacks,
+volume, stop and reset. Mono or stereo PCM of 8 to 32 bits and float input are
+converted, and other rates such as 44.1 kHz are resampled to 48 kHz. No
+microphone, MIDI synthesis or multi-client mixing yet. The audio driver and
+MMDeviceEnumerator are registered at startup, and registry changes are saved
+to system.reg and user.reg in sdmc:/switch/wine.
 
-OpenTTD's existing -s null -m null arguments disable sound and music. Leave
-them until the playback probe passes; then use -s win32 to try sound effects.
-This package does not change OpenTTD's arguments or supply a sound base set.
+OpenTTD plays sound effects with -s win32 -m null, which the OpenTTD package
+selects, with the OpenSFX base set.
 ''')
 subprocess.run([sys.executable, str(probe / 'tools/verify-wow64-package.py'), str(stage)], check=True)
 archive = build / 'wine-nx-audio-dynarec-34.zip'

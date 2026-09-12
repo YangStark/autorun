@@ -9,14 +9,14 @@
 
 /* The registry of the in-process Horizon server, following server/registry.c:
  * keys under \Registry with sorted subkeys and values, symbolic links, change
- * notifications, and the "WINE REGISTRY Version 2" text of system.reg and
- * user.reg for the initial contents. Nothing is saved; the registry lasts as
- * long as the process. As in Wine, creating a key creates only the last
- * element of its path. WoW64 redirection needs Wow6432Node keys, which the
- * packaged registry does not have, so the tree has a single view. Names are
- * UTF-16 with lengths in bytes and compare without ASCII case (Wine folds all
- * of Unicode). Callers hold the server lock; nothing here performs I/O, so
- * the host tests include this header directly. */
+ * notifications, and parsing the "WINE REGISTRY Version 2" text of system.reg
+ * and user.reg. horizon_registry_server.h loads those files at the first
+ * request and writes them back after each change. As in Wine, creating a key
+ * creates only the last element of its path. WoW64 redirection needs
+ * Wow6432Node keys, which the server does not create, so the tree has a single
+ * view. Names are UTF-16 with lengths in bytes and compare without ASCII case
+ * (Wine folds all of Unicode). Callers hold the server lock; nothing here
+ * performs I/O, so the host tests include this header directly. */
 
 #define HORIZON_REG_SUCCESS                0x00000000u
 #define HORIZON_REG_NAME_EXISTS            0x40000000u
