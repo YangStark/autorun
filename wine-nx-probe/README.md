@@ -1,5 +1,94 @@
 # Wine-NX Probe And Runtime
 
+`nx-wow64-dynarec-33` removes OpenTTD's second cursor. On build-32 hardware,
+OpenTTD loaded almost instantly, but the runtime's arrow was drawn over the
+cursor OpenTTD draws itself.
+- Wine tells the display driver about cursor changes with `WM_WINE_SETCURSOR`,
+  a hardware message the server queues when the visible cursor changes. The
+  Horizon server does not queue it, and the Switch driver had no `SetCursor`
+  callback, so the arrow was drawn in every frame.
+- The driver now reads the cursor handle and show count from the shared input
+  state (`get_shared_input`) each time it polls input. The arrow is hidden
+  while the show count is negative, or when a program that had set a cursor
+  sets none. Before any program sets a cursor, the arrow is shown.
+- `wine_nx_cursor_show` stops drawing the arrow and presents the change;
+  cursor-only frames are skipped while it is hidden. `SetCursor` is plugged in
+  for a server that queues the message.
+- `tests/check_pointer_events.py` covers no cursor yet, a class cursor,
+  `SetCursor(NULL)`, `ShowCursor(FALSE)`, the callback and an unreadable state.
+
+`nx-wow64-dynarec-32` stops re-checking translated x86 code on every jump.
+Build 31 showed file access was not the cost:
+- By 45 s OpenTTD had made 29,314 reads, 97% served from the new cache, with
+  634 ms spent inside `NtReadFile`. Loading took as long as on build 30.
+- `native_entries` tracked `syscalls` (70,383 and 70,661), so the remaining
+  time was x86 execution between system calls.
+
+The cause:
+- The dynarec build forced every translated block to `always_test`. Box64 then
+  points each block's jump table entry at its `jmpnext` stub instead of its
+  code.
+- So every jump, call or return between blocks went through `native_next`,
+  `LinkNext` and `DBGetBlock`, which hashed the block's x86 bytes before running
+  it. Every iteration of a loop spanning blocks, such as OpenTTD's sprite
+  decoding, paid a C call and a hash.
+- Box64 normally write-protects translated guest pages instead. This port does
+  not, which is why every entry was checked.
+
+The fix:
+- Blocks link directly again. `cmake/Box64Core.cmake` no longer forces
+  `always_test`. It records the largest block size and counts hash validations
+  (`block_tests`).
+- winebox64 exports `BTCpuNotifyMemoryFree`, `BTCpuNotifyUnmapViewOfSection`,
+  `BTCpuNotifyMemoryProtect`, `BTCpuFlushInstructionCache2` and
+  `BTCpuFlushInstructionCacheHeavy`.
+- Through a new unix call (winebox64 ABI 3), they reach
+  `wine_nx_box64_invalidate`. It frees the blocks in freed or unmapped memory,
+  and marks those in re-protected or flushed memory so their next entry checks
+  the hash. It walks the jump table from the largest block size before the
+  range, skipping unused table levels.
+- Code that a program changes without such a report keeps its old translation.
+- `[PROGRESS]` adds `block_tests`.
+
+Tests:
+- In `tests/box64_execution.c`, a loop that calls into another block 5,000
+  times makes fewer than 50 block validations.
+- Code rewritten at a reused address and reported runs the new code, and so does
+  code written after its blocks were freed. The existing tests now report the
+  code they rewrite.
+- `tests/wow64_box64_unix.c` checks the new call's version, size, address limit
+  and arguments.
+
+`nx-wow64-dynarec-31` caches reads from the SD card. On build 30, OpenTTD's
+white screen lasted about 70 seconds, 40 of them loading graphics: 29,314 reads
+at about 1,000 per second. OpenTTD reads each sprite with a seek and a 4 KB
+read, and libnx sends every `read()` to the FS service as an `fsFileRead`
+request. Horizon has no page cache or file mapping, and libnx has no file data
+cache. Nintendo's SDK keeps one in its fs client library; Atmosphère's
+reimplementation of that path is still a stub. Dolphin's disc readers cache
+aligned blocks the same way.
+- `source/sd_read_cache.h` keeps 8 aligned 128 KB chunks per file, 32 MB in
+  all. A read inside a chunk is a copy, a miss reads the whole chunk in one
+  request, and the least recently used chunk is replaced, as in Dolphin's
+  `SectorReader`. Reads of 64 KB or more go straight to the file.
+- `source/sd_cache.c` installs it in place of libnx's sdmc device before the
+  runtime opens a file, keeping the device index that paths without a device
+  name use. Wine's file calls, image mapping, NLS and fonts all go through it.
+- Only read-only files are cached. Opening a path for writing, renaming,
+  removing or truncating it stops caching of every open file with that path, and
+  a file opened while a writer has its path open is not cached. Files opened
+  before the cache was installed pass through. Data is copied to the caller
+  after the cache lock is released, so a fault on the caller's buffer cannot
+  happen while it is held.
+- `[PROGRESS]` adds `read_ms` (time inside `NtReadFile`), `sd_reads` and
+  `sd_ms` (requests to the FS service and their time), `cache_hits` and
+  `syscalls`. Load time left over, beyond `read_ms`, is x86 execution,
+  translation and other system calls.
+- `tests/sd_read_cache.c` covers OpenTTD's read pattern, the end of a file,
+  least recently used replacement against 20,000 random reads, failed
+  requests, the memory limit and open-file rules.
+Hardware results are pending.
+
 `nx-wow64-dynarec-30` fixes OpenTTD's white screen and idle hang.
 Build 29 hardware showed the same end as build 28: five
 `NtQueryPerformanceCounter` calls, then an `NtDelayExecution` that never
