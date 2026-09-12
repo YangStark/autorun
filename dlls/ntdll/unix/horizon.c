@@ -57,6 +57,7 @@
 #include "horizon_msg_queue.h"
 #include "horizon_win_timers.h"
 #include "horizon_threads.h"
+#include "horizon_registry.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -288,6 +289,17 @@ struct horizon_fd_queue
 #define HORIZON_REQ_MAP_VIEW 67
 #define HORIZON_REQ_MAP_IMAGE_VIEW 68
 #define HORIZON_REQ_UNMAP_VIEW 71
+#define HORIZON_REQ_GET_TOKEN_SID 230
+#define HORIZON_REQ_CREATE_KEY 86
+#define HORIZON_REQ_OPEN_KEY 87
+#define HORIZON_REQ_DELETE_KEY 88
+#define HORIZON_REQ_ENUM_KEY 91
+#define HORIZON_REQ_SET_KEY_VALUE 92
+#define HORIZON_REQ_GET_KEY_VALUE 93
+#define HORIZON_REQ_ENUM_KEY_VALUE 94
+#define HORIZON_REQ_DELETE_KEY_VALUE 95
+#define HORIZON_REQ_SET_REGISTRY_NOTIFICATION 99
+#define HORIZON_REQ_RENAME_KEY 100
 #define HORIZON_REQ_CREATE_TIMER 101
 #define HORIZON_REQ_OPEN_TIMER 102
 #define HORIZON_REQ_SET_TIMER 103
@@ -575,6 +587,7 @@ enum horizon_event_op
 enum horizon_server_object_type
 {
     HORIZON_SERVER_OBJECT_RESERVE = 1,
+    HORIZON_SERVER_OBJECT_REG_KEY,
     HORIZON_SERVER_OBJECT_EVENT,
     HORIZON_SERVER_OBJECT_KEYED_EVENT,
     HORIZON_SERVER_OBJECT_MUTEX,
@@ -602,6 +615,8 @@ struct horizon_server_reply_header
     unsigned int error;
     unsigned int reply_size;
 };
+
+#include "horizon_registry_wire.h"
 
 struct horizon_init_first_thread_request
 {
@@ -2494,6 +2509,7 @@ struct horizon_server_object
     unsigned int desktop_top_window;
     unsigned int desktop_msg_window;
     struct horizon_obj_locator desktop_locator;
+    struct horizon_reg_key *reg_key;
     int std_stream;                 /* 1 stdout, 2 stderr: writes are echoed to the log */
     unsigned int queue_tid;         /* message queue object: its thread, 0 once the thread ended */
 };
@@ -2504,6 +2520,8 @@ struct horizon_server_handle_entry
     struct horizon_server_object *object;
     struct horizon_server_handle_entry *next;
 };
+
+static struct horizon_reg horizon_registry;
 
 static LONG horizon_server_next_handle = 0x100;
 static pthread_mutex_t horizon_server_objects_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -3158,6 +3176,7 @@ static void horizon_server_free_object( struct horizon_server_object *object )
             break;
         }
     }
+    if (object->reg_key) horizon_reg_release( &horizon_registry, object->reg_key );
     if (object->file_fd != -1) close( object->file_fd );
     free( object->file_name );
     free( object->dir_mask );
@@ -3184,6 +3203,8 @@ static unsigned int horizon_server_close_object_handle( unsigned int handle )
         entry = *ptr;
         object = entry->object;
         *ptr = entry->next;
+        if (object && object->reg_key)
+            horizon_reg_handle_closed( &horizon_registry, object->reg_key, handle );
         if (object && object->refs && !--object->refs)
         {
             /* DeleteFileW opens with DELETE_ON_CLOSE, then closes. Defer until
@@ -9463,6 +9484,8 @@ static int horizon_server_handle_unmap_view( struct horizon_server_connection *c
     return horizon_server_write_status( connection->reply_fd, HORIZON_STATUS_SUCCESS );
 }
 
+#include "horizon_registry_server.h"
+
 static int horizon_server_handle_create_event( struct horizon_server_connection *connection,
                                                const unsigned char *message,
                                                const unsigned char *data, unsigned int data_size )
@@ -9992,6 +10015,21 @@ static void *horizon_server_thread( void *param )
 
         switch (header->req)
         {
+        case HORIZON_REQ_GET_TOKEN_SID:
+            status = horizon_server_handle_registry_user( connection, message );
+            break;
+        case HORIZON_REQ_CREATE_KEY:
+        case HORIZON_REQ_OPEN_KEY:
+        case HORIZON_REQ_DELETE_KEY:
+        case HORIZON_REQ_ENUM_KEY:
+        case HORIZON_REQ_SET_KEY_VALUE:
+        case HORIZON_REQ_GET_KEY_VALUE:
+        case HORIZON_REQ_ENUM_KEY_VALUE:
+        case HORIZON_REQ_DELETE_KEY_VALUE:
+        case HORIZON_REQ_SET_REGISTRY_NOTIFICATION:
+        case HORIZON_REQ_RENAME_KEY:
+            status = horizon_server_handle_registry( connection, message, request_data, header->request_size );
+            break;
         case HORIZON_REQ_INIT_FIRST_THREAD:
             status = horizon_server_handle_init_first_thread( connection, message );
             break;
