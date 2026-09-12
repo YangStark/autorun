@@ -15,7 +15,7 @@ def inspect(path, option):
 
 for directory, arch in (("system32", "aarch64"), ("syswow64", "i386")):
     path = stage / "drive_c/windows" / directory
-    modules = {p.name.lower(): p for p in path.glob("*.dll")}
+    modules = {p.name.lower(): p for p in path.iterdir() if p.suffix.lower() in (".dll", ".drv")}
     assert modules, f"No modules in {path}"
     for name, module in modules.items():
         info = inspect(module, "--coff-imports")
@@ -96,6 +96,18 @@ if target == "sdmc:/switch/wine/drive_c/notepad.exe":
     assert (stage / "drive_c/notepad-test.txt").is_file()
     for folder in ("drive_c/windows/fonts", "share/wine/fonts"):
         assert list((stage / folder).glob("*.ttf")), folder
+elif target == "sdmc:/switch/wine/drive_c/pe32-audio.exe":
+    audio = stage / "drive_c/pe32-audio.exe"
+    info = inspect(audio, "--coff-imports")
+    assert "Arch: i386\n" in info and "Type: HIGHLOW" in inspect(audio, "--coff-basereloc")
+    for symbol in ("waveOutOpen", "waveOutWrite", "waveOutReset", "waveOutClose", "NtDisplayString"):
+        assert f"Symbol: {symbol} " in info, symbol
+    deps = re.findall(r"^Import \{\n  Name: (.+)$", info, re.M)
+    assert all(dep.lower() in syswow64 for dep in deps), deps
+    assert {"winmm.dll", "mmdevapi.dll", "avrt.dll"} <= syswow64
+    driver = stage / "drive_c/windows/syswow64/winenxaudio.drv"
+    assert "Name: WineNXAudioDriver" in inspect(driver, "--coff-exports")
+    assert b"winenxaudio.drv\0" in driver.read_bytes(), "Static unixlib lookup requires the module name"
 else:
     assert target == "sdmc:/switch/wine/drive_c/7zr.exe"
     assert (stage / "args.txt").read_text().strip().lower() == "c:\\7zr.exe b 1 -mmt2 -md18"
