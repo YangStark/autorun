@@ -37,6 +37,7 @@ extern int   wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons );
 extern int   wine_nx_pointer_take( int *x, int *y, unsigned int *buttons, unsigned int *pressed,
                                    unsigned int *released );
 extern void  wine_nx_pointer_set_pos( int x, int y );
+extern void  wine_nx_cursor_show( int visible );
 extern void  wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 extern int   wine_nx_runtime_verbose __attribute__((weak));
 
@@ -499,6 +500,36 @@ static void wine_nx_send_mouse( int x, int y, DWORD flags )
     NtUserSendHardwareInput( 0, 0, &input, 0 );
 }
 
+/* Whether to draw the arrow, from the cursor the program set and its show
+ * count. Until a program sets a cursor there is none and the arrow is shown; a
+ * program that later sets none, over a cursor it draws itself, hides it, and
+ * so does a negative show count (ShowCursor). */
+static BOOL wine_nx_cursor_visible_for( HCURSOR cursor, int count, BOOL *seen )
+{
+    if (cursor) *seen = TRUE;
+    return count >= 0 && (cursor || !*seen);
+}
+
+/* Wine tells the display driver about cursor changes with WM_WINE_SETCURSOR,
+ * which the Horizon server does not queue. Read the state instead. */
+static void wine_nx_update_cursor( void )
+{
+    static BOOL seen;
+    struct object_lock lock = OBJECT_LOCK_INIT;
+    const input_shm_t *input_shm;
+    HCURSOR cursor = 0;
+    int count = 0;
+    NTSTATUS status;
+
+    while ((status = get_shared_input( 0, &lock, &input_shm )) == STATUS_PENDING)
+    {
+        cursor = wine_server_ptr_handle( input_shm->cursor );
+        count = input_shm->cursor_count;
+    }
+    if (status) return;
+    wine_nx_cursor_show( wine_nx_cursor_visible_for( cursor, count, &seen ) );
+}
+
 BOOL wine_nx_drv_ProcessEvents( DWORD mask )
 {
     static unsigned int last_buttons;
@@ -519,8 +550,21 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
     if (first) nxdrv_trace( "[NXINPUT] buttons=%x flags=%x,%x x=%d", buttons, first, second, x );
     else if (moved) nxdrv_trace_hot( "[NXINPUT] move x=%d y=%d buttons=%x", x, y, buttons, 0 );
     last_buttons = buttons;
+    wine_nx_update_cursor();
     wine_nx_fb_present();
     return moved || first;
+}
+
+/**********************************************************************
+ *           wine_nx_drv_SetCursor
+ *
+ * For a server that queues WM_WINE_SETCURSOR; the shared state is authoritative.
+ */
+void wine_nx_drv_SetCursor( HWND hwnd, HCURSOR cursor )
+{
+    (void)hwnd;
+    (void)cursor;
+    wine_nx_update_cursor();
 }
 
 /**********************************************************************

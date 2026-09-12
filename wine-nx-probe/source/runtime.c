@@ -199,6 +199,7 @@ int wine_nx_runtime_verbose;
 static struct pointer_cursor wine_nx_cursor =
     { .x = WINE_NX_FB_W / 2, .y = WINE_NX_FB_H / 2, .width = WINE_NX_FB_W, .height = WINE_NX_FB_H };
 static int wine_nx_cursor_moved;
+static int wine_nx_cursor_visible = 1;  /* 0 while the program hides the mouse cursor */
 /* Controller and touchscreen state, guarded by wine_nx_pointer_mutex. */
 static pthread_mutex_t wine_nx_pointer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct pointer_cursor wine_nx_pointer =
@@ -289,9 +290,11 @@ void wine_nx_fb_present(void)
         }
         if (wine_nx_fb_pending_bits)
         {
-            pointer_cursor_paint( &wine_nx_cursor, wine_nx_fb_pending_bits, wine_nx_fb_pending_stride, 1 );
+            if (wine_nx_cursor_visible)
+                pointer_cursor_paint( &wine_nx_cursor, wine_nx_fb_pending_bits, wine_nx_fb_pending_stride, 1 );
             framebufferEnd( &wine_nx_fb );
-            pointer_cursor_paint( &wine_nx_cursor, wine_nx_fb_pending_bits, wine_nx_fb_pending_stride, 0 );
+            if (wine_nx_cursor_visible)
+                pointer_cursor_paint( &wine_nx_cursor, wine_nx_fb_pending_bits, wine_nx_fb_pending_stride, 0 );
             wine_nx_fb_pending_bits = NULL;
             wine_nx_fb_pending_stride = 0;
             wine_nx_fb_pending_dirty = 0;
@@ -309,7 +312,20 @@ static void wine_nx_cursor_move( int x, int y )
     if (x != (int)wine_nx_cursor.x || y != (int)wine_nx_cursor.y)
     {
         pointer_cursor_place( &wine_nx_cursor, x, y );
-        wine_nx_cursor_moved = 1;
+        if (wine_nx_cursor_visible) wine_nx_cursor_moved = 1;
+    }
+    pthread_mutex_unlock( &wine_nx_fb_mutex );
+}
+
+/* The program showed or hid the mouse cursor. Programs that draw their own,
+ * like OpenTTD, hide it; the arrow must not be drawn over theirs. */
+void wine_nx_cursor_show( int visible )
+{
+    pthread_mutex_lock( &wine_nx_fb_mutex );
+    if (wine_nx_cursor_visible != !!visible)
+    {
+        wine_nx_cursor_visible = !!visible;
+        wine_nx_cursor_moved = 1;  /* present the change */
     }
     pthread_mutex_unlock( &wine_nx_fb_mutex );
 }

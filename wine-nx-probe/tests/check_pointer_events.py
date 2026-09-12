@@ -13,7 +13,25 @@ fixture = r'''
 #include <stdio.h>
 typedef int BOOL, INT;
 typedef unsigned int UINT, DWORD;
-typedef void *HWND;
+typedef void *HWND, *HCURSOR;
+typedef int NTSTATUS;
+typedef unsigned int user_handle_t;
+#define STATUS_PENDING 0x103
+struct object_lock { int id; };
+#define OBJECT_LOCK_INIT {0}
+typedef struct { user_handle_t cursor; int cursor_count; } input_shm_t;
+#define wine_server_ptr_handle(h) ((void *)(unsigned long)(h))
+/* The input state the program's SetCursor and ShowCursor calls leave. */
+static input_shm_t shared_input;
+static NTSTATUS shared_input_status;
+static NTSTATUS get_shared_input(unsigned int tid, struct object_lock *lock, const input_shm_t **input_shm) {
+    assert(!tid);
+    if (shared_input_status) return shared_input_status;
+    if (!lock->id) { lock->id = 1; *input_shm = &shared_input; return STATUS_PENDING; }
+    return 0;
+}
+static int cursor_shown = 1;
+static void wine_nx_cursor_show(int visible) { cursor_shown = visible; }
 typedef long LPARAM;
 #define TRUE 1
 #define FALSE 0
@@ -104,8 +122,30 @@ int main(void) {
     assert(take(0, 110, 50, L, 0, 0) == -1);
     /* Another thread took the release: the state still catches up. */
     assert(take(0, 110, 50, 0, 0, 0) == (ABS | MOUSEEVENTF_LEFTUP));
+    /* The arrow follows the cursor the program set: shown until a program sets
+     * one, hidden when it sets none over its own cursor or hides it. */
+    assert(cursor_shown);
+    shared_input.cursor = 0x10010;           /* a class cursor */
+    take(0, 110, 50, 0, 0, 0);
+    assert(cursor_shown);
+    shared_input.cursor = 0;                 /* SetCursor(NULL), as OpenTTD over its own */
+    take(0, 110, 50, 0, 0, 0);
+    assert(!cursor_shown);
+    shared_input.cursor = 0x10010;
+    shared_input.cursor_count = -1;          /* ShowCursor(FALSE) */
+    take(0, 110, 50, 0, 0, 0);
+    assert(!cursor_shown);
+    shared_input.cursor_count = 0;
+    wine_nx_drv_SetCursor(0, (HCURSOR)0x10010);
+    assert(cursor_shown);
+    shared_input_status = (NTSTATUS)0xc0000034;  /* unreadable: leave it as it is */
+    shared_input.cursor = 0;
+    take(0, 110, 50, 0, 0, 0);
+    assert(cursor_shown);
+    shared_input_status = 0;
     assert(wine_nx_drv_SetCursorPos(12, 34) && set_x == 12 && set_y == 34);
-    puts("PASS: stick moves, A left and B right clicks, drag, touch press, clicks between calls and SetCursorPos");
+    puts("PASS: stick moves, A left and B right clicks, drag, touch press, clicks between calls, cursor visibility "
+         "and SetCursorPos");
     return 0;
 }
 '''
