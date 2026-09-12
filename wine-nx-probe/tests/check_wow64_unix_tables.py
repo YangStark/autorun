@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Check that the Switch's WoW64 unixlib stub tables cover every call of the Wine DLLs they serve.
+"""Check that the Switch's WoW64 unixlib tables cover every call of the Wine DLLs they serve.
 
-A unix call indexes the table without a bounds check, so a table shorter than
-the DLL's enum would jump to an arbitrary address."""
+The call gate refuses a code at or above the table's declared count, so a count
+larger than the table, or a table shorter than the DLL's enum, would jump to an
+arbitrary address. ws2_32 is served by a stub table here; opengl32 and
+winenxaudio.drv link their real tables, whose counts come from the DLL's own
+enum."""
 from pathlib import Path
 import re
 import subprocess
@@ -23,18 +26,24 @@ def table_size(name):
 
 checks = [
     ('wine_nx_ws2_32_wow64_unix_funcs', 'dlls/ws2_32/ws2_32_private.h', 'ws_unix_funcs', 'ws_unix_funcs_count'),
-    ('wine_nx_opengl32_wow64_unix_funcs', 'dlls/opengl32/unixlib.h', 'unix_funcs', 'funcs_count'),
 ]
 for table, header, enum, last in checks:
     count = enum_count(header, enum, last)
     size = table_size(table)
     assert size == count, f'{table} has {size} entries, {header} defines {count}'
-# opengl32's DllMain needs its first three calls to succeed.
-opengl = stubs[stubs.index('wine_nx_opengl32_wow64_unix_funcs[3102]'):]
-assert re.match(r'[^{]*\{\s*stub_success,[^\n]*\n\s*stub_success,[^\n]*\n\s*stub_success,', opengl)
-for table, *_ in checks:
-    count = table.replace('_funcs', '_count')
-    assert f'const unsigned int {count} = ARRAY_SIZE({table});' in stubs, f'{count} must be the size of {table}'
+    name = table.replace('_funcs', '_count')
+    assert f'const unsigned int {name} = ARRAY_SIZE({table});' in stubs, f'{name} must be the size of {table}'
+
+# opengl32 and winenxaudio.drv have their real unix tables linked in, so their
+# bound has to come from the DLL's own enum rather than a length written here.
+opengl = (root / 'wine-nx-probe/source/opengl32_unix.c').read_text()
+assert 'const unsigned int wine_nx_opengl32_wow64_unix_count = funcs_count;' in opengl, \
+    'opengl32 call count must be the DLL enum count'
+audio = (root / 'wine-nx-probe/source/audio_unix.c').read_text()
+assert 'C_ASSERT(ARRAY_SIZE(wine_nx_audio_wow64_unix_funcs) == funcs_count);' in audio, \
+    'the audio table must cover mmdevapi enum'
+assert 'const unsigned int wine_nx_audio_wow64_unix_count = ARRAY_SIZE(wine_nx_audio_wow64_unix_funcs);' in audio, \
+    'the audio call count must be the size of its table'
 
 # The x86 unix call gate (loader.c) and the static table dispatch (virtual.c),
 # compiled against small tables: build 18 refused every handle but ntdll's,
@@ -70,11 +79,21 @@ static int last;
 static NTSTATUS ntdll_call( void *args ) { last = 1; return (NTSTATUS)(UINT_PTR)args; }
 static NTSTATUS ws2_call( void *args ) { last = 2; return (NTSTATUS)(UINT_PTR)args; }
 static NTSTATUS gl_call( void *args ) { last = 3; return 0; }
+static NTSTATUS audio_call( void *args ) { last = 4; return 0; }
 static const unixlib_entry_t unix_call_wow64_funcs[] = { ntdll_call, ntdll_call };
 const unixlib_entry_t wine_nx_ws2_32_wow64_unix_funcs[5] = { ws2_call, ws2_call, ws2_call, ws2_call, ws2_call };
 const unixlib_entry_t wine_nx_opengl32_wow64_unix_funcs[3] = { gl_call, gl_call, gl_call };
+const unixlib_entry_t wine_nx_audio_wow64_unix_funcs[2] = { audio_call, audio_call };
 const unsigned int wine_nx_ws2_32_wow64_unix_count = 5;
 const unsigned int wine_nx_opengl32_wow64_unix_count = 3;
+const unsigned int wine_nx_audio_wow64_unix_count = 2;
+/* opengl32's calls are timed as they are dispatched (wine_nx_gl_profile). */
+struct wine_nx_gl_profile_entry { unsigned long long time; unsigned int calls; };
+struct wine_nx_gl_profile_entry wine_nx_gl_profile_entries[8];
+unsigned long long wine_nx_gl_call_time;
+unsigned int wine_nx_gl_calls;
+static unsigned long long ticks;
+static unsigned long long horizon_interrupt_time( void ) { return ++ticks; }
 ''' + libs + '\n' + function(virtual, 'NTSTATUS wine_nx_call_static_wow64_unix') + '\n' + \
     function(loader, 'NTSTATUS wine_nx_call_ntdll_wow64') + r'''
 #define H(t) ((unixlib_handle_t)(UINT_PTR)(t))
@@ -86,6 +105,11 @@ int main(void)
     CHECK( wine_nx_call_ntdll_wow64( H(wine_nx_opengl32_wow64_unix_funcs), 0, 0x1000 ) == 0 && last == 3 );
     CHECK( wine_nx_call_ntdll_wow64( H(wine_nx_ws2_32_wow64_unix_funcs), 4, 9 ) == 9 && last == 2 );
     last = 0;
+    CHECK( wine_nx_gl_calls == 1 && wine_nx_gl_profile_entries[0].calls == 1 && wine_nx_gl_call_time );
+    last = 0;
+    CHECK( wine_nx_call_ntdll_wow64( H(wine_nx_audio_wow64_unix_funcs), 1, 0 ) == 0 && last == 4 );
+    CHECK( wine_nx_call_ntdll_wow64( H(wine_nx_audio_wow64_unix_funcs), 2, 0 ) == STATUS_INVALID_PARAMETER );
+    last = 0;  /* the refused calls below must reach no table at all */
     CHECK( wine_nx_call_ntdll_wow64( H(wine_nx_opengl32_wow64_unix_funcs), 3, 0 ) == STATUS_INVALID_PARAMETER );
     CHECK( wine_nx_call_ntdll_wow64( H(wine_nx_ws2_32_wow64_unix_funcs), 5, 0 ) == STATUS_INVALID_PARAMETER );
     CHECK( wine_nx_call_ntdll_wow64( H(wine_nx_ws2_32_wow64_unix_funcs + 1), 0, 0 ) == STATUS_INVALID_HANDLE );
@@ -100,6 +124,6 @@ with tempfile.TemporaryDirectory() as tmp:
     subprocess.run(['cc', '-std=gnu11', '-Wall', '-Werror', '-Wno-unused-parameter', '-fsanitize=address,undefined',
                     str(source), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
-print('PASS: WoW64 unixlib stub tables match ws2_32 (%d) and opengl32 (%d) call counts; the x86 unix call gate '
-      'reaches ntdll and both static tables within their sizes and refuses other handles'
-      % (table_size(checks[0][0]), table_size(checks[1][0])))
+print('PASS: the ws2_32 stub table matches its %d calls, opengl32 and winenxaudio.drv count their own; '
+      'the x86 unix call gate reaches ntdll and every static table within its size, times opengl32 calls '
+      'and refuses other handles' % table_size(checks[0][0]))
