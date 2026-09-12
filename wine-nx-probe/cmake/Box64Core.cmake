@@ -102,8 +102,18 @@ function(wine_nx_add_box64_core target)
     # ARM_DYNAREC, without the x64test harness.
     set(dynarec_sources dynarec.c dynablock.c dynarec_native_functions.c dynacache_reloc.c)
     list(TRANSFORM dynarec_sources PREPEND "${root}/src/dynarec/")
+    # Count hash validations of translated blocks, reported by the runtime.
+    list(REMOVE_ITEM dynarec_sources "${root}/src/dynarec/dynablock.c")
+    file(READ "${root}/src/dynarec/dynablock.c" dynablock_source)
+    wine_nx_box64_patch(dynablock_source
+        "        //if (db->always_test) SchedYield(); // just calm down...\n        uint32_t hash = X31_hash_code(db->x64_addr, db->x64_size);"
+        "        //if (db->always_test) SchedYield(); // just calm down...\n        extern unsigned int wine_nx_box64_block_tests;\n        __atomic_add_fetch(&wine_nx_box64_block_tests, 1, __ATOMIC_RELAXED);\n        uint32_t hash = X31_hash_code(db->x64_addr, db->x64_size);"
+        "count block validations")
+    set(dynablock_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-dynablock.c")
+    file(WRITE "${dynablock_generated}" "${dynablock_source}")
+    list(APPEND dynarec_sources "${dynablock_generated}")
     if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
-        set_source_files_properties("${root}/src/dynarec/dynablock.c" PROPERTIES
+        set_source_files_properties("${dynablock_generated}" PROPERTIES
             COMPILE_DEFINITIONS "pthread_sigmask=wine_nx_box64_sigmask")
     endif()
     list(REMOVE_ITEM dynarec_sources "${root}/src/dynarec/dynarec.c")
@@ -163,10 +173,14 @@ function(wine_nx_add_box64_core target)
         "    redundant_helper = current_helper = NULL;\n    //block->done = 1;\n    return block;\n}"
         "    redundant_helper = current_helper = NULL;\n${to_exec}    //block->done = 1;\n    return block;\n}"
         "dynarec_native.c FillBlock64")
-    # Guest pages remain writable: route every block entry through Box64's
-    # hash validator. Callret patching is disabled by the host adapter.
-    wine_nx_box64_patch(native_source "    block->always_test = helper.always_test;"
-        "    block->always_test = 1;" "always validate writable guest code")
+    # Guest code pages stay writable, so translated blocks are not write
+    # protected. winebox64 reports freed, unmapped, re-protected and flushed
+    # guest memory, and wine_nx_box64_invalidate frees or marks the blocks
+    # there; otherwise blocks link directly. The largest block size bounds how
+    # far before a range a block may start.
+    wine_nx_box64_patch(native_source "    //block->x64_addr = (void*)start;\n    block->x64_size = end-start;"
+        "    //block->x64_addr = (void*)start;\n    block->x64_size = end-start;\n    { extern void wine_nx_box64_note_block_size(size_t); wine_nx_box64_note_block_size(block->x64_size); }"
+        "record the largest block size")
     set(native_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-dynarec_native.c")
     file(WRITE "${native_generated}" "${native_source}")
 

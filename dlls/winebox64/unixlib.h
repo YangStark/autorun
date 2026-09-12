@@ -2,7 +2,7 @@
 #ifndef WINEBOX64_UNIXLIB_H
 #define WINEBOX64_UNIXLIB_H
 #include "../../wine-nx-probe/source/wow64_box64_bridge.h"
-#define WINEBOX64_ABI_VERSION 2
+#define WINEBOX64_ABI_VERSION 3
 
 enum winebox64_run_operation { winebox64_query_abi, winebox64_execute };
 
@@ -25,11 +25,23 @@ struct winebox64_unix_params
     ULONG code;
     ULONG arguments;
 };
-enum winebox64_calls { winebox64_run, winebox64_call_unix };
+/* Guest memory whose translated code is no longer valid: freed or unmapped
+ * (destroy), or re-protected or flushed. */
+struct winebox64_invalidate_params
+{
+    ULONG version;
+    ULONG size;
+    ULONGLONG address;
+    ULONGLONG length;
+    ULONG destroy;
+    ULONG pad;
+};
+enum winebox64_calls { winebox64_run, winebox64_call_unix, winebox64_invalidate };
 
 /* Both sides are native ARM64. Keep the version first so an older native
  * table can reject a new layout before accessing any changed fields. */
 C_ASSERT( offsetof(struct winebox64_run_params, context) == 16 );
 C_ASSERT( sizeof(struct winebox64_run_params) == 48 );
 C_ASSERT( sizeof(struct winebox64_unix_params) == 24 );
+C_ASSERT( sizeof(struct winebox64_invalidate_params) == 32 );
 #endif

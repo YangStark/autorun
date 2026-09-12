@@ -12,9 +12,12 @@
  * build the same split with a shared memory file, so the path is exercised
  * before hardware.
  *
- * Guest code is not write-protected after translation (protectDB is a no-op),
- * so blocks are hash-validated on every entry before reuse. Writes within an
- * already executing block still require future write-fault/SMC support.
+ * Guest code is not write-protected after translation (protectDB is a no-op).
+ * Blocks link directly. winebox64 forwards WoW64's reports of freed, unmapped,
+ * re-protected and flushed guest memory to wine_nx_box64_invalidate, which
+ * frees the blocks there or makes their next entry check the code's hash.
+ * Code a program changes without such a report (self-modifying code without
+ * NtFlushInstructionCache) keeps running its old translation.
  * Runs stop at the gate pages because they are reported non-executable: the
  * dynarec leaves them to the interpreter, whose instruction hook stops there.
  */
@@ -89,6 +92,8 @@ cpu_ext_t cpuext = {0}; /* no optional host instructions: portable across Switch
 
 uint64_t wine_nx_box64_dynarec_bytes;
 unsigned long long wine_nx_box64_native_entries;
+unsigned int wine_nx_box64_block_tests;  /* hash validations in DBGetBlock */
+static size_t max_block_size;            /* the largest guest block translated */
 
 #if JMPTABL_SHIFTMAX != 16
 #error Jump-table top-level shift must be 16
@@ -266,6 +271,76 @@ void wine_nx_box64_dynarec_add_stop( uint32_t address )
         __atomic_store_n( &stop_page_count, stop_page_count + 1, __ATOMIC_RELEASE );
     }
     pthread_mutex_unlock( &stop_page_mutex );
+}
+
+/* Called by FillBlock64, which runs under the translator lock. */
+void wine_nx_box64_note_block_size( size_t size )
+{
+    if (size > max_block_size) max_block_size = size;
+}
+
+/* Guest memory at [addr, addr + size) was freed or unmapped (destroy), or
+ * re-protected or flushed: free the translated blocks overlapping it, or make
+ * their next entry check the code's hash, as Box64's cleanDBFromAddressRange
+ * does. Each block has one jump table entry, at its first guest address, and a
+ * block starting up to the largest block size earlier may reach into the
+ * range. Unused table levels are skipped whole. */
+static inline uintptr_t next_table_boundary( uintptr_t pos, unsigned int shift )
+{
+    return (pos | (((uintptr_t)1 << shift) - 1)) + 1;
+}
+
+void wine_nx_box64_invalidate( uintptr_t addr, size_t size, int destroy )
+{
+    uintptr_t end, pos;
+
+    if (!size || !dynarec_ready || addr > 0xffffffffu) return;
+    end = size > 0x100000000ull - addr ? 0x100000000ull : addr + size;
+    size = end - addr;
+    for (pos = addr > max_block_size ? addr - max_block_size : 0; pos < end;)
+    {
+        uintptr_t *entries, target;
+        dynablock_t *db;
+#ifdef JMPTABL_SHIFT4
+        uintptr_t ****level3 = jmptbl4[(pos >> JMPTABL_START4) & JMPTABLE_MASK4];
+        uintptr_t ***level2;
+        uintptr_t **level1;
+
+        if (level3 == jmptbl_default3)
+        {
+            pos = next_table_boundary( pos, JMPTABL_START4 );
+            continue;
+        }
+        level2 = level3[(pos >> JMPTABL_START3) & JMPTABLE_MASK3];
+#else
+        uintptr_t ***level2 = jmptbl3[(pos >> JMPTABL_START3) & JMPTABLE_MASK3];
+        uintptr_t **level1;
+#endif
+        if (level2 == jmptbl_default2)
+        {
+            pos = next_table_boundary( pos, JMPTABL_START3 );
+            continue;
+        }
+        level1 = level2[(pos >> JMPTABL_START2) & JMPTABLE_MASK2];
+        if (level1 == jmptbl_default1)
+        {
+            pos = next_table_boundary( pos, JMPTABL_START2 );
+            continue;
+        }
+        entries = level1[(pos >> JMPTABL_START1) & JMPTABLE_MASK1];
+        if (entries == jmptbl_default0)
+        {
+            pos = next_table_boundary( pos, JMPTABL_START1 );
+            continue;
+        }
+        target = entries[pos & JMPTABLE_MASK0];
+        if (target != (uintptr_t)native_next && (db = *(dynablock_t **)(target - sizeof(void *))))
+        {
+            if (destroy) FreeRangeDynablock( db, addr, size );
+            else MarkRangeDynablock( db, addr, size );
+        }
+        pos++;
+    }
 }
 
 uintptr_t AllocDynarecMap( uintptr_t x64_addr, size_t size, int is_new )

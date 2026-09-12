@@ -81,4 +81,14 @@ static NTSTATUS call_guest_unix( void *args )
         return STATUS_INVALID_PARAMETER;
     return wine_nx_call_ntdll_wow64( p->handle, p->code, p->arguments );
 }
-const unixlib_entry_t wine_nx_winebox64_unix_funcs[] = { run_guest, call_guest_unix };
+/* Defined by the dynarec glue; the interpreter has no translations to drop. */
+extern void wine_nx_box64_invalidate( uintptr_t address, size_t size, int destroy ) __attribute__((weak));
+static NTSTATUS invalidate_guest_code( void *args )
+{
+    struct winebox64_invalidate_params *p = args;
+    if (!p || p->version != WINEBOX64_ABI_VERSION || p->size != sizeof(*p) || p->address > 0xffffffffu)
+        return STATUS_INVALID_PARAMETER;
+    if (&wine_nx_box64_invalidate) wine_nx_box64_invalidate( p->address, p->length, !!p->destroy );
+    return STATUS_SUCCESS;
+}
+const unixlib_entry_t wine_nx_winebox64_unix_funcs[] = { run_guest, call_guest_unix, invalidate_guest_code };

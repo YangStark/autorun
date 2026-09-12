@@ -113,6 +113,19 @@ static NTSTATUS read_guest( void *opaque, ULONG address, void *buffer, SIZE_T si
     memcpy( buffer, (void *)(uintptr_t)address, size );
     return STATUS_SUCCESS;
 }
+#ifdef WINE_NX_BOX64_DYNAREC
+extern void wine_nx_box64_invalidate( uintptr_t address, size_t size, int destroy );
+extern unsigned int wine_nx_box64_block_tests;
+#endif
+/* Translated code is only revalidated when a change is reported, as winebox64
+ * does for NtFlushInstructionCache, so code written over code is reported. */
+static void put_code( unsigned char *memory, ULONG offset, const unsigned char *code, size_t size )
+{
+    memcpy( memory + offset, code, size );
+#ifdef WINE_NX_BOX64_DYNAREC
+    wine_nx_box64_invalidate( BASE + offset, size, 0 );
+#endif
+}
 static void init_context( I386_CONTEXT *ctx, ULONG pc, ULONG sp )
 {
     XMM_SAVE_AREA32 fx = {0};
@@ -318,7 +331,7 @@ int main(void)
 
 #ifndef WINE_NX_BOX64_DYNAREC
     /* An actual infinite guest loop is stopped by the interpreter hook. */
-    memory[0x200] = 0xeb; memory[0x201] = 0xfe;
+    put_code( memory, 0x200, (const unsigned char[]){ 0xeb, 0xfe }, 2 );
     init_context( &context, BASE + 0x200, BASE + 0x6000 );
     assert( wine_nx_box64_run( &context, 0, &f.gates, &host, &f, 0, 10, &executed ) == STATUS_TIMEOUT );
     assert( COUNT_IS(executed, 10) );
@@ -326,7 +339,7 @@ int main(void)
 #endif
 
     /* A Linux syscall must not escape through a native host syscall layer. */
-    memory[0x200] = 0xcd; memory[0x201] = 0x80;
+    put_code( memory, 0x200, (const unsigned char[]){ 0xcd, 0x80 }, 2 );
     init_context( &context, BASE + 0x200, BASE + 0x6000 );
     assert( wine_nx_box64_run( &context, 0, &f.gates, &host, &f, 0, 10, &executed ) != STATUS_SUCCESS );
     /* x87 state crosses a gate both within one run and across the stop/free/
@@ -467,6 +480,32 @@ int main(void)
         printf( "fetch cache: %llu instructions, %u checked reads\n", (unsigned long long)executed, guest_reads );
         assert( guest_reads <= 4 );
     }
+#ifdef WINE_NX_BOX64_DYNAREC
+    /* Blocks link directly: a loop calling into another block 5000 times does
+     * not check the code's hash on each transition. */
+    {
+        static const unsigned char call_loop[] = {
+            0x31,0xc0,                          /* xor eax, eax */
+            0xb9,0x88,0x13,0,0,                 /* mov ecx, 5000 */
+            0xe8,0x0a,0,0,0,                    /* call sub */
+            0x49,                               /* dec ecx */
+            0x75,0xf8,                          /* jnz call */
+            0xba,0x20,0x80,0,0x10,0xff,0xe2,    /* completion */
+            0x40,                               /* sub: inc eax */
+            0xc3                                /* ret */
+        };
+        unsigned int tests_before;
+
+        put_code( memory, 0x900, call_loop, sizeof(call_loop) );
+        init_context( &context, BASE + 0x900, BASE + 0x6000 );
+        tests_before = wine_nx_box64_block_tests;
+        assert( !wine_nx_box64_run( &context, 0, &f.gates, &host, &f, BASE + 0x8020, 100000, &executed ) );
+        printf( "call loop: eax=%u, %u block validations\n", (unsigned)context.Eax,
+                wine_nx_box64_block_tests - tests_before );
+        assert( context.Eax == 5000 && context.Ecx == 0 );
+        assert( wine_nx_box64_block_tests - tests_before < 50 );
+    }
+#endif
     /* Instruction-fetch failures are reported without dereferencing the PC. */
     init_context( &context, BASE - 1, BASE + 0x6000 );
     assert( wine_nx_box64_run( &context, 0, &f.gates, &host, &f, 0, 10, &executed ) == STATUS_ACCESS_VIOLATION );
@@ -487,7 +526,7 @@ int main(void)
         assert( !wine_nx_box64_handle_fault( BASE + SIZE - 0x1000 ) );
         for (i = 0; i < sizeof(fault_programs) / sizeof(fault_programs[0]); ++i)
         {
-            memcpy( memory + 0x200, fault_programs[i], sizeof(fault_programs[i]) );
+            put_code( memory, 0x200, fault_programs[i], sizeof(fault_programs[i]) );
             init_context( &context, BASE + 0x200, BASE + 0x6000 );
             assert( wine_nx_box64_run( &context, 0, &f.gates, &host, &f, 0, 10,
                                        &executed ) == STATUS_ACCESS_VIOLATION );
@@ -508,18 +547,27 @@ int main(void)
             0xba,0x20,0x80,0,0x10,0xff,0xe2
         };
         *(ULONG *)(memory + 0x3008) = 17;
-        memcpy( memory + 0x200, recovered, sizeof(recovered) );
+        put_code( memory, 0x200, recovered, sizeof(recovered) );
         init_context( &context, BASE + 0x200, BASE + 0x6000 );
         assert( !wine_nx_box64_run( &context, 0, &f.gates, &host, &f,
                                    BASE + 0x8020, 10, &executed ) );
         assert( context.Eax == 17 && *(ULONG *)(memory + 0x3008) == 29 );
-        /* Reuse the same guest address with different code: a stale block
-         * would store 29 again. No executable-alias writes are permitted. */
-        memory[0x201] = 43;
+        /* Reuse the same guest address with different code, reported: a stale
+         * block would store 29 again. No executable-alias writes are permitted. */
+        put_code( memory, 0x201, (const unsigned char[]){ 43 }, 1 );
         init_context( &context, BASE + 0x200, BASE + 0x6000 );
         assert( !wine_nx_box64_run( &context, 0, &f.gates, &host, &f,
                                    BASE + 0x8020, 10, &executed ) );
         assert( context.Eax == 29 && *(ULONG *)(memory + 0x3008) == 43 );
+#ifdef WINE_NX_BOX64_DYNAREC
+        /* Freed code loses its blocks: new code at the address is translated afresh. */
+        wine_nx_box64_invalidate( BASE + 0x200, sizeof(recovered), 1 );
+        memory[0x201] = 55;
+        init_context( &context, BASE + 0x200, BASE + 0x6000 );
+        assert( !wine_nx_box64_run( &context, 0, &f.gates, &host, &f,
+                                   BASE + 0x8020, 10, &executed ) );
+        assert( context.Eax == 43 && *(ULONG *)(memory + 0x3008) == 55 );
+#endif
     }
     printf( "Native operand/decoder fault recovery: %d faults, subsequent atomic execution passed\n",
             native_faults );
@@ -534,7 +582,8 @@ int main(void)
     assert( wine_nx_box64_dynarec_bytes > 0 && wine_nx_box64_native_entries > 0 );
     printf( "Native dispatch entries: %llu\n", wine_nx_box64_native_entries );
     printf( "Dynarec emitted bytes: %llu\n", (unsigned long long)wine_nx_box64_dynarec_bytes );
-    puts( "Box64 i386 dynarec: gates, FS, SSE, x87, reentry, code revalidation and fault recovery passed" );
+    puts( "Box64 i386 dynarec: gates, FS, SSE, x87, reentry, direct block links, reported code changes and fault "
+          "recovery passed" );
     puts( "Instruction budgets and precise fault contexts are not validated by this dynarec test." );
 #else
     puts( "Box64 i386 execution: native gate round trip, FS, SSE, reentry and bounded execution passed" );

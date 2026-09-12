@@ -46,6 +46,64 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
 }
 
 void * WINAPI BTCpuGetBopCode(void) { return ULongToPtr( gates.syscall ); }
+
+/* WoW64 reports guest memory whose translated code is no longer valid. The
+ * dynarec links blocks directly and does not write-protect guest code, so these
+ * reports are what keep translations current. */
+static void invalidate( const void *address, SIZE_T size, BOOL destroy )
+{
+    struct winebox64_invalidate_params params = { WINEBOX64_ABI_VERSION, sizeof(params) };
+
+    if (!gates.syscall || !size || (ULONG_PTR)address > 0xffffffff) return;
+    params.address = (ULONG_PTR)address;
+    params.length = size;
+    params.destroy = destroy;
+    WINE_UNIX_CALL( winebox64_invalidate, &params );
+}
+
+/* The whole view mapped at base, queried before it is unmapped. */
+static SIZE_T view_size( void *base )
+{
+    MEMORY_BASIC_INFORMATION info;
+    char *address = base;
+    SIZE_T size = 0;
+
+    while ((ULONG_PTR)address < 0x100000000 &&
+           !NtQueryVirtualMemory( NtCurrentProcess(), address, MemoryBasicInformation, &info, sizeof(info), NULL ) &&
+           info.State != MEM_FREE && info.AllocationBase == base)
+    {
+        size += info.RegionSize;
+        address = (char *)info.BaseAddress + info.RegionSize;
+    }
+    return size;
+}
+
+void WINAPI BTCpuFlushInstructionCache2( const void *address, SIZE_T size )
+{
+    invalidate( address, size, FALSE );
+}
+
+void WINAPI BTCpuFlushInstructionCacheHeavy( const void *address, SIZE_T size )
+{
+    if (address) invalidate( address, size, FALSE );
+    else invalidate( NULL, (SIZE_T)0x100000000, FALSE );
+}
+
+void WINAPI BTCpuNotifyMemoryFree( void *address, SIZE_T size, ULONG free_type, BOOL is_post, NTSTATUS status )
+{
+    if (is_post && !status) invalidate( address, size, TRUE );
+}
+
+void WINAPI BTCpuNotifyMemoryProtect( void *address, SIZE_T size, ULONG new_protect, BOOL is_post, NTSTATUS status )
+{
+    if (is_post && !status) invalidate( address, size, FALSE );
+}
+
+void WINAPI BTCpuNotifyUnmapViewOfSection( void *address, BOOL is_post, NTSTATUS status )
+{
+    /* Before the view goes: its extent cannot be queried afterwards. */
+    if (!is_post) invalidate( address, view_size( address ), TRUE );
+}
 void * WINAPI __wine_get_unix_opcode(void) { return ULongToPtr( gates.unix_call ); }
 
 static I386_CONTEXT *get_thread_context( ULONG *fs_base )

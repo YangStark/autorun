@@ -1,5 +1,6 @@
 /* Copyright 2026 Wine-NX contributors. LGPL-2.1-or-later. */
 #include <assert.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include "wow64_box64_engine.h"
@@ -60,6 +61,18 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *ctx, ULONG fs_base,
     assert( host->read( opaque, 0x10000000, buffer, sizeof(buffer) ) == STATUS_ACCESS_VIOLATION );
     *executed = 7;
     return STATUS_TIMEOUT;
+}
+
+static unsigned int invalidations;
+static uintptr_t invalidated_address;
+static size_t invalidated_size;
+static int invalidated_destroy;
+void wine_nx_box64_invalidate( uintptr_t address, size_t size, int destroy )
+{
+    ++invalidations;
+    invalidated_address = address;
+    invalidated_size = size;
+    invalidated_destroy = destroy;
 }
 
 NTSTATUS wine_nx_call_ntdll_wow64( unixlib_handle_t handle, ULONG code, ULONG arguments )
@@ -131,6 +144,25 @@ int main(void)
     assert( call_unix( &u ) == STATUS_INVALID_PARAMETER && !unix_calls );
     ++u.size;
     assert( call_unix( &u ) == STATUS_INVALID_HANDLE && unix_calls == 1 );
-    puts( "WoW64 native ABI: handshake, version/size, guest read limits and dispatch passed" );
+    {
+        unixlib_entry_t invalidate = wine_nx_winebox64_unix_funcs[winebox64_invalidate];
+        struct winebox64_invalidate_params v = { WINEBOX64_ABI_VERSION, sizeof(v), 0x10001000, 0x2000, 1, 0 };
+
+        assert( invalidate( NULL ) == STATUS_INVALID_PARAMETER );
+        --v.version;
+        assert( invalidate( &v ) == STATUS_INVALID_PARAMETER && !invalidations );
+        ++v.version;
+        --v.size;
+        assert( invalidate( &v ) == STATUS_INVALID_PARAMETER && !invalidations );
+        ++v.size;
+        v.address = 0x100000000ull;
+        assert( invalidate( &v ) == STATUS_INVALID_PARAMETER && !invalidations );
+        v.address = 0x10001000;
+        assert( invalidate( &v ) == STATUS_SUCCESS && invalidations == 1 );
+        assert( invalidated_address == 0x10001000 && invalidated_size == 0x2000 && invalidated_destroy == 1 );
+        v.destroy = 0;
+        assert( invalidate( &v ) == STATUS_SUCCESS && invalidations == 2 && !invalidated_destroy );
+    }
+    puts( "WoW64 native ABI: handshake, version/size, guest read limits, dispatch and code invalidation passed" );
     return 0;
 }
