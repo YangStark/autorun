@@ -27,13 +27,17 @@ env = dict(os.environ, PATH=f'{toolchain}:/opt/homebrew/opt/bison/bin:' + os.env
 inputs = Path(os.environ.get('WINE_NX_OPENTTD_INPUTS', Path.home() / 'switch/winebox64_nx/local-inputs'))
 openttd_zip = inputs / 'openttd-15.3-windows-win32.zip'
 opengfx_zip = inputs / 'opengfx-8.0-all.zip'
+opensfx_zip = inputs / 'opensfx-1.0.3-all.zip'
+openmsx_zip = inputs / 'openmsx-0.3.1-all.zip'
 OPENTTD_SHA256 = '3f092edc8f381c3d2d3a59458703899da6f876345b3850a3c76c0dffe68f0e74'
 OPENGFX_SHA256 = '43a0c1dabf39cb865394f3a6cc36d4da5c10ecfaaf55652043104806810903be'
-# GDI video without a drawing thread, no sound or music, the Switch's screen size,
+OPENSFX_SHA256 = 'e0a218b7dd9438e701503b0f84c25a97c1c11b7c2f025323fb19d6db16ef3759'
+OPENMSX_SHA256 = '92e293ae89f13ad679f43185e83fb81fb8cad47fe63f4af3d3d9f955130460f5'
+# GDI video without a drawing thread, Windows base sound set and no music, the Switch's screen size,
 # and the configuration next to the game.
-ARGUMENTS = r'-v win32:no_threads -s null -m null -r 1280x720 -c C:\openttd\openttd.cfg'
+ARGUMENTS = r'-v win32:no_threads -s opensfx -m openmsx -r 1280x720 -c C:\openttd\openttd.cfg'
 
-for path, digest in ((openttd_zip, OPENTTD_SHA256), (opengfx_zip, OPENGFX_SHA256)):
+for path, digest in ((openttd_zip, OPENTTD_SHA256), (opengfx_zip, OPENGFX_SHA256), (opensfx_zip, OPENSFX_SHA256), (openmsx_zip, OPENMSX_SHA256)):
     assert path.is_file(), f'Missing input: {path}'
     actual = hashlib.sha256(path.read_bytes()).hexdigest()
     assert actual == digest, f'{path.name} is not the tested package: {actual}'
@@ -54,6 +58,16 @@ with ZipFile(opengfx_zip) as z:
     with tarfile.open(fileobj=io.BytesIO(z.read('opengfx-8.0.tar'))) as tar:
         members = [m for m in tar.getmembers() if m.isfile() and '..' not in Path(m.name).parts]
         tar.extractall(game / 'baseset', members=members)
+for package in (opensfx_zip, openmsx_zip):
+    with ZipFile(package) as z:
+        for member in z.namelist():
+            if not member.endswith('.tar'):
+                continue
+            with tarfile.open(fileobj=io.BytesIO(z.read(member))) as tar:
+                files = [m for m in tar.getmembers() if m.isfile() and '..' not in Path(m.name).parts]
+                for m in files:
+                    target = game / 'baseset' / Path(m.name).name
+                    target.write_bytes(tar.extractfile(m).read())
 # The sprite font needs no FreeType fonts; declining the survey skips the modal
 # question on the first start.
 (game / 'openttd.cfg').write_text('[misc]\nprefer_sprite_font = true\n\n[network]\nparticipate_survey = no\n')
@@ -98,9 +112,9 @@ while queue:
 
 readme = (stage / 'README.txt').read_text()
 (stage / 'README.txt').write_text(readme + '''
-OpenTTD 15.3 (32-bit, with OpenGFX 8.0) is in C:\\openttd. Choose C:\\openttd\\openttd.exe
-in the menu. openttd.args.txt next to it selects GDI video without a drawing thread, no
-sound or music, a 1280x720 window and C:\\openttd\\openttd.cfg (sprite font). Networking
+OpenTTD 15.3 (32-bit, with OpenGFX 8.0 and the bundled Windows base sound set) is in C:\\openttd. Choose C:\\openttd\\openttd.exe
+in the menu. openttd.args.txt next to it selects GDI video without a drawing thread, the
+Windows base sound set, no music, a 1280x720 window and C:\\openttd\\openttd.cfg (sprite font). Networking
 and OpenGL are unavailable: their DLLs load, but report every call as unsupported.
 Expected first milestone: the OpenTTD main menu with the title game running behind it.
 ''')
@@ -115,7 +129,7 @@ assert 'cryptbase.dll' in staged, 'advapi32 forwards SystemFunction036 to cryptb
 assert list((game / 'baseset').rglob('opengfx.obg')), 'OpenGFX is missing'
 assert (game / 'lang/english.lng').is_file()
 
-archive = build / 'wine-nx-openttd-dynarec-30.zip'
+archive = build / 'wine-nx-openttd-dynarec-33.zip'
 with ZipFile(archive, 'w', ZIP_DEFLATED) as z:
     for f in sorted(stage.rglob('*')):
         if f.is_file() and f.name != '.DS_Store' and f.suffix != '.log':

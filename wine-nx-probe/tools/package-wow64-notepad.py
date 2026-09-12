@@ -65,7 +65,13 @@ for folder in ['drive_c/windows/fonts', 'share/wine/fonts']:
 (stage / 'target.txt').write_text('sdmc:/switch/wine/drive_c/notepad.exe\n')
 (stage / 'args.txt').write_text('C:\\notepad.exe C:\\notepad-test.txt\n')
 (stage / 'drive_c/notepad-test.txt').write_bytes(b'Wine-NX x86 Notepad through the ARM64 dynarec.\r\n\r\nMove the cursor with the right stick. A is the left mouse button, B the right.\r\nOpen a menu, select text by holding A, right-click with B, and try Save As.\r\n')
-(stage / 'README.txt').write_text('''Wine-NX x86 programs on the nx-wow64-dynarec-30 runtime.
+(stage / 'README.txt').write_text('''Wine-NX x86 programs on the nx-wow64-dynarec-33 runtime.
+Build 33 hides the Switch arrow while a program hides the mouse cursor or draws its own
+(OpenTTD's second cursor).
+Build 32 lets translated x86 blocks jump straight to each other instead of re-checking
+their code on every jump, which made loops slow (OpenTTD's long white screen).
+Build 31 caches reads from the SD card (128 KB chunks), for OpenTTD's graphics loading.
+Its [PROGRESS] lines add the time in file reads and SD requests, and cache hits.
 Build 30 fixes OpenTTD's white screen: QueryPerformanceCounter counted from 1601 instead of
 from boot, and MSVC's steady_clock overflowed. OpenTTD never drew and slept for ~49 days.
 Build 29 replaced Wine's select()-based Sleep with svcSleepThread; the hang remained.
@@ -114,7 +120,7 @@ Since build 18 the log always has Wine's error messages (err:), including those 
 Install by merging switch/ into the SD root.
 ''')
 subprocess.run([sys.executable, str(verify), str(stage)], check=True)
-archive = build / 'wine-nx-notepad-dynarec-30.zip'
+archive = build / 'wine-nx-notepad-dynarec-33.zip'
 with ZipFile(archive, 'w', ZIP_DEFLATED) as z:
     for f in sorted(stage.rglob('*')):
         if f.is_file() and f.name != '.DS_Store' and f.suffix != '.log':
