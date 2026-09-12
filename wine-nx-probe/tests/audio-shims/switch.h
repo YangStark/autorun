@@ -15,5 +15,8 @@ Result audoutStopAudioOut(void);
 Result audoutAppendAudioOutBuffer(AudioOutBuffer *);
 Result audoutGetReleasedAudioOutBuffer(AudioOutBuffer **, u32 *);
 void armDCacheFlush(void *, size_t);
+typedef uint32_t Handle;
+#define CUR_THREAD_HANDLE 0xFFFF8000
+Result svcSetThreadPriority(Handle, u32);
 void *memalign(size_t, size_t);
 #endif

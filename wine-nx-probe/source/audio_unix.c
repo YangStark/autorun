@@ -18,13 +18,17 @@
 
 #define NX_RATE 48000
 #define NX_CHUNK 480
+/* Buffers held by audout at once: the cushion that covers scheduling delays,
+ * NX_BUFFERS * NX_CHUNK frames (40 ms) between the mixer and silence. Two of
+ * them (20 ms) broke up when a frame of the game overran its slice. */
+#define NX_BUFFERS 4
 struct nx_audio_stream
 {
     BYTE *ring, *scratch;
     unsigned int capacity, held, submitted, read, locked;
     UINT64 played;
-    AudioOutBuffer buffers[2];
-    unsigned int frames[2];
+    AudioOutBuffer buffers[NX_BUFFERS];
+    unsigned int frames[NX_BUFFERS];
     float volume[2];
     HANDLE event;
     DWORD flags;
@@ -122,10 +126,10 @@ static NTSTATUS nx_get_device_period(void *args)
 static void nx_free(struct nx_audio_stream *s)
 {
     SIZE_T size = 0;
+    unsigned int i;
     if (s->scratch) NtFreeVirtualMemory(GetCurrentProcess(), (void **)&s->scratch, &size, MEM_RELEASE);
     free(s->ring);
-    free(s->buffers[0].buffer);
-    free(s->buffers[1].buffer);
+    for (i = 0; i < NX_BUFFERS; i++) free(s->buffers[i].buffer);
     free(s);
 }
 static NTSTATUS nx_create_stream(void *args)
@@ -149,7 +153,7 @@ static NTSTATUS nx_create_stream(void *args)
     p->result = E_OUTOFMEMORY;
     if (!(s = calloc(1, sizeof(*s)))) goto done;
     s->capacity = (p->duration * NX_RATE + 9999999) / 10000000;
-    if (s->capacity < 4 * NX_CHUNK) s->capacity = 4 * NX_CHUNK;
+    if (s->capacity < 2 * NX_BUFFERS * NX_CHUNK) s->capacity = 2 * NX_BUFFERS * NX_CHUNK;
     s->source_rate = p->fmt->nSamplesPerSec;
     s->source_channels = p->fmt->nChannels;
     s->source_bits = p->fmt->wBitsPerSample;
@@ -163,7 +167,7 @@ static NTSTATUS nx_create_stream(void *args)
                                             0xffffffff00000000ULL, &bytes,
                                             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
     { nx_free(s); goto done; }
-    for (i = 0; i < 2; i++)
+    for (i = 0; i < NX_BUFFERS; i++)
     {
         s->buffers[i].buffer = memalign(0x1000, 0x1000);
         s->buffers[i].buffer_size = 0x1000;
@@ -181,6 +185,9 @@ done:
 }
 /* Keep frames in padding until audout returns ownership of the DMA buffer.
  * Reusing memory on submission would both truncate playback and lie to waveOut. */
+/* Gaps in playback, for Wine-NX's [PROGRESS]. */
+unsigned int wine_nx_audio_underruns;
+
 static void nx_pump(struct nx_audio_stream *s)
 {
     AudioOutBuffer *released;
@@ -189,7 +196,7 @@ static void nx_pump(struct nx_audio_stream *s)
     if (R_FAILED(audoutGetReleasedAudioOutBuffer(&released, &count))) { s->failed = TRUE; return; }
     while (count && released)
     {
-        for (i = 0; i < 2; i++) if (released == &s->buffers[i])
+        for (i = 0; i < NX_BUFFERS; i++) if (released == &s->buffers[i])
         {
             s->held -= s->frames[i];
             s->submitted -= s->frames[i];
@@ -200,7 +207,11 @@ static void nx_pump(struct nx_audio_stream *s)
         }
         if (R_FAILED(audoutGetReleasedAudioOutBuffer(&released, &count))) { s->failed = TRUE; return; }
     }
-    for (i = 0; i < 2 && s->held > s->submitted; i++) if (!s->frames[i])
+    /* Nothing left with the hardware while frames are still to play: audout
+     * reached the end and the listener heard the gap. Reported by [PROGRESS]. */
+    if (s->played && !s->submitted) wine_nx_audio_underruns++;
+
+    for (i = 0; i < NX_BUFFERS && s->held > s->submitted; i++) if (!s->frames[i])
     {
         unsigned int frames = s->held - s->submitted;
         short *dst = s->buffers[i].buffer;
@@ -222,6 +233,11 @@ static NTSTATUS nx_timer_loop(void *args)
 {
     struct nx_audio_stream *s = nx_stream(((struct timer_loop_params *)args)->stream);
     LARGE_INTEGER delay;
+
+    /* Feeding audout must not wait behind the game's threads, which all run at
+     * the default priority: a slice lost here is a gap in the sound. This
+     * thread sleeps between refills, so it takes little from them. */
+    svcSetThreadPriority(CUR_THREAD_HANDLE, 0x38);
     delay.QuadPart = -50000;
     for (;;)
     {
@@ -372,7 +388,7 @@ static NTSTATUS nx_##name(void *args) { struct name##_params *p = args; \
 struct nx_audio_stream *s = nx_stream(p->stream); (void)s; pthread_mutex_lock(&audio_lock); \
 *p->member = (value); p->result = S_OK; pthread_mutex_unlock(&audio_lock); return STATUS_SUCCESS; }
 NX_QUERY(get_buffer_size, frames, s->capacity)
-NX_QUERY(get_latency, latency, 200000)
+NX_QUERY(get_latency, latency, (REFERENCE_TIME)NX_BUFFERS * NX_CHUNK * 10000000 / NX_RATE)
 NX_QUERY(get_current_padding, padding, s->held)
 NX_QUERY(get_next_packet_size, frames, 0)
 NX_QUERY(get_frequency, freq, NX_RATE * 4)

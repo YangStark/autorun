@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include "../source/audio_unix.c"
 
-static AudioOutBuffer *queued[2];
+static AudioOutBuffer *queued[NX_BUFFERS];
 static unsigned int queued_count, ready;
 static BOOL host_started;
 Result audoutInitialize(void) { return 0; }
@@ -13,7 +13,7 @@ Result audoutStopAudioOut(void) { host_started = FALSE; return 0; }
 Result audoutAppendAudioOutBuffer(AudioOutBuffer *b)
 {
     unsigned int i;
-    assert(queued_count < 2);
+    assert(queued_count < NX_BUFFERS);
     assert(!((UINT_PTR)b->buffer & 0xfff));
     assert(b->data_size <= b->buffer_size);
     for (i = 0; i < queued_count; i++) assert(queued[i] != b);
@@ -25,12 +25,15 @@ Result audoutGetReleasedAudioOutBuffer(AudioOutBuffer **b, u32 *count)
     *count = 0; *b = NULL;
     if (ready && queued_count)
     {
+        unsigned int i;
         *b = queued[0]; *count = 1;
-        queued[0] = queued[1]; queued_count--; ready--;
+        for (i = 0; i + 1 < queued_count; i++) queued[i] = queued[i + 1];
+        queued_count--; ready--;
     }
     return 0;
 }
 void armDCacheFlush(void *p, size_t size) { (void)p; (void)size; }
+Result svcSetThreadPriority(Handle h, u32 priority) { (void)h; (void)priority; return 0; }
 void *memalign(size_t alignment, size_t size)
 { void *p = NULL; if (posix_memalign(&p, alignment, size)) return NULL; return p; }
 NTSTATUS WINAPI NtAllocateVirtualMemory(HANDLE proc, void **p, ULONG_PTR bits, SIZE_T *size, ULONG type, ULONG prot)
@@ -58,39 +61,50 @@ int main(void)
     UINT32 channels = 0;
     struct create_stream_params create = {.flow=eRender, .share=AUDCLNT_SHAREMODE_SHARED,
         .duration=400000, .fmt=&fmt, .channel_count=&channels, .stream=&handle};
+    const unsigned int total = (NX_BUFFERS + 1) * NX_CHUNK;
     BYTE *data = NULL;
-    struct get_render_buffer_params get = {.frames=1440, .data=&data};
-    struct release_render_buffer_params put = {.written_frames=1440};
+    struct get_render_buffer_params get = {.frames=total, .data=&data};
+    struct release_render_buffer_params put = {.written_frames=total};
     struct start_params startp;
     struct stop_params stopp;
     struct reset_params resetp;
     struct release_stream_params release;
     struct nx_audio_stream *s;
-    unsigned int i;
+    unsigned int i, cycles, before;
+    BOOL wrapped = FALSE;
     nx_test_connect(&connect); assert(connect.priority == Priority_Preferred);
     nx_create_stream(&create); assert(create.result == S_OK && channels == 2 && handle);
     s = nx_stream(handle);
     get.stream = put.stream = handle;
     nx_get_render_buffer(&get); assert(get.result == S_OK && data);
-    for (i = 0; i < 1440; i++) { ((short *)data)[i*2] = i; ((short *)data)[i*2+1] = -i; }
-    nx_release_render_buffer(&put); assert(put.result == S_OK && s->held == 1440);
+    for (i = 0; i < total; i++) { ((short *)data)[i*2] = i; ((short *)data)[i*2+1] = -i; }
+    nx_release_render_buffer(&put); assert(put.result == S_OK && s->held == total);
     startp.stream = handle; nx_start(&startp);
-    assert(startp.result == S_OK && host_started && queued_count == 2);
-    assert(s->held == 1440 && s->submitted == 960 && !s->played);
+    /* Only what audout can hold goes out; the rest stays owned by the ring. */
+    assert(startp.result == S_OK && host_started && queued_count == NX_BUFFERS);
+    assert(s->held == total && s->submitted == NX_BUFFERS * NX_CHUNK && !s->played);
     assert(((short *)queued[0]->buffer)[2] == 1);
-    assert(((short *)queued[1]->buffer)[0] == 480);
-    nx_pump(s); assert(s->held == 1440 && !s->played);
+    assert(((short *)queued[1]->buffer)[0] == NX_CHUNK);
+    nx_pump(s); assert(s->held == total && !s->played);
     ready = 1; nx_pump(s);
-    assert(s->held == 960 && s->played == 480 && queued_count == 2);
-    assert(((short *)queued[1]->buffer)[0] == 960);
-    ready = 2; nx_pump(s);
-    assert(!s->held && s->played == 1440 && !queued_count);
+    assert(s->held == total - NX_CHUNK && s->played == NX_CHUNK && queued_count == NX_BUFFERS);
+    assert(((short *)queued[NX_BUFFERS - 1]->buffer)[0] == (short)(NX_BUFFERS * NX_CHUNK));
+    ready = NX_BUFFERS; nx_pump(s);
+    assert(!s->held && s->played == total && !queued_count);
     /* Cross the ring boundary, preserving order and silence. */
-    get.frames = put.written_frames = 960;
-    nx_get_render_buffer(&get); assert(get.result == S_OK);
     put.flags = AUDCLNT_BUFFERFLAGS_SILENT;
-    nx_release_render_buffer(&put); nx_pump(s);
-    for (i = 0; i < 960; i++) assert(((short *)queued[i/480]->buffer)[(i%480)*2] == 0);
+    for (cycles = 0; cycles < 2 * s->capacity / NX_CHUNK; cycles++)
+    {
+        before = s->read;
+        get.frames = put.written_frames = NX_CHUNK;
+        nx_get_render_buffer(&get); assert(get.result == S_OK);
+        nx_release_render_buffer(&put); assert(put.result == S_OK);
+        nx_pump(s); assert(queued_count == 1);
+        for (i = 0; i < NX_CHUNK; i++) assert(((short *)queued[0]->buffer)[i*2] == 0);
+        ready = 1; nx_pump(s);
+        if (s->read < before) wrapped = TRUE;
+    }
+    assert(wrapped);
     resetp.stream = handle; nx_reset(&resetp); assert(resetp.result == AUDCLNT_E_NOT_STOPPED);
     stopp.stream = handle; nx_stop(&stopp); assert(stopp.result == S_OK && !host_started);
     nx_reset(&resetp); assert(resetp.result == S_OK && !s->held && !s->played && !queued_count);
