@@ -6898,8 +6898,11 @@ static NTSTATUS cancel_async_file_read( HANDLE handle, IO_STATUS_BLOCK *io )
 }
 
 #ifdef __SWITCH__
-/* Completed reads, reported by the runtime's [PROGRESS] line. */
+/* Completed reads and their time inside NtReadFile, reported by the runtime's
+ * [PROGRESS] line. */
+extern unsigned long long horizon_interrupt_time(void);
 unsigned int wine_nx_file_reads;
+unsigned long long wine_nx_file_read_100ns;
 #endif
 
 /******************************************************************************
@@ -6918,6 +6921,9 @@ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, vo
     enum server_fd_type type;
     ULONG_PTR cvalue = apc ? 0 : (ULONG_PTR)apc_user;
     BOOL send_completion = FALSE, async_read, timeout_init_done = FALSE;
+#ifdef __SWITCH__
+    unsigned long long wine_nx_read_start = horizon_interrupt_time();
+#endif
 
     TRACE( "(%p,%p,%p,%p,%p,%p,0x%08x,%p,%p)\n",
            handle, event, apc, apc_user, io, buffer, length, offset, key );
@@ -7099,6 +7105,8 @@ err:
             static unsigned int read_traces;
 
             __atomic_add_fetch( &wine_nx_file_reads, 1, __ATOMIC_RELAXED );
+            __atomic_add_fetch( &wine_nx_file_read_100ns, horizon_interrupt_time() - wine_nx_read_start,
+                                __ATOMIC_RELAXED );
             if (&wine_nx_runtime_trace && &wine_nx_runtime_verbose && wine_nx_runtime_verbose &&
                 __atomic_fetch_add( &read_traces, 1, __ATOMIC_RELAXED ) < 256)
             {

@@ -23,4 +23,6 @@ flags="-std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-f
 "$build/clipboard"
 "${CC:-clang}" $flags "$root/wine-nx-probe/tests/launcher_list.c" -o "$build/launcher_list"
 "$build/launcher_list"
+"${CC:-clang}" $flags "$root/wine-nx-probe/tests/sd_read_cache.c" -o "$build/sd_read_cache"
+"$build/sd_read_cache"
 python3 "$root/wine-nx-probe/tools/make-7zr-tree.py" "$build/drive_c" >/dev/null

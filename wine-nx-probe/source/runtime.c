@@ -56,6 +56,7 @@ extern NTSTATUS wine_nx_loader_last_import_status(void);
 extern const char *wine_nx_loader_last_open_path(void);
 extern NTSTATUS wine_nx_loader_last_open_status(void);
 extern const char *wine_nx_loader_last_export_diag(void);
+extern int wine_nx_sd_cache_install(void);
 extern int wine_nx_launcher_run( const char *drive_c, const char *runtime_dir, const char *build,
                                  int (*machine_of)( const char *path, unsigned short *machine ),
                                  int *verbose, char *target, size_t target_size );
@@ -533,12 +534,22 @@ static void runtime_report_interpreter(void)
     {
         /* Without verbose traces a white screen says nothing about whether a
          * program is still loading, computing or drawing. Every 10 seconds, if
-         * anything changed: file reads, frames shown and dynarec entries. */
+         * anything changed: completed file reads and the time inside NtReadFile,
+         * read requests to the SD card, their time and the reads the cache
+         * served, system calls, frames shown and dynarec entries. */
         extern unsigned int wine_nx_file_reads __attribute__((weak));
+        extern unsigned long long wine_nx_file_read_100ns __attribute__((weak));
+        extern unsigned int wine_nx_syscalls __attribute__((weak));
+        extern unsigned int wine_nx_sd_reads, wine_nx_sd_hits;
+        extern unsigned long long wine_nx_sd_read_ns;
         static unsigned int calls, last_reads = ~0u, last_frames = ~0u;
         static u64 start;
         unsigned int reads = &wine_nx_file_reads ? __atomic_load_n( &wine_nx_file_reads, __ATOMIC_RELAXED ) : 0;
         unsigned int frames = __atomic_load_n( &wine_nx_fb_frames, __ATOMIC_RELAXED );
+        unsigned long long read_ms = &wine_nx_file_read_100ns
+                                     ? __atomic_load_n( &wine_nx_file_read_100ns, __ATOMIC_RELAXED ) / 10000 : 0;
+        unsigned int syscalls = &wine_nx_syscalls ? __atomic_load_n( &wine_nx_syscalls, __ATOMIC_RELAXED ) : 0;
+        char native[80] = "";
 
         if (!start) start = now;
         if (++calls % 2 || (reads == last_reads && frames == last_frames)) return;
@@ -547,14 +558,17 @@ static void runtime_report_interpreter(void)
 #ifdef WINE_NX_BOX64_DYNAREC
         {
             extern unsigned long long wine_nx_box64_native_entries;
-            log_line( "[PROGRESS] %llus reads=%u frames=%u native_entries=%llu",
-                      (unsigned long long)(armTicksToNs( now - start ) / 1000000000ull), reads, frames,
-                      __atomic_load_n( &wine_nx_box64_native_entries, __ATOMIC_RELAXED ) );
+            extern unsigned int wine_nx_box64_block_tests;
+            snprintf( native, sizeof(native), " native_entries=%llu block_tests=%u",
+                      __atomic_load_n( &wine_nx_box64_native_entries, __ATOMIC_RELAXED ),
+                      __atomic_load_n( &wine_nx_box64_block_tests, __ATOMIC_RELAXED ) );
         }
-#else
-        log_line( "[PROGRESS] %llus reads=%u frames=%u",
-                  (unsigned long long)(armTicksToNs( now - start ) / 1000000000ull), reads, frames );
 #endif
+        log_line( "[PROGRESS] %llus reads=%u read_ms=%llu sd_reads=%u sd_ms=%llu cache_hits=%u syscalls=%u "
+                  "frames=%u%s", (unsigned long long)(armTicksToNs( now - start ) / 1000000000ull), reads, read_ms,
+                  __atomic_load_n( &wine_nx_sd_reads, __ATOMIC_RELAXED ),
+                  __atomic_load_n( &wine_nx_sd_read_ns, __ATOMIC_RELAXED ) / 1000000,
+                  __atomic_load_n( &wine_nx_sd_hits, __ATOMIC_RELAXED ), syscalls, frames, native );
         return;
     }
 
@@ -1437,6 +1451,7 @@ int main( int argc, char **argv )
     unsigned int attach_status = STATUS_INVALID_IMAGE_FORMAT;
     int autorun;
     USHORT target_machine;
+    int sd_cache = wine_nx_sd_cache_install();  /* before any file on the card is opened */
 
     log_main_thread = pthread_self();
     log_main_thread_set = 1;
@@ -1479,6 +1494,8 @@ int main( int argc, char **argv )
 
     log_line( "wine-nx-runtime: generic Wine ntdll PE loader path" );
     log_line( "[BUILD] %s", WINE_NX_RUNTIME_BUILD );
+    log_line( "[SDCACHE] %s", sd_cache ? "sdmc reads cached: 128 KB chunks, 8 per file, 32 MB in all"
+                                      : "no sdmc device; reads are not cached" );
     log_line( "[INIT] verbose traces %s (verbose.txt)", wine_nx_runtime_verbose ? "on" : "off" );
     log_line( "[TARGET] %s", target );
 
