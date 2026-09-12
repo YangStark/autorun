@@ -67,6 +67,7 @@ static unsigned int horizon_server_object_attributes_size(const unsigned char *d
     *offset=(sizeof(*a)+a->sd_len+a->name_len+3)&~3u;
     return *offset > size ? HORIZON_REG_INVALID_PARAMETER : 0;
 }
+static void horizon_server_signal_changed_locked(void) { }  /* horizon.c wakes pending waits */
 #include "../../dlls/ntdll/unix/horizon_registry_server.h"
 #define CHECK_LAYOUT(n) _Static_assert(sizeof(struct horizon_##n) == sizeof(struct n), #n)
 CHECK_LAYOUT(create_key_request); CHECK_LAYOUT(create_key_reply);

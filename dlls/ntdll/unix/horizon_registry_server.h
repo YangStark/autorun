@@ -95,11 +95,12 @@ static void horizon_registry_load_file(struct horizon_reg_key *base, const char 
 }
 
 /* Notifications retain event objects, not handles which can be closed/reused.
- * The caller holds horizon_server_objects_mutex. Waiters poll signaled. */
+ * The caller holds horizon_server_objects_mutex; pending waits are woken. */
 static void horizon_registry_signal( void *event )
 {
     struct horizon_server_object *object = event;
     object->signaled = 1;
+    horizon_server_signal_changed_locked();
     if (!--object->refs) horizon_server_free_object( object );
 }
 

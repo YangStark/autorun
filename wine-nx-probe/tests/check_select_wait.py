@@ -8,6 +8,7 @@ def extract(start, end):
     return source[source.index(start):source.index(end, source.index(start))]
 fixture = r'''
 #include <assert.h>
+#include <errno.h>
 #include <stddef.h>
 #include <string.h>
 #include <pthread.h>
@@ -16,6 +17,8 @@ fixture = r'''
 #define HORIZON_STATUS_TIMEOUT 0x102
 #define HORIZON_STATUS_INVALID_PARAMETER 0xc000000du
 #define HORIZON_STATUS_ABANDONED_WAIT_0 0x80u
+#define HORIZON_SERVER_WAIT_SLICE 200000LL
+#define HORIZON_SERVER_POLL_INTERVAL 10000LL
 #define TRUE 1
 #define FALSE 0
 #define TRACE(...) ((void)0)
@@ -34,19 +37,32 @@ static unsigned horizon_server_wait_object_locked(unsigned h, int consume) {
     }
     return 0;
 }
-static long long ticks;
-static unsigned calls, ready_after, signals, reply_status;
+static void assert_locked(void) { assert(pthread_mutex_trylock(&horizon_server_objects_mutex) == EBUSY); }
+static long long ticks, first_timeout, last_timeout;
+static unsigned calls, ready_after, signals, sleeps, reply_status;
+static int queue_wait;
 static unsigned horizon_server_select_status(const struct horizon_select_request *r,
  const unsigned char *d, unsigned n, int initial) {
-    (void)r; (void)d; (void)n; signals += initial;
+    (void)r; (void)d; (void)n; assert_locked(); signals += initial;
     return ++calls >= ready_after ? 0 : HORIZON_STATUS_TIMEOUT;
+}
+static int horizon_server_select_polls_locked(const struct horizon_select_request *r,
+ const unsigned char *d, unsigned n) {
+    (void)r; (void)d; (void)n; assert_locked(); return queue_wait;
+}
+/* The sleeper is woken by an object change a millisecond later at most. */
+static void horizon_server_sleep_locked(long long timeout) {
+    assert_locked(); assert(timeout > 0);
+    if (!sleeps++) first_timeout = timeout;
+    last_timeout = timeout;
+    ticks += timeout < 10000 ? timeout : 10000;
 }
 static void NtQueryPerformanceCounter(LARGE_INTEGER *now, void *freq) { (void)freq; now->QuadPart = ticks; }
 static void NtQuerySystemTime(LARGE_INTEGER *now) { now->QuadPart = ticks; }
-static void test_sleep(unsigned us) { ticks += us * 10; }
-#define usleep test_sleep
 static int horizon_server_write_reply(int fd, const void *data, unsigned size, const void *extra, unsigned n) {
     (void)fd; (void)size; (void)extra; (void)n;
+    assert(pthread_mutex_trylock(&horizon_server_objects_mutex) == 0); /* Replies go out unlocked. */
+    pthread_mutex_unlock(&horizon_server_objects_mutex);
     reply_status = ((const struct horizon_select_reply *)data)->header.error; return 0;
 }
 '''
@@ -54,16 +70,23 @@ tests = r'''
 static void run(long long timeout, unsigned ready, unsigned expected, unsigned attempts) {
     struct horizon_select_request r = { 8, timeout };
     struct horizon_server_connection c = { 1 };
-    ticks = 100000; calls = signals = 0; ready_after = ready;
+    ticks = 100000; calls = signals = sleeps = 0; ready_after = ready;
     horizon_server_handle_select(&c, (const unsigned char *)&r, NULL, 0);
-    assert(reply_status == expected && calls == attempts && signals == 1);
+    assert(reply_status == expected && calls == attempts && signals == 1 && sleeps == attempts - 1);
 }
 int main(void) {
     run(0, 2, 0x102, 1); /* Zero timeout does not block. */
     run(-120000, 100, 0x102, 3); /* Server monotonic deadline. */
+    assert(first_timeout == 20000 && last_timeout == 10000); /* Sleeps end at the deadline. */
     run(120000, 100, 0x102, 3); /* NT absolute wall deadline. */
+    assert(first_timeout == 20000 && last_timeout == 10000);
     run(-200000, 3, 0, 3); /* Signal arrives before deadline. */
-    run(0x7fffffffffffffffLL, 5, 0, 5); /* Infinite waits remain pending. */
+    run(0x7fffffffffffffffLL, 5, 0, 5); /* Infinite waits remain pending, */
+    assert(first_timeout == HORIZON_SERVER_WAIT_SLICE); /* sleeping until an object changes. */
+    queue_wait = 1;
+    run(0x7fffffffffffffffLL, 3, 0, 3); /* Message queue waits recheck every millisecond. */
+    assert(first_timeout == HORIZON_SERVER_POLL_INTERVAL && last_timeout == HORIZON_SERVER_POLL_INTERVAL);
+    queue_wait = 0;
     struct horizon_select_wait_op op = { 0, { 0, 1 } };
     unsigned size = offsetof(struct horizon_select_wait_op, handles[2]);
     states[0] = 0x102; states[1] = 0;
@@ -77,7 +100,7 @@ int main(void) {
     assert(horizon_server_select_wait(&op, size, 0) == 0x81 && consumed[1] == 3);
     states[0] = states[1] = 0; abandoned[0] = 1;
     assert(horizon_server_select_wait(&op, size, 1) == 0x80 && consumed[0] == 2 && consumed[1] == 4);
-    puts("Horizon waits: deadlines, infinite pending, signal once, wait-any index, atomic wait-all, abandoned passed");
+    puts("Horizon waits: deadlines, infinite pending, queue polling, signal once, wait-any index, atomic wait-all, abandoned passed");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='wine-nx-wait-test-') as tmp:

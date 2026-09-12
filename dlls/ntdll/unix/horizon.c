@@ -211,6 +211,7 @@ struct horizon_pipe
     size_t head;
     size_t tail;
     size_t used;
+    unsigned int client_cores;  /* request pipes: the cores their client thread is pinned to */
     unsigned char buffer[HORIZON_PIPE_BUFFER_SIZE];
 };
 
@@ -2463,6 +2464,9 @@ struct horizon_server_connection
     /* Thread object of the client; the connection holds one reference until
      * the client's request pipe closes, which is when the thread terminates. */
     struct horizon_server_object *thread;
+    /* The client's request pipe, and the cores this thread last followed it to. */
+    struct horizon_pipe *request_pipe;
+    unsigned int core_mask;
 };
 
 struct horizon_server_object
@@ -2525,6 +2529,36 @@ static struct horizon_reg horizon_registry;
 
 static LONG horizon_server_next_handle = 0x100;
 static pthread_mutex_t horizon_server_objects_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Pending selects and thread start gates sleep here, releasing the object lock;
+ * each change that can signal an object wakes them. */
+static pthread_cond_t horizon_server_objects_cond = PTHREAD_COND_INITIALIZER;
+static unsigned int horizon_server_sleepers;  /* guarded by horizon_server_objects_mutex */
+
+/* Longest sleep between rechecks, a safety net for changes nothing wakes (100ns). */
+#define HORIZON_SERVER_WAIT_SLICE    200000LL
+/* Message queues become signaled without a wakeup (window timers, input): waits
+ * on them recheck this often (100ns). */
+#define HORIZON_SERVER_POLL_INTERVAL 10000LL
+
+/* Called with horizon_server_objects_mutex held after an object may have become
+ * signaled or a suspended thread may start. */
+static void horizon_server_signal_changed_locked(void)
+{
+    if (horizon_server_sleepers) pthread_cond_broadcast( &horizon_server_objects_cond );
+}
+
+/* Sleeps with horizon_server_objects_mutex held until an object changes or
+ * timeout (100ns, at most HORIZON_SERVER_WAIT_SLICE) passes. */
+static void horizon_server_sleep_locked( long long timeout )
+{
+    if (timeout > HORIZON_SERVER_WAIT_SLICE) timeout = HORIZON_SERVER_WAIT_SLICE;
+    horizon_server_sleepers++;
+    /* libnx's relative wait: newlib's pthread_cond_timedwait reads the realtime
+     * clock, which fails until the time service has set the boot time. */
+    condvarWaitTimeout( &horizon_server_objects_cond.cond, &horizon_server_objects_mutex.normal,
+                        (u64)timeout * 100 );
+    horizon_server_sleepers--;
+}
 static struct horizon_server_handle_entry *horizon_server_handles;
 /* Every thread object, running or terminated, while referenced (open_thread). */
 static struct horizon_server_object *horizon_server_threads;
@@ -2718,10 +2752,23 @@ void horizon_get_memory_info( unsigned long long *total, unsigned long long *use
     if (*used > *total) *used = *total;
 }
 
+/* The pipe behind a descriptor from horizon_pipe, or NULL. */
+static struct horizon_pipe *horizon_pipe_from_fd( int fd )
+{
+    struct horizon_pipe_file *file;
+    __handle *handle;
+
+    if (fd < 0 || horizon_pipe_device == -1 || !(handle = __get_handle( fd ))) return NULL;
+    if (handle->device != (unsigned int)horizon_pipe_device || !handle->fileStruct) return NULL;
+    file = *(struct horizon_pipe_file **)handle->fileStruct;
+    return file ? file->pipe : NULL;
+}
+
 void horizon_pin_current_thread( ULONG_PTR requested_mask )
 {
     ULONG_PTR system_mask = horizon_get_system_affinity_mask();
     ULONG_PTR mask = requested_mask & system_mask;
+    struct horizon_pipe *pipe;
     LONG index;
     int preferred;
     Result rc;
@@ -2737,10 +2784,15 @@ void horizon_pin_current_thread( ULONG_PTR requested_mask )
     preferred = lowest_set_core( mask );
     rc = svcSetThreadCoreMask( CUR_THREAD_HANDLE, preferred, (u32)mask );
     if (R_FAILED(rc))
+    {
         WARN( "svcSetThreadCoreMask(preferred %u, mask %#lx) failed %#x.\n",
               preferred, (unsigned long)mask, rc );
-    else
-        TRACE( "pinned current thread to preferred %u, mask %#lx.\n", preferred, (unsigned long)mask );
+        return;
+    }
+    TRACE( "pinned current thread to preferred %u, mask %#lx.\n", preferred, (unsigned long)mask );
+    /* Its server connection thread follows it (horizon_server_follow_client). */
+    if ((pipe = horizon_pipe_from_fd( ntdll_get_thread_data()->request_fd )))
+        __atomic_store_n( &pipe->client_cores, (unsigned int)mask, __ATOMIC_RELAXED );
 }
 
 static void horizon_set_reent_errno( struct _reent *r, int error )
@@ -4402,6 +4454,7 @@ static void horizon_server_end_thread_locked( struct horizon_server_connection *
     for (entry = horizon_server_handles; entry; entry = entry->next)
         if (entry->object->type == HORIZON_SERVER_OBJECT_MUTEX)
             horizon_mutex_abandon( &entry->object->mutex, thread->thread.tid );
+    horizon_server_signal_changed_locked();
     if (!--thread->refs) horizon_server_free_object( thread );
 }
 
@@ -4418,15 +4471,18 @@ static unsigned int horizon_server_signal_object_locked( unsigned int handle )
     {
     case HORIZON_SERVER_OBJECT_EVENT:
         object->signaled = 1;
+        horizon_server_signal_changed_locked();
         return HORIZON_STATUS_SUCCESS;
     case HORIZON_SERVER_OBJECT_MUTEX:
     {
         unsigned int previous;
+        horizon_server_signal_changed_locked();
         return horizon_mutex_release( &object->mutex, horizon_server_current_tid(), &previous );
     }
     case HORIZON_SERVER_OBJECT_SEMAPHORE:
         if (object->count == object->max) return HORIZON_STATUS_SEMAPHORE_LIMIT_EXCEEDED;
         object->count++;
+        horizon_server_signal_changed_locked();
         return HORIZON_STATUS_SUCCESS;
     default:
         return HORIZON_STATUS_OBJECT_TYPE_MISMATCH;
@@ -4548,17 +4604,11 @@ static int horizon_server_handle_init_thread( struct horizon_server_connection *
     /* CREATE_SUSPENDED: hold the reply until resume_thread opens the start
      * gate, so no Windows code runs first. Wine's kernelbase creates every
      * thread suspended and resumes it after NtCreateThreadEx returns. */
-    for (;;)
-    {
-        int may_start;
-
-        pthread_mutex_lock( &horizon_server_objects_mutex );
-        may_start = !connection->thread || horizon_thread_may_start( &connection->thread->thread );
-        if (may_start && connection->thread) connection->thread->thread.started = 1;
-        pthread_mutex_unlock( &horizon_server_objects_mutex );
-        if (may_start) break;
-        usleep( 1000 );
-    }
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    while (connection->thread && !horizon_thread_may_start( &connection->thread->thread ))
+        horizon_server_sleep_locked( HORIZON_SERVER_WAIT_SLICE );
+    if (connection->thread) connection->thread->thread.started = 1;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
 
     memset( &reply, 0, sizeof(reply) );
     reply.header.error = HORIZON_STATUS_SUCCESS;
@@ -8048,6 +8098,20 @@ static int horizon_server_handle_query_directory_file( struct horizon_server_con
 
 static void *horizon_server_thread( void *param );
 
+/* A client thread and its connection thread take turns, so they share a core:
+ * requests and replies hand over without waking another core, and connection
+ * threads stop crowding the process's default core. */
+static void horizon_server_follow_client( struct horizon_server_connection *connection )
+{
+    unsigned int mask;
+
+    if (!connection->request_pipe) return;
+    mask = __atomic_load_n( &connection->request_pipe->client_cores, __ATOMIC_RELAXED );
+    if (!mask || mask == connection->core_mask) return;
+    connection->core_mask = mask;
+    svcSetThreadCoreMask( CUR_THREAD_HANDLE, lowest_set_core( mask ), mask );
+}
+
 static LONG horizon_server_next_tid = 4;
 
 static int horizon_server_handle_new_thread( struct horizon_server_connection *connection,
@@ -8138,6 +8202,7 @@ static int horizon_server_handle_resume_thread( struct horizon_server_connection
     pthread_mutex_lock( &horizon_server_objects_mutex );
     if ((object = horizon_server_get_thread_locked( request->handle, &status )))
         status = horizon_thread_resume( &object->thread, &reply.count );
+    horizon_server_signal_changed_locked();  /* the start gate */
     pthread_mutex_unlock( &horizon_server_objects_mutex );
     reply.header.error = status;
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
@@ -9537,6 +9602,7 @@ static int horizon_server_handle_event_op( struct horizon_server_connection *con
             break;
         case HORIZON_SET_EVENT:
             object->signaled = 1;
+            horizon_server_signal_changed_locked();
             break;
         case HORIZON_RESET_EVENT:
             object->signaled = 0;
@@ -9634,6 +9700,7 @@ static int horizon_server_handle_release_mutex( struct horizon_server_connection
     status = horizon_server_find_typed_object_locked( request->handle, HORIZON_SERVER_OBJECT_MUTEX, &object );
     if (status == HORIZON_STATUS_SUCCESS)
         status = horizon_mutex_release( &object->mutex, connection->tid, &reply.prev_count );
+    horizon_server_signal_changed_locked();
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
     reply.header.error = status;
@@ -9717,6 +9784,7 @@ static int horizon_server_handle_release_semaphore( struct horizon_server_connec
         {
             reply.prev_count = object->count;
             object->count += request->count;
+            horizon_server_signal_changed_locked();
         }
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
@@ -9796,6 +9864,7 @@ static int horizon_server_handle_set_timer( struct horizon_server_connection *co
         object->timer_when = request->expire;
         object->timer_period = request->period > 0 ? request->period : 0;
         object->signaled = 1;
+        horizon_server_signal_changed_locked();
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
@@ -9861,7 +9930,6 @@ static unsigned int horizon_server_select_wait( const struct horizon_select_wait
     count = (size - offsetof( struct horizon_select_wait_op, handles )) / sizeof(op->handles[0]);
     if (!count) return HORIZON_STATUS_INVALID_PARAMETER;
 
-    pthread_mutex_lock( &horizon_server_objects_mutex );
     if (wait_all)
     {
         status = HORIZON_STATUS_SUCCESS;
@@ -9888,7 +9956,6 @@ static unsigned int horizon_server_select_wait( const struct horizon_select_wait
             if (status != HORIZON_STATUS_TIMEOUT) break;
         }
     }
-    pthread_mutex_unlock( &horizon_server_objects_mutex );
     return status;
 }
 
@@ -9899,11 +9966,9 @@ static unsigned int horizon_server_select_signal_and_wait( const struct horizon_
 
     if (size < sizeof(*op)) return HORIZON_STATUS_INVALID_PARAMETER;
 
-    pthread_mutex_lock( &horizon_server_objects_mutex );
     status = initial ? horizon_server_signal_object_locked( op->signal ) : HORIZON_STATUS_SUCCESS;
     if (status == HORIZON_STATUS_SUCCESS)
         status = horizon_server_wait_object_locked( op->wait, TRUE );
-    pthread_mutex_unlock( &horizon_server_objects_mutex );
     return status;
 }
 
@@ -9942,22 +10007,78 @@ static unsigned int horizon_server_select_status( const struct horizon_select_re
     }
 }
 
+static int horizon_server_handle_polls_locked( unsigned int handle )
+{
+    struct horizon_server_handle_entry *entry;
+
+    if (!handle || handle == HORIZON_CURRENT_THREAD_HANDLE) return 0;
+    return (entry = horizon_server_find_handle_locked( handle )) &&
+           entry->object->type == HORIZON_SERVER_OBJECT_MSG_QUEUE;
+}
+
+/* Whether a select waits on a message queue, which can become signaled without
+ * a wakeup. Called with horizon_server_objects_mutex held. */
+static int horizon_server_select_polls_locked( const struct horizon_select_request *request,
+                                               const unsigned char *data, unsigned int data_size )
+{
+    const unsigned char *select_data;
+    unsigned int count, i;
+    int op;
+
+    if (request->size < sizeof(op)) return 0;
+    if (data_size >= HORIZON_APC_RESULT_SIZE + request->size)
+        select_data = data + HORIZON_APC_RESULT_SIZE;
+    else if (data_size >= request->size)
+        select_data = data;
+    else return 0;
+    memcpy( &op, select_data, sizeof(op) );
+
+    switch (op)
+    {
+    case HORIZON_SELECT_WAIT:
+    case HORIZON_SELECT_WAIT_ALL:
+    {
+        const struct horizon_select_wait_op *wait = (const void *)select_data;
+
+        if (request->size < offsetof( struct horizon_select_wait_op, handles[1] )) return 0;
+        count = (request->size - offsetof( struct horizon_select_wait_op, handles )) / sizeof(wait->handles[0]);
+        for (i = 0; i < count; i++)
+            if (horizon_server_handle_polls_locked( wait->handles[i] )) return 1;
+        return 0;
+    }
+    case HORIZON_SELECT_SIGNAL_AND_WAIT:
+        if (request->size < sizeof(struct horizon_select_signal_and_wait_op)) return 0;
+        return horizon_server_handle_polls_locked(
+            ((const struct horizon_select_signal_and_wait_op *)select_data)->wait );
+    default:
+        return 0;
+    }
+}
+
 static int horizon_server_handle_select( struct horizon_server_connection *connection,
                                          const unsigned char *message,
                                          const unsigned char *data, unsigned int data_size )
 {
     const struct horizon_select_request *request = (const void *)message;
     struct horizon_select_reply reply;
+    int polls;
 
     memset( &reply, 0, sizeof(reply) );
-    /* Each client has its own server connection/thread. Poll outside the object
-     * lock so other clients can signal objects while this request is pending.
+    /* Each client has its own server connection/thread. A pending wait sleeps on
+     * horizon_server_objects_cond, which releases the object lock so other
+     * clients can signal objects meanwhile and wake it
+     * (horizon_server_signal_changed_locked). Message queues also change without
+     * that wakeup (window timers), so waits on them recheck every millisecond.
      * Negative server deadlines are absolute performance-counter ticks (100ns),
      * positive deadlines use NT wall-clock time; INT64_MAX means infinite.
      * Signal-and-wait must perform its signal only on the first attempt. */
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    polls = horizon_server_select_polls_locked( request, data, data_size );
     for (int initial = 1;; initial = 0)
     {
         LARGE_INTEGER now;
+        long long timeout = HORIZON_SERVER_WAIT_SLICE;
+
         reply.header.error = horizon_server_select_status( request, data, data_size, initial );
         if (reply.header.error != HORIZON_STATUS_TIMEOUT || !request->timeout) break;
         if (request->timeout != 0x7fffffffffffffffLL)
@@ -9966,15 +10087,19 @@ static int horizon_server_handle_select( struct horizon_server_connection *conne
             {
                 NtQueryPerformanceCounter( &now, NULL );
                 if (now.QuadPart > -(request->timeout + 1)) break;
+                timeout = -(request->timeout + 1) - now.QuadPart + 1;
             }
             else
             {
                 NtQuerySystemTime( &now );
                 if (now.QuadPart >= request->timeout) break;
+                timeout = request->timeout - now.QuadPart;
             }
         }
-        usleep( 1000 );
+        if (polls && timeout > HORIZON_SERVER_POLL_INTERVAL) timeout = HORIZON_SERVER_POLL_INTERVAL;
+        horizon_server_sleep_locked( timeout );
     }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
     reply.signaled = 1;
 
     TRACE( "Horizon server select size %u timeout %lld status %08x.\n",
@@ -9989,6 +10114,7 @@ static void *horizon_server_thread( void *param )
     struct horizon_zombie *zombie;
 
     horizon_server_current = connection;
+    connection->request_pipe = horizon_pipe_from_fd( connection->request_fd );
     for (;;)
     {
         struct horizon_server_request_header *header = (void *)message;
@@ -9997,6 +10123,7 @@ static void *horizon_server_thread( void *param )
         int ret = horizon_read_exact( connection->request_fd, message, sizeof(message) );
 
         if (ret <= 0) break;
+        horizon_server_follow_client( connection );
         if (header->request_size)
         {
             if (!(request_data = malloc( header->request_size )))
