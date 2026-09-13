@@ -291,6 +291,7 @@ struct horizon_fd_queue
 #define HORIZON_REQ_MAP_IMAGE_VIEW 68
 #define HORIZON_REQ_UNMAP_VIEW 71
 #define HORIZON_REQ_GET_TOKEN_SID 230
+#define HORIZON_REQ_ALLOCATE_LOCALLY_UNIQUE_ID 252
 #define HORIZON_REQ_CREATE_KEY 86
 #define HORIZON_REQ_OPEN_KEY 87
 #define HORIZON_REQ_DELETE_KEY 88
@@ -1351,6 +1352,14 @@ struct horizon_set_timer_request
     unsigned long long arg;
     int period;
     char pad[4];
+};
+
+/* Wine's luid_t after the reply header: AllocateLocallyUniqueId's answer. */
+struct horizon_allocate_locally_unique_id_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int low_part;
+    int high_part;
 };
 
 struct horizon_set_timer_reply
@@ -9847,6 +9856,21 @@ static int horizon_server_handle_create_timer( struct horizon_server_connection 
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
 }
 
+/* Identifiers that are unique for as long as this process runs, which is what
+ * the name promises. wined3d asks for one before it will create an adapter, so
+ * Direct3D does not start without this; the wineserver counts up the same way. */
+static int horizon_server_handle_allocate_locally_unique_id( struct horizon_server_connection *connection )
+{
+    static LONG last_luid;
+    struct horizon_allocate_locally_unique_id_reply reply;
+
+    memset( &reply, 0, sizeof(reply) );
+    reply.header.error = HORIZON_STATUS_SUCCESS;
+    reply.low_part = (unsigned int)InterlockedIncrement( &last_luid );
+    reply.high_part = 0;
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
 static int horizon_server_handle_set_timer( struct horizon_server_connection *connection,
                                             const unsigned char *message )
 {
@@ -10144,6 +10168,9 @@ static void *horizon_server_thread( void *param )
         {
         case HORIZON_REQ_GET_TOKEN_SID:
             status = horizon_server_handle_registry_user( connection, message );
+            break;
+        case HORIZON_REQ_ALLOCATE_LOCALLY_UNIQUE_ID:
+            status = horizon_server_handle_allocate_locally_unique_id( connection );
             break;
         case HORIZON_REQ_CREATE_KEY:
         case HORIZON_REQ_OPEN_KEY:
