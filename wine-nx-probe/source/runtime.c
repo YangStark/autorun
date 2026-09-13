@@ -387,6 +387,42 @@ void wine_nx_cursor_show( int visible )
 #define WINE_NX_POINTER_LEFT  0x1
 #define WINE_NX_POINTER_RIGHT 0x2
 
+/* The console has no keyboard, so the controller stands in for one. These are
+ * the controls that send keys, in the order of the bits in
+ * wine_nx_pad_key_state; A and B are left alone because they are the mouse
+ * buttons. sdmc:/switch/wine/keys.txt overrides the virtual-key codes, one
+ * NAME=code line each, so a game that wants other keys needs no new build. */
+enum
+{
+    WINE_NX_KEY_UP, WINE_NX_KEY_DOWN, WINE_NX_KEY_LEFT, WINE_NX_KEY_RIGHT,
+    WINE_NX_KEY_X, WINE_NX_KEY_Y, WINE_NX_KEY_L, WINE_NX_KEY_R,
+    WINE_NX_KEY_ZL, WINE_NX_KEY_ZR, WINE_NX_KEY_PLUS, WINE_NX_KEY_MINUS,
+    WINE_NX_KEY_STICKL, WINE_NX_KEY_STICKR, WINE_NX_KEY_COUNT
+};
+
+static const char *const wine_nx_pad_key_names[WINE_NX_KEY_COUNT] =
+{
+    "UP", "DOWN", "LEFT", "RIGHT", "X", "Y", "L", "R",
+    "ZL", "ZR", "PLUS", "MINUS", "STICKL", "STICKR"
+};
+
+/* Defaults that suit a game: the d-pad and left stick steer, the triggers
+ * accelerate and brake, and the face and shoulder buttons carry what a keyboard
+ * usually has under the left hand. */
+unsigned short wine_nx_pad_keys[WINE_NX_KEY_COUNT] =
+{
+    0x26, 0x28, 0x25, 0x27,  /* arrows */
+    0x20, 0x46,              /* X space, Y f */
+    0x09, 0x10,              /* L tab, R shift */
+    0x28, 0x26,              /* ZL down, ZR up */
+    0x1b, 0x09,              /* plus escape, minus tab */
+    0x11, 0x12,              /* stick presses: control, alt */
+};
+
+/* Which of those controls are held, read by the display driver's ProcessEvents
+ * (dlls/win32u/winnx_drv.c), which turns the changes into key events. */
+unsigned int wine_nx_pad_key_state;
+
 /* One mouse for win32u, in native 1280x720 display coordinates: the right
  * analog stick moves the cursor, A holds the left button and B the right,
  * and a touchscreen contact puts the cursor under the finger with the left
@@ -427,6 +463,29 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
     wine_nx_pointer_tick = now;
     if (held & HidNpadButton_A) pressed |= WINE_NX_POINTER_LEFT;
     if (held & HidNpadButton_B) pressed |= WINE_NX_POINTER_RIGHT;
+    {
+        /* The left stick steers as well as the d-pad, past a dead zone. */
+        HidAnalogStickState steer = padGetStickPos( &wine_nx_pad, 0 );
+        static const struct { u64 button; int key; } buttons[] =
+        {
+            { HidNpadButton_X, WINE_NX_KEY_X }, { HidNpadButton_Y, WINE_NX_KEY_Y },
+            { HidNpadButton_L, WINE_NX_KEY_L }, { HidNpadButton_R, WINE_NX_KEY_R },
+            { HidNpadButton_ZL, WINE_NX_KEY_ZL }, { HidNpadButton_ZR, WINE_NX_KEY_ZR },
+            { HidNpadButton_Plus, WINE_NX_KEY_PLUS }, { HidNpadButton_Minus, WINE_NX_KEY_MINUS },
+            { HidNpadButton_StickL, WINE_NX_KEY_STICKL }, { HidNpadButton_StickR, WINE_NX_KEY_STICKR },
+            { HidNpadButton_Up, WINE_NX_KEY_UP }, { HidNpadButton_Down, WINE_NX_KEY_DOWN },
+            { HidNpadButton_Left, WINE_NX_KEY_LEFT }, { HidNpadButton_Right, WINE_NX_KEY_RIGHT },
+        };
+        unsigned int keys = 0, i;
+
+        for (i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
+            if (held & buttons[i].button) keys |= 1u << buttons[i].key;
+        if (steer.y >  12000) keys |= 1u << WINE_NX_KEY_UP;
+        if (steer.y < -12000) keys |= 1u << WINE_NX_KEY_DOWN;
+        if (steer.x < -12000) keys |= 1u << WINE_NX_KEY_LEFT;
+        if (steer.x >  12000) keys |= 1u << WINE_NX_KEY_RIGHT;
+        __atomic_store_n( &wine_nx_pad_key_state, keys, __ATOMIC_RELAXED );
+    }
     *x = (int)wine_nx_pointer.x;
     *y = (int)wine_nx_pointer.y;
     *buttons = pressed;
@@ -749,6 +808,46 @@ static int read_bool_file( const char *path )
     if (!read_first_line( path, line, sizeof(line) )) return 0;
     return !strcmp( line, "1" ) || !strcasecmp( line, "true" ) ||
            !strcasecmp( line, "yes" ) || !strcasecmp( line, "run" );
+}
+
+/* switch/wine/keys.txt: one NAME=code line for each control whose key should
+ * differ from the default, where code is a Windows virtual-key code, decimal or
+ * 0x-prefixed. Unknown names and malformed lines are reported and skipped, so a
+ * typo costs one control rather than the file. */
+static void read_key_map( const char *path )
+{
+    char line[80];
+    FILE *file = fopen( path, "r" );
+    unsigned int changed = 0;
+
+    if (!file) return;
+    while (fgets( line, sizeof(line), file ))
+    {
+        char *equals, *name = line, *value;
+        unsigned int i;
+
+        trim_line( line );
+        if (!line[0] || line[0] == '#') continue;
+        if (!(equals = strchr( line, '=' )))
+        {
+            log_line( "[NXINPUT] keys.txt: no '=' in '%s'", line );
+            continue;
+        }
+        *equals = 0;
+        value = equals + 1;
+        while (*name == ' ') name++;
+        while (*value == ' ') value++;
+        for (i = 0; i < WINE_NX_KEY_COUNT; i++)
+            if (!strcasecmp( name, wine_nx_pad_key_names[i] ))
+            {
+                wine_nx_pad_keys[i] = (unsigned short)strtoul( value, NULL, 0 );
+                changed++;
+                break;
+            }
+        if (i == WINE_NX_KEY_COUNT) log_line( "[NXINPUT] keys.txt: unknown control '%s'", name );
+    }
+    fclose( file );
+    log_line( "[NXINPUT] keys.txt: %u controls remapped", changed );
 }
 
 static unsigned int close_handle_object( HANDLE handle )
@@ -1603,6 +1702,7 @@ int main( int argc, char **argv )
      * old mapping, which is there to compare the two. */
     if (&wine_nx_nouveau_pin_cached && read_bool_file( RUNTIME_DIR "/gl-uncached.txt" ))
         wine_nx_nouveau_pin_cached = 0;
+    read_key_map( RUNTIME_DIR "/keys.txt" );
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else
     {

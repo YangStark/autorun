@@ -36,6 +36,27 @@ shutil.copytree(build / 'opengl-sd-card/switch/wine', stage,
 # The launcher lists every program in drive_c; target.txt only preselects one.
 (stage / 'target.txt').write_text('sdmc:/switch/wine/drive_c/openttd/openttd.exe\n')
 (stage / 'run-entry.txt').write_text('1\n')
+# The controller stands in for a keyboard; this lists what each control sends
+# and how to change it, with every line commented out so the defaults hold.
+(stage / 'keys.txt').write_text('''# Keys the controller sends, one NAME=code line each, where code is a Windows
+# virtual-key code in decimal or 0x form. Remove the # to change one. A and B
+# are not here: they stay the left and right mouse buttons.
+#
+# UP=0x26      d-pad up, or the left stick pushed up
+# DOWN=0x28
+# LEFT=0x25
+# RIGHT=0x27
+# X=0x20       space
+# Y=0x46       f
+# L=0x09       tab
+# R=0x10       shift
+# ZL=0x28      down arrow, a brake in a racing game
+# ZR=0x26      up arrow, the accelerator
+# PLUS=0x1B    escape
+# MINUS=0x09   tab
+# STICKL=0x11  control
+# STICKR=0x12  alt
+''')
 (stage / f'BUILD-{marker}-README.txt').write_text(f'''Wine-NX build {marker}: the whole SD-card payload.
 Copy the switch folder to the SD card, merging folders; it replaces the runtime
 NRO and the Wine payload of any earlier build.
