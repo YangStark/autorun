@@ -264,3 +264,20 @@ const unixlib_entry_t wine_nx_crypt32_unix_funcs[] =
     stub_not_implemented,  /* unix_close_cert_store */
     stub_not_implemented,  /* unix_enum_root_certs */
 };
+
+/* The same for the 32-bit crypt32 a WoW64 program loads. Its DllMain returns
+ * FALSE when the unix side is missing (dlls/crypt32/main.c), and a failed
+ * DllMain of a statically imported DLL ends the process before it starts:
+ * Quake III Arena imports crypt32 and stopped with c0000142. */
+const unixlib_entry_t wine_nx_crypt32_wow64_unix_funcs[7] =
+{
+    stub_success,          /* unix_process_attach */
+    stub_success,          /* unix_process_detach */
+    stub_not_implemented,  /* unix_open_cert_store */
+    stub_not_implemented,  /* unix_import_store_key */
+    stub_not_implemented,  /* unix_import_store_cert */
+    stub_not_implemented,  /* unix_close_cert_store */
+    stub_not_implemented,  /* unix_enum_root_certs */
+};
+
+const unsigned int wine_nx_crypt32_wow64_unix_count = ARRAY_SIZE(wine_nx_crypt32_wow64_unix_funcs);

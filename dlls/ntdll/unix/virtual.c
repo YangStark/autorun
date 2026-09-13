@@ -1080,6 +1080,8 @@ extern const unsigned int wine_nx_ws2_32_wow64_unix_count;
 extern const unsigned int wine_nx_opengl32_wow64_unix_count;
 extern const unixlib_entry_t wine_nx_audio_wow64_unix_funcs[];
 extern const unsigned int wine_nx_audio_wow64_unix_count;
+extern const unixlib_entry_t wine_nx_crypt32_wow64_unix_funcs[];
+extern const unsigned int wine_nx_crypt32_wow64_unix_count;
 
 static const struct
 {
@@ -1091,6 +1093,7 @@ static const struct
     { "ws2_32.dll", wine_nx_ws2_32_wow64_unix_funcs, &wine_nx_ws2_32_wow64_unix_count },
     { "opengl32.dll", wine_nx_opengl32_wow64_unix_funcs, &wine_nx_opengl32_wow64_unix_count },
     { "winenxaudio.drv", wine_nx_audio_wow64_unix_funcs, &wine_nx_audio_wow64_unix_count },
+    { "crypt32.dll", wine_nx_crypt32_wow64_unix_funcs, &wine_nx_crypt32_wow64_unix_count },
 };
 
 /* The x86 unix call gate passes on whatever handle a 32-bit DLL presents, so
