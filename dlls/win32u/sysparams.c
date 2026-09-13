@@ -172,6 +172,11 @@ static UINT limit_resolutions = 0;
 BOOL decorated_mode = TRUE;
 UINT64 thunk_lock_callback = 0;
 
+#ifdef __SWITCH__
+/* wine-nx-probe/source/runtime.c, cleared by switch/wine/no-display-devices.txt */
+extern int wine_nx_display_devices __attribute__((weak));
+#endif
+
 #define VIRTUAL_HMONITOR ((HMONITOR)(UINT_PTR)(0x10000 + 1))
 static struct monitor virtual_monitor =
 {
@@ -1964,7 +1969,13 @@ static void add_source( const char *name, UINT state_flags, UINT dpi, void *para
 
     TRACE( "name %s, state_flags %#x\n", name, state_flags );
 
+#ifdef __SWITCH__
+    /* add_gpu adds nothing when the registry refuses the keys, and the driver
+     * reports its source anyway; drop it instead of asserting. */
+    if (list_empty( &gpus )) return;
+#else
     assert( !list_empty( &gpus ) );
+#endif
     gpu = LIST_ENTRY( list_tail( &gpus ), struct gpu, entry );
 
     /* in virtual desktop mode, report all physical sources as detached */
@@ -2089,7 +2100,11 @@ static void add_monitor( const struct gdi_monitor *gdi_monitor, void *param )
     char buffer[MAX_PATH];
     char monitor_id_string[16];
 
+#ifdef __SWITCH__
+    if (list_empty( &sources )) return;
+#else
     assert( !list_empty( &sources ) );
+#endif
     source = LIST_ENTRY( list_tail( &sources ), struct source, entry );
 
     if (!(monitor = calloc( 1, sizeof(*monitor) ))) return;
@@ -2322,7 +2337,11 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
     TRACE( "current %s, host_modes_count %u, host_modes %p, param %p\n", debugstr_devmodew( current ),
            host_modes_count, host_modes, param );
 
+#ifdef __SWITCH__
+    if (list_empty( &sources )) return;
+#else
     assert( !list_empty( &sources ) );
+#endif
     source = LIST_ENTRY( list_tail( &sources ), struct source, entry );
 
     if (emulate_modeset)
@@ -3057,20 +3076,25 @@ static BOOL lock_display_devices( BOOL force )
     serial = get_monitor_update_serial();
 
 #ifdef __SWITCH__
-    /* The Switch has no display-device registry; the device-manager
-     * enumeration (add_gpu/add_source) relies on registry keys that fail to
-     * create on this port, leaving the gpus list empty and crashing. Use a
-     * single fixed 1280x720 virtual monitor instead (same mechanism as the
-     * service window station path below). The server-side monitor serial may
-     * stay at zero on Horizon, so don't let the generic serial fast path skip
-     * this first-time initialization while the local monitor list is empty. */
-    if (force || list_empty( &monitors ) || monitor_update_serial < serial)
+    /* Enumerating the real devices writes them to the registry and reads them
+     * back; the Horizon server only grew one later, so switch/wine/
+     * no-display-devices.txt puts the fixed 1280x720 virtual monitor back.
+     * A virtual monitor has no source, which is enough for the desktop but
+     * leaves wined3d with an adapter that has no output, and every d3d9
+     * adapter call then fails with D3DERR_INVALIDCALL. */
+    if (&wine_nx_display_devices && !wine_nx_display_devices)
     {
-        clear_display_devices();
-        list_add_tail( &monitors, &virtual_monitor.entry );
-        monitor_update_serial = serial;
+        if (force || list_empty( &monitors ) || monitor_update_serial < serial)
+        {
+            clear_display_devices();
+            list_add_tail( &monitors, &virtual_monitor.entry );
+            monitor_update_serial = serial;
+        }
+        return TRUE;
     }
-    return TRUE;
+    /* The server-side monitor serial stays at zero on Horizon, so the fast
+     * path below would skip this first enumeration entirely. */
+    if (list_empty( &sources )) force = TRUE;
 #endif
 
     if (!force && monitor_update_serial >= serial) return TRUE;
@@ -3095,12 +3119,26 @@ static BOOL lock_display_devices( BOOL force )
         release_display_manager_ctx( &ctx );
 
         ret = update_display_cache_from_registry( serial );
+#ifdef __SWITCH__
+        WARN( "display devices: %u gpus, %u sources, %u monitors\n",
+              list_count( &gpus ), list_count( &sources ), list_count( &monitors ) );
+#endif
     }
 
     if (!ret)
     {
+#ifdef __SWITCH__
+        /* The registry could not hold the devices; the fixed virtual monitor
+         * keeps the desktop usable, without an output for Direct3D. */
+        ERR( "Failed to read display config, falling back to the virtual monitor.\n" );
+        clear_display_devices();
+        list_add_tail( &monitors, &virtual_monitor.entry );
+        monitor_update_serial = serial;
+        return TRUE;
+#else
         ERR( "Failed to read display config.\n" );
         pthread_mutex_unlock( &display_lock );
+#endif
     }
     return ret;
 }
@@ -4812,7 +4850,10 @@ INT get_display_depth( UNICODE_STRING *name )
         return 32;
     }
 
-    if (!source_get_current_settings( source, &current_mode )) depth = 32;
+    /* A source whose mode was never filled in reports no depth at all, and
+     * programs check this before opening a window: Quake III warns about a
+     * "low desktop color depth" and offers to quit. */
+    if (!source_get_current_settings( source, &current_mode ) || !current_mode.dmBitsPerPel) depth = 32;
     else depth = current_mode.dmBitsPerPel;
 
     unlock_display_devices();

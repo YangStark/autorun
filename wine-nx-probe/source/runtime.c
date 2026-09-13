@@ -191,6 +191,12 @@ int wine_nx_runtime_verbose;
  * sdmc:/switch/wine/gl-uncached.txt containing 1. */
 extern int wine_nx_nouveau_pin_cached __attribute__((weak));
 
+/* Whether the display driver registers its GPU, source and monitor with
+ * win32u's device manager, which programs enumerate and wined3d insists on.
+ * sdmc:/switch/wine/no-display-devices.txt containing 1 goes back to the
+ * forced virtual screen, in case that walk of the registry misbehaves. */
+int wine_nx_display_devices = 1;
+
 /***********************************************************************
  * Framebuffer platform hooks used by the win32u Switch display driver
  * (dlls/win32u/winnx_drv.c).  The driver renders into ordinary DIB memory;
@@ -1703,6 +1709,9 @@ int main( int argc, char **argv )
     if (&wine_nx_nouveau_pin_cached && read_bool_file( RUNTIME_DIR "/gl-uncached.txt" ))
         wine_nx_nouveau_pin_cached = 0;
     read_key_map( RUNTIME_DIR "/keys.txt" );
+    if (read_bool_file( RUNTIME_DIR "/no-display-devices.txt" )) wine_nx_display_devices = 0;
+    log_line( "[INIT] display devices %s (no-display-devices.txt)",
+              wine_nx_display_devices ? "registered" : "off" );
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else
     {

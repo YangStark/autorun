@@ -1030,6 +1030,7 @@ static void load_display_driver(void)
             extern void wine_nx_drv_SetCursor( HWND, HCURSOR );
             extern UINT wine_nx_drv_UpdateDisplayDevices( const struct gdi_device_manager *, void * );
             extern UINT wine_nx_drv_OpenGLInit( UINT, const struct opengl_funcs *, const struct opengl_driver_funcs ** );
+            extern int wine_nx_display_devices __attribute__((weak));
             null_user_driver.pCreateWindow         = wine_nx_drv_CreateWindow;
             null_user_driver.pCreateWindowSurface  = wine_nx_drv_CreateWindowSurface;
             null_user_driver.pWindowPosChanged     = wine_nx_drv_WindowPosChanged;
@@ -1037,10 +1038,14 @@ static void load_display_driver(void)
             null_user_driver.pSetCursorPos         = wine_nx_drv_SetCursorPos;
             null_user_driver.pSetCursor            = wine_nx_drv_SetCursor;
             null_user_driver.pOpenGLInit           = wine_nx_drv_OpenGLInit;
-            /* NB: pUpdateDisplayDevices is intentionally NOT overridden — the
-             * device-manager + registry enumeration path crashes on the
-             * Switch's minimal registry. The virtual screen size is forced
-             * directly in get_virtual_screen_rect instead. */
+            /* The device manager walks the registry, which the Switch did not
+             * have when this driver was written; the Horizon server has one
+             * now, and programs ask after the display devices it registers.
+             * wined3d will not make an adapter without EnumDisplayDevices, so
+             * Direct3D needs them. switch/wine/no-display-devices.txt puts the
+             * forced virtual screen of get_virtual_screen_rect back. */
+            if (!&wine_nx_display_devices || wine_nx_display_devices)
+                null_user_driver.pUpdateDisplayDevices = wine_nx_drv_UpdateDisplayDevices;
         }
         __wine_set_user_driver( &null_user_driver, WINE_GDI_DRIVER_VERSION );
         return;
