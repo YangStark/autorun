@@ -39,7 +39,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-45"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-54"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -1782,7 +1782,10 @@ int main( int argc, char **argv )
         struct __wine_debug_channel *options = (void *)((char *)teb->Peb + 2 * page_size);
 
         options[0].name[0] = 0;
-        options[0].flags = (1 << __WINE_DBCL_ERR) | (wine_nx_runtime_verbose ? 1 << __WINE_DBCL_FIXME : 0);
+        /* Wine reports a good deal at warning level and returns quietly after
+         * it, which is where wined3d refuses to start, so verbose runs want it. */
+        options[0].flags = (1 << __WINE_DBCL_ERR) |
+                           (wine_nx_runtime_verbose ? (1 << __WINE_DBCL_FIXME) | (1 << __WINE_DBCL_WARN) : 0);
     }
     {
         unsigned long long total, used;

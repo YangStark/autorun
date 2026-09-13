@@ -28,10 +28,11 @@ package('package-wow64-openttd.py')
 shutil.rmtree(build / 'audio-sd-card', ignore_errors=True)
 package('package-wow64-audio.py', WINE_NX_AUDIO_BASE=str(build / 'openttd-sd-card/switch/wine'))
 package('package-wow64-opengl.py', WINE_NX_OPENGL_BASE=str(build / 'audio-sd-card/switch/wine'))
+package('package-wow64-d3d9.py', WINE_NX_D3D9_BASE=str(build / 'opengl-sd-card/switch/wine'))
 
 # The checkpoint READMEs describe one checkpoint each; this package has its own.
 shutil.rmtree(stage_root, ignore_errors=True)
-shutil.copytree(build / 'opengl-sd-card/switch/wine', stage,
+shutil.copytree(build / 'd3d9-sd-card/switch/wine', stage,
                 ignore=shutil.ignore_patterns('*.log', '.DS_Store', '*-README.txt'))
 # The launcher lists every program in drive_c; target.txt only preselects one.
 (stage / 'target.txt').write_text('sdmc:/switch/wine/drive_c/openttd/openttd.exe\n')

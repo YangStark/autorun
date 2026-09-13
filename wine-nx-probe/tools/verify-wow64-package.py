@@ -125,6 +125,16 @@ elif target == "sdmc:/switch/wine/drive_c/openttd/openttd.exe":
     assert deps and all(dep.lower() in syswow64 for dep in deps), deps
     assert list((game / "baseset").rglob("opengfx.obg")), "OpenGFX is missing"
     assert (game / "openttd.args.txt").read_text().startswith("-v "), "OpenTTD needs a video driver"
+elif target == "sdmc:/switch/wine/drive_c/pe32-d3d9.exe":
+    d3d9 = stage / "drive_c/pe32-d3d9.exe"
+    info = inspect(d3d9, "--coff-imports")
+    assert "Arch: i386\n" in info and "Type: HIGHLOW" in inspect(d3d9, "--coff-basereloc")
+    for symbol in ("Direct3DCreate9", "CreateWindowExW", "NtDisplayString"):
+        assert f"Symbol: {symbol} " in info, f"Missing Direct3D test import: {symbol}"
+    deps = re.findall(r"^Import \{\n  Name: (.+)$", info, re.M)
+    assert deps and all(dep.lower() in syswow64 for dep in deps), deps
+    # d3d9 hands the work to wined3d, which draws with opengl32.
+    assert {"wined3d.dll", "opengl32.dll"} <= syswow64
 elif target == "sdmc:/switch/wine/drive_c/quake3/quake3e.exe":
     game = stage / "drive_c/quake3"
     info = inspect(game / "quake3e.exe", "--coff-imports")
