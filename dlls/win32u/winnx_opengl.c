@@ -20,6 +20,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -42,8 +43,18 @@ static const struct opengl_drawable_funcs nx_drawable_funcs;
 struct nx_gl_drawable
 {
     struct opengl_drawable base;
-    BOOL screen;  /* this drawable took the screen from the framebuffer */
+    BOOL screen;  /* this drawable shares the screen's EGL surface */
 };
+
+/* The one EGL surface on the screen's NWindow, and the drawables sharing it.
+ * win32u gives a window a second drawable whenever another context is made
+ * current on it while the first is still in use - wined3d does exactly that
+ * when it replaces its caps context with a versioned one - so the drawables
+ * of a window share the surface rather than each asking for the screen. */
+static pthread_mutex_t nx_screen_mutex = PTHREAD_MUTEX_INITIALIZER;
+static EGLSurface nx_screen_surface;
+static unsigned int nx_screen_refs;
+static int nx_screen_format;
 
 static struct nx_gl_drawable *impl_from_opengl_drawable( struct opengl_drawable *base )
 {
@@ -71,12 +82,30 @@ static EGLConfig nx_config_for_format( int format )
 static void nx_drawable_destroy( struct opengl_drawable *base )
 {
     struct nx_gl_drawable *gl = impl_from_opengl_drawable( base );
+    EGLSurface surface = NULL;
 
-    /* win32u destroys the EGL surface after this callback, but the framebuffer
-     * can only take the NWindow back once the surface has let it go. */
-    if (base->surface) funcs->p_eglDestroySurface( egl->display, base->surface );
+    if (!gl->screen)
+    {
+        /* win32u destroys the EGL surface after this callback. */
+        return;
+    }
+
+    /* The screen's surface outlives this drawable while another one shares it;
+     * take it away from win32u either way, so the framebuffer only gets the
+     * NWindow back once the surface is really gone. */
     base->surface = NULL;
-    if (gl->screen) wine_nx_gl_release_window();
+
+    pthread_mutex_lock( &nx_screen_mutex );
+    if (nx_screen_refs && !--nx_screen_refs)
+    {
+        surface = nx_screen_surface;
+        nx_screen_surface = NULL;
+    }
+    pthread_mutex_unlock( &nx_screen_mutex );
+
+    if (!surface) return;
+    funcs->p_eglDestroySurface( egl->display, surface );
+    wine_nx_gl_release_window();
 }
 
 static void nx_drawable_flush( struct opengl_drawable *base, UINT flags )
@@ -138,6 +167,27 @@ static BOOL nx_surface_create( HWND hwnd, BOOL raw, int format, struct opengl_dr
     gl->base.buffer_map[GL_FRONT - GL_FRONT_LEFT] = GL_BACK;
     gl->base.buffer_map[GL_FRONT_AND_BACK - GL_FRONT_LEFT] = GL_BACK;
 
+    pthread_mutex_lock( &nx_screen_mutex );
+    if (nx_screen_surface && nx_screen_format == format)
+    {
+        /* Another drawable of this window still has the screen; share it. */
+        gl->base.surface = nx_screen_surface;
+        gl->screen = TRUE;
+        nx_screen_refs++;
+        pthread_mutex_unlock( &nx_screen_mutex );
+        TRACE( "hwnd %p: sharing the screen surface %p\n", hwnd, nx_screen_surface );
+        *drawable = &gl->base;
+        return TRUE;
+    }
+    if (nx_screen_surface)
+    {
+        pthread_mutex_unlock( &nx_screen_mutex );
+        ERR( "hwnd %p: the screen has a format %d surface, cannot serve format %d\n",
+             hwnd, nx_screen_format, format );
+        goto err;
+    }
+    pthread_mutex_unlock( &nx_screen_mutex );
+
     if (!(window = wine_nx_gl_acquire_window()))
     {
         ERR( "hwnd %p: the screen already has an OpenGL surface\n", hwnd );
@@ -148,8 +198,17 @@ static BOOL nx_surface_create( HWND hwnd, BOOL raw, int format, struct opengl_dr
                                                               (EGLNativeWindowType)window, NULL )))
     {
         ERR( "hwnd %p: eglCreateWindowSurface failed, error %#x\n", hwnd, funcs->p_eglGetError() );
+        /* nothing is sharing the screen yet, so give it back here */
+        gl->screen = FALSE;
+        wine_nx_gl_release_window();
         goto err;
     }
+
+    pthread_mutex_lock( &nx_screen_mutex );
+    nx_screen_surface = gl->base.surface;
+    nx_screen_format = format;
+    nx_screen_refs = 1;
+    pthread_mutex_unlock( &nx_screen_mutex );
 
     TRACE( "created drawable %s with EGL surface %p\n", debugstr_opengl_drawable( &gl->base ), gl->base.surface );
     {
