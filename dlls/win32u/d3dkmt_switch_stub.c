@@ -8,6 +8,10 @@
  * win32u syscall table (KeServiceDescriptorTable[1]) stays complete, and keep
  * the d3dkmt_* helpers opengl.c references resolvable.  Restore the real file
  * when a GPU backend lands.
+ *
+ * The adapter and device entry points are real, though: wined3d refuses to
+ * create an adapter without them, so d3d9 needs them before it can reach the
+ * OpenGL backend.
  */
 
 #if 0
@@ -15,6 +19,8 @@
 #endif
 
 #include "config.h"
+
+#include <pthread.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -24,27 +30,110 @@
 #include "win32u_private.h"
 #include "ntuser_private.h"
 
+/* wined3d opens a D3DKMT adapter and one device per output before it creates
+ * any d3d9 device, so those four entry points have to work even without a GPU
+ * kernel interface: hand out handles and remember what each one is. */
+
+#define D3DKMT_HANDLE_BIT 0x40000000
+#define D3DKMT_MAX_OBJECTS 256
+
+static pthread_mutex_t d3dkmt_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned char d3dkmt_objects[D3DKMT_MAX_OBJECTS];
+
+static D3DKMT_HANDLE alloc_object_handle( enum d3dkmt_type type )
+{
+    D3DKMT_HANDLE handle = 0;
+    unsigned int index;
+
+    pthread_mutex_lock( &d3dkmt_lock );
+    for (index = 1; index < D3DKMT_MAX_OBJECTS; index++)
+    {
+        if (d3dkmt_objects[index]) continue;
+        d3dkmt_objects[index] = type;
+        handle = (index << 6) | D3DKMT_HANDLE_BIT;
+        break;
+    }
+    pthread_mutex_unlock( &d3dkmt_lock );
+
+    return handle;
+}
+
+static BOOL object_handle_is( D3DKMT_HANDLE handle, enum d3dkmt_type type )
+{
+    unsigned int index = (handle & ~0xc0000000) >> 6;
+    BOOL ret;
+
+    if (index >= D3DKMT_MAX_OBJECTS) return FALSE;
+    pthread_mutex_lock( &d3dkmt_lock );
+    ret = d3dkmt_objects[index] == type;
+    pthread_mutex_unlock( &d3dkmt_lock );
+
+    return ret;
+}
+
+static BOOL free_object_handle( D3DKMT_HANDLE handle, enum d3dkmt_type type )
+{
+    unsigned int index = (handle & ~0xc0000000) >> 6;
+    BOOL ret;
+
+    if (index >= D3DKMT_MAX_OBJECTS) return FALSE;
+    pthread_mutex_lock( &d3dkmt_lock );
+    if ((ret = d3dkmt_objects[index] == type)) d3dkmt_objects[index] = 0;
+    pthread_mutex_unlock( &d3dkmt_lock );
+
+    return ret;
+}
+
 /* --- NtGdiDdDDI* syscall entry points (auto-generated from ntgdi.h) --- */
 NTSTATUS WINAPI NtGdiDdDDIAcquireKeyedMutex( D3DKMT_ACQUIREKEYEDMUTEX *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
 NTSTATUS WINAPI NtGdiDdDDIAcquireKeyedMutex2( D3DKMT_ACQUIREKEYEDMUTEX2 *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
 NTSTATUS WINAPI NtGdiDdDDICheckOcclusion( const D3DKMT_CHECKOCCLUSION *desc ) { return STATUS_PROCEDURE_NOT_FOUND; }
 NTSTATUS WINAPI NtGdiDdDDICheckVidPnExclusiveOwnership( const D3DKMT_CHECKVIDPNEXCLUSIVEOWNERSHIP *desc ) { return STATUS_PROCEDURE_NOT_FOUND; }
-NTSTATUS WINAPI NtGdiDdDDICloseAdapter( const D3DKMT_CLOSEADAPTER *desc ) { return STATUS_PROCEDURE_NOT_FOUND; }
+NTSTATUS WINAPI NtGdiDdDDICloseAdapter( const D3DKMT_CLOSEADAPTER *desc )
+{
+    if (!desc || !desc->hAdapter) return STATUS_INVALID_PARAMETER;
+    if (!free_object_handle( desc->hAdapter, D3DKMT_ADAPTER )) return STATUS_INVALID_PARAMETER;
+    return STATUS_SUCCESS;
+}
 NTSTATUS WINAPI NtGdiDdDDICreateAllocation( D3DKMT_CREATEALLOCATION *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
 NTSTATUS WINAPI NtGdiDdDDICreateAllocation2( D3DKMT_CREATEALLOCATION *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
-NTSTATUS WINAPI NtGdiDdDDICreateDevice( D3DKMT_CREATEDEVICE *desc ) { return STATUS_PROCEDURE_NOT_FOUND; }
+NTSTATUS WINAPI NtGdiDdDDICreateDevice( D3DKMT_CREATEDEVICE *desc )
+{
+    D3DKMT_HANDLE handle;
+
+    if (!desc) return STATUS_INVALID_PARAMETER;
+    if (!object_handle_is( desc->hAdapter, D3DKMT_ADAPTER )) return STATUS_INVALID_PARAMETER;
+    if (!(handle = alloc_object_handle( D3DKMT_DEVICE ))) return STATUS_NO_MEMORY;
+
+    desc->hDevice = handle;
+    return STATUS_SUCCESS;
+}
 NTSTATUS WINAPI NtGdiDdDDICreateKeyedMutex( D3DKMT_CREATEKEYEDMUTEX *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
 NTSTATUS WINAPI NtGdiDdDDICreateKeyedMutex2( D3DKMT_CREATEKEYEDMUTEX2 *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
 NTSTATUS WINAPI NtGdiDdDDICreateSynchronizationObject( D3DKMT_CREATESYNCHRONIZATIONOBJECT *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
 NTSTATUS WINAPI NtGdiDdDDICreateSynchronizationObject2( D3DKMT_CREATESYNCHRONIZATIONOBJECT2 *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
 NTSTATUS WINAPI NtGdiDdDDIDestroyAllocation( const D3DKMT_DESTROYALLOCATION *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
 NTSTATUS WINAPI NtGdiDdDDIDestroyAllocation2( const D3DKMT_DESTROYALLOCATION2 *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
-NTSTATUS WINAPI NtGdiDdDDIDestroyDevice( const D3DKMT_DESTROYDEVICE *desc ) { return STATUS_PROCEDURE_NOT_FOUND; }
+NTSTATUS WINAPI NtGdiDdDDIDestroyDevice( const D3DKMT_DESTROYDEVICE *desc )
+{
+    if (!desc || !desc->hDevice) return STATUS_INVALID_PARAMETER;
+    if (!free_object_handle( desc->hDevice, D3DKMT_DEVICE )) return STATUS_INVALID_PARAMETER;
+    return STATUS_SUCCESS;
+}
 NTSTATUS WINAPI NtGdiDdDDIDestroyKeyedMutex( const D3DKMT_DESTROYKEYEDMUTEX *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
 NTSTATUS WINAPI NtGdiDdDDIDestroySynchronizationObject( const D3DKMT_DESTROYSYNCHRONIZATIONOBJECT *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
 NTSTATUS WINAPI NtGdiDdDDIEscape( const D3DKMT_ESCAPE *desc ) { return STATUS_PROCEDURE_NOT_FOUND; }
 NTSTATUS WINAPI NtGdiDdDDIOpenAdapterFromHdc( D3DKMT_OPENADAPTERFROMHDC *desc ) { return STATUS_PROCEDURE_NOT_FOUND; }
-NTSTATUS WINAPI NtGdiDdDDIOpenAdapterFromLuid( D3DKMT_OPENADAPTERFROMLUID *desc ) { return STATUS_PROCEDURE_NOT_FOUND; }
+NTSTATUS WINAPI NtGdiDdDDIOpenAdapterFromLuid( D3DKMT_OPENADAPTERFROMLUID *desc )
+{
+    D3DKMT_HANDLE handle;
+
+    if (!desc) return STATUS_INVALID_PARAMETER;
+    if (!(handle = alloc_object_handle( D3DKMT_ADAPTER ))) return STATUS_NO_MEMORY;
+
+    desc->hAdapter = handle;
+    return STATUS_SUCCESS;
+}
 NTSTATUS WINAPI NtGdiDdDDIOpenKeyedMutex( D3DKMT_OPENKEYEDMUTEX *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
 NTSTATUS WINAPI NtGdiDdDDIOpenKeyedMutex2( D3DKMT_OPENKEYEDMUTEX2 *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
 NTSTATUS WINAPI NtGdiDdDDIOpenKeyedMutexFromNtHandle( D3DKMT_OPENKEYEDMUTEXFROMNTHANDLE *params ) { return STATUS_PROCEDURE_NOT_FOUND; }
