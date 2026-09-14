@@ -133,7 +133,7 @@ static void copy_plane(BYTE **dstp, unsigned int dst_pitch, unsigned int dst_hei
     size_t copy_size = min(src_pitch, dst_pitch);
     const BYTE *src = *srcp;
     BYTE *dst = *dstp;
-    unsigned int i;
+    unsigned int i, rows = min(abs(src_height), dst_height);
 
     if (src_height < 0)
     {
@@ -142,7 +142,7 @@ static void copy_plane(BYTE **dstp, unsigned int dst_pitch, unsigned int dst_hei
         src_height = -src_height;
         src += src_height * src_pitch;
 
-        for (i = 0; i < src_height; ++i)
+        for (i = 0; i < rows; ++i)
         {
             src -= src_pitch;
             memcpy(dst, src, copy_size);
@@ -151,7 +151,7 @@ static void copy_plane(BYTE **dstp, unsigned int dst_pitch, unsigned int dst_hei
     }
     else
     {
-        for (i = 0; i < src_height; ++i)
+        for (i = 0; i < rows; ++i)
         {
             memcpy(dst, src, copy_size);
             dst += dst_pitch;
@@ -166,7 +166,7 @@ static void copy_plane(BYTE **dstp, unsigned int dst_pitch, unsigned int dst_hei
 static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
 {
     struct vmr7 *filter = impl_from_IBaseFilter(&iface->filter.IBaseFilter_iface);
-    unsigned int data_size, width, depth, src_pitch;
+    unsigned int data_size, width, depth, src_pitch, frame_size;
     const BITMAPINFOHEADER *bitmap_header;
     REFERENCE_TIME start_time, end_time;
     VMRPRESENTATIONINFO info = {0};
@@ -214,6 +214,18 @@ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
         src_pitch = (width + 3) & ~3;
     else /* packed YUV (UYVY or YUY2) or RGB */
         src_pitch = ((width * depth / 8) + 3) & ~3;
+
+    frame_size = src_pitch * abs(height);
+    if (bitmap_header->biCompression == mmioFOURCC('N','V','1','2')
+            || bitmap_header->biCompression == mmioFOURCC('Y','V','1','2'))
+        frame_size = frame_size * 3 / 2;
+    if (data_size > frame_size)
+    {
+        /* A decoder may give its buffer's size; blizzard.ax gives the size of
+         * its RGB32 frames when connected with YUY2. */
+        TRACE("Sample size %u is larger than a frame, %u bytes.\n", data_size, frame_size);
+        data_size = frame_size;
+    }
 
     info.dwFlags = VMRSample_TimeValid;
     info.rtStart = start_time;
@@ -277,7 +289,7 @@ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
     }
     else
     {
-        memcpy(surface_desc.lpSurface, data, data_size);
+        memcpy(surface_desc.lpSurface, data, min(data_size, surface_desc.lPitch * surface_desc.dwHeight));
     }
 
     IDirectDrawSurface7_Unlock(info.lpSurf, NULL);
