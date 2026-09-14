@@ -43,6 +43,8 @@
 #include "xinput.h"
 
 #include "wine/debug.h"
+#include "wine/unixlib.h"
+#include "nx_pad.h"
 
 DEFINE_GUID(GUID_DEVINTERFACE_WINEXINPUT,0x6c53d5fd,0x6480,0x440f,0xb6,0x18,0x47,0x67,0x50,0xc5,0xe1,0xa6);
 
@@ -122,6 +124,31 @@ static HMODULE xinput_instance;
 static HANDLE start_event;
 static HANDLE update_event;
 static HANDLE steam_overlay_event;
+
+/* Wine-NX: the Switch's controller, read by the runtime through a static unix
+ * call table (wine-nx-probe/source/xinput_unix.c). There is no HID device on
+ * the console. Elsewhere __wine_init_unix_call fails and the HID path runs. */
+static BOOL nx_backend;
+
+static DWORD nx_get_state(DWORD index, XINPUT_STATE *state)
+{
+    struct nx_xinput_state_params params = {index};
+
+    if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+    if (WINE_UNIX_CALL(nx_xinput_get_state, &params) || !params.connected) return ERROR_DEVICE_NOT_CONNECTED;
+    if (state) *state = params.state;
+    return ERROR_SUCCESS;
+}
+
+static DWORD nx_set_state(DWORD index, XINPUT_VIBRATION *vibration)
+{
+    struct nx_xinput_vibration_params params = {index};
+
+    if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+    if (vibration) params.vibration = *vibration;
+    if (WINE_UNIX_CALL(nx_xinput_set_state, &params) || !params.connected) return ERROR_DEVICE_NOT_CONNECTED;
+    return ERROR_SUCCESS;
+}
 
 static void check_value_caps(struct xinput_controller *controller, USHORT usage, HIDP_VALUE_CAPS *caps)
 {
@@ -797,6 +824,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
     case DLL_PROCESS_ATTACH:
         xinput_instance = inst;
         DisableThreadLibraryCalls(inst);
+        nx_backend = !__wine_init_unix_call();
         break;
     }
     return TRUE;
@@ -807,6 +835,8 @@ void WINAPI DECLSPEC_HOTPATCH XInputEnable(BOOL enable)
     int index;
 
     TRACE("enable %d.\n", enable);
+
+    if (nx_backend) return;
 
     /* Setting to false will stop messages from XInputSetState being sent
     to the controllers. Setting to true will send the last vibration
@@ -829,6 +859,8 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputSetState(DWORD index, XINPUT_VIBRATION *vib
 
     TRACE("index %lu, vibration %p.\n", index, vibration);
 
+    if (nx_backend) return nx_set_state(index, vibration);
+
     start_update_thread();
 
     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
@@ -847,6 +879,8 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputSetState(DWORD index, XINPUT_VIBRATION *vib
 static DWORD xinput_get_state(DWORD index, XINPUT_STATE *state)
 {
     if (!state) return ERROR_BAD_ARGUMENTS;
+
+    if (nx_backend) return nx_get_state(index, state);
 
     start_update_thread();
 
@@ -1082,6 +1116,9 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetKeystroke(DWORD index, DWORD reserved, P
 
     if (index >= XUSER_MAX_COUNT && index != XUSER_INDEX_ANY) return ERROR_BAD_ARGUMENTS;
 
+    /* No keystroke events from the Switch pad yet. */
+    if (nx_backend) return nx_get_state(index == XUSER_INDEX_ANY ? 0 : index, NULL) ? ERROR_DEVICE_NOT_CONNECTED : ERROR_EMPTY;
+
     if (index == XUSER_INDEX_ANY)
     {
         int i;
@@ -1112,6 +1149,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetDSoundAudioDeviceGuids(DWORD index, GUID
           debugstr_guid(capture_guid));
 
     if (index >= XUSER_MAX_COUNT || !render_guid || !capture_guid) return ERROR_BAD_ARGUMENTS;
+    if (nx_backend) return nx_get_state(index, NULL) ? ERROR_DEVICE_NOT_CONNECTED : ERROR_NOT_SUPPORTED;
     if (!controllers[index].device) return ERROR_DEVICE_NOT_CONNECTED;
 
     return ERROR_NOT_SUPPORTED;
@@ -1124,6 +1162,13 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetBatteryInformation(DWORD index, BYTE typ
     if (!once++) FIXME("index %lu, type %u, battery %p.\n", index, type, battery);
 
     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+    if (nx_backend)
+    {
+        if (nx_get_state(index, NULL)) return ERROR_DEVICE_NOT_CONNECTED;
+        battery->BatteryType = BATTERY_TYPE_WIRED;
+        battery->BatteryLevel = BATTERY_LEVEL_FULL;
+        return ERROR_SUCCESS;
+    }
     if (!controllers[index].device) return ERROR_DEVICE_NOT_CONNECTED;
 
     return ERROR_NOT_SUPPORTED;
@@ -1139,6 +1184,33 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilitiesEx(DWORD unk, DWORD index, D
     DWORD ret = ERROR_SUCCESS;
 
     TRACE("unk %lu, index %lu, flags %#lx, capabilities %p.\n", unk, index, flags, caps);
+
+    if (nx_backend)
+    {
+        if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+        if ((ret = nx_get_state(index, NULL))) return ret;
+        memset(caps, 0, sizeof(*caps));
+#if XINPUT_VER >= 4
+        caps->Capabilities.Type = XINPUT_DEVTYPE_GAMEPAD;
+        caps->Capabilities.Flags |= XINPUT_CAPS_PMD_SUPPORTED;
+#endif
+        caps->Capabilities.SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+#if XINPUT_VER >= 3
+        caps->Capabilities.Flags |= XINPUT_CAPS_VOICE_SUPPORTED;
+#endif
+        caps->Capabilities.Gamepad.wButtons = XINPUT_BUTTONS_ALL;
+        caps->Capabilities.Gamepad.bLeftTrigger = 0xff;
+        caps->Capabilities.Gamepad.bRightTrigger = 0xff;
+        caps->Capabilities.Gamepad.sThumbLX = ~0x3f;
+        caps->Capabilities.Gamepad.sThumbLY = ~0x3f;
+        caps->Capabilities.Gamepad.sThumbRX = ~0x3f;
+        caps->Capabilities.Gamepad.sThumbRY = ~0x3f;
+        /* an Xbox 360 controller, which is what games expect behind XInput */
+        caps->VendorId = 0x045e;
+        caps->ProductId = 0x028e;
+        caps->VersionNumber = 0x0114;
+        return ERROR_SUCCESS;
+    }
 
     start_update_thread();
 

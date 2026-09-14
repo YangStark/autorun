@@ -597,6 +597,7 @@ add_executable(wine-nx-runtime
     source/ntdll_pe_compat.c
     source/ws2_32_unix_stub.c
     source/audio_unix.c
+    source/xinput_unix.c
     $<TARGET_OBJECTS:wine-horizon-real>
     $<TARGET_OBJECTS:wine-server-real>
     $<TARGET_OBJECTS:wine-sync-real>
@@ -622,7 +623,7 @@ add_executable(wine-nx-runtime
 )
 
 set_target_properties(wine-nx-runtime PROPERTIES SUFFIX ".elf")
-set_source_files_properties(source/audio_unix.c PROPERTIES COMPILE_DEFINITIONS WINE_UNIX_LIB)
+set_source_files_properties(source/audio_unix.c source/xinput_unix.c PROPERTIES COMPILE_DEFINITIONS WINE_UNIX_LIB)
 target_include_directories(wine-nx-runtime PRIVATE "${WINE_NX_PE_BUILD_DIR}/include")
 
 option(WINE_NX_BOX64_INTERPRETER "Build the experimental WoW64 Box64 interpreter adapter" OFF)

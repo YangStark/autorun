@@ -431,6 +431,9 @@ unsigned short wine_nx_pad_keys[WINE_NX_KEY_COUNT] =
  * (dlls/win32u/winnx_drv.c), which turns the changes into key events. */
 unsigned int wine_nx_pad_key_state;
 
+/* When a program last read the controller through XInput (xinput_unix.c). */
+extern u64 wine_nx_xinput_last_poll;
+
 /* One mouse for win32u, in native 1280x720 display coordinates: the right
  * analog stick moves the cursor, A holds the left button and B the right,
  * and a touchscreen contact puts the cursor under the finger with the left
@@ -440,8 +443,8 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
     HidTouchScreenState touch = {0};
     HidAnalogStickState stick;
     unsigned int pressed = 0;
-    u64 now, held;
-    int moved;
+    u64 now, held, xinput_poll;
+    int moved, gamepad;
 
     pthread_mutex_lock( &wine_nx_pointer_mutex );
     if (!wine_nx_pointer_ready)
@@ -458,6 +461,10 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
     now = armGetSystemTick();
     held = padGetButtons( &wine_nx_pad );
     stick = padGetStickPos( &wine_nx_pad, 1 );
+    /* A program reading the controller through XInput gets it whole: no keys,
+     * clicks or cursor come from it meanwhile. The touchscreen still points. */
+    xinput_poll = wine_nx_xinput_last_poll;
+    gamepad = xinput_poll && (xinput_poll >= now || armTicksToNs( now - xinput_poll ) < 1000000000ull);
     if (hidGetTouchScreenStates( &touch, 1 ) && touch.count > 0)
     {
         int old_x = (int)wine_nx_pointer.x, old_y = (int)wine_nx_pointer.y;
@@ -466,11 +473,11 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
         moved = (int)wine_nx_pointer.x != old_x || (int)wine_nx_pointer.y != old_y;
         pressed |= WINE_NX_POINTER_LEFT;
     }
-    else moved = pointer_cursor_step( &wine_nx_pointer, stick.x, stick.y,
-                                      armTicksToNs( now - wine_nx_pointer_tick ) );
+    else moved = gamepad ? 0 : pointer_cursor_step( &wine_nx_pointer, stick.x, stick.y,
+                                                    armTicksToNs( now - wine_nx_pointer_tick ) );
     wine_nx_pointer_tick = now;
-    if (held & HidNpadButton_A) pressed |= WINE_NX_POINTER_LEFT;
-    if (held & HidNpadButton_B) pressed |= WINE_NX_POINTER_RIGHT;
+    if (!gamepad && (held & HidNpadButton_A) && !wine_nx_pad_keys[WINE_NX_KEY_A]) pressed |= WINE_NX_POINTER_LEFT;
+    if (!gamepad && (held & HidNpadButton_B) && !wine_nx_pad_keys[WINE_NX_KEY_B]) pressed |= WINE_NX_POINTER_RIGHT;
     {
         /* The left stick steers as well as the d-pad, past a dead zone. */
         HidAnalogStickState steer = padGetStickPos( &wine_nx_pad, 0 );
@@ -493,6 +500,7 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
         if (steer.y < -12000) keys |= 1u << WINE_NX_KEY_DOWN;
         if (steer.x < -12000) keys |= 1u << WINE_NX_KEY_LEFT;
         if (steer.x >  12000) keys |= 1u << WINE_NX_KEY_RIGHT;
+        if (gamepad) keys = 0;
         __atomic_store_n( &wine_nx_pad_key_state, keys, __ATOMIC_RELAXED );
     }
     *x = (int)wine_nx_pointer.x;
