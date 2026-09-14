@@ -60,6 +60,7 @@
 #include "horizon_registry.h"
 #include "horizon_read_redirect.h"
 #include "horizon_object_dirs.h"
+#include "horizon_keyboard.h"
 #include "horizon_free_range.h"
 
 #include <errno.h>
@@ -373,6 +374,7 @@ struct horizon_fd_queue
 #define HORIZON_REQ_ALLOCATE_LOCALLY_UNIQUE_ID 252
 #define HORIZON_REQ_OPEN_DIRECTORY 242
 #define HORIZON_REQ_GET_DIRECTORY_ENTRIES 243
+#define HORIZON_REQ_UPDATE_RAWINPUT_DEVICES 285
 #define HORIZON_REQ_CREATE_KEY 86
 #define HORIZON_REQ_OPEN_KEY 87
 #define HORIZON_REQ_DELETE_KEY 88
@@ -611,6 +613,10 @@ unsigned int horizon_set_process_machine( unsigned short machine )
 #define HORIZON_INPUT_MOUSE 0
 #define HORIZON_IMDT_MOUSE 0x02
 #define HORIZON_IMO_HARDWARE 0x01
+#define HORIZON_INPUT_KEYBOARD 1
+#define HORIZON_IMDT_KEYBOARD 0x01
+#define HORIZON_WM_INPUT 0x00ff
+#define HORIZON_RIM_INPUT 0
 #define HORIZON_MOUSEEVENTF_MOVE 0x0001
 #define HORIZON_MOUSEEVENTF_LEFTDOWN 0x0002
 #define HORIZON_MOUSEEVENTF_LEFTUP 0x0004
@@ -1953,10 +1959,22 @@ struct horizon_hw_mouse_input
     unsigned long long info;
 };
 
+/* union hw_input's kbd */
+struct horizon_hw_keyboard_input
+{
+    int type;
+    unsigned short vkey;
+    unsigned short scan;
+    unsigned int flags;
+    unsigned int time;
+    unsigned long long info;
+};
+
 union horizon_hw_input
 {
     int type;
     struct horizon_hw_mouse_input mouse;
+    struct horizon_hw_keyboard_input kbd;
     unsigned char raw[40];
 };
 
@@ -2515,6 +2533,10 @@ struct horizon_input_message
     int y;
     unsigned int time;
     unsigned long long info;
+    unsigned int device;             /* HORIZON_IMDT_*; 0 is the mouse */
+    unsigned int data_flags;         /* hardware_msg_data.flags */
+    int raw_keyboard;                /* WM_INPUT, carrying raw */
+    struct horizon_raw_keyboard raw;
     struct horizon_input_message *next;
 };
 
@@ -2691,6 +2713,10 @@ static struct horizon_session_view *horizon_session_views;
 static struct horizon_obj_locator horizon_input_locator;
 static struct horizon_input_message *horizon_input_messages;
 static struct horizon_input_message **horizon_input_messages_tail = &horizon_input_messages;
+/* update_rawinput_devices: the registrations of the one process that runs. */
+static struct horizon_rawinput_device *horizon_rawinput_devices;
+static unsigned int horizon_rawinput_device_count;
+static int horizon_alt_pressed;  /* wineserver's desktop->alt_pressed */
 static unsigned int horizon_next_input_message_id = 1;
 static unsigned int horizon_mouse_buttons;
 static struct horizon_message_queue horizon_posted_messages = { NULL, &horizon_posted_messages.head };
@@ -6223,6 +6249,52 @@ static unsigned int horizon_server_queue_mouse_locked( struct horizon_user_windo
     return HORIZON_STATUS_SUCCESS;
 }
 
+static unsigned int horizon_server_queue_key_locked( struct horizon_user_window *window, unsigned int msg,
+                                                     unsigned long long wparam, unsigned long long lparam,
+                                                     int x, int y, unsigned int time, unsigned long long info,
+                                                     unsigned int data_flags, const struct horizon_raw_keyboard *raw )
+{
+    struct horizon_input_message *queued;
+
+    if (!window) return HORIZON_STATUS_SUCCESS;
+    if (!(queued = calloc( 1, sizeof(*queued) ))) return HORIZON_STATUS_NO_MEMORY;
+    queued->id = horizon_next_input_message_id++;
+    if (!queued->id) queued->id = horizon_next_input_message_id++;
+    queued->tid = window->tid;
+    queued->win = window->handle;
+    queued->msg = msg;
+    queued->wparam = wparam;
+    queued->lparam = lparam;
+    queued->x = x;
+    queued->y = y;
+    queued->time = time;
+    queued->info = info;
+    queued->device = HORIZON_IMDT_KEYBOARD;
+    queued->data_flags = data_flags;
+    if (raw)
+    {
+        queued->raw_keyboard = 1;
+        queued->raw = *raw;
+    }
+    *horizon_input_messages_tail = queued;
+    horizon_input_messages_tail = &queued->next;
+    return HORIZON_STATUS_SUCCESS;
+}
+
+static void horizon_server_remove_input_message_locked( struct horizon_input_message *message )
+{
+    struct horizon_input_message **ptr;
+
+    for (ptr = &horizon_input_messages; *ptr; ptr = &(*ptr)->next)
+    {
+        if (*ptr != message) continue;
+        *ptr = message->next;
+        if (horizon_input_messages_tail == &message->next) horizon_input_messages_tail = ptr;
+        free( message );
+        return;
+    }
+}
+
 static int horizon_server_msg_in_filter( const struct horizon_get_message_request *request, unsigned int msg )
 {
     return msg >= request->get_first && msg <= request->get_last;
@@ -6262,6 +6334,87 @@ static const struct horizon_mouse_button_event
     { HORIZON_MOUSEEVENTF_RIGHTUP,   HORIZON_WM_RBUTTONUP,   HORIZON_MK_RBUTTON, HORIZON_VK_RBUTTON, 0 },
 };
 
+/* A controller key (wine_nx_send_keys, dlls/win32u/winnx_drv.c), as
+ * server/queue.c queues it: WM_INPUT for a raw keyboard registration, which is
+ * how DirectInput 8 reads keys, and the key message for the focus window unless
+ * that registration asked for RIDEV_NOLEGACY. */
+static int horizon_server_handle_send_keyboard( struct horizon_server_connection *connection,
+                                                const struct horizon_send_hardware_message_request *request )
+{
+    const struct horizon_hw_keyboard_input *kbd = &request->input.kbd;
+    struct horizon_send_hardware_message_reply reply;
+    const struct horizon_rawinput_device *raw_device = NULL;
+    struct horizon_user_window *focus = NULL, *raw_target = NULL;
+    struct horizon_obj_locator desktop_locator;
+    struct horizon_input_shm *input;
+    struct horizon_desktop_shm *desktop;
+    struct horizon_key_event event;
+    unsigned int status = HORIZON_STATUS_SUCCESS, time, focus_handle = 0, raw_handle = 0;
+    int legacy = 0;
+
+    memset( &reply, 0, sizeof(reply) );
+    memset( &event, 0, sizeof(event) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(input = horizon_server_input_shared_locked()) ||
+        !(desktop = horizon_server_desktop_shared_locked( &desktop_locator )))
+        status = HORIZON_STATUS_INVALID_HANDLE;
+    else
+    {
+        time = kbd->time ? kbd->time : horizon_server_input_time();
+        horizon_keyboard_event( desktop->keystate, &horizon_alt_pressed, kbd->vkey, kbd->scan, kbd->flags,
+                                (unsigned int)kbd->info, &event );
+        if (request->win) focus = horizon_server_find_window_locked( request->win );
+        if (!focus && input->focus) focus = horizon_server_find_window_locked( input->focus );
+        if (!focus && input->active) focus = horizon_server_find_window_locked( input->active );
+
+        if ((raw_device = horizon_rawinput_find( horizon_rawinput_devices, horizon_rawinput_device_count,
+                                                 HORIZON_RAWINPUT_USAGE_KEYBOARD )))
+        {
+            raw_target = raw_device->target ? horizon_server_find_window_locked( raw_device->target ) : focus;
+            status = horizon_server_queue_key_locked( raw_target, HORIZON_WM_INPUT, HORIZON_RIM_INPUT, 0,
+                                                      desktop->cursor.x, desktop->cursor.y, time, kbd->info,
+                                                      kbd->flags, &event.raw );
+        }
+        legacy = !raw_device || !(raw_device->flags & HORIZON_RIDEV_NOLEGACY);
+        if (!status && legacy)
+            status = horizon_server_queue_key_locked( focus, event.message, event.vkey, event.lparam,
+                                                      desktop->cursor.x, desktop->cursor.y, time, kbd->info,
+                                                      event.data_flags, NULL );
+        horizon_keyboard_update_state( desktop->keystate, event.message, event.vkey, 0xc0 );
+        horizon_keyboard_update_state( input->keystate, event.message, event.vkey, 0x80 );
+        input->keystate_serial++;
+        desktop->keystate_serial++;
+
+        if (raw_target)
+        {
+            struct horizon_msgq *queue = horizon_server_queue_locked( raw_target->tid );
+
+            raw_handle = raw_target->handle;
+            if (queue) horizon_msgq_touch( queue, HORIZON_MSGQ_QS_RAWINPUT );
+        }
+        if (focus)
+        {
+            struct horizon_msgq *queue = horizon_server_queue_locked( focus->tid );
+
+            focus_handle = focus->handle;
+            if (queue && legacy) horizon_msgq_touch( queue, HORIZON_MSGQ_QS_KEY );
+        }
+        horizon_server_refresh_queues_locked();
+        reply.prev_x = reply.new_x = desktop->cursor.x;
+        reply.prev_y = reply.new_y = desktop->cursor.y;
+        horizon_server_flush_input_locked();
+        horizon_server_flush_session_range_locked(
+            desktop_locator.offset,
+            offsetof( struct horizon_shared_object, shm ) + sizeof(struct horizon_desktop_shm) );
+    }
+    reply.header.error = status;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
+    horizon_trace( "[HZINPUT] key vk=%02x scan=%02x flags=%x msg=%x focus=%08x raw=%08x legacy=%d err=%08x\n",
+                   kbd->vkey, kbd->scan, kbd->flags, event.message, focus_handle, raw_handle, legacy, status );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
 static int horizon_server_handle_send_hardware_message( struct horizon_server_connection *connection,
                                                         const unsigned char *message )
 {
@@ -6274,6 +6427,9 @@ static int horizon_server_handle_send_hardware_message( struct horizon_server_co
     struct horizon_obj_locator desktop_locator;
     unsigned int status = HORIZON_STATUS_SUCCESS, time, flags, target_handle = 0, i;
     int x, y;
+
+    if (request->input.type == HORIZON_INPUT_KEYBOARD)
+        return horizon_server_handle_send_keyboard( connection, request );
 
     memset( &reply, 0, sizeof(reply) );
     pthread_mutex_lock( &horizon_server_objects_mutex );
@@ -6359,6 +6515,32 @@ done:
                    mouse->flags, reply.new_x, reply.new_y, target_handle,
                    horizon_mouse_buttons, status );
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+/* RegisterRawInputDevices sends the process's whole list each time. */
+static int horizon_server_handle_update_rawinput_devices( struct horizon_server_connection *connection,
+                                                          const unsigned char *data, unsigned int data_size )
+{
+    unsigned int count = data_size / sizeof(struct horizon_rawinput_device), status = HORIZON_STATUS_SUCCESS, i;
+    struct horizon_rawinput_device *devices = NULL;
+
+    if (count && !(devices = malloc( count * sizeof(*devices) ))) status = HORIZON_STATUS_NO_MEMORY;
+    else
+    {
+        if (count) memcpy( devices, data, count * sizeof(*devices) );
+        pthread_mutex_lock( &horizon_server_objects_mutex );
+        free( horizon_rawinput_devices );
+        horizon_rawinput_devices = devices;
+        horizon_rawinput_device_count = count;
+        pthread_mutex_unlock( &horizon_server_objects_mutex );
+    }
+    horizon_trace( "[HZINPUT] update_rawinput_devices count=%u err=%08x\n", count, status );
+    for (i = 0; devices && i < count; i++)
+        horizon_trace( "[HZINPUT]   usage=%08x flags=%x target=%08x\n",
+                       ((const struct horizon_rawinput_device *)data)[i].usage,
+                       ((const struct horizon_rawinput_device *)data)[i].flags,
+                       ((const struct horizon_rawinput_device *)data)[i].target );
+    return horizon_server_write_status( connection->reply_fd, status );
 }
 
 static int horizon_server_handle_accept_hardware_message( struct horizon_server_connection *connection,
@@ -7488,6 +7670,7 @@ static int horizon_server_handle_get_message( struct horizon_server_connection *
     const struct horizon_get_message_request *request = (const void *)message;
     struct horizon_get_message_reply reply;
     struct horizon_hardware_msg_data hardware;
+    unsigned char hardware_raw[sizeof(struct horizon_hardware_msg_data) + sizeof(struct horizon_raw_keyboard)];
     struct horizon_input_message *queued;
     struct horizon_posted_message **posted = NULL;
     struct horizon_win_timer *timer = NULL;
@@ -7592,14 +7775,29 @@ static int horizon_server_handle_get_message( struct horizon_server_connection *
             reply.x = queued->x;
             reply.y = queued->y;
             reply.time = queued->time;
-            reply.total = sizeof(hardware);
-            reply.header.reply_size = sizeof(hardware);
             hardware.info = queued->info;
             hardware.hw_id = queued->id;
-            hardware.source.device = HORIZON_IMDT_MOUSE;
+            hardware.flags = queued->data_flags;
+            hardware.source.device = queued->device ? queued->device : HORIZON_IMDT_MOUSE;
             hardware.source.origin = HORIZON_IMO_HARDWARE;
-            reply_data = &hardware;
-            reply_data_size = sizeof(hardware);
+            hardware.size = sizeof(hardware);
+            if (queued->raw_keyboard)
+            {
+                /* WM_INPUT: RAWKEYBOARD follows, where NtUserGetRawInputData reads it */
+                hardware.size += sizeof(queued->raw);
+                hardware.rawinput.type = HORIZON_RIM_TYPEKEYBOARD;
+                hardware.rawinput.device = HORIZON_WINE_KEYBOARD_HANDLE;
+                hardware.rawinput.usage = HORIZON_RAWINPUT_USAGE_KEYBOARD;
+                memcpy( hardware_raw + sizeof(hardware), &queued->raw, sizeof(queued->raw) );
+            }
+            memcpy( hardware_raw, &hardware, sizeof(hardware) );
+            reply.total = hardware.size;
+            reply.header.reply_size = hardware.size;
+            reply_data = hardware_raw;
+            reply_data_size = hardware.size;
+            /* No accept_hardware_message follows raw input: PM_REMOVE takes it, as in server/queue.c. */
+            if (queued->raw_keyboard && (request->flags & HORIZON_PM_REMOVE))
+                horizon_server_remove_input_message_locked( queued );
             found = 1;
             break;
         }
@@ -10531,6 +10729,10 @@ static void *horizon_server_thread( void *param )
             break;
         case HORIZON_REQ_GET_DIRECTORY_ENTRIES:
             status = horizon_server_handle_get_directory_entries( connection, message );
+            break;
+        case HORIZON_REQ_UPDATE_RAWINPUT_DEVICES:
+            status = horizon_server_handle_update_rawinput_devices( connection, request_data,
+                                                                    header->request_size );
             break;
         case HORIZON_REQ_CREATE_KEYED_EVENT:
             status = horizon_server_handle_create_keyed_event( connection, request_data, header->request_size );

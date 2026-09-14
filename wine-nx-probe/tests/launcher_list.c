@@ -32,6 +32,10 @@ static void test_program_args(void)
     assert( launcher_args_path( "sdmc:/x/APP.EXE", path, sizeof(path) ) && !strcmp( path, "sdmc:/x/APP.args.txt" ) );
     assert( !launcher_args_path( "sdmc:/x/readme.txt", path, sizeof(path) ) );
     assert( !launcher_args_path( "sdmc:/switch/wine/drive_c/openttd/openttd.exe", path, 20 ) );
+    assert( launcher_keys_path( "sdmc:/x/SPEED2.EXE", path, sizeof(path) ) && !strcmp( path, "sdmc:/x/SPEED2.keys.txt" ) );
+    assert( !launcher_keys_path( "sdmc:/x/a.exe", path, 18 ) );  /* sdmc:/x/a.keys.txt needs 19 */
+    assert( launcher_keys_path( "sdmc:/x/a.exe", path, 19 ) && !strcmp( path, "sdmc:/x/a.keys.txt" ) );
+    assert( !launcher_keys_path( "sdmc:/x/readme.txt", path, sizeof(path) ) );
     assert( launcher_command_line( "C:\\openttd\\openttd.exe", "-s null -m null", line, sizeof(line) ) );
     assert( !strcmp( line, "C:\\openttd\\openttd.exe -s null -m null" ) );
     assert( launcher_command_line( "C:\\Program Files\\a.exe", "-x", line, sizeof(line) ) );

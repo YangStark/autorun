@@ -492,8 +492,9 @@ static void wine_nx_pointer_flags( unsigned int last, unsigned int held, unsigne
 /* The controller stands in for the keyboard the console does not have. The
  * runtime polls it and keeps the held controls in wine_nx_pad_key_state, with
  * the virtual-key code of each in wine_nx_pad_keys (wine-nx-probe/source/
- * runtime.c, overridable through switch/wine/keys.txt). */
-#define WINE_NX_PAD_KEY_COUNT 14
+ * runtime.c, overridable through switch/wine/keys.txt and a program's own
+ * NAME.keys.txt). */
+#define WINE_NX_PAD_KEY_COUNT 16
 extern unsigned int wine_nx_pad_key_state __attribute__((weak));
 extern unsigned short wine_nx_pad_keys[] __attribute__((weak));
 
@@ -509,11 +510,16 @@ static BOOL wine_nx_send_keys(void)
     for (i = 0; i < WINE_NX_PAD_KEY_COUNT; i++)
     {
         INPUT input = {0};
+        UINT scan;
 
         if (!(changed & (1u << i)) || !wine_nx_pad_keys[i]) continue;
         input.type = INPUT_KEYBOARD;
         input.ki.wVk = wine_nx_pad_keys[i];
         input.ki.dwFlags = (held & (1u << i)) ? 0 : KEYEVENTF_KEYUP;
+        /* DirectInput names keys by scan code, and an arrow is E0 48, not 48. */
+        scan = NtUserMapVirtualKeyEx( input.ki.wVk, MAPVK_VK_TO_VSC_EX, NtUserGetKeyboardLayout( 0 ) );
+        input.ki.wScan = scan & 0xff;
+        if ((scan & 0xff00) == 0xe000) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
         NtUserSendHardwareInput( 0, 0, &input, 0 );
     }
     nxdrv_trace( "[NXINPUT] keys held=%x changed=%x", held, changed, 0, 0 );

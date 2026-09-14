@@ -31,6 +31,8 @@ flags="-std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-f
 "$build/read_redirect"
 "${CC:-clang}" $flags "$root/wine-nx-probe/tests/horizon_object_dirs.c" -o "$build/object_dirs"
 "$build/object_dirs"
+"${CC:-clang}" $flags "$root/wine-nx-probe/tests/horizon_keyboard.c" -o "$build/keyboard"
+"$build/keyboard"
 "${CC:-clang}" $flags "$root/wine-nx-probe/tests/horizon_free_range.c" -o "$build/free_range"
 "$build/free_range"
 python3 "$root/wine-nx-probe/tools/make-7zr-tree.py" "$build/drive_c" >/dev/null

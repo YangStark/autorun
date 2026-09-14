@@ -48,16 +48,28 @@ static inline int launcher_args_match( const char *args, const char *dos )
     return !strncasecmp( args, dos, len ) && (!args[len] || args[len] == ' ' || args[len] == '\t');
 }
 
-/* A program's own arguments live next to it: openttd.exe reads
- * openttd.args.txt. Returns 0 when the path does not end in .exe or does not fit. */
+/* A program's own file lives next to it, named after it with suffix in place of
+ * .exe. Returns 0 when the path does not end in .exe or does not fit. */
+static inline int launcher_sibling_path( const char *exe_path, const char *suffix, char *out, size_t size )
+{
+    size_t len = strlen( exe_path ), suffix_size = strlen( suffix ) + 1;
+
+    if (len < 4 || strcasecmp( exe_path + len - 4, ".exe" ) || len - 4 + suffix_size > size) return 0;
+    memcpy( out, exe_path, len - 4 );
+    memcpy( out + len - 4, suffix, suffix_size );
+    return 1;
+}
+
+/* A program's own arguments: openttd.exe reads openttd.args.txt. */
 static inline int launcher_args_path( const char *exe_path, char *out, size_t size )
 {
-    size_t len = strlen( exe_path );
+    return launcher_sibling_path( exe_path, ".args.txt", out, size );
+}
 
-    if (len < 4 || strcasecmp( exe_path + len - 4, ".exe" ) || len - 4 + sizeof(".args.txt") > size) return 0;
-    memcpy( out, exe_path, len - 4 );
-    memcpy( out + len - 4, ".args.txt", sizeof(".args.txt") );
-    return 1;
+/* A program's own controls, applied over keys.txt: SPEED2.EXE reads SPEED2.keys.txt. */
+static inline int launcher_keys_path( const char *exe_path, char *out, size_t size )
+{
+    return launcher_sibling_path( exe_path, ".keys.txt", out, size );
 }
 
 /* The command line for a program with its own arguments; a path with spaces is quoted. */

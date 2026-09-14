@@ -395,21 +395,22 @@ void wine_nx_cursor_show( int visible )
 
 /* The console has no keyboard, so the controller stands in for one. These are
  * the controls that send keys, in the order of the bits in
- * wine_nx_pad_key_state; A and B are left alone because they are the mouse
- * buttons. sdmc:/switch/wine/keys.txt overrides the virtual-key codes, one
- * NAME=code line each, so a game that wants other keys needs no new build. */
+ * wine_nx_pad_key_state. A and B are the mouse buttons unless given a key.
+ * sdmc:/switch/wine/keys.txt overrides the virtual-key codes, one NAME=code
+ * line each, and a program's own NAME.keys.txt next to it overrides those, so
+ * a game that wants other keys needs no new build. */
 enum
 {
     WINE_NX_KEY_UP, WINE_NX_KEY_DOWN, WINE_NX_KEY_LEFT, WINE_NX_KEY_RIGHT,
     WINE_NX_KEY_X, WINE_NX_KEY_Y, WINE_NX_KEY_L, WINE_NX_KEY_R,
     WINE_NX_KEY_ZL, WINE_NX_KEY_ZR, WINE_NX_KEY_PLUS, WINE_NX_KEY_MINUS,
-    WINE_NX_KEY_STICKL, WINE_NX_KEY_STICKR, WINE_NX_KEY_COUNT
+    WINE_NX_KEY_STICKL, WINE_NX_KEY_STICKR, WINE_NX_KEY_A, WINE_NX_KEY_B, WINE_NX_KEY_COUNT
 };
 
 static const char *const wine_nx_pad_key_names[WINE_NX_KEY_COUNT] =
 {
     "UP", "DOWN", "LEFT", "RIGHT", "X", "Y", "L", "R",
-    "ZL", "ZR", "PLUS", "MINUS", "STICKL", "STICKR"
+    "ZL", "ZR", "PLUS", "MINUS", "STICKL", "STICKR", "A", "B"
 };
 
 /* Defaults that suit a game: the d-pad and left stick steer, the triggers
@@ -423,6 +424,7 @@ unsigned short wine_nx_pad_keys[WINE_NX_KEY_COUNT] =
     0x28, 0x26,              /* ZL down, ZR up */
     0x1b, 0x09,              /* plus escape, minus tab */
     0x11, 0x12,              /* stick presses: control, alt */
+    0, 0,                    /* A and B: none, so they click */
 };
 
 /* Which of those controls are held, read by the display driver's ProcessEvents
@@ -481,6 +483,7 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
             { HidNpadButton_StickL, WINE_NX_KEY_STICKL }, { HidNpadButton_StickR, WINE_NX_KEY_STICKR },
             { HidNpadButton_Up, WINE_NX_KEY_UP }, { HidNpadButton_Down, WINE_NX_KEY_DOWN },
             { HidNpadButton_Left, WINE_NX_KEY_LEFT }, { HidNpadButton_Right, WINE_NX_KEY_RIGHT },
+            { HidNpadButton_A, WINE_NX_KEY_A }, { HidNpadButton_B, WINE_NX_KEY_B },  /* sent only if given a key */
         };
         unsigned int keys = 0, i;
 
@@ -831,12 +834,17 @@ static void read_key_map( const char *path )
     {
         char *equals, *name = line, *value;
         unsigned int i;
+        int c;
 
+        /* Drop the rest of a line longer than the buffer: the tail of a long
+         * comment must not be read as a control. */
+        if (!strchr( line, '\n' ) && !feof( file ))
+            while ((c = fgetc( file )) != EOF && c != '\n') {}
         trim_line( line );
         if (!line[0] || line[0] == '#') continue;
         if (!(equals = strchr( line, '=' )))
         {
-            log_line( "[NXINPUT] keys.txt: no '=' in '%s'", line );
+            log_line( "[NXINPUT] %s: no '=' in '%s'", path, line );
             continue;
         }
         *equals = 0;
@@ -850,10 +858,10 @@ static void read_key_map( const char *path )
                 changed++;
                 break;
             }
-        if (i == WINE_NX_KEY_COUNT) log_line( "[NXINPUT] keys.txt: unknown control '%s'", name );
+        if (i == WINE_NX_KEY_COUNT) log_line( "[NXINPUT] %s: unknown control '%s'", path, name );
     }
     fclose( file );
-    log_line( "[NXINPUT] keys.txt: %u controls remapped", changed );
+    log_line( "[NXINPUT] %s: %u controls remapped", path, changed );
 }
 
 static unsigned int close_handle_object( HANDLE handle )
@@ -1053,6 +1061,13 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
      * Format expected: "<argv[0]> <args...>" — a full Win32 command line.
      * If present, use it verbatim as CommandLine so curl etc. see args via
      * GetCommandLineA/W. Otherwise fall back to the dos_path alone. */
+    /* A program's own controls, over keys.txt: SPEED2.EXE reads SPEED2.keys.txt. */
+    {
+        char keys_path[512];
+
+        if (target[1] != ':' && launcher_keys_path( target, keys_path, sizeof(keys_path) ))
+            read_key_map( keys_path );
+    }
     cmdline_str = dos_path;
     if (target[1] != ':' && launcher_args_path( target, args_path, sizeof(args_path) ) &&
         read_first_line( args_path, args_buf, sizeof(args_buf) ) &&
