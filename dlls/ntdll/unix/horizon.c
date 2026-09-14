@@ -43,6 +43,7 @@
 #include "windef.h"
 #include "winbase.h"
 #include "wine/debug.h"
+#include "wine/rbtree.h"
 #include "unix_private.h"
 #include "horizon_mman.h"
 #include "horizon_private.h"
@@ -2826,10 +2827,21 @@ struct horizon_mapping
     int prot;
     struct horizon_backing *backing;
     VirtmemReservation *reservation;
-    struct horizon_mapping *next;
+    struct rb_entry entry;
 };
 
-static struct horizon_mapping *mappings;
+static int compare_mapping( const void *addr, const struct rb_entry *entry )
+{
+    struct horizon_mapping *mapping = RB_ENTRY_VALUE( entry, struct horizon_mapping, entry );
+
+    if (addr < mapping->addr) return -1;
+    if (addr > mapping->addr) return 1;
+    return 0;
+}
+
+/* The mappings by address. They never overlap, so their ends are in the order
+ * of their starts. */
+static struct rb_tree mappings = { compare_mapping, NULL };
 
 static int lowest_set_core( ULONG_PTR mask )
 {
@@ -11893,23 +11905,12 @@ static int get_effective_horizon_prot( int prot )
 
 static void list_add_mapping( struct horizon_mapping *mapping )
 {
-    mapping->next = mappings;
-    mappings = mapping;
+    rb_put( &mappings, mapping->addr, &mapping->entry );
 }
 
 static void list_remove_mapping( struct horizon_mapping *mapping )
 {
-    struct horizon_mapping **ptr = &mappings;
-
-    while (*ptr)
-    {
-        if (*ptr == mapping)
-        {
-            *ptr = mapping->next;
-            return;
-        }
-        ptr = &(*ptr)->next;
-    }
+    rb_remove( &mappings, &mapping->entry );
 }
 
 /* The kernel's heap and alias regions. MapProcessCodeMemory refuses them, but
@@ -11998,19 +11999,23 @@ int horizon_get_kernel_regions( void **starts, size_t *sizes, int max )
 
 static struct horizon_mapping *find_overlap_mapping( void *addr, size_t size )
 {
-    struct horizon_mapping *mapping;
+    struct rb_entry *ptr = mappings.root;
+    struct horizon_mapping *found = NULL;
     char *start = addr;
     char *end = start + size;
 
-    for (mapping = mappings; mapping; mapping = mapping->next)
+    while (ptr)
     {
-        char *mapping_start = mapping->addr;
-        char *mapping_end = mapping_start + mapping->size;
+        struct horizon_mapping *mapping = RB_ENTRY_VALUE( ptr, struct horizon_mapping, entry );
 
-        if (start < mapping_end && mapping_start < end) return mapping;
+        if ((char *)mapping->addr + mapping->size <= start) ptr = ptr->right;
+        else
+        {
+            found = mapping;
+            ptr = ptr->left;
+        }
     }
-
-    return NULL;
+    return found && (char *)found->addr < end ? found : NULL;
 }
 
 static int read_fd_at( int fd, void *buffer, size_t size, off_t offset )
@@ -12028,6 +12033,9 @@ static int read_fd_at( int fd, void *buffer, size_t size, off_t offset )
         return -1;
     }
 
+/* The lowest mapping overlapping [addr, addr + size). Unmapping and protecting
+ * walk a range from its start, and Wine's free-area search probes addresses
+ * through here: a list of every mapping made each of those a full scan. */
     while (size)
     {
         ssize_t ret = read( work_fd, ptr, size );
@@ -12815,7 +12823,10 @@ void *horizon_mmap( void *start, size_t size, int prot, int flags, int fd, off_t
     {
         void *ret = horizon_mmap_tryfixed( start, size, prot, flags, fd, offset );
 
-        if (ret != MAP_FAILED || errno != EEXIST) return ret;
+        /* MAP_FIXED_NOREPLACE wants that address or nothing. Wine's free-area
+         * search probes with it, and a mapping made elsewhere instead only cost
+         * an allocation and an unmap before its next probe. */
+        if (ret != MAP_FAILED || errno != EEXIST || (flags & MAP_FIXED_NOREPLACE)) return ret;
     }
     return horizon_mmap_alloc( size, prot, flags, fd, offset );
 }
