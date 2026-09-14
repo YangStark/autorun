@@ -67,7 +67,7 @@ extern const char *wine_nx_loader_last_export_diag(void);
 extern int wine_nx_sd_cache_install(void);
 extern int wine_nx_launcher_run( const char *drive_c, const char *runtime_dir, const char *build,
                                  int (*machine_of)( const char *path, unsigned short *machine ),
-                                 int *verbose, char *target, size_t target_size );
+                                 int *verbose, int *profile, char *target, size_t target_size );
 
 static FILE *log_file;
 
@@ -227,6 +227,9 @@ void wine_nx_runtime_trace( const char *msg )
  * whole program down. Their call sites check this first; it is set from
  * sdmc:/switch/wine/verbose.txt containing 1. */
 int wine_nx_runtime_verbose;
+/* The sampling profiler's [PROF] lines (thread_profile.c): sdmc:/switch/wine/profile.txt
+ * containing 1, which the launcher's X toggles like Y does verbose.txt. */
+static int runtime_profile;
 
 /* libdrm_nouveau's switch for CPU-cacheable pinned GPU memory, cleared by
  * sdmc:/switch/wine/gl-uncached.txt containing 1. */
@@ -1857,11 +1860,7 @@ int main( int argc, char **argv )
                   wine_nx_nouveau_skip_clean ? "off" : clean_alternates ? "alternating from 60 s, 30 s off/30 s on" : "on" );
     if (read_bool_file( RUNTIME_DIR "/no-balance.txt" )) wine_nx_balance_enabled = 0;
     log_line( "[INIT] core balancing %s (no-balance.txt)", wine_nx_balance_enabled ? "on" : "off" );
-    if (read_bool_file( RUNTIME_DIR "/profile.txt" ))
-    {
-        extern void wine_nx_profile_start( void );
-        wine_nx_profile_start();
-    }
+    runtime_profile = read_bool_file( RUNTIME_DIR "/profile.txt" );
     read_key_map( RUNTIME_DIR "/keys.txt" );
     if (read_bool_file( RUNTIME_DIR "/no-display-devices.txt" )) wine_nx_display_devices = 0;
     log_line( "[INIT] display devices %s (no-display-devices.txt)",
@@ -1873,7 +1872,7 @@ int main( int argc, char **argv )
          * target.txt only preselects the last choice. */
         read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );
         if (!wine_nx_launcher_run( WINE_DRIVE_C, RUNTIME_DIR, WINE_NX_RUNTIME_BUILD, launcher_machine,
-                                   &wine_nx_runtime_verbose, target, sizeof(target) ))
+                                   &wine_nx_runtime_verbose, &runtime_profile, target, sizeof(target) ))
         {
             log_line( "[LAUNCHER] closed without starting a program" );
             pthread_mutex_lock( &log_mutex );
@@ -1890,6 +1889,13 @@ int main( int argc, char **argv )
     log_line( "[SDCACHE] %s", sd_cache ? "sdmc reads cached: 128 KB chunks, 8 per file, 32 MB in all"
                                       : "no sdmc device; reads are not cached" );
     log_line( "[INIT] verbose traces %s (verbose.txt)", wine_nx_runtime_verbose ? "on" : "off" );
+    log_line( "[INIT] profiler %s (profile.txt)", runtime_profile ? "on" : "off" );
+    /* After the launcher, where X may have turned it on or off. */
+    if (runtime_profile)
+    {
+        extern void wine_nx_profile_start( void );
+        wine_nx_profile_start();
+    }
     log_line( "[TARGET] %s", target );
 
     status = runtime_target_machine( target, &target_machine );

@@ -73,7 +73,7 @@ static void launcher_write_line( const char *runtime_dir, const char *name, cons
 }
 
 static void launcher_draw( const char *build, int count, int selected, int first, int verbose,
-                           const char *args )
+                           int profile, const char *args )
 {
     int i;
 
@@ -101,15 +101,18 @@ static void launcher_draw( const char *build, int count, int selected, int first
         if (args) printf( "   arguments: %.52s", args );
         printf( "\n" );
     }
-    printf( CONSOLE_ESC(44;1H) "A start   Up/Down choose   L/R page   Y verbose logs: %s   + quit",
-            verbose ? CONSOLE_YELLOW "on " CONSOLE_RESET : "off" );
+    printf( CONSOLE_ESC(44;1H) "A start  Up/Down choose  L/R page  Y verbose: %s  X profiler: %s  + quit",
+            verbose ? CONSOLE_YELLOW "on " CONSOLE_RESET : "off",
+            profile ? CONSOLE_YELLOW "on " CONSOLE_RESET : "off" );
     consoleUpdate( NULL );
 }
 
 /* Show the menu. Returns 1 with the chosen program in *target, or 0 when the
- * user quits. The choice is saved to target.txt; Y toggles verbose.txt. */
+ * user quits. The choice is saved to target.txt; Y toggles verbose.txt and X
+ * profile.txt. */
 int wine_nx_launcher_run( const char *drive_c, const char *runtime_dir, const char *build,
-                          launcher_machine_fn machine_of, int *verbose, char *target, size_t target_size )
+                          launcher_machine_fn machine_of, int *verbose, int *profile,
+                          char *target, size_t target_size )
 {
     const u64 moves = HidNpadButton_AnyUp | HidNpadButton_AnyDown | HidNpadButton_L | HidNpadButton_R;
     char args[896], args_path[256];
@@ -167,6 +170,12 @@ int wine_nx_launcher_run( const char *drive_c, const char *runtime_dir, const ch
             launcher_write_line( runtime_dir, "verbose.txt", *verbose ? "1" : "0" );
             redraw = 1;
         }
+        if (down & HidNpadButton_X)
+        {
+            *profile = !*profile;
+            launcher_write_line( runtime_dir, "profile.txt", *profile ? "1" : "0" );
+            redraw = 1;
+        }
         if ((down & HidNpadButton_A) && count)
         {
             snprintf( target, target_size, "%s", launcher_entries[selected].path );
@@ -190,7 +199,7 @@ int wine_nx_launcher_run( const char *drive_c, const char *runtime_dir, const ch
             if (!shown && count && have_args && launcher_args_match( args, launcher_entries[selected].dos ))
                 shown = args;
             first = launcher_first_visible( first, selected, count, LAUNCHER_ROWS );
-            launcher_draw( build, count, selected, first, *verbose, shown );
+            launcher_draw( build, count, selected, first, *verbose, *profile, shown );
             redraw = 0;
         }
         svcSleepThread( 16000000 );
