@@ -2,10 +2,13 @@
 # Build devkitPro's switch-mesa 20.1 and libdrm_nouveau with Wine-NX's changes
 # (mesa/switch-mesa-20.1-wine-nx.patch, mesa/libdrm_nouveau-wine-nx.patch) into
 # build-switch-mesa/install.
-# WINE_NX_MESA_SRC is fincs' patched tree as the switch-mesa PKGBUILD leaves it
-# (default ~/mesa-devkit/mesa-20.1.0-rc3); WINE_NX_LIBDRM_SRC is devkitPro's
-# libdrm_nouveau (default ~/libdrm_nouveau). WINE_NX_MESA_IMAGE is a devkitPro
-# image with meson, mako, flex and bison (default devkitpro-mesa-rust:latest).
+# WINE_NX_MESA_SRC is fincs' patched tree as the switch-mesa PKGBUILD leaves it,
+# or a checkout of danfromtico/mesa-switch-legacy main, which already carries the
+# Mesa patch (default ~/mesa-devkit/mesa-20.1.0-rc3); WINE_NX_LIBDRM_SRC is
+# devkitPro's libdrm_nouveau or danfromtico/libdrm-nouveau-legacy main (default
+# ~/libdrm_nouveau). A patch the source already carries is skipped.
+# WINE_NX_MESA_IMAGE is a devkitPro image with meson, mako, flex and bison
+# (default devkitpro-mesa-rust:latest).
 # Link the runtime with -DWINE_NX_MESA_LIB_DIR=<install>/opt/devkitpro/portlibs/switch/lib.
 set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -15,11 +18,21 @@ image="${WINE_NX_MESA_IMAGE:-devkitpro-mesa-rust:latest}"
 out="$root/wine-nx-probe/build-switch-mesa"
 lib="$out/install/opt/devkitpro/portlibs/switch/lib"
 
+# Apply a patch unless the tree already carries it; a tree holding only part of
+# it still stops the build.
+apply_once() {
+    if patch -d "$1" -p1 -R -f -s --dry-run < "$2" >/dev/null 2>&1; then
+        echo "${2##*/} is already applied in $1"
+    else
+        patch -d "$1" -p1 -N < "$2"
+    fi
+}
+
 mkdir -p "$out"
 rsync -a --delete "$src/" "$out/src/"
-patch -d "$out/src" -p1 < "$root/wine-nx-probe/mesa/switch-mesa-20.1-wine-nx.patch"
+apply_once "$out/src" "$root/wine-nx-probe/mesa/switch-mesa-20.1-wine-nx.patch"
 rsync -a --delete --exclude .git "$drm_src/" "$out/libdrm_nouveau/"
-patch -d "$out/libdrm_nouveau" -p1 < "$root/wine-nx-probe/mesa/libdrm_nouveau-wine-nx.patch"
+apply_once "$out/libdrm_nouveau" "$root/wine-nx-probe/mesa/libdrm_nouveau-wine-nx.patch"
 docker run --rm --platform linux/arm64 -v "$out:/mesa" -w /mesa/src "$image" bash -lc '
     set -e
     [ -f ../build/build.ninja ] || /opt/devkitpro/meson-cross.sh switch ../crossfile.txt ../build -Db_ndebug=true
