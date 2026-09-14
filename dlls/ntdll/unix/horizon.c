@@ -2676,6 +2676,8 @@ struct horizon_server_handle_entry
     unsigned int handle;
     struct horizon_server_object *object;
     struct horizon_server_handle_entry *next;
+    struct horizon_server_handle_entry **pprev;     /* what points at it in horizon_server_handles */
+    struct horizon_server_handle_entry *hash_next;  /* in its horizon_server_handle_hash bucket */
 };
 
 static struct horizon_reg horizon_registry;
@@ -2713,6 +2715,11 @@ static void horizon_server_sleep_locked( long long timeout )
     horizon_server_sleepers--;
 }
 static struct horizon_server_handle_entry *horizon_server_handles;
+/* The same entries by handle value, which only grows. Requests look their
+ * handles up, and walking every open handle made each lookup slower as the
+ * number of handles grew. */
+#define HORIZON_SERVER_HANDLE_HASH_SIZE 4096
+static struct horizon_server_handle_entry *horizon_server_handle_hash[HORIZON_SERVER_HANDLE_HASH_SIZE];
 /* Every thread object, running or terminated, while referenced (open_thread). */
 static struct horizon_server_object *horizon_server_threads;
 static unsigned int horizon_server_running_threads;
@@ -3364,14 +3371,40 @@ static unsigned int horizon_server_alloc_handle(void)
     return __sync_add_and_fetch( &horizon_server_next_handle, 4 );
 }
 
+static struct horizon_server_handle_entry **horizon_server_handle_bucket( unsigned int handle )
+{
+    return &horizon_server_handle_hash[(handle >> 2) & (HORIZON_SERVER_HANDLE_HASH_SIZE - 1)];
+}
+
 static struct horizon_server_handle_entry *horizon_server_find_handle_locked( unsigned int handle )
 {
     struct horizon_server_handle_entry *entry;
 
-    for (entry = horizon_server_handles; entry; entry = entry->next)
+    for (entry = *horizon_server_handle_bucket( handle ); entry; entry = entry->hash_next)
         if (entry->handle == handle) return entry;
 
     return NULL;
+}
+
+/* Adds an entry, its handle already set, to the list and the hash. */
+static void horizon_server_link_handle_locked( struct horizon_server_handle_entry *entry )
+{
+    struct horizon_server_handle_entry **bucket = horizon_server_handle_bucket( entry->handle );
+
+    if ((entry->next = horizon_server_handles)) entry->next->pprev = &entry->next;
+    entry->pprev = &horizon_server_handles;
+    horizon_server_handles = entry;
+    entry->hash_next = *bucket;
+    *bucket = entry;
+}
+
+static void horizon_server_unlink_handle_locked( struct horizon_server_handle_entry *entry )
+{
+    struct horizon_server_handle_entry **ptr = horizon_server_handle_bucket( entry->handle );
+
+    if ((*entry->pprev = entry->next)) entry->next->pprev = entry->pprev;
+    while (*ptr != entry) ptr = &(*ptr)->hash_next;
+    *ptr = entry->hash_next;
 }
 
 static struct horizon_server_handle_entry *horizon_server_create_handle_locked( int type )
@@ -3388,8 +3421,7 @@ static struct horizon_server_handle_entry *horizon_server_create_handle_locked( 
 
     entry->handle = horizon_server_alloc_handle();
     entry->object = object;
-    entry->next = horizon_server_handles;
-    horizon_server_handles = entry;
+    horizon_server_link_handle_locked( entry );
 
     object->id = entry->handle;
     object->type = type;
@@ -3408,8 +3440,7 @@ static struct horizon_server_handle_entry *horizon_server_create_handle_for_obje
     entry->object = object;
     object->refs++;
     if (object->type == HORIZON_SERVER_OBJECT_COMPLETION) object->completion_closed = 0;
-    entry->next = horizon_server_handles;
-    horizon_server_handles = entry;
+    horizon_server_link_handle_locked( entry );
     return entry;
 }
 
@@ -3454,7 +3485,6 @@ static int horizon_server_object_has_handles_locked( const struct horizon_server
 
 static unsigned int horizon_server_close_object_handle( unsigned int handle )
 {
-    struct horizon_server_handle_entry **ptr;
     struct horizon_server_handle_entry *entry;
     struct horizon_server_object *object;
     unsigned int status = HORIZON_STATUS_SUCCESS;
@@ -3462,13 +3492,10 @@ static unsigned int horizon_server_close_object_handle( unsigned int handle )
     if (!handle) return HORIZON_STATUS_INVALID_HANDLE;
 
     pthread_mutex_lock( &horizon_server_objects_mutex );
-    for (ptr = &horizon_server_handles; *ptr; ptr = &(*ptr)->next)
+    if ((entry = horizon_server_find_handle_locked( handle )))
     {
-        if ((*ptr)->handle != handle) continue;
-
-        entry = *ptr;
         object = entry->object;
-        *ptr = entry->next;
+        horizon_server_unlink_handle_locked( entry );
         /* server/completion.c's close_handle: closing a port's last handle
          * abandons the waits on it. */
         if (object && object->type == HORIZON_SERVER_OBJECT_COMPLETION &&
@@ -3548,8 +3575,7 @@ static unsigned int horizon_server_duplicate_object_handle( unsigned int handle,
 
     duplicate->handle = horizon_server_alloc_handle();
     duplicate->object->refs++;
-    duplicate->next = horizon_server_handles;
-    horizon_server_handles = duplicate;
+    horizon_server_link_handle_locked( duplicate );
     *new_handle = duplicate->handle;
     pthread_mutex_unlock( &horizon_server_objects_mutex );
     return HORIZON_STATUS_SUCCESS;
@@ -3923,7 +3949,7 @@ static unsigned int horizon_server_create_named_object_handle_locked(
     {
         struct horizon_server_handle_entry *failed = *entry;
 
-        horizon_server_handles = failed->next;
+        horizon_server_unlink_handle_locked( failed );
         horizon_server_free_object( failed->object );
         free( failed );
         *entry = NULL;
@@ -4710,17 +4736,14 @@ static struct horizon_server_object *horizon_server_alloc_thread_locked( unsigne
 static void horizon_server_end_completion_wait_locked( struct horizon_server_connection *connection )
 {
     struct horizon_server_object *wait = connection->completion_wait;
-    struct horizon_server_handle_entry **ptr, *entry;
+    struct horizon_server_handle_entry *entry;
 
     if (!wait) return;
-    for (ptr = &horizon_server_handles; *ptr; ptr = &(*ptr)->next)
+    if ((entry = horizon_server_find_handle_locked( connection->completion_wait_handle )) && entry->object == wait)
     {
-        if ((*ptr)->handle != connection->completion_wait_handle || (*ptr)->object != wait) continue;
-        entry = *ptr;
-        *ptr = entry->next;
+        horizon_server_unlink_handle_locked( entry );
         wait->refs--;
         free( entry );
-        break;
     }
     connection->completion_wait = NULL;
     connection->completion_wait_handle = 0;
@@ -4763,14 +4786,18 @@ static unsigned int horizon_server_signal_object_locked( unsigned int handle )
     switch (object->type)
     {
     case HORIZON_SERVER_OBJECT_EVENT:
-        object->signaled = 1;
-        horizon_server_signal_changed_locked();
+        if (!object->signaled)
+        {
+            object->signaled = 1;
+            horizon_server_signal_changed_locked();
+        }
         return HORIZON_STATUS_SUCCESS;
     case HORIZON_SERVER_OBJECT_MUTEX:
     {
-        unsigned int previous;
-        horizon_server_signal_changed_locked();
-        return horizon_mutex_release( &object->mutex, horizon_server_current_tid(), &previous );
+        unsigned int previous, status = horizon_mutex_release( &object->mutex, horizon_server_current_tid(), &previous );
+
+        if (!status && !object->mutex.count) horizon_server_signal_changed_locked();
+        return status;
     }
     case HORIZON_SERVER_OBJECT_SEMAPHORE:
         if (object->count == object->max) return HORIZON_STATUS_SEMAPHORE_LIMIT_EXCEEDED;
@@ -5089,7 +5116,7 @@ static int horizon_server_handle_open_mapping( struct horizon_server_connection 
 
                 if (reply.header.error)
                 {
-                    horizon_server_handles = entry->next;
+                    horizon_server_unlink_handle_locked( entry );
                     horizon_server_free_object( entry->object );
                     free( entry );
                     entry = NULL;
@@ -10376,8 +10403,12 @@ static int horizon_server_handle_event_op( struct horizon_server_connection *con
             object->signaled = 0;
             break;
         case HORIZON_SET_EVENT:
-            object->signaled = 1;
-            horizon_server_signal_changed_locked();
+            /* Waiters need waking only when it becomes signaled. */
+            if (!object->signaled)
+            {
+                object->signaled = 1;
+                horizon_server_signal_changed_locked();
+            }
             break;
         case HORIZON_RESET_EVENT:
             object->signaled = 0;
@@ -10685,7 +10716,8 @@ static int horizon_server_handle_release_mutex( struct horizon_server_connection
     status = horizon_server_find_typed_object_locked( request->handle, HORIZON_SERVER_OBJECT_MUTEX, &object );
     if (status == HORIZON_STATUS_SUCCESS)
         status = horizon_mutex_release( &object->mutex, connection->tid, &reply.prev_count );
-    horizon_server_signal_changed_locked();
+    /* Only a release that frees the mutex lets a waiter take it. */
+    if (status == HORIZON_STATUS_SUCCESS && !object->mutex.count) horizon_server_signal_changed_locked();
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
     reply.header.error = status;
@@ -11997,6 +12029,9 @@ int horizon_get_kernel_regions( void **starts, size_t *sizes, int max )
     return i;
 }
 
+/* The lowest mapping overlapping [addr, addr + size). Unmapping and protecting
+ * walk a range from its start, and Wine's free-area search probes addresses
+ * through here: a list of every mapping made each of those a full scan. */
 static struct horizon_mapping *find_overlap_mapping( void *addr, size_t size )
 {
     struct rb_entry *ptr = mappings.root;
@@ -12033,9 +12068,6 @@ static int read_fd_at( int fd, void *buffer, size_t size, off_t offset )
         return -1;
     }
 
-/* The lowest mapping overlapping [addr, addr + size). Unmapping and protecting
- * walk a range from its start, and Wine's free-area search probes addresses
- * through here: a list of every mapping made each of those a full scan. */
     while (size)
     {
         ssize_t ret = read( work_fd, ptr, size );
