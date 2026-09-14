@@ -33,6 +33,15 @@
 #include "wow64_private.h"
 #include "wine/debug.h"
 
+#ifdef __aarch64__
+/* Wine's msvcrt setjmp.h declares _setjmpex as the one-argument shape of the
+ * compiler builtin whenever the compiler has one, and that form passes the
+ * stack-pointer entry as the unwind frame. The callback return below needs a
+ * NULL frame, so name ntdll's two-argument entry point directly. */
+extern int __cdecl __attribute__((__nothrow__,__returns_twice__))
+wow64_setjmpex( jmp_buf, void * ) __asm__("_setjmpex");
+#endif
+
 WINE_DEFAULT_DEBUG_CHANNEL(wow);
 
 USHORT native_machine = 0;
@@ -1301,7 +1310,7 @@ NTSTATUS WINAPI Wow64KiUserCallbackDispatcher( ULONG id, void *args, ULONG len,
 #ifdef __aarch64__
             if (__wine_switch_cpu_backend == IMAGE_FILE_MACHINE_I386)
             {
-                if (!_setjmpex( frame.jmpbuf, NULL ))
+                if (!wow64_setjmpex( frame.jmpbuf, NULL ))
                     cpu_simulate();
                 else
                     pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &orig_ctx );
