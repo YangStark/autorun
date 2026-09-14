@@ -394,12 +394,82 @@ static UINT cp_fields_resample(IDirectSoundBufferImpl *dsb, UINT count, LONG64 *
     return max_ipos;
 }
 
+/* Upsampling by four-point cubic (Catmull-Rom) interpolation between the two
+ * middle samples. The FIR above takes some 66 taps per output sample; run as
+ * translated x86 code on the Switch that mixed one game's sounds on a quarter
+ * of a core. Raising the rate needs no anti-aliasing, so four points do. The
+ * output lags the input by one sample. Advances like cp_fields_resample. */
+static UINT cp_fields_resample_cubic(IDirectSoundBufferImpl *dsb, UINT count, LONG64 *freqAccNum)
+{
+    UINT i, channel;
+    UINT istride = dsb->pwfx->nBlockAlign;
+    UINT ostride = dsb->device->pwfx->nChannels * sizeof(float);
+    UINT committed_samples = 0;
+    UINT channels = dsb->mix_channels;
+    UINT num = dsb->freqAdjustNum, den = dsb->freqAdjustDen, acc = *freqAccNum, ipos = 0;
+    UINT max_ipos = (*freqAccNum + count * dsb->freqAdjustNum) / dsb->freqAdjustDen;
+    UINT required_input = max_ipos + 4;
+    float inv_den = 1.0f / den;
+    float *intermediate, *itmp;
+    DWORD len = required_input * channels * sizeof(float);
+
+    *freqAccNum = (*freqAccNum + count * dsb->freqAdjustNum) % dsb->freqAdjustDen;
+
+    if (!secondarybuffer_is_audible(dsb))
+        return max_ipos;
+
+    if (!dsb->device->cp_buffer) {
+        dsb->device->cp_buffer = malloc(len);
+        dsb->device->cp_buffer_len = len;
+    } else if (len > dsb->device->cp_buffer_len) {
+        dsb->device->cp_buffer = realloc(dsb->device->cp_buffer, len);
+        dsb->device->cp_buffer_len = len;
+    }
+
+    intermediate = dsb->device->cp_buffer;
+
+    if(dsb->use_committed) {
+        committed_samples = (dsb->writelead - dsb->committed_mixpos) / istride;
+        committed_samples = committed_samples <= required_input ? committed_samples : required_input;
+    }
+
+    itmp = intermediate;
+    for (channel = 0; channel < channels; channel++) {
+        for (i = 0; i < committed_samples; i++)
+            *(itmp++) = get_current_sample(dsb, dsb->committedbuff,
+                dsb->writelead, dsb->committed_mixpos + i * istride, channel);
+        for (; i < required_input; i++)
+            *(itmp++) = get_current_sample(dsb, dsb->buffer->memory,
+                    dsb->buflen, dsb->sec_mixpos + i * istride, channel);
+    }
+
+    for (i = 0; i < count; ++i) {
+        float t = acc * inv_den;
+
+        for (channel = 0; channel < channels; channel++) {
+            const float *s = &intermediate[channel * required_input + ipos];
+
+            dsb->put(dsb, i * ostride, channel, s[1] + 0.5f * t * (s[2] - s[0] + t * (2.0f * s[0] - 5.0f * s[1]
+                     + 4.0f * s[2] - s[3] + t * (3.0f * (s[1] - s[2]) + s[3] - s[0]))));
+        }
+        acc += num;
+        while (acc >= den) {
+            acc -= den;
+            ipos++;
+        }
+    }
+
+    return max_ipos;
+}
+
 static void cp_fields(IDirectSoundBufferImpl *dsb, UINT count, LONG64 *freqAccNum)
 {
     DWORD ipos, adv;
 
     if (dsb->freqAdjustNum == dsb->freqAdjustDen)
         adv = cp_fields_noresample(dsb, count); /* *freqAccNum is unmodified */
+    else if (dsb->freqAdjustNum < dsb->freqAdjustDen)
+        adv = cp_fields_resample_cubic(dsb, count, freqAccNum);
     else
         adv = cp_fields_resample(dsb, count, freqAccNum);
 
