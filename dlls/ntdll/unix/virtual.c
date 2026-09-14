@@ -3576,6 +3576,28 @@ static IMAGE_BASE_RELOCATION *process_relocation_block( char *page, IMAGE_BASE_R
  * Map an executable (PE format) image into an existing view.
  * virtual_mutex must be held by caller.
  */
+#ifdef __SWITCH__
+extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+
+/* Programs break when an image built without DYNAMIC_BASE is moved, and in the
+ * 32-bit layout the kernel's randomly placed heap region can cover such an
+ * image's fixed base, so the runtime log records every such move. */
+static void wine_nx_log_relocated_image( const UNICODE_STRING *nt_name, ULONG64 base, ULONG64 addr )
+{
+    char msg[256], name[128];
+    unsigned int i, start = 0, pos = 0, len = nt_name ? nt_name->Length / sizeof(WCHAR) : 0;
+
+    if (!&wine_nx_runtime_trace) return;
+    for (i = 0; i < len; i++) if (nt_name->Buffer[i] == '\\') start = i + 1;
+    for (i = start; i < len && pos < sizeof(name) - 1; i++)
+        name[pos++] = nt_name->Buffer[i] < 0x80 ? (char)nt_name->Buffer[i] : '?';
+    name[pos] = 0;
+    snprintf( msg, sizeof(msg), "[IMAGE] relocated %s from 0x%llx to 0x%llx (not built for relocation)",
+              name, (unsigned long long)base, (unsigned long long)addr );
+    wine_nx_runtime_trace( msg );
+}
+#endif
+
 static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRING *nt_name, int fd,
                                      struct pe_image_info *image_info, USHORT machine,
                                      int shared_fd, BOOL removable )
@@ -3783,6 +3805,10 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     {
         TRACE_(module)( "relocating %s dynamic base %lx -> %lx mapped at %p\n", debugstr_us(nt_name),
                         (ULONG_PTR)image_info->base, (ULONG_PTR)image_info->map_addr, ptr );
+#ifdef __SWITCH__
+        if (!(image_info->dll_charact & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE))
+            wine_nx_log_relocated_image( nt_name, image_info->base, image_info->map_addr );
+#endif
 
         if (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
             ((IMAGE_NT_HEADERS64 *)nt)->OptionalHeader.ImageBase = image_info->map_addr;
