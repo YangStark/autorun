@@ -291,6 +291,8 @@ struct horizon_pipe
     size_t head;
     size_t tail;
     size_t used;
+    unsigned int read_waiters;  /* threads waiting in can_read, so only they are signaled */
+    unsigned int write_waiters; /* threads waiting in can_write */
     unsigned int client_cores;  /* request pipes: the cores their client thread is pinned to */
     unsigned char buffer[HORIZON_PIPE_BUFFER_SIZE];
 };
@@ -2991,6 +2993,7 @@ static ssize_t horizon_pipe_write_r( struct _reent *r, void *fdptr, const char *
 {
     struct horizon_pipe_file *file = *(struct horizon_pipe_file **)fdptr;
     struct horizon_pipe *pipe;
+    unsigned int wake;
     size_t total = 0;
 
     if (!file || !file->write_end)
@@ -3007,7 +3010,13 @@ static ssize_t horizon_pipe_write_r( struct _reent *r, void *fdptr, const char *
         size_t chunk, space;
 
         while (pipe->read_open && pipe->used == HORIZON_PIPE_BUFFER_SIZE)
+        {
+            /* The reader has to make room first. */
+            if (pipe->read_waiters) pthread_cond_signal( &pipe->can_read );
+            pipe->write_waiters++;
             pthread_cond_wait( &pipe->can_write, &pipe->mutex );
+            pipe->write_waiters--;
+        }
 
         if (!pipe->read_open)
         {
@@ -3024,9 +3033,13 @@ static ssize_t horizon_pipe_write_r( struct _reent *r, void *fdptr, const char *
         pipe->tail = (pipe->tail + chunk) % HORIZON_PIPE_BUFFER_SIZE;
         pipe->used += chunk;
         total += chunk;
-        pthread_cond_signal( &pipe->can_read );
     }
+    wake = pipe->read_waiters;
     pthread_mutex_unlock( &pipe->mutex );
+    /* A signal is a system call on Horizon, so only for a waiting reader, and
+     * after unlocking, or the reader wakes straight into this thread's lock and
+     * the unlock becomes a second system call (2% of NFSU2's main thread). */
+    if (wake) pthread_cond_signal( &pipe->can_read );
     return total;
 }
 
@@ -3034,6 +3047,7 @@ static ssize_t horizon_pipe_read_r( struct _reent *r, void *fdptr, char *ptr, si
 {
     struct horizon_pipe_file *file = *(struct horizon_pipe_file **)fdptr;
     struct horizon_pipe *pipe;
+    unsigned int wake;
     size_t total = 0;
 
     if (!file || file->write_end)
@@ -3050,7 +3064,13 @@ static ssize_t horizon_pipe_read_r( struct _reent *r, void *fdptr, char *ptr, si
         size_t chunk;
 
         while (pipe->write_open && !pipe->used)
+        {
+            /* A writer waiting for room can go on with what this took. */
+            if (total && pipe->write_waiters) pthread_cond_signal( &pipe->can_write );
+            pipe->read_waiters++;
             pthread_cond_wait( &pipe->can_read, &pipe->mutex );
+            pipe->read_waiters--;
+        }
 
         if (!pipe->used)
         {
@@ -3064,9 +3084,10 @@ static ssize_t horizon_pipe_read_r( struct _reent *r, void *fdptr, char *ptr, si
         pipe->head = (pipe->head + chunk) % HORIZON_PIPE_BUFFER_SIZE;
         pipe->used -= chunk;
         total += chunk;
-        pthread_cond_signal( &pipe->can_write );
     }
+    wake = pipe->write_waiters;
     pthread_mutex_unlock( &pipe->mutex );
+    if (wake) pthread_cond_signal( &pipe->can_write );
     return total;
 }
 
