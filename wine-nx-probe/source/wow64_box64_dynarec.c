@@ -396,6 +396,17 @@ void DynarecMapClearCache( void *addr, size_t size )
 #endif
 }
 
+/* For the exception handler: whether pc lies in translated code, where a
+ * resumed fault must keep x16 and x17 (the guest's ESI and EDI). Lock-free:
+ * arenas are never freed. */
+int wine_nx_box64_is_translated_pc( uintptr_t pc )
+{
+    size_t offset;
+    struct nx_arena *arena = find_arena( (void *)pc, &offset );
+
+    return arena && offset < arena->used;
+}
+
 #ifdef JMPTABL_SHIFT4
 static uintptr_t *create_jump_table( uintptr_t idx0, uintptr_t idx1, uintptr_t idx2, uintptr_t idx3,
                                      uintptr_t idx4, int for32bits )

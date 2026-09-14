@@ -164,6 +164,82 @@ static void horizon_restore_exception_context( ThreadExceptionDump *ctx )
     __builtin_unreachable();
 }
 
+/* The same restore giving up x9 instead of x17, for a fault in Box64's
+ * translated code. Box64 keeps the guest's ESI and EDI in x16 and x17
+ * (vendor/box64/src/dynarec/arm64/arm64_mapping.h) and never uses x8 or x9, so
+ * resuming there through x17 left EDI holding the fault address - build 62's
+ * freeze. tico-dolphin resumes its JIT through x17 and keeps x17 out of the
+ * JIT's register pool for this reason. */
+static void horizon_restore_exception_context_x9( ThreadExceptionDump *ctx ) __attribute__((noreturn));
+
+static void horizon_restore_exception_context_x9( ThreadExceptionDump *ctx )
+{
+    __asm__ __volatile__(
+        "mov x21, %0\n"
+        "ldp q0,  q1,  [x21, #288]\n"
+        "ldp q2,  q3,  [x21, #320]\n"
+        "ldp q4,  q5,  [x21, #352]\n"
+        "ldp q6,  q7,  [x21, #384]\n"
+        "ldp q8,  q9,  [x21, #416]\n"
+        "ldp q10, q11, [x21, #448]\n"
+        "ldp q12, q13, [x21, #480]\n"
+        "ldp q14, q15, [x21, #512]\n"
+        "ldp q16, q17, [x21, #544]\n"
+        "ldp q18, q19, [x21, #576]\n"
+        "ldp q20, q21, [x21, #608]\n"
+        "ldp q22, q23, [x21, #640]\n"
+        "ldp q24, q25, [x21, #672]\n"
+        "ldp q26, q27, [x21, #704]\n"
+        "ldp q28, q29, [x21, #736]\n"
+        "ldp q30, q31, [x21, #768]\n"
+        "ldr w16, [x21, #800]\n"
+        "msr nzcv, x16\n"
+        "ldr x16, [x21, #264]\n"
+        "ldr x9, [x21, #272]\n"
+        "str x9, [x16, #-16]!\n"
+        "mov x9, x16\n"
+        "ldr x30, [x21, #256]\n"
+        "ldr x29, [x21, #248]\n"
+        "ldp x0,  x1,  [x21, #16]\n"
+        "ldp x2,  x3,  [x21, #32]\n"
+        "ldp x4,  x5,  [x21, #48]\n"
+        "ldp x6,  x7,  [x21, #64]\n"
+        "ldr x8,  [x21, #80]\n"
+        "ldp x10, x11, [x21, #96]\n"
+        "ldp x12, x13, [x21, #112]\n"
+        "ldp x14, x15, [x21, #128]\n"
+        "ldp x16, x17, [x21, #144]\n"
+        "ldp x18, x19, [x21, #160]\n"
+        "ldr x20, [x21, #176]\n"
+        "ldp x22, x23, [x21, #192]\n"
+        "ldp x24, x25, [x21, #208]\n"
+        "ldp x26, x27, [x21, #224]\n"
+        "ldr x28, [x21, #240]\n"
+        "mov sp, x9\n"
+        "ldr x21, [x21, #184]\n"
+        "ldr x9, [sp], #16\n"
+        "br x9\n"
+        :
+        : "r"(ctx)
+        : "memory");
+
+    __builtin_unreachable();
+}
+
+/* Dynarec builds: whether pc lies in Box64's translated code. */
+extern int wine_nx_box64_is_translated_pc( ULONG_PTR pc ) __attribute__((weak));
+
+/* Resume a handled fault: through x9 in translated code, through x17 elsewhere,
+ * where the ARM64 ABI lets veneers clobber it. */
+static void horizon_resume_exception( ThreadExceptionDump *ctx ) __attribute__((noreturn));
+
+static void horizon_resume_exception( ThreadExceptionDump *ctx )
+{
+    if (wine_nx_box64_is_translated_pc && wine_nx_box64_is_translated_pc( ctx->pc.x ))
+        horizon_restore_exception_context_x9( ctx );
+    horizon_restore_exception_context( ctx );
+}
+
 /* Cooperative NtContinue/RtlRestoreContext return. Like the exception restore
  * above, x17 is the final branch scratch register. This is not a replacement
  * for reconstructing a guest context from an interrupted dynarec block. */
@@ -10763,7 +10839,7 @@ void __libnx_exception_handler( ThreadExceptionDump *ctx )
     }
 
 #if defined(__aarch64__)
-    horizon_restore_exception_context( ctx );
+    horizon_resume_exception( ctx );
 #else
     wine_nx_runtime_trace( "[EXC] handled fault but cannot restore non-AArch64 context" );
     for (;;) svcSleepThread( 1000ULL * 1000ULL * 1000ULL );
