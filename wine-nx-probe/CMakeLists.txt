@@ -672,6 +672,14 @@ find_library(SWITCH_DRM_NOUVEAU drm_nouveau HINTS "$ENV{DEVKITPRO}/portlibs/swit
 # build-switch-mesa.sh builds switch-mesa with Wine-NX's nouveau changes; this
 # links it instead of devkitPro's package.
 set(WINE_NX_MESA_LIB_DIR "" CACHE PATH "Folder with libEGL.a, libglapi.a and libdrm_nouveau.a from build-switch-mesa.sh")
+option(WINE_NX_STOCK_MESA "Link devkitPro's Mesa even when build-switch-mesa.sh's is installed" OFF)
+# A build tree configured without the option silently lost every nouveau fix
+# (NFSU2 builds 56-66), so use build-switch-mesa.sh's install when it is there.
+set(WINE_NX_MESA_DEFAULT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build-switch-mesa/install/opt/devkitpro/portlibs/switch/lib")
+if(NOT WINE_NX_MESA_LIB_DIR AND NOT WINE_NX_STOCK_MESA AND EXISTS "${WINE_NX_MESA_DEFAULT_DIR}/libdrm_nouveau.a")
+    set(WINE_NX_MESA_LIB_DIR "${WINE_NX_MESA_DEFAULT_DIR}")
+endif()
+message(STATUS "Mesa: ${WINE_NX_MESA_LIB_DIR}")
 if(WINE_NX_MESA_LIB_DIR)
     set(SWITCH_EGL "${WINE_NX_MESA_LIB_DIR}/libEGL.a")
     set(SWITCH_GLAPI "${WINE_NX_MESA_LIB_DIR}/libglapi.a")
