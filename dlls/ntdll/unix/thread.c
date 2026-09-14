@@ -1127,6 +1127,9 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
     close( ntdll_get_thread_data()->wait_fd[1] );
     close( ntdll_get_thread_data()->reply_fd );
     close( ntdll_get_thread_data()->request_fd );
+#ifdef __SWITCH__
+    if (wine_nx_thread_unregister) wine_nx_thread_unregister();
+#endif
     pthread_exit( UIntToPtr(status) );
 }
 
@@ -1181,6 +1184,7 @@ static void start_thread( TEB *teb )
         ULONG_PTR affinity = get_current_thread_affinity();
         horizon_pin_current_thread( affinity == get_system_affinity_mask() ? 0 : affinity );
     }
+    if (wine_nx_thread_register) wine_nx_thread_register( 'w', HandleToULong( teb->ClientId.UniqueThread ), teb );
 #endif
     signal_start_thread( thread_data->start, thread_data->param, suspend, teb );
 }

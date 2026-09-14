@@ -2916,6 +2916,7 @@ void horizon_pin_current_thread( ULONG_PTR requested_mask )
         index = InterlockedIncrement( &next_core_index ) - 1;
         mask = nth_core_mask( system_mask, index % count );
     }
+    else if (wine_nx_thread_affinity_fixed) wine_nx_thread_affinity_fixed();
 
     preferred = lowest_set_core( mask );
     rc = svcSetThreadCoreMask( CUR_THREAD_HANDLE, preferred, (u32)mask );
@@ -2929,6 +2930,18 @@ void horizon_pin_current_thread( ULONG_PTR requested_mask )
     /* Its server connection thread follows it (horizon_server_follow_client). */
     if ((pipe = horizon_pipe_from_fd( ntdll_get_thread_data()->request_fd )))
         __atomic_store_n( &pipe->client_cores, (unsigned int)mask, __ATOMIC_RELAXED );
+}
+
+/* The runtime's core balancer moved a Wine thread (wine_nx_thread_balance,
+ * which holds the thread registered, so its TEB is there): its connection
+ * thread follows it from the next request. */
+void horizon_follow_thread_cores( void *teb, unsigned int mask )
+{
+    struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&((TEB *)teb)->GdiTebBatch;
+    struct horizon_pipe *pipe;
+
+    if ((pipe = horizon_pipe_from_fd( thread_data->request_fd )))
+        __atomic_store_n( &pipe->client_cores, mask, __ATOMIC_RELAXED );
 }
 
 static void horizon_set_reent_errno( struct _reent *r, int error )
@@ -10539,6 +10552,7 @@ static void *horizon_server_thread( void *param )
 
     horizon_server_current = connection;
     connection->request_pipe = horizon_pipe_from_fd( connection->request_fd );
+    if (wine_nx_thread_register) wine_nx_thread_register( 's', connection->tid, NULL );
     /* A client blocks until this thread replies. At the program threads'
      * priority (59) it waited for a round-robin slice behind whatever else ran
      * on the core: 0.1-0.9 ms per request in NFSU2. Above them, below the audio
@@ -11028,6 +11042,7 @@ done:
     pthread_mutex_unlock( &horizon_server_objects_mutex );
     horizon_server_current = NULL;
     free( connection );
+    if (wine_nx_thread_unregister) wine_nx_thread_unregister();
     horizon_zombie_reap( &horizon_server_zombies );
     if ((zombie = malloc( sizeof(*zombie) )))
         horizon_zombie_push( &horizon_server_zombies, zombie, pthread_self() );

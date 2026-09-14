@@ -37,6 +37,8 @@ flags="-std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-f
 "$build/free_range"
 "${CC:-clang}" $flags -I"$root/include" "$root/wine-nx-probe/tests/xinput_nx_pad.c" -o "$build/xinput_pad"
 "$build/xinput_pad"
+"${CC:-clang}" $flags "$root/wine-nx-probe/tests/thread_profile.c" -o "$build/thread_profile"
+"$build/thread_profile"
 "${CC:-clang}" $flags "$root/wine-nx-probe/tests/box64_options.c" -o "$build/box64_options"
 "$build/box64_options"
 python3 "$root/wine-nx-probe/tools/make-7zr-tree.py" "$build/drive_c" >/dev/null

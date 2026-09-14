@@ -598,6 +598,7 @@ add_executable(wine-nx-runtime
     source/ws2_32_unix_stub.c
     source/audio_unix.c
     source/xinput_unix.c
+    source/thread_profile.c
     $<TARGET_OBJECTS:wine-horizon-real>
     $<TARGET_OBJECTS:wine-server-real>
     $<TARGET_OBJECTS:wine-sync-real>

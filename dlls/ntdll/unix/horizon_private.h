@@ -18,6 +18,11 @@
 extern unsigned int horizon_set_process_machine( unsigned short machine );
 extern ULONG_PTR horizon_get_system_affinity_mask(void);
 extern unsigned int horizon_get_processor_count(void);
+/* The runtime's thread profiler (wine-nx-probe/source/thread_profile.c); weak,
+ * since the ntdll test executables link without the runtime. */
+extern void wine_nx_thread_register( char kind, unsigned int tid, void *teb ) __attribute__((weak));
+extern void wine_nx_thread_unregister( void ) __attribute__((weak));
+extern void wine_nx_thread_affinity_fixed( void ) __attribute__((weak));
 extern void horizon_get_memory_info( unsigned long long *total, unsigned long long *used );
 extern void horizon_get_address_space_limits( void **start, void **limit );
 extern int horizon_get_kernel_regions( void **starts, size_t *sizes, int max );

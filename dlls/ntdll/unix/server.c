@@ -363,10 +363,23 @@ static inline unsigned int wait_reply( struct __server_request_info *req )
 /***********************************************************************
  *           server_call_unlocked
  */
+#ifdef __SWITCH__
+/* Round trips to the in-process server by request, for the runtime's [SERVER]
+ * report: each goes over a pipe to a server thread and back. */
+unsigned int wine_nx_server_request_count = REQ_NB_REQUESTS;
+unsigned int wine_nx_server_calls[REQ_NB_REQUESTS];
+unsigned long long wine_nx_server_ticks[REQ_NB_REQUESTS];
+const char *wine_nx_server_names[REQ_NB_REQUESTS];
+#endif
+
 unsigned int server_call_unlocked( void *req_ptr )
 {
     struct __server_request_info * const req = req_ptr;
     unsigned int ret;
+#ifdef __SWITCH__
+    unsigned int code = req->u.req.request_header.req;
+    u64 start = armGetSystemTick();
+#endif
 
     FTRACE_BLOCK_START("req %s", req->name)
     TRACE_(client)("%s start\n", req->name); \
@@ -374,6 +387,14 @@ unsigned int server_call_unlocked( void *req_ptr )
         ret = wait_reply( req );
     TRACE_(client)("%s end\n", req->name);
     FTRACE_BLOCK_END()
+#ifdef __SWITCH__
+    if (code < REQ_NB_REQUESTS)
+    {
+        wine_nx_server_names[code] = req->name;
+        __atomic_add_fetch( &wine_nx_server_calls[code], 1, __ATOMIC_RELAXED );
+        __atomic_add_fetch( &wine_nx_server_ticks[code], armGetSystemTick() - start, __ATOMIC_RELAXED );
+    }
+#endif
     return ret;
 }
 

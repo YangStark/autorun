@@ -374,11 +374,17 @@ static inline uintptr_t next_table_boundary( uintptr_t pos, unsigned int shift )
     return (pos | (((uintptr_t)1 << shift) - 1)) + 1;
 }
 
+/* For [PROGRESS]: reports of changed guest memory, and lookups that found their
+ * block marked by one, so that entering it checks its code under the
+ * translator's lock (Box64's DBGetBlock). */
+unsigned int wine_nx_box64_invalidations, wine_nx_box64_marked_lookups;
+
 void wine_nx_box64_invalidate( uintptr_t addr, size_t size, int destroy )
 {
     uintptr_t end, pos;
 
     if (!size || !dynarec_ready || addr > 0xffffffffu) return;
+    __atomic_add_fetch( &wine_nx_box64_invalidations, 1, __ATOMIC_RELAXED );
     end = size > 0x100000000ull - addr ? 0x100000000ull : addr + size;
     size = end - addr;
     for (pos = addr > max_block_size ? addr - max_block_size : 0; pos < end;)
@@ -555,6 +561,21 @@ int wine_nx_box64_describe_native_pc( uintptr_t pc, const unsigned long long *x,
               (unsigned long)x64, (unsigned long)(uintptr_t)db->x64_addr, (unsigned long)db->x64_size,
               db->done ? "" : " (unfinished)", (unsigned)x[10], (unsigned)x[11], (unsigned)x[12],
               (unsigned)x[13], (unsigned)x[14], (unsigned)x[15], (unsigned)x[16], (unsigned)x[17] );
+    return 1;
+}
+
+/* For the sampling profiler (thread_profile.c), from another thread than the
+ * one running pc, lock-free for the same reason: the x86 address behind pc, or
+ * its block's start while the block is being written. 0 outside translated code. */
+int wine_nx_box64_pc_to_x86( uintptr_t pc, uintptr_t *x86 )
+{
+    size_t offset;
+    struct nx_arena *arena = find_arena( (void *)pc, &offset );
+    dynablock_t *db;
+
+    if (!arena || !(db = block_at( arena, offset ))) return 0;
+    /* The block's code pointers are executable-alias addresses, and so is pc. */
+    *x86 = db->done ? getX64Address( db, (uintptr_t)arena->rx + offset ) : (uintptr_t)db->x64_addr;
     return 1;
 }
 
@@ -790,7 +811,10 @@ int getNeedTest( uintptr_t addr )
 {
     const uintptr_t target = getJumpAddress64( addr );
     dynablock_t *block = *(dynablock_t **)(target - sizeof(void *));
-    return block && target != (uintptr_t)block->block;
+
+    if (!block || target == (uintptr_t)block->block) return 0;
+    __atomic_add_fetch( &wine_nx_box64_marked_lookups, 1, __ATOMIC_RELAXED );
+    return 1;
 }
 
 void *customMalloc( size_t size ) { return malloc( size ); }

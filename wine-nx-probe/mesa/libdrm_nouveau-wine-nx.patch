@@ -1,17 +1,18 @@
 --- a/source/nouveau.c
 +++ b/source/nouveau.c
-@@ -336,23 +336,177 @@
- 		nvbo->access = 0;
+@@ -337,19 +337,176 @@
  	return ret;
  }
-+
+ 
+-static void
+-nouveau_bo_del(struct nouveau_bo *bo)
 +/* Wine-NX: a bo costs a heap allocation, two nvservices ioctls and a GPU
 + * address space mapping, and Mesa creates and destroys them per transfer. Keep
 + * freed ones for reuse, capped so the process heap stays available. */
 +#define NOUVEAU_BO_CACHE_ENTRIES 16
 +#define NOUVEAU_BO_CACHE_BYTES   (16u << 20)
 +#define NOUVEAU_BO_CACHE_MAX_BO  (8u << 20)
- 
++
 +static Mutex nouveau_bo_cache_lock;
 +static struct nouveau_bo_priv *nouveau_bo_cache[NOUVEAU_BO_CACHE_ENTRIES];
 +static unsigned int nouveau_bo_cache_count;
@@ -22,18 +23,16 @@
 +unsigned int wine_nx_nouveau_bo_new, wine_nx_nouveau_bo_reused;
 +uint64_t wine_nx_nouveau_bo_new_ns;
 +
- static void
--nouveau_bo_del(struct nouveau_bo *bo)
++static void
 +nouveau_bo_destroy(struct nouveau_bo_priv *nvbo)
  {
 -	CALLED();
 -	struct nouveau_bo_priv *nvbo = nouveau_bo(bo);
 -	struct nouveau_device_priv *nvdev = nouveau_device(bo->device);
--
++	struct nouveau_device_priv *nvdev = nouveau_device(nvbo->base.device);
+ 
 -	nouveau_bo_fence_wait(bo, 0);
 -	nvAddressSpaceUnmap(&nvdev->addr_space, bo->offset);
-+	struct nouveau_device_priv *nvdev = nouveau_device(nvbo->base.device);
-+
 +	nouveau_bo_fence_wait(&nvbo->base, 0);
 +	nvAddressSpaceUnmap(&nvdev->addr_space, nvbo->base.offset);
  	nvMapClose(&nvbo->map);
@@ -41,8 +40,8 @@
 +	if (nvbo->map_addr && !nvbo->user_memory)
  		free(nvbo->map_addr);
  	free(nvbo);
- }
- 
++}
++
 +/* A cached bo keeps its memory, its nvmap handle and its GPU address; only the
 + * fence of its last use is still pending, and its next user waits for that. */
 +static struct nouveau_bo_priv *
@@ -109,18 +108,21 @@
 +int wine_nx_nouveau_pin_cached = 1;
 +unsigned int wine_nx_nouveau_cache_cleans;
 +uint64_t wine_nx_nouveau_cache_clean_ns;
++/* Wine-NX: set by the runtime when switch/wine/gl-noclean.txt exists, to see
++ * whether the GPU reads pinned buffers correctly without the clean below. */
++int wine_nx_nouveau_skip_clean;
 +
-+/* Writes the bo's cache lines back so the GPU reads what the CPU wrote. Lines
-+ * that are already clean cost little, so callers may be generous. Only the
-+ * CPU-to-GPU direction: nothing invalidates after the GPU writes, which pinned
-+ * buffers (upload sources) never need. */
++/* Writes the bo's cache lines back so the GPU reads what the CPU wrote. It
++ * walks the whole bo: NFSU2's pinned Direct3D buffers took ~2 ms per clean.
++ * Only the CPU-to-GPU direction: nothing invalidates after the GPU writes,
++ * which pinned buffers (upload sources) never need. */
 +void
 +nouveau_bo_cpu_clean(struct nouveau_bo *bo)
 +{
 +	struct nouveau_bo_priv *nvbo = nouveau_bo(bo);
 +	uint64_t start;
 +
-+	if (!nvbo->cacheable || !nvbo->map_addr)
++	if (!nvbo->cacheable || !nvbo->map_addr || wine_nx_nouveau_skip_clean)
 +		return;
 +
 +	start = armTicksToNs(armGetSystemTick());
@@ -132,7 +134,7 @@
 +/* Wine-NX: a bo over page-aligned memory the caller owns (GL_AMD_pinned_memory).
 + * nvservices maps the pages for the GPU in place: nothing is copied, and the
 + * memory is left to the caller once the bo is gone. */
- int
++int
 +nouveau_bo_wrap_user(struct nouveau_device *dev, uint32_t flags, void *ptr,
 +		     uint64_t size, struct nouveau_bo **pbo)
 +{
@@ -180,13 +182,10 @@
 +	nvbo->fence.id = UINT32_MAX;
 +	*pbo = bo;
 +	return 0;
-+}
-+
-+int
- nouveau_bo_new(struct nouveau_device *dev, uint32_t flags, uint32_t align,
- 	       uint64_t size, union nouveau_bo_config *config,
- 	       struct nouveau_bo **pbo)
-@@ -364,6 +518,8 @@
+ }
+ 
+ int
+@@ -364,6 +521,8 @@
  	struct nouveau_bo *bo = &nvbo->base;
  	Result rc;
  
@@ -195,7 +194,7 @@
  	if (align < 0x1000)
  		align = 0x1000;
  	size = (size + 0xFFF) &~ 0xFFF;
-@@ -375,6 +531,26 @@
+@@ -375,6 +534,26 @@
  	if (config)
  		kind = (NvKind)config->nvc0.memtype;
  
@@ -222,7 +221,7 @@
  	TRACE("Allocating BO of size %ld, align %d, flags 0x%x and kind 0x%x\n", size, align, flags, kind);
  	void* mem = memalign(0x1000, size);
  	if (!mem)
-@@ -410,7 +586,10 @@
+@@ -410,7 +589,10 @@
  	bo->flags = flags;
  	nvbo->map_addr = mem;
  	nvbo->fence.id = UINT32_MAX;

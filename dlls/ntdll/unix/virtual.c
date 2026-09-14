@@ -1941,6 +1941,31 @@ static struct file_view *find_view( const void *addr, size_t size )
 }
 
 
+#ifdef __SWITCH__
+/* For the runtime's sampling profiler (thread_profile.c): the image mapped over
+ * addr, as its base and export name ("" for one that exports nothing, as most
+ * executables). */
+BOOL wine_nx_image_at( const void *addr, void **base, char *name, size_t size )
+{
+    struct file_view *view;
+    const char *export;
+    sigset_t sigset;
+    BOOL ret = FALSE;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if ((view = find_view( addr, 0 )) && (view->protect & SEC_IMAGE))
+    {
+        export = wine_nx_module_export_name( view->base );
+        *base = view->base;
+        snprintf( name, size, "%s", export ? export : "" );
+        ret = TRUE;
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return ret;
+}
+#endif
+
+
 /***********************************************************************
  *           is_write_watch_range
  */

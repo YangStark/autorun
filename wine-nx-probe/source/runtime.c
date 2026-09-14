@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -23,6 +24,13 @@
 #include "launcher_list.h"
 #include "pointer_cursor.h"
 #include "std_stream_lines.h"
+#include "thread_profile.h"
+
+/* The sampler finds an x86 context through these without Wine's headers. */
+C_ASSERT( FIELD_OFFSET( TEB, TlsSlots[WOW64_TLS_CPURESERVED] ) == NX_PROF_TEB_CPU_AREA );
+C_ASSERT( sizeof(WOW64_CPURESERVED) == NX_PROF_CPU_CONTEXT && TYPE_ALIGNMENT( I386_CONTEXT ) <= NX_PROF_CPU_CONTEXT );
+C_ASSERT( FIELD_OFFSET( I386_CONTEXT, Ebp ) == NX_PROF_I386_EBP );
+C_ASSERT( FIELD_OFFSET( I386_CONTEXT, Esp ) == NX_PROF_I386_ESP );
 
 u32 __nx_applet_type = AppletType_Application;
 size_t __nx_heap_size = 256 * 1024 * 1024;
@@ -39,7 +47,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-54"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-77"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -122,6 +130,37 @@ static int log_line_is_urgent( const char *line )
 static void runtime_tick_std_streams(void);
 static void runtime_report_interpreter(void);
 
+/* Set at startup unless gl-noclean.txt or gl-clean.txt chose: the cache clean
+ * of pinned GPU buffers before each submission goes off and on. */
+static int clean_alternates;
+extern int wine_nx_nouveau_skip_clean __attribute__((weak));
+
+/* A test of the clean libdrm_nouveau does before every GPU submission, ~12% of
+ * Direct3D's drawing thread in NFSU2: from a minute in, 30 seconds off, 30
+ * seconds on. [PROGRESS] cleans= stops growing while it is off, so one race
+ * shows its cost, and whether anything flickers shows whether the GPU needs it. */
+static void runtime_alternate_clean(void)
+{
+    static u64 start;
+    static int last = -1;
+    u64 now = armGetSystemTick(), seconds;
+    int skip;
+
+    if (!clean_alternates) return;
+    if (!start) start = now;
+    seconds = armTicksToNs( now - start ) / 1000000000ull;
+    skip = seconds >= 60 && (seconds / 30) % 2 == 0;
+    if (skip == last) return;
+    last = skip;
+    wine_nx_nouveau_skip_clean = skip;
+    if (log_file)
+    {
+        pthread_mutex_lock( &log_mutex );
+        fprintf( log_file, "[CLEAN] %s at %llus\n", skip ? "off" : "on", (unsigned long long)seconds );
+        pthread_mutex_unlock( &log_mutex );
+    }
+}
+
 /* Flushing each line to the SD card serialized every thread behind the file
  * lock. Buffer instead and flush often enough that a hang loses under 200 ms.
  * The same thread emits idle partial output lines and reports interpreter speed. */
@@ -135,6 +174,8 @@ static void *log_flusher( void *arg )
         svcSleepThread( 200000000LL );
         runtime_tick_std_streams();
         if (++ticks % 25 == 0) runtime_report_interpreter();
+        if (ticks % 10 == 0) wine_nx_thread_balance();
+        runtime_alternate_clean();
         pthread_mutex_lock( &log_mutex );
         fflush( log_file );
         pthread_mutex_unlock( &log_mutex );
@@ -190,6 +231,9 @@ int wine_nx_runtime_verbose;
 /* libdrm_nouveau's switch for CPU-cacheable pinned GPU memory, cleared by
  * sdmc:/switch/wine/gl-uncached.txt containing 1. */
 extern int wine_nx_nouveau_pin_cached __attribute__((weak));
+/* Set by sdmc:/switch/wine/gl-noclean.txt containing 1: submissions skip the CPU
+ * cache clean of pinned GPU buffers, to see whether the GPU needs it. */
+extern int wine_nx_nouveau_skip_clean __attribute__((weak));
 
 /* Whether the display driver registers its GPU, source and monitor with
  * win32u's device manager, which programs enumerate and wined3d insists on.
@@ -703,6 +747,7 @@ static void runtime_report_interpreter(void)
         extern unsigned int wine_nx_nouveau_cache_cleans __attribute__((weak));
         extern unsigned long long wine_nx_nouveau_cache_clean_ns __attribute__((weak));
         extern int wine_nx_gl_pinned_memory __attribute__((weak));
+        extern unsigned int wine_nx_syscall_counts[] __attribute__((weak));
         static unsigned int calls, last_reads = ~0u, last_frames = ~0u;
         static u64 start;
         unsigned int reads = &wine_nx_file_reads ? __atomic_load_n( &wine_nx_file_reads, __ATOMIC_RELAXED ) : 0;
@@ -711,19 +756,61 @@ static void runtime_report_interpreter(void)
         unsigned long long read_ms = &wine_nx_file_read_100ns
                                      ? __atomic_load_n( &wine_nx_file_read_100ns, __ATOMIC_RELAXED ) / 10000 : 0;
         unsigned int syscalls = &wine_nx_syscalls ? __atomic_load_n( &wine_nx_syscalls, __ATOMIC_RELAXED ) : 0;
-        char native[80] = "", gl[384] = "", audio[32] = "";
+        char native[256] = "", gl[384] = "", audio[32] = "", systop[64] = "";
 
         if (!start) start = now;
         if (++calls % 2 || (reads == last_reads && frames == last_frames)) return;
         last_reads = reads;
         last_frames = frames;
+        /* The three system calls made most since the last line, as id:calls: a
+         * program's busy loop shows here without verbose traces. */
+        if (wine_nx_syscall_counts)
+        {
+            static unsigned int last_counts[0x2000];
+            unsigned int best_id[3] = {0}, best_n[3] = {0}, id, k, j;
+            int len;
+
+            for (id = 0; id < 0x2000; id++)
+            {
+                unsigned int count = __atomic_load_n( &wine_nx_syscall_counts[id], __ATOMIC_RELAXED );
+                unsigned int n = count - last_counts[id];
+
+                last_counts[id] = count;
+                for (k = 0; k < 3; k++)
+                {
+                    if (n <= best_n[k]) continue;
+                    for (j = 2; j > k; j--)
+                    {
+                        best_n[j] = best_n[j - 1];
+                        best_id[j] = best_id[j - 1];
+                    }
+                    best_n[k] = n;
+                    best_id[k] = id;
+                    break;
+                }
+            }
+            len = snprintf( systop, sizeof(systop), " sys_top=" );
+            for (k = 0; k < 3 && best_n[k] && len > 0 && len < (int)sizeof(systop); k++)
+                len += snprintf( systop + len, sizeof(systop) - len, "%s%x:%u", k ? "," : "", best_id[k], best_n[k] );
+            if (!best_n[0]) systop[0] = 0;
+        }
 #ifdef WINE_NX_BOX64_DYNAREC
         {
             extern unsigned long long wine_nx_box64_native_entries;
             extern unsigned int wine_nx_box64_block_tests;
-            snprintf( native, sizeof(native), " native_entries=%llu block_tests=%u",
+            extern unsigned int wine_nx_box64_invalidations, wine_nx_box64_marked_lookups;
+            extern unsigned int wine_nx_box64_callret_clean, wine_nx_box64_callret_dirty;
+            extern unsigned int wine_nx_box64_translator_locks, wine_nx_box64_inline_unix_calls;
+            snprintf( native, sizeof(native), " native_entries=%llu block_tests=%u invalidations=%u marked_lookups=%u"
+                      " callret_clean=%u callret_dirty=%u translator_locks=%u inline_unix=%u",
                       __atomic_load_n( &wine_nx_box64_native_entries, __ATOMIC_RELAXED ),
-                      __atomic_load_n( &wine_nx_box64_block_tests, __ATOMIC_RELAXED ) );
+                      __atomic_load_n( &wine_nx_box64_block_tests, __ATOMIC_RELAXED ),
+                      __atomic_load_n( &wine_nx_box64_invalidations, __ATOMIC_RELAXED ),
+                      __atomic_load_n( &wine_nx_box64_marked_lookups, __ATOMIC_RELAXED ),
+                      __atomic_load_n( &wine_nx_box64_callret_clean, __ATOMIC_RELAXED ),
+                      __atomic_load_n( &wine_nx_box64_callret_dirty, __ATOMIC_RELAXED ),
+                      __atomic_load_n( &wine_nx_box64_translator_locks, __ATOMIC_RELAXED ),
+                      __atomic_load_n( &wine_nx_box64_inline_unix_calls, __ATOMIC_RELAXED ) );
         }
 #endif
         /* OpenGL: frames swapped and the time in eglSwapBuffers, calls into opengl32's unix
@@ -766,11 +853,26 @@ static void runtime_report_interpreter(void)
         if (&wine_nx_audio_underruns && wine_nx_audio_underruns)
             snprintf( audio, sizeof(audio), " audio_under=%u",
                       __atomic_load_n( &wine_nx_audio_underruns, __ATOMIC_RELAXED ) );
+        /* The libnx heap backs everything: Wine's guest memory, the GPU's
+         * buffers and translated code. Under a 32-bit address space it is only
+         * the heap region (1 GiB, or 2 GiB without the alias region). Free is
+         * what malloc holds unused plus what it has not taken from the heap. */
+        struct mallinfo heap = mallinfo();
+        extern char *fake_heap_start, *fake_heap_end;
+        unsigned long long heap_size = (unsigned long long)(fake_heap_end - fake_heap_start);
+        unsigned long long heap_free = heap.fordblks + (heap_size > heap.arena ? heap_size - heap.arena : 0);
+
         log_line( "[PROGRESS] %llus reads=%u read_ms=%llu sd_reads=%u sd_ms=%llu cache_hits=%u syscalls=%u "
-                  "frames=%u%s%s%s", (unsigned long long)(armTicksToNs( now - start ) / 1000000000ull), reads, read_ms,
+                  "frames=%u heap_used_mb=%llu heap_free_mb=%llu%s%s%s%s",
+                  (unsigned long long)(armTicksToNs( now - start ) / 1000000000ull), reads, read_ms,
                   __atomic_load_n( &wine_nx_sd_reads, __ATOMIC_RELAXED ),
                   __atomic_load_n( &wine_nx_sd_read_ns, __ATOMIC_RELAXED ) / 1000000,
-                  __atomic_load_n( &wine_nx_sd_hits, __ATOMIC_RELAXED ), syscalls, frames, native, gl, audio );
+                  __atomic_load_n( &wine_nx_sd_hits, __ATOMIC_RELAXED ), syscalls, frames,
+                  (unsigned long long)heap.uordblks >> 20, heap_free >> 20, systop, native, gl, audio );
+        {
+            extern void wine_nx_thread_report( void );
+            wine_nx_thread_report();
+        }
         return;
     }
 
@@ -1644,6 +1746,7 @@ static NTSTATUS runtime_start_wow64( void *module, void *entry,
         /* Wow64LdrpInitialize currently ignores its native context argument.
          * It changes the saved x86 PC to LdrInitializeThunk and never returns. */
         log_line( "[WOW64] entering Wine's x86 LdrInitializeThunk via ARM64 wow64.dll" );
+        wine_nx_thread_register( 'w', HandleToULong( teb->ClientId.UniqueThread ), teb );
         call_pe_entry_point( initialize );
         return STATUS_UNSUCCESSFUL;
     }
@@ -1744,6 +1847,21 @@ int main( int argc, char **argv )
      * old mapping, which is there to compare the two. */
     if (&wine_nx_nouveau_pin_cached && read_bool_file( RUNTIME_DIR "/gl-uncached.txt" ))
         wine_nx_nouveau_pin_cached = 0;
+    if (&wine_nx_nouveau_skip_clean && read_bool_file( RUNTIME_DIR "/gl-noclean.txt" ))
+        wine_nx_nouveau_skip_clean = 1;
+    else if (&wine_nx_nouveau_skip_clean && read_bool_file( RUNTIME_DIR "/gl-clean-test.txt" ))
+        clean_alternates = 1;
+    if (&wine_nx_nouveau_pin_cached && &wine_nx_nouveau_skip_clean)
+        log_line( "[INIT] pinned GPU buffers %s, cache clean before submissions %s (gl-uncached.txt, gl-noclean.txt, gl-clean-test.txt)",
+                  wine_nx_nouveau_pin_cached ? "cacheable" : "uncached",
+                  wine_nx_nouveau_skip_clean ? "off" : clean_alternates ? "alternating from 60 s, 30 s off/30 s on" : "on" );
+    if (read_bool_file( RUNTIME_DIR "/no-balance.txt" )) wine_nx_balance_enabled = 0;
+    log_line( "[INIT] core balancing %s (no-balance.txt)", wine_nx_balance_enabled ? "on" : "off" );
+    if (read_bool_file( RUNTIME_DIR "/profile.txt" ))
+    {
+        extern void wine_nx_profile_start( void );
+        wine_nx_profile_start();
+    }
     read_key_map( RUNTIME_DIR "/keys.txt" );
     if (read_bool_file( RUNTIME_DIR "/no-display-devices.txt" )) wine_nx_display_devices = 0;
     log_line( "[INIT] display devices %s (no-display-devices.txt)",

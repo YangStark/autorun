@@ -396,6 +396,8 @@ void *wine_nx_current_teb(void)
 
 /* System calls from PE code, reported by the runtime's [PROGRESS] line. */
 unsigned int wine_nx_syscalls;
+/* Calls per system call id (table << 12 | function), for the runtime's [PROGRESS] line. */
+unsigned int wine_nx_syscall_counts[0x2000];
 
 NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
                                     ULONG_PTR x0, ULONG_PTR x1,
@@ -421,7 +423,11 @@ NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
         return STATUS_INVALID_SYSTEM_SERVICE;
     /* winebox64 reads each x86 syscall's stack arguments through this. */
     if ((void *)handler == (void *)NtReadVirtualMemory) trace_syscall = FALSE;
-    else __atomic_add_fetch( &wine_nx_syscalls, 1, __ATOMIC_RELAXED );
+    else
+    {
+        __atomic_add_fetch( &wine_nx_syscalls, 1, __ATOMIC_RELAXED );
+        __atomic_add_fetch( &wine_nx_syscall_counts[syscall_id & 0x1fff], 1, __ATOMIC_RELAXED );
+    }
 
     arg_bytes = table->ArgumentTable ? table->ArgumentTable[func_idx] : 0;
 
