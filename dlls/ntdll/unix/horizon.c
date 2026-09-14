@@ -692,7 +692,9 @@ enum horizon_server_object_type
     HORIZON_SERVER_OBJECT_WINSTATION,
     HORIZON_SERVER_OBJECT_DESKTOP,
     HORIZON_SERVER_OBJECT_MSG_QUEUE,
-    HORIZON_SERVER_OBJECT_DIRECTORY
+    HORIZON_SERVER_OBJECT_DIRECTORY,
+    HORIZON_SERVER_OBJECT_COMPLETION,
+    HORIZON_SERVER_OBJECT_COMPLETION_WAIT
 };
 
 struct horizon_server_request_header
@@ -709,6 +711,7 @@ struct horizon_server_reply_header
 };
 
 #include "horizon_registry_wire.h"
+#include "horizon_completion.h"
 
 struct horizon_init_first_thread_request
 {
@@ -2598,6 +2601,11 @@ struct horizon_server_connection
     /* The client's request pipe, and the cores this thread last followed it to. */
     struct horizon_pipe *request_pipe;
     unsigned int core_mask;
+    /* The completion wait object remove_completion gave this client (one
+     * reference) and the handle the client selects on; server/completion.c
+     * keeps both in the thread. */
+    struct horizon_server_object *completion_wait;
+    unsigned int completion_wait_handle;
 };
 
 struct horizon_server_object
@@ -2648,6 +2656,14 @@ struct horizon_server_object
     int std_stream;                 /* 1 stdout, 2 stderr: writes are echoed to the log */
     unsigned int queue_tid;         /* message queue object: its thread, 0 once the thread ended */
     int directory;                  /* directory object: enum horizon_object_dir */
+    struct horizon_completion_queue completion; /* completion port: queued messages */
+    int completion_closed;          /* completion port: its last handle was closed */
+    struct horizon_server_object *wait_port; /* completion wait: the port it waits on, referenced */
+    struct horizon_completion_msg wait_msg;  /* completion wait: the message the wait took */
+    int wait_has_msg;
+    struct horizon_server_object *file_completion; /* file: the port its I/O results go to, referenced */
+    unsigned long long file_completion_key;
+    unsigned int file_completion_flags;  /* FILE_SKIP_* */
 };
 
 struct horizon_server_handle_entry
@@ -3375,6 +3391,7 @@ static struct horizon_server_handle_entry *horizon_server_create_handle_for_obje
     entry->handle = horizon_server_alloc_handle();
     entry->object = object;
     object->refs++;
+    if (object->type == HORIZON_SERVER_OBJECT_COMPLETION) object->completion_closed = 0;
     entry->next = horizon_server_handles;
     horizon_server_handles = entry;
     return entry;
@@ -3396,6 +3413,10 @@ static void horizon_server_free_object( struct horizon_server_object *object )
             break;
         }
     }
+    horizon_completion_clear( &object->completion );
+    if (object->wait_port && !--object->wait_port->refs) horizon_server_free_object( object->wait_port );
+    if (object->file_completion && !--object->file_completion->refs)
+        horizon_server_free_object( object->file_completion );
     if (object->reg_key) horizon_reg_release( &horizon_registry, object->reg_key );
     if (object->file_fd != -1) close( object->file_fd );
     free( object->file_name );
@@ -3405,6 +3426,15 @@ static void horizon_server_free_object( struct horizon_server_object *object )
 }
 
 static unsigned int horizon_server_errno_status( int error );
+
+static int horizon_server_object_has_handles_locked( const struct horizon_server_object *object )
+{
+    const struct horizon_server_handle_entry *entry;
+
+    for (entry = horizon_server_handles; entry; entry = entry->next)
+        if (entry->object == object) return 1;
+    return 0;
+}
 
 static unsigned int horizon_server_close_object_handle( unsigned int handle )
 {
@@ -3423,6 +3453,14 @@ static unsigned int horizon_server_close_object_handle( unsigned int handle )
         entry = *ptr;
         object = entry->object;
         *ptr = entry->next;
+        /* server/completion.c's close_handle: closing a port's last handle
+         * abandons the waits on it. */
+        if (object && object->type == HORIZON_SERVER_OBJECT_COMPLETION &&
+            !horizon_server_object_has_handles_locked( object ))
+        {
+            object->completion_closed = 1;
+            horizon_server_signal_changed_locked();
+        }
         if (object && object->reg_key)
             horizon_reg_handle_closed( &horizon_registry, object->reg_key, handle );
         if (object && object->refs && !--object->refs)
@@ -4570,6 +4608,11 @@ static int horizon_server_object_is_signaled( const struct horizon_server_object
         struct horizon_msgq *queue = horizon_msgq_find( &horizon_msg_queues, object->queue_tid );
         return queue && horizon_msgq_signaled( queue );
     }
+    case HORIZON_SERVER_OBJECT_COMPLETION:
+        return object->completion.depth > 0;
+    case HORIZON_SERVER_OBJECT_COMPLETION_WAIT:
+        return horizon_completion_wait_signaled( object->wait_port ? &object->wait_port->completion : NULL,
+                                                 object->wait_port && object->wait_port->completion_closed );
     case HORIZON_SERVER_OBJECT_PROCESS:
     case HORIZON_SERVER_OBJECT_RESERVE:
     case HORIZON_SERVER_OBJECT_KEYED_EVENT:
@@ -4595,6 +4638,10 @@ static int horizon_server_consume_signal( struct horizon_server_object *object )
     case HORIZON_SERVER_OBJECT_TIMER:
         if (!object->manual_reset) object->signaled = 0;
         break;
+    case HORIZON_SERVER_OBJECT_COMPLETION_WAIT:
+        return horizon_completion_wait_satisfy( object->wait_port ? &object->wait_port->completion : NULL,
+                                                object->wait_port && object->wait_port->completion_closed,
+                                                &object->wait_msg, &object->wait_has_msg );
     default:
         break;
     }
@@ -4643,6 +4690,27 @@ static struct horizon_server_object *horizon_server_alloc_thread_locked( unsigne
     return object;
 }
 
+/* Drops a client's completion wait object and the handle it was given. */
+static void horizon_server_end_completion_wait_locked( struct horizon_server_connection *connection )
+{
+    struct horizon_server_object *wait = connection->completion_wait;
+    struct horizon_server_handle_entry **ptr, *entry;
+
+    if (!wait) return;
+    for (ptr = &horizon_server_handles; *ptr; ptr = &(*ptr)->next)
+    {
+        if ((*ptr)->handle != connection->completion_wait_handle || (*ptr)->object != wait) continue;
+        entry = *ptr;
+        *ptr = entry->next;
+        wait->refs--;
+        free( entry );
+        break;
+    }
+    connection->completion_wait = NULL;
+    connection->completion_wait_handle = 0;
+    if (!--wait->refs) horizon_server_free_object( wait );
+}
+
 /* The client's request pipe closed: it can no longer run Windows code. Mark it
  * terminated (waiters wake), abandon its mutexes and drop the connection's
  * reference. Callers hold horizon_server_objects_mutex. */
@@ -4651,6 +4719,7 @@ static void horizon_server_end_thread_locked( struct horizon_server_connection *
     struct horizon_server_object *thread = connection->thread;
     struct horizon_server_handle_entry *entry;
 
+    horizon_server_end_completion_wait_locked( connection );
     if (!thread) return;
     connection->thread = NULL;
     if (horizon_thread_mark_terminated( &thread->thread, horizon_server_now() ))
@@ -10083,6 +10152,216 @@ static int horizon_server_handle_query_event( struct horizon_server_connection *
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
 }
 
+/* I/O completion ports (horizon_completion.h, after server/completion.c). A
+ * client thread waits on its own completion wait object: remove_completion
+ * hands out that object's handle when the port's queue is empty, the client's
+ * select takes the next message into it, and get_thread_completion returns
+ * the message. */
+static void horizon_server_post_completion_locked( struct horizon_server_object *port, unsigned long long ckey,
+                                                   unsigned long long cvalue, unsigned int status,
+                                                   unsigned long long information )
+{
+    if (horizon_completion_add( &port->completion, ckey, cvalue, status, information ))
+        horizon_server_signal_changed_locked();
+}
+
+/* The client's completion wait object, created with a handle at its first wait. */
+static struct horizon_server_object *horizon_server_completion_wait_locked( struct horizon_server_connection *connection )
+{
+    struct horizon_server_handle_entry *entry;
+
+    if (connection->completion_wait) return connection->completion_wait;
+    if (!(entry = horizon_server_create_handle_locked( HORIZON_SERVER_OBJECT_COMPLETION_WAIT ))) return NULL;
+    entry->object->refs++;  /* the connection's */
+    connection->completion_wait = entry->object;
+    connection->completion_wait_handle = entry->handle;
+    return entry->object;
+}
+
+static void horizon_server_bind_completion_wait_locked( struct horizon_server_object *wait,
+                                                        struct horizon_server_object *port )
+{
+    if (wait->wait_port == port) return;
+    port->refs++;
+    if (wait->wait_port && !--wait->wait_port->refs) horizon_server_free_object( wait->wait_port );
+    wait->wait_port = port;
+}
+
+static int horizon_server_handle_create_completion( struct horizon_server_connection *connection,
+                                                    const unsigned char *data, unsigned int data_size )
+{
+    struct horizon_create_completion_reply reply;
+    struct horizon_server_handle_entry *entry = NULL;
+    struct horizon_object_name name;
+
+    memset( &reply, 0, sizeof(reply) );
+    reply.header.error = horizon_server_parse_object_attributes( data, data_size, &name );
+    if (reply.header.error == HORIZON_STATUS_SUCCESS)
+    {
+        pthread_mutex_lock( &horizon_server_objects_mutex );
+        reply.header.error = horizon_server_create_named_object_handle_locked(
+            HORIZON_SERVER_OBJECT_COMPLETION, &name, &entry );
+        if (entry) reply.handle = entry->handle;
+        pthread_mutex_unlock( &horizon_server_objects_mutex );
+    }
+    horizon_trace( "[HZIOCP] create_completion -> handle=0x%x err=0x%x", reply.handle, reply.header.error );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_add_completion( struct horizon_server_connection *connection,
+                                                 const unsigned char *message )
+{
+    const struct horizon_add_completion_request *request = (const void *)message;
+    struct horizon_server_object *port = NULL;
+    unsigned int status;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    status = horizon_server_find_typed_object_locked( request->handle, HORIZON_SERVER_OBJECT_COMPLETION, &port );
+    if (status == HORIZON_STATUS_SUCCESS)
+        horizon_server_post_completion_locked( port, request->ckey, request->cvalue, request->status,
+                                               request->information );
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_status( connection->reply_fd, status );
+}
+
+static int horizon_server_handle_remove_completion( struct horizon_server_connection *connection,
+                                                    const unsigned char *message )
+{
+    const struct horizon_remove_completion_request *request = (const void *)message;
+    struct horizon_remove_completion_reply reply;
+    struct horizon_server_object *port = NULL, *wait;
+    struct horizon_completion_msg msg;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    reply.header.error = horizon_server_find_typed_object_locked( request->handle,
+                                                                  HORIZON_SERVER_OBJECT_COMPLETION, &port );
+    if (reply.header.error == HORIZON_STATUS_SUCCESS)
+    {
+        if (horizon_completion_take( &port->completion, &msg ))
+        {
+            reply.ckey = msg.ckey;
+            reply.cvalue = msg.cvalue;
+            reply.information = msg.information;
+            reply.status = msg.status;
+            if (connection->completion_wait)
+                horizon_server_bind_completion_wait_locked( connection->completion_wait, port );
+        }
+        else if (!(wait = horizon_server_completion_wait_locked( connection )))
+            reply.header.error = HORIZON_STATUS_NO_MEMORY;
+        else
+        {
+            horizon_server_bind_completion_wait_locked( wait, port );
+            reply.wait_handle = connection->completion_wait_handle;
+            reply.header.error = HORIZON_STATUS_PENDING;
+        }
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_get_thread_completion( struct horizon_server_connection *connection )
+{
+    struct horizon_get_thread_completion_reply reply;
+    struct horizon_server_object *wait;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(wait = connection->completion_wait) || !wait->wait_has_msg)
+        reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else
+    {
+        reply.ckey = wait->wait_msg.ckey;
+        reply.cvalue = wait->wait_msg.cvalue;
+        reply.information = wait->wait_msg.information;
+        reply.status = wait->wait_msg.status;
+        wait->wait_has_msg = 0;
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_query_completion( struct horizon_server_connection *connection,
+                                                   const unsigned char *message )
+{
+    const struct horizon_query_completion_request *request = (const void *)message;
+    struct horizon_query_completion_reply reply;
+    struct horizon_server_object *port = NULL;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    reply.header.error = horizon_server_find_typed_object_locked( request->handle,
+                                                                  HORIZON_SERVER_OBJECT_COMPLETION, &port );
+    if (reply.header.error == HORIZON_STATUS_SUCCESS) reply.depth = port->completion.depth;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+/* server/fd.c's set_completion_info, add_fd_completion and
+ * set_fd_completion_mode, for regular files. */
+static int horizon_server_handle_set_completion_info( struct horizon_server_connection *connection,
+                                                      const unsigned char *message )
+{
+    const struct horizon_set_completion_info_request *request = (const void *)message;
+    struct horizon_server_object *file = NULL, *port = NULL;
+    unsigned int status;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    status = horizon_server_find_typed_object_locked( request->handle, HORIZON_SERVER_OBJECT_FILE, &file );
+    if (status == HORIZON_STATUS_SUCCESS &&
+        (!horizon_completion_file_overlapped( file->file_options ) || file->file_completion))
+        status = HORIZON_STATUS_INVALID_PARAMETER;
+    if (status == HORIZON_STATUS_SUCCESS)
+        status = horizon_server_find_typed_object_locked( request->chandle, HORIZON_SERVER_OBJECT_COMPLETION, &port );
+    if (status == HORIZON_STATUS_SUCCESS)
+    {
+        port->refs++;
+        file->file_completion = port;
+        file->file_completion_key = request->ckey;
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    horizon_trace( "[HZIOCP] set_completion_info handle=0x%x port=0x%x key=0x%llx -> 0x%x",
+                   request->handle, request->chandle, (unsigned long long)request->ckey, status );
+    return horizon_server_write_status( connection->reply_fd, status );
+}
+
+static int horizon_server_handle_add_fd_completion( struct horizon_server_connection *connection,
+                                                    const unsigned char *message )
+{
+    const struct horizon_add_fd_completion_request *request = (const void *)message;
+    struct horizon_server_object *file = NULL;
+    unsigned int status;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    status = horizon_server_find_typed_object_locked( request->handle, HORIZON_SERVER_OBJECT_FILE, &file );
+    if (status == HORIZON_STATUS_SUCCESS && file->file_completion &&
+        horizon_completion_file_posts( request->async, file->file_completion_flags ))
+        horizon_server_post_completion_locked( file->file_completion, file->file_completion_key,
+                                               request->cvalue, request->status, request->information );
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_status( connection->reply_fd, status );
+}
+
+static int horizon_server_handle_set_fd_completion_mode( struct horizon_server_connection *connection,
+                                                         const unsigned char *message )
+{
+    const struct horizon_set_fd_completion_mode_request *request = (const void *)message;
+    struct horizon_server_object *file = NULL;
+    unsigned int status;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    status = horizon_server_find_typed_object_locked( request->handle, HORIZON_SERVER_OBJECT_FILE, &file );
+    if (status == HORIZON_STATUS_SUCCESS)
+    {
+        if (horizon_completion_file_overlapped( file->file_options ))
+            file->file_completion_flags = horizon_completion_file_mode( file->file_completion_flags,
+                                                                        request->flags );
+        else status = HORIZON_STATUS_INVALID_PARAMETER;
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_status( connection->reply_fd, status );
+}
+
 static int horizon_server_handle_create_keyed_event( struct horizon_server_connection *connection,
                                                      const unsigned char *data, unsigned int data_size )
 {
@@ -10779,6 +11058,34 @@ static void *horizon_server_thread( void *param )
             break;
         case HORIZON_REQ_QUERY_EVENT:
             status = horizon_server_handle_query_event( connection, message );
+            break;
+        case HORIZON_REQ_CREATE_COMPLETION:
+            status = horizon_server_handle_create_completion( connection, request_data, header->request_size );
+            break;
+        case HORIZON_REQ_OPEN_COMPLETION:
+            status = horizon_server_handle_open_named_object( connection, message, request_data,
+                                                              header->request_size, HORIZON_SERVER_OBJECT_COMPLETION );
+            break;
+        case HORIZON_REQ_ADD_COMPLETION:
+            status = horizon_server_handle_add_completion( connection, message );
+            break;
+        case HORIZON_REQ_REMOVE_COMPLETION:
+            status = horizon_server_handle_remove_completion( connection, message );
+            break;
+        case HORIZON_REQ_GET_THREAD_COMPLETION:
+            status = horizon_server_handle_get_thread_completion( connection );
+            break;
+        case HORIZON_REQ_QUERY_COMPLETION:
+            status = horizon_server_handle_query_completion( connection, message );
+            break;
+        case HORIZON_REQ_SET_COMPLETION_INFO:
+            status = horizon_server_handle_set_completion_info( connection, message );
+            break;
+        case HORIZON_REQ_ADD_FD_COMPLETION:
+            status = horizon_server_handle_add_fd_completion( connection, message );
+            break;
+        case HORIZON_REQ_SET_FD_COMPLETION_MODE:
+            status = horizon_server_handle_set_fd_completion_mode( connection, message );
             break;
         case HORIZON_REQ_OPEN_EVENT:
             status = horizon_server_handle_open_named_object( connection, message, request_data,
