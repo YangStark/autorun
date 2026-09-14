@@ -1,97 +1,220 @@
 /* Copyright 2026 Wine-NX contributors. LGPL-2.1-or-later.
  * Included by horizon.c with the server's wire and object definitions. */
+#include <ctype.h>
 #include <time.h>
+#include <unistd.h>
+
+/* Where system.reg and user.reg live; the host test uses a scratch directory. */
+#ifndef HORIZON_REGISTRY_DIR
+#define HORIZON_REGISTRY_DIR "sdmc:/switch/wine/"
+#endif
 
 static long long horizon_registry_now(void)
 {
     return (long long)time(NULL) * 10000000 + HORIZON_REG_TICKS_1601_TO_1970;
 }
 
-static void horizon_registry_save_value(FILE *file, const struct horizon_reg_value *value)
+/* The hive writer follows server/registry.c's save_all_subkeys, so its files
+ * load in Wine and back through horizon_reg_load. This is server/unicode.c's
+ * dump_strW: backslashes and the escape characters get a backslash, control
+ * characters C or octal escapes, characters above ASCII \x escapes. */
+static int horizon_registry_save_str( FILE *file, const unsigned short *str, unsigned int len,
+                                      const char escape[2] )
 {
-    unsigned int i;
-    if (!value->namelen) fputs("@", file);
-    else
+    static const char escapes[] = ".......abtnvfr.............e....";
+    int count = 0;
+
+    for (len /= 2; len; str++, len--)
     {
-        fputc('"', file);
-        for (i = 0; i < value->namelen / 2; i++) fputc(value->name[i] < 128 ? value->name[i] : '?', file);
-        fputc('"', file);
-    }
-    if (value->type == HORIZON_REG_SZ || value->type == HORIZON_REG_EXPAND_SZ)
-    {
-        fputs("=\"", file);
-        for (i = 0; i + 1 < value->len / 2; i++)
+        if (*str > 127)
         {
-            unsigned short c = ((const unsigned short *)value->data)[i];
-            if (c == '"' || c == '\\') fputc('\\', file);
-            fputc(c < 128 ? c : '?', file);
+            if (len > 1 && str[1] < 128 && isxdigit( str[1] )) count += fprintf( file, "\\x%04x", *str );
+            else count += fprintf( file, "\\x%x", *str );
         }
-        fputs("\"\n", file);
+        else if (*str < 32)
+        {
+            if (escapes[*str] != '.') count += fprintf( file, "\\%c", escapes[*str] );
+            else if (len > 1 && str[1] >= '0' && str[1] <= '7') count += fprintf( file, "\\%03o", *str );
+            else count += fprintf( file, "\\%o", *str );
+        }
+        else
+        {
+            if (*str == '\\' || *str == escape[0] || *str == escape[1]) { fputc( '\\', file ); count++; }
+            fputc( *str, file );
+            count++;
+        }
     }
-    else
-    {
-        fprintf(file, "=hex(%x):", value->type);
-        for (i = 0; i < value->len; i++) fprintf(file, "%02x%s", value->data[i], i + 1 < value->len ? "," : "");
-        fputc('\n', file);
-    }
+    return count;
 }
 
-static void horizon_registry_save_tree(FILE *file, const struct horizon_reg_key *key,
-                                       const char *prefix, int write_header)
+/* server/registry.c's dump_value. */
+static void horizon_registry_save_value( FILE *file, const struct horizon_reg_value *value )
 {
-    char path[1024], child_prefix[1024];
-    unsigned int i, j, len = 0;
-    if (write_header)
+    const unsigned short *str = (const unsigned short *)value->data;
+    unsigned int i, dword;
+    int count;
+
+    if (value->namelen)
     {
-        if (prefix && *prefix) fprintf(file, "\n[%s]\n", prefix);
-        for (i = 0; i < key->value_count; i++) horizon_registry_save_value(file, &key->values[i]);
+        fputc( '"', file );
+        count = 1 + horizon_registry_save_str( file, value->name, value->namelen, "\"\"" );
+        count += fprintf( file, "\"=" );
+    }
+    else count = fprintf( file, "@=" );
+
+    switch (value->type)
+    {
+    case HORIZON_REG_SZ:
+    case HORIZON_REG_EXPAND_SZ:
+    case HORIZON_REG_MULTI_SZ:
+        /* only properly terminated strings in string format */
+        if (value->len < 2 || value->len % 2 || str[value->len / 2 - 1]) break;
+        if (value->type != HORIZON_REG_SZ) fprintf( file, "str(%x):", value->type );
+        fputc( '"', file );
+        horizon_registry_save_str( file, str, value->len - 2, "\"\"" );
+        fputs( "\"\n", file );
+        return;
+    case HORIZON_REG_DWORD:
+        if (value->len != sizeof(dword)) break;
+        memcpy( &dword, value->data, sizeof(dword) );
+        fprintf( file, "dword:%08x\n", dword );
+        return;
+    }
+
+    if (value->type == HORIZON_REG_BINARY) count += fprintf( file, "hex:" );
+    else count += fprintf( file, "hex(%x):", value->type );
+    for (i = 0; i < value->len; i++)
+    {
+        count += fprintf( file, "%02x", value->data[i] );
+        if (i + 1 < value->len)
+        {
+            fputc( ',', file );
+            if (++count > 76)
+            {
+                fputs( "\\\n  ", file );
+                count = 2;
+            }
+        }
+    }
+    fputc( '\n', file );
+}
+
+/* A key's path below its hive, as a list from the key up. */
+struct horizon_registry_path
+{
+    const struct horizon_reg_key *key;
+    const struct horizon_registry_path *parent;  /* NULL for a child of the hive */
+};
+
+/* server/registry.c's dump_path: elements are separated by an escaped backslash. */
+static void horizon_registry_save_path( FILE *file, const struct horizon_registry_path *path )
+{
+    if (path->parent)
+    {
+        horizon_registry_save_path( file, path->parent );
+        fputs( "\\\\", file );
+    }
+    horizon_registry_save_str( file, path->key->name, path->key->namelen, "[]" );
+}
+
+/* server/registry.c's save_subkeys; path is NULL for the hive itself. */
+static void horizon_registry_save_subkeys( FILE *file, const struct horizon_reg_key *key,
+                                           const struct horizon_registry_path *path )
+{
+    struct horizon_registry_path child = { NULL, path };
+    unsigned int i;
+
+    if (key->flags & HORIZON_REG_FLAG_VOLATILE) return;
+    /* keys with values, no subkeys, a class or a link; the others are implied by their subkeys */
+    if (key->value_count || !key->subkey_count || key->class || (key->flags & HORIZON_REG_FLAG_SYMLINK))
+    {
+        fputs( "\n[", file );
+        if (path) horizon_registry_save_path( file, path );
+        fprintf( file, "] %u\n", (unsigned int)((key->modif - HORIZON_REG_TICKS_1601_TO_1970) / 10000000) );
+        fprintf( file, "#time=%x%08x\n", (unsigned int)((unsigned long long)key->modif >> 32), (unsigned int)key->modif );
+        if (key->class)
+        {
+            fputs( "#class=\"", file );
+            horizon_registry_save_str( file, key->class, key->classlen, "\"\"" );
+            fputs( "\"\n", file );
+        }
+        if (key->flags & HORIZON_REG_FLAG_SYMLINK) fputs( "#link\n", file );
+        for (i = 0; i < key->value_count; i++) horizon_registry_save_value( file, &key->values[i] );
     }
     for (i = 0; i < key->subkey_count; i++)
     {
-        const struct horizon_reg_key *child = key->subkeys[i];
-        len = 0;
-        if (prefix) { len = strlen(prefix); memcpy(path, prefix, len); if (len) path[len++] = '\\'; }
-        for (j = 0; j < child->namelen / 2 && len + 1 < sizeof(path); j++) path[len++] = child->name[j] < 128 ? child->name[j] : '?';
-        path[len] = 0;
-        snprintf(child_prefix, sizeof(child_prefix), "%s", path);
-        horizon_registry_save_tree(file, child, child_prefix, 1);
+        child.key = key->subkeys[i];
+        horizon_registry_save_subkeys( file, child.key, &child );
     }
 }
 
-/* Save the two prefix hives after a mutating request. This is intentionally
- * best-effort: a read-only SD card must not make RegSetValue fail. */
-static void horizon_registry_save(void)
+/* Write a hive to name.tmp and move it over name. Horizon's RenameFile does
+ * not replace an existing file, so when the rename fails the old hive is
+ * removed first; loading takes name.tmp if the process stops in between. A
+ * failed write leaves the last complete hive in place. */
+static void horizon_registry_save_hive( const struct horizon_reg_key *hive, const char *root, const char *name )
 {
+    char path[256], tmp[sizeof(path) + 4];
+    FILE *file;
+    int error;
+
+    snprintf( path, sizeof(path), "%s%s", HORIZON_REGISTRY_DIR, name );
+    snprintf( tmp, sizeof(tmp), "%s.tmp", path );
+    if (!(file = fopen( tmp, "wb" ))) return;
+    setvbuf( file, NULL, _IOFBF, 64 * 1024 );
+    fprintf( file, "WINE REGISTRY Version 2\n;; All keys relative to %s\n", root );
+    horizon_registry_save_subkeys( file, hive, NULL );
+    error = ferror( file );
+    if (fclose( file ) || error) return;
+    if (rename( tmp, path ) == -1 && !unlink( path )) rename( tmp, path );
+}
+
+/* Save the hive holding key after a mutating request, or both hives when the
+ * key is in neither (or deleted). This is intentionally best-effort: a
+ * read-only SD card must not make RegSetValue fail. */
+static void horizon_registry_save( const struct horizon_reg_key *key )
+{
+    static const unsigned short machine_name[] = {'M','a','c','h','i','n','e'};
+    static const unsigned short user_name[] = {'U','s','e','r'};
+    static const unsigned short sid_name[] = {'S','-','1','-','5','-','2','1','-','0','-','0','-','0','-','1','0','0','0'};
     struct horizon_reg_key *machine, *user;
     unsigned int index;
-    FILE *file;
-    machine = horizon_reg_find_subkey(horizon_registry.root, (const unsigned short[]){'M','a','c','h','i','n','e'}, 12, &index);
-    user = horizon_reg_find_subkey(horizon_registry.root, (const unsigned short[]){'U','s','e','r','\\','S','-','1','-','5','-','2','1','-','0','-','0','-','0','-','1','0','0','0'}, 46, &index);
-    if (machine && (file = fopen("sdmc:/switch/wine/system.reg.tmp", "wb")))
-    {
-        fputs("WINE REGISTRY Version 2\n", file); horizon_registry_save_tree(file, machine, "", 0); fclose(file);
-        rename("sdmc:/switch/wine/system.reg.tmp", "sdmc:/switch/wine/system.reg");
-    }
-    if (user && (file = fopen("sdmc:/switch/wine/user.reg.tmp", "wb")))
-    {
-        fputs("WINE REGISTRY Version 2\n", file); horizon_registry_save_tree(file, user, "", 0); fclose(file);
-        rename("sdmc:/switch/wine/user.reg.tmp", "sdmc:/switch/wine/user.reg");
-    }
+
+    machine = horizon_reg_find_subkey( horizon_registry.root, machine_name, sizeof(machine_name), &index );
+    if ((user = horizon_reg_find_subkey( horizon_registry.root, user_name, sizeof(user_name), &index )))
+        user = horizon_reg_find_subkey( user, sid_name, sizeof(sid_name), &index );
+    while (key && key != machine && key != user) key = key->parent;
+    if (machine && (!key || key == machine)) horizon_registry_save_hive( machine, "\\\\Machine", "system.reg" );
+    if (user && (!key || key == user)) horizon_registry_save_hive( user, "\\\\User\\\\S-1-5-21-0-0-0-1000", "user.reg" );
 }
 
-static void horizon_registry_load_file(struct horizon_reg_key *base, const char *path)
+/* Returns whether path held a registry file. */
+static int horizon_registry_load_file( struct horizon_reg_key *base, const char *path )
 {
     FILE *file;
     long length;
     char *buffer;
     unsigned int errors = 0;
-    if (!(file = fopen(path, "rb"))) return;
-    if (fseek(file, 0, SEEK_END) || (length = ftell(file)) < 0 || length > 16 * 1024 * 1024 ||
-        fseek(file, 0, SEEK_SET) || !(buffer = malloc((size_t)length))) { fclose(file); return; }
-    if (fread(buffer, 1, (size_t)length, file) == (size_t)length)
-        horizon_reg_load(&horizon_registry, base, buffer, (size_t)length, &errors);
-    free(buffer);
-    fclose(file);
+    int loaded = 0;
+
+    if (!(file = fopen( path, "rb" ))) return 0;
+    if (fseek( file, 0, SEEK_END ) || (length = ftell( file )) < 0 || length > 16 * 1024 * 1024 ||
+        fseek( file, 0, SEEK_SET ) || !(buffer = malloc( (size_t)length + 1 ))) { fclose( file ); return 0; }
+    if (fread( buffer, 1, (size_t)length, file ) == (size_t)length)
+        loaded = horizon_reg_load( &horizon_registry, base, buffer, (size_t)length, &errors ) != HORIZON_REG_NOT_REGISTRY_FILE;
+    free( buffer );
+    fclose( file );
+    return loaded;
+}
+
+static void horizon_registry_load_hive( struct horizon_reg_key *base, const char *name )
+{
+    char path[256];
+
+    snprintf( path, sizeof(path), "%s%s", HORIZON_REGISTRY_DIR, name );
+    if (horizon_registry_load_file( base, path )) return;
+    snprintf( path, sizeof(path), "%s%s.tmp", HORIZON_REGISTRY_DIR, name );
+    horizon_registry_load_file( base, path );
 }
 
 /* Notifications retain event objects, not handles which can be closed/reused.
@@ -139,8 +262,8 @@ static unsigned int horizon_registry_init(void)
             return HORIZON_REG_NO_MEMORY;
         }
     }
-    horizon_registry_load_file(machine, "sdmc:/switch/wine/system.reg");
-    horizon_registry_load_file(user, "sdmc:/switch/wine/user.reg");
+    horizon_registry_load_hive( machine, "system.reg" );
+    horizon_registry_load_hive( user, "user.reg" );
     return 0;
 }
 
@@ -257,11 +380,11 @@ static int horizon_server_handle_registry( struct horizon_server_connection *con
     {
     case HORIZON_REQ_DELETE_KEY:
         status = horizon_reg_delete( &horizon_registry, key );
-        if (!status) horizon_registry_save();
+        if (!status) horizon_registry_save( key );
         break;
     case HORIZON_REQ_RENAME_KEY:
         status = horizon_reg_rename( &horizon_registry, key, (const void *)data, data_size );
-        if (!status) horizon_registry_save();
+        if (!status) horizon_registry_save( key );
         break;
     case HORIZON_REQ_ENUM_KEY:
     {
@@ -285,7 +408,7 @@ static int horizon_server_handle_registry( struct horizon_server_connection *con
         if (req->namelen > data_size || (req->namelen & 1)) status = HORIZON_REG_INVALID_PARAMETER;
         else status = horizon_reg_set_value( &horizon_registry, key, (const void *)data, req->namelen,
                                              req->type, data + req->namelen, data_size - req->namelen );
-        if (!status) horizon_registry_save();
+        if (!status) horizon_registry_save( key );
         break;
     }
     case HORIZON_REQ_GET_KEY_VALUE:
@@ -301,7 +424,7 @@ static int horizon_server_handle_registry( struct horizon_server_connection *con
     }
     case HORIZON_REQ_DELETE_KEY_VALUE:
         status = horizon_reg_delete_value( &horizon_registry, key, (const void *)data, data_size );
-        if (!status) horizon_registry_save();
+        if (!status) horizon_registry_save( key );
         break;
     case HORIZON_REQ_SET_REGISTRY_NOTIFICATION:
     {

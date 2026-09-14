@@ -1,10 +1,13 @@
-/* Exercise the registry wire adapter, including actual protocol layouts. */
+/* Exercise the registry wire adapter, including actual protocol layouts, and
+ * the hives it saves and loads. */
 #include <assert.h>
+#include <errno.h>
 #include <stddef.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "wine/server_protocol.h"
 #include "../../dlls/ntdll/unix/horizon_registry.h"
 struct horizon_server_request_header { int req; unsigned int request_size, reply_size; };
@@ -68,7 +71,18 @@ static unsigned int horizon_server_object_attributes_size(const unsigned char *d
     return *offset > size ? HORIZON_REG_INVALID_PARAMETER : 0;
 }
 static void horizon_server_signal_changed_locked(void) { }  /* horizon.c wakes pending waits */
+/* The hives go to a scratch directory, where rename fails over an existing
+ * file as Horizon's RenameFile does. */
+static char registry_dir[256];
+#define HORIZON_REGISTRY_DIR registry_dir
+static int horizon_rename(const char *from, const char *to)
+{
+    if (!access(to, F_OK)) { errno = EEXIST; return -1; }
+    return rename(from, to);
+}
+#define rename horizon_rename
 #include "../../dlls/ntdll/unix/horizon_registry_server.h"
+#undef rename
 #define CHECK_LAYOUT(n) _Static_assert(sizeof(struct horizon_##n) == sizeof(struct n), #n)
 CHECK_LAYOUT(create_key_request); CHECK_LAYOUT(create_key_reply);
 CHECK_LAYOUT(open_key_request); CHECK_LAYOUT(open_key_reply);
@@ -87,6 +101,156 @@ static unsigned int open_path(unsigned int root, const char *path)
     horizon_server_handle_registry(&connection,(void *)&req,(void *)name,wide(name,path));
     assert(!status()); return ((struct horizon_open_key_reply *)last_reply)->hkey;
 }
+static const unsigned short none[1];
+static struct horizon_reg_key *open_key(struct horizon_reg_key *base, const unsigned short *path, unsigned int len)
+{
+    struct horizon_reg_key *key;
+    return horizon_reg_open(&horizon_registry, base, path, len, 0, &key) ? NULL : key;
+}
+static struct horizon_reg_key *machine_key(void)
+{
+    static const unsigned short name[] = u"Machine";
+    unsigned int index;
+    return horizon_reg_find_subkey(horizon_registry.root, name, sizeof(name) - 2, &index);
+}
+/* horizon_reg_create makes only the last element of a path. */
+static struct horizon_reg_key *create_path(const unsigned short *path, unsigned int len, unsigned int options,
+                                           const unsigned short *class, unsigned int classlen)
+{
+    struct horizon_reg_key *key = NULL;
+    unsigned int end;
+    for (end = 2; end <= len; end += 2)
+    {
+        if (end < len && path[end / 2] != '\\') continue;
+        if (key) horizon_reg_release(&horizon_registry, key);
+        horizon_reg_create(&horizon_registry, machine_key(), path, end, 0, end == len ? options : 0,
+                           end == len ? class : NULL, end == len ? classlen : 0, &key);
+        assert(key);
+    }
+    return key;
+}
+static void check_value(struct horizon_reg_key *base, const unsigned short *path, unsigned int path_len,
+                        const unsigned short *name, unsigned int namelen, int type, const void *data, unsigned int len)
+{
+    struct horizon_reg_key *key = open_key(base, path, path_len);
+    unsigned char buffer[256];
+    unsigned int total = 0, size;
+    int got;
+    assert(key);
+    assert(horizon_reg_get_value(key, name, namelen, &got, &total, buffer, sizeof(buffer), &size) == HORIZON_REG_SUCCESS);
+    assert(got == type && total == len && size == len && !memcmp(buffer, data, len));
+    horizon_reg_release(&horizon_registry, key);
+}
+static int key_exists(const unsigned short *path, unsigned int len)
+{
+    struct horizon_reg_key *key = open_key(machine_key(), path, len);
+    if (key) horizon_reg_release(&horizon_registry, key);
+    return key != NULL;
+}
+/* A restart of the runtime: the hives load again from the files. */
+static void reload(void)
+{
+    horizon_reg_release(&horizon_registry, horizon_registry.root);
+    horizon_registry.root = NULL;
+    assert(!horizon_registry_init());
+}
+static void read_file(const char *path, char *buffer, size_t size)
+{
+    FILE *file = fopen(path, "rb");
+    size_t len;
+    assert(file);
+    len = fread(buffer, 1, size - 1, file);
+    buffer[len] = 0;
+    fclose(file);
+}
+/* Keys and values survive a restart in Wine's format, after saves over
+ * existing hives and a stop between removing a hive and moving its successor in. */
+static void test_save_and_load(void)
+{
+    static const unsigned short clsid[] = u"Software\\Classes\\CLSID\\{4315d437-5b8c-11d0-bd3b-00a0c911ce86}\\InprocServer32";
+    static const unsigned short seed[] = u"Software\\Classes\\CLSID\\{BCDE0395-E52F-467C-8E3D-C4579291692E}\\InprocServer32";
+    static const unsigned short odd[] = u"Software\\Wine-NX [\"x\"] \u00e9\\sub";
+    static const unsigned short empty[] = u"Software\\Empty", volatile_key[] = u"Software\\Volatile";
+    static const unsigned short user_path[] = u"\\Registry\\User\\S-1-5-21-0-0-0-1000", drivers[] = u"Software\\Wine\\Drivers";
+    static const unsigned short class[] = u"cls\"\\";
+    static const unsigned short dll[] = u"devenum.dll", mmdevapi[] = u"mmdevapi.dll", both[] = u"Both";
+    static const unsigned short model[] = u"ThreadingModel", quote_name[] = u"quote\"back\\slash";
+    static const unsigned short text[] = u"line\nnext \"q\" \\ \u263aa \u00e9g \u00e9b \x01" u"7 \x01";
+    static const unsigned short multi[] = u"a\0b\0", ab[] = u"ab";
+    static const unsigned short dword_name[] = u"dword", binary_name[] = u"binary", multi_name[] = u"multi";
+    static const unsigned short unterminated_name[] = u"unterminated", odd_name[] = u"odd";
+    static const unsigned short test_name[] = u"Test", saved_name[] = u"Saved";
+    unsigned char binary[100], odd_data[3] = {1, 2, 3}, one[4] = {1, 0, 0, 0};
+    unsigned int dword = 0x12345678, i;
+    struct horizon_reg_key *key, *user;
+    char path[512], tmp[512], user_file[512], text_file[8192];
+
+    for (i = 0; i < sizeof(binary); i++) binary[i] = i * 7;
+    snprintf(path, sizeof(path), "%ssystem.reg", registry_dir);
+    snprintf(tmp, sizeof(tmp), "%ssystem.reg.tmp", registry_dir);
+    snprintf(user_file, sizeof(user_file), "%suser.reg", registry_dir);
+    /* main's set_key_value requests saved each hive */
+    assert(!access(path, F_OK) && !access(user_file, F_OK) && access(tmp, F_OK));
+
+    key = create_path(clsid, sizeof(clsid) - 2, 0, NULL, 0);
+    assert(!horizon_reg_set_value(&horizon_registry, key, none, 0, HORIZON_REG_SZ, dll, sizeof(dll)));
+    assert(!horizon_reg_set_value(&horizon_registry, key, model, sizeof(model) - 2, HORIZON_REG_SZ, both, sizeof(both)));
+    horizon_reg_release(&horizon_registry, key);
+    key = create_path(odd, sizeof(odd) - 2, 0, class, sizeof(class) - 2);
+    assert(!horizon_reg_set_value(&horizon_registry, key, quote_name, sizeof(quote_name) - 2, HORIZON_REG_SZ, text, sizeof(text)));
+    assert(!horizon_reg_set_value(&horizon_registry, key, dword_name, sizeof(dword_name) - 2, HORIZON_REG_DWORD, &dword, 4));
+    assert(!horizon_reg_set_value(&horizon_registry, key, binary_name, sizeof(binary_name) - 2, HORIZON_REG_BINARY, binary, sizeof(binary)));
+    assert(!horizon_reg_set_value(&horizon_registry, key, multi_name, sizeof(multi_name) - 2, HORIZON_REG_MULTI_SZ, multi, sizeof(multi)));
+    assert(!horizon_reg_set_value(&horizon_registry, key, unterminated_name, sizeof(unterminated_name) - 2, HORIZON_REG_SZ, ab, 4));
+    assert(!horizon_reg_set_value(&horizon_registry, key, odd_name, sizeof(odd_name) - 2, HORIZON_REG_EXPAND_SZ, odd_data, 3));
+    assert(!horizon_reg_set_value(&horizon_registry, key, none, 0, HORIZON_REG_NONE, none, 0));
+    horizon_reg_release(&horizon_registry, key);
+    horizon_reg_release(&horizon_registry, create_path(empty, sizeof(empty) - 2, 0, NULL, 0));
+    key = create_path(volatile_key, sizeof(volatile_key) - 2, HORIZON_REG_OPTION_VOLATILE, NULL, 0);
+    assert(!horizon_reg_set_value(&horizon_registry, key, dword_name, sizeof(dword_name) - 2, HORIZON_REG_DWORD, &dword, 4));
+    horizon_reg_release(&horizon_registry, key);
+
+    horizon_registry_save(NULL);  /* over the files main's requests left */
+    assert(access(tmp, F_OK) && !access(path, F_OK));
+    read_file(path, text_file, sizeof(text_file));
+    assert(strstr(text_file, "WINE REGISTRY Version 2\n;; All keys relative to \\\\Machine\n") == text_file);
+    assert(strstr(text_file, "\n[Software\\\\Classes\\\\CLSID\\\\{4315d437-5b8c-11d0-bd3b-00a0c911ce86}\\\\InprocServer32] "));
+    assert(strstr(text_file, "\n\"quote\\\"back\\\\slash\"=\"line\\nnext \\\"q\\\" \\\\ \\x263aa \\xe9g \\x00e9b \\0017 \\1\"\n"));
+    read_file(user_file, text_file, sizeof(text_file));
+    assert(strstr(text_file, "WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n") == text_file);
+    assert(strstr(text_file, "\n[Software\\\\Wine\\\\Drivers] "));
+
+    reload();
+    check_value(machine_key(), seed, sizeof(seed) - 2, none, 0, HORIZON_REG_SZ, mmdevapi, sizeof(mmdevapi));
+    check_value(machine_key(), seed, sizeof(seed) - 2, saved_name, sizeof(saved_name) - 2, HORIZON_REG_DWORD, one, 4);
+    check_value(machine_key(), clsid, sizeof(clsid) - 2, none, 0, HORIZON_REG_SZ, dll, sizeof(dll));
+    check_value(machine_key(), clsid, sizeof(clsid) - 2, model, sizeof(model) - 2, HORIZON_REG_SZ, both, sizeof(both));
+    check_value(machine_key(), odd, sizeof(odd) - 2, quote_name, sizeof(quote_name) - 2, HORIZON_REG_SZ, text, sizeof(text));
+    check_value(machine_key(), odd, sizeof(odd) - 2, dword_name, sizeof(dword_name) - 2, HORIZON_REG_DWORD, &dword, 4);
+    check_value(machine_key(), odd, sizeof(odd) - 2, binary_name, sizeof(binary_name) - 2, HORIZON_REG_BINARY, binary, sizeof(binary));
+    check_value(machine_key(), odd, sizeof(odd) - 2, multi_name, sizeof(multi_name) - 2, HORIZON_REG_MULTI_SZ, multi, sizeof(multi));
+    check_value(machine_key(), odd, sizeof(odd) - 2, unterminated_name, sizeof(unterminated_name) - 2, HORIZON_REG_SZ, ab, 4);
+    check_value(machine_key(), odd, sizeof(odd) - 2, odd_name, sizeof(odd_name) - 2, HORIZON_REG_EXPAND_SZ, odd_data, 3);
+    check_value(machine_key(), odd, sizeof(odd) - 2, none, 0, HORIZON_REG_NONE, none, 0);
+    assert((key = open_key(machine_key(), odd, sizeof(odd) - 2)));
+    assert(key->classlen >= sizeof(class) - 2 && !memcmp(key->class, class, sizeof(class) - 2));
+    horizon_reg_release(&horizon_registry, key);
+    assert(key_exists(empty, sizeof(empty) - 2) && !key_exists(volatile_key, sizeof(volatile_key) - 2));
+    assert((user = open_key(NULL, user_path, sizeof(user_path) - 2)));
+    check_value(user, drivers, sizeof(drivers) - 2, test_name, sizeof(test_name) - 2, HORIZON_REG_DWORD, one, 4);
+    horizon_reg_release(&horizon_registry, user);
+
+    /* stopped after removing system.reg, before moving system.reg.tmp in */
+    assert(!rename(path, tmp));
+    reload();
+    check_value(machine_key(), clsid, sizeof(clsid) - 2, none, 0, HORIZON_REG_SZ, dll, sizeof(dll));
+    horizon_registry_save(NULL);
+    assert(access(tmp, F_OK) && !access(path, F_OK));
+
+    horizon_reg_release(&horizon_registry, horizon_registry.root);
+    horizon_registry.root = NULL;
+    assert(!unlink(path) && !unlink(user_file) && !rmdir(registry_dir));
+}
 int main(void)
 {
     unsigned int key, user, i;
@@ -97,6 +261,9 @@ int main(void)
     struct horizon_set_registry_notification_request notify = {{REQ_set_registry_notification,0,0},0,0,0,4,{0}};
     struct horizon_server_handle_entry *event;
     struct {struct horizon_server_request_header header; unsigned int handle, which;} token = {{REQ_get_token_sid,0,0},0xfffffffa,1};
+    snprintf(registry_dir, sizeof(registry_dir), "%s/wine-nx-registry.XXXXXX", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    assert(mkdtemp(registry_dir));
+    strcat(registry_dir, "/");
     horizon_server_handle_registry_user(&connection,(void *)&token);
     assert(status()==HORIZON_STATUS_BUFFER_TOO_SMALL);
     token.header.reply_size=28; horizon_server_handle_registry_user(&connection,(void *)&token);
@@ -116,10 +283,13 @@ int main(void)
     set.hkey=user; set.namelen=wide(name,"Test"); memcpy((char *)name+set.namelen,"\1\0\0\0",4);
     horizon_server_handle_registry(&connection,(void *)&set,(void *)name,set.namelen+4);
     assert(!status() && event->object->refs==1 && event->object->signaled);
+    set.hkey=key; set.namelen=wide(name,"Saved"); memcpy((char *)name+set.namelen,"\1\0\0\0",4);
+    horizon_server_handle_registry(&connection,(void *)&set,(void *)name,set.namelen+4);
+    assert(!status());
     set.namelen=100; horizon_server_handle_registry(&connection,(void *)&set,(void *)name,4);
     assert(status()==HORIZON_REG_INVALID_PARAMETER);
     for(i=0;i<handle_count;i++) horizon_server_free_object(handles[i].object);
-    horizon_reg_release(&horizon_registry,horizon_registry.root);
-    puts("Registry server: protocol layouts, HKCU identity, COM/audio seeds, truncated replies and notifications passed");
+    test_save_and_load();
+    puts("Registry server: protocol layouts, HKCU identity, COM/audio seeds, truncated replies, notifications and saved hives passed");
     return 0;
 }
