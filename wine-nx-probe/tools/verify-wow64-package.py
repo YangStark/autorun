@@ -147,6 +147,19 @@ elif target == "sdmc:/switch/wine/drive_c/quake3/quake3e.exe":
     # The engine loads these itself, so they are not in its import table.
     assert "opengl32.dll" in syswow64
     assert (game / "quake3e.args.txt").read_text().startswith("+set "), "Quake3e needs its command line"
+elif target == "sdmc:/switch/wine/drive_c/WarCraft III Setup/war3-setup.exe":
+    setup = stage / "drive_c/WarCraft III Setup/war3-setup.exe"
+    info = inspect(setup, "--coff-imports")
+    assert "Arch: i386\n" in info and "Type: HIGHLOW" in inspect(setup, "--coff-basereloc")
+    for symbol in ("RegSetValueExW", "OleInitialize", "LoadLibraryW", "NtDisplayString"):
+        assert f"Symbol: {symbol} " in info, f"Missing setup import: {symbol}"
+    deps = re.findall(r"^Import \{\n  Name: (.+)$", info, re.M)
+    assert deps and all(dep.lower() in syswow64 for dep in deps), deps
+    # What the setup registers, and what WarCraft III's movies load through it.
+    assert {"quartz.dll", "devenum.dll", "msacm32.dll", "ddraw.dll", "dsound.dll", "d3d9.dll"} <= syswow64
+    for name in ("l3codeca.acm", "msacm32.drv"):
+        assert (stage / "drive_c/windows/syswow64" / name).is_file(), f"{name} not staged"
+    assert (stage / "drive_c/WarCraft III").is_dir()
 else:
     assert target == "sdmc:/switch/wine/drive_c/7zr.exe"
     assert (stage / "args.txt").read_text().strip().lower() == "c:\\7zr.exe b 1 -mmt2 -md18"
