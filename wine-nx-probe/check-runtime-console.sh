@@ -29,4 +29,6 @@ flags="-std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-f
 "$build/registry"
 "${CC:-clang}" $flags "$root/wine-nx-probe/tests/horizon_read_redirect.c" -o "$build/read_redirect"
 "$build/read_redirect"
+"${CC:-clang}" $flags "$root/wine-nx-probe/tests/horizon_free_range.c" -o "$build/free_range"
+"$build/free_range"
 python3 "$root/wine-nx-probe/tools/make-7zr-tree.py" "$build/drive_c" >/dev/null

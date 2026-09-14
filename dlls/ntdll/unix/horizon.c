@@ -59,6 +59,7 @@
 #include "horizon_threads.h"
 #include "horizon_registry.h"
 #include "horizon_read_redirect.h"
+#include "horizon_free_range.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -10937,6 +10938,90 @@ static void list_remove_mapping( struct horizon_mapping *mapping )
     }
 }
 
+/* The kernel's heap and alias regions. MapProcessCodeMemory refuses them, but
+ * virtmemAddReservation records a reservation over them without asking, so a
+ * reservation there is bookkeeping over pages that belong to someone else - in
+ * the heap, libnx's malloc arena. Launched with a 32-bit address space they sit
+ * below 4 GiB, among Wine's own allocations. */
+struct horizon_kernel_region
+{
+    u64 addr;
+    u64 size;
+};
+
+static struct horizon_kernel_region horizon_kernel_regions[2];
+static int horizon_kernel_region_count = -1;
+
+/* No locks and no tracing: this can run under virtmemLock. */
+static void horizon_load_kernel_regions(void)
+{
+    static const u32 info[][2] =
+    {
+        { InfoType_HeapRegionAddress,  InfoType_HeapRegionSize },
+        { InfoType_AliasRegionAddress, InfoType_AliasRegionSize },
+    };
+    int i, count = 0;
+
+    if (horizon_kernel_region_count >= 0) return;
+    for (i = 0; i < 2; i++)
+    {
+        u64 addr, size;
+
+        if (R_FAILED( svcGetInfo( &addr, info[i][0], CUR_PROCESS_HANDLE, 0 ) ) ||
+            R_FAILED( svcGetInfo( &size, info[i][1], CUR_PROCESS_HANDLE, 0 ) ) || !size)
+            continue;
+        horizon_kernel_regions[count].addr = addr;
+        horizon_kernel_regions[count].size = size;
+        count++;
+    }
+    horizon_kernel_region_count = count;
+}
+
+static BOOL horizon_overlaps_kernel_region( void *addr, size_t size )
+{
+    u64 start = (u64)(uintptr_t)addr, end = start + size;
+    int i;
+
+    horizon_load_kernel_regions();
+    for (i = 0; i < horizon_kernel_region_count; i++)
+        if (start < horizon_kernel_regions[i].addr + horizon_kernel_regions[i].size &&
+            horizon_kernel_regions[i].addr < end)
+            return TRUE;
+    return FALSE;
+}
+
+/* The regions for virtual_init to keep Wine's free-area search out of. */
+int horizon_get_kernel_regions( void **starts, size_t *sizes, int max )
+{
+    MemoryInfo meminfo;
+    u32 page_info;
+    u64 addr, size;
+    int i;
+
+    horizon_load_kernel_regions();
+    for (i = 0; i < horizon_kernel_region_count && i < max; i++)
+    {
+        starts[i] = (void *)(uintptr_t)horizon_kernel_regions[i].addr;
+        sizes[i] = horizon_kernel_regions[i].size;
+        horizon_trace( "[VA] kernel region %d base=0x%llx size=0x%llx", i,
+                       (unsigned long long)horizon_kernel_regions[i].addr,
+                       (unsigned long long)horizon_kernel_regions[i].size );
+    }
+    /* Not excluded: outside the 39-bit layout the stack region can span the
+     * small map, where fixed low image bases have to go. Reported only. */
+    if (R_SUCCEEDED( svcGetInfo( &addr, InfoType_StackRegionAddress, CUR_PROCESS_HANDLE, 0 ) ) &&
+        R_SUCCEEDED( svcGetInfo( &size, InfoType_StackRegionSize, CUR_PROCESS_HANDLE, 0 ) ))
+        horizon_trace( "[VA] kernel stack region base=0x%llx size=0x%llx",
+                       (unsigned long long)addr, (unsigned long long)size );
+    /* Where Wine's first TEB block has landed on the 32-bit layout: heap (type
+     * 0x5) means those pages are libnx's malloc arena. */
+    if (R_SUCCEEDED( svcQueryMemory( &meminfo, &page_info, 0x7ffe0000 ) ))
+        horizon_trace( "[VA] query 0x7ffe0000 base=0x%llx size=0x%llx type=0x%x perm=0x%x",
+                       (unsigned long long)meminfo.addr, (unsigned long long)meminfo.size,
+                       meminfo.type, meminfo.perm );
+    return i;
+}
+
 static struct horizon_mapping *find_overlap_mapping( void *addr, size_t size )
 {
     struct horizon_mapping *mapping;
@@ -11584,11 +11669,40 @@ static int protect_range_locked( void *addr, size_t size, int prot )
     return 0;
 }
 
+/* horizon_region_query over svcQueryMemory. No locks and no tracing: it runs under virtmemLock. */
+static int horizon_query_region( void *context, unsigned long long addr, struct horizon_region *region )
+{
+    MemoryInfo info;
+    u32 page_info;
+
+    (void)context;
+    if (R_FAILED( svcQueryMemory( &info, &page_info, addr ) )) return 0;
+    region->addr = info.addr;
+    region->size = info.size;
+    region->type = info.type;
+    return 1;
+}
+
 static int add_reservation_mapping_locked( void *start, size_t size )
 {
-    VirtmemReservation *reservation = reserve_fixed_range_locked( start, size );
+    VirtmemReservation *reservation;
     struct horizon_mapping *mapping;
 
+    /* see horizon_kernel_regions: this would claim pages the kernel gave away */
+    if (horizon_overlaps_kernel_region( start, size ))
+    {
+        errno = EEXIST;
+        return -1;
+    }
+    /* And what libnx mapped outside Wine's views - thread stacks, JIT code - which
+     * a 32-bit address space puts in the same low gigabyte (horizon_free_range.h).
+     * virtmemLock is held, so no libnx thread can map a stack in the meantime. */
+    if (!horizon_range_unmapped( (unsigned long long)(uintptr_t)start, size, horizon_query_region, NULL ))
+    {
+        errno = EEXIST;
+        return -1;
+    }
+    reservation = reserve_fixed_range_locked( start, size );
     if (!reservation) return -1;
     if (!(mapping = alloc_mapping( start, size, NULL, 0, reservation, PROT_NONE )))
     {

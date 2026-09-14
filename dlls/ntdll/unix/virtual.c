@@ -4326,6 +4326,38 @@ void virtual_init(void)
     free_ranges[0].end = (void *)~0;
     free_ranges_end = free_ranges + 1;
 
+#ifdef __SWITCH__
+    {
+        /* The kernel's heap and alias regions lie inside the address space but
+         * are not Wine's: the kernel refuses mappings there while a Horizon
+         * reservation accepts them, so a TEB or stack reserved over libnx's heap
+         * shares its pages with malloc. On a 32-bit address space they sit below
+         * 4 GiB among Wine's own allocations. System views keep the free-area
+         * search from offering them. A view costs a byte per page and a table
+         * per 4 GiB, so only the part below 4 GiB is covered; in the 39-bit
+         * layout the regions lie far above it and nothing changes. */
+        void *starts[2];
+        size_t sizes[2];
+        struct file_view *view;
+        char *top = (char *)min( host_addr_space_limit, (void *)limit_4g );
+        int i, count = horizon_get_kernel_regions( starts, sizes, 2 );
+
+        for (i = 0; i < count; i++)
+        {
+            char *start = max( (char *)starts[i], (char *)address_space_start );
+            char *end = min( (char *)starts[i] + sizes[i], top );
+
+            start = (char *)((UINT_PTR)start & ~page_mask);
+            end = (char *)(((UINT_PTR)end + page_mask) & ~page_mask);
+            if (start >= end) continue;
+            if (create_view( &view, start, end - start, VPROT_SYSTEM ))
+                horizon_trace( "[VA] could not keep Wine out of %p-%p", start, end );
+            else
+                horizon_trace( "[VA] kept Wine out of %p-%p", start, end );
+        }
+    }
+#endif
+
     /* make the DOS area accessible (except the low 64K) to hide bugs in broken apps like Excel 2003 */
     size = (char *)address_space_start - (char *)0x10000;
     if (size && mmap_is_in_reserved_area( (void*)0x10000, size ) == 1)
@@ -4719,7 +4751,21 @@ TEB *virtual_alloc_first_teb(void)
     teb_block_pos = 30;
     ptr = (char *)teb_block + 30 * block_size;
     data_size = 2 * block_size;
+#ifdef __SWITCH__
+    /* A Horizon reservation is bookkeeping only: where the kernel has given the
+     * pages to one of its own regions, the commit is refused while the memory
+     * stays mapped for its owner, and a TEB placed there would share pages with
+     * libnx's malloc arena. Refuse to start rather than run on them. */
+    if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &data_size,
+                                           MEM_COMMIT, PAGE_READWRITE )))
+    {
+        horizon_trace( "[VA] first TEB block commit at %p failed: %08x", ptr, status );
+        ERR( "wine: failed to commit the first TEB block at %p: %08x\n", ptr, status );
+        exit(1);
+    }
+#else
     NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &data_size, MEM_COMMIT, PAGE_READWRITE );
+#endif
     peb = (PEB *)((char *)teb_block + 31 * block_size + (is_win64 ? 0 : page_size));
     teb = init_teb( ptr, FALSE );
     pthread_key_create( &teb_key, NULL );
@@ -4762,8 +4808,19 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
             teb_block_pos = 32;
         }
         ptr = ((char *)teb_block + --teb_block_pos * block_size);
+#ifdef __SWITCH__
+        /* see virtual_alloc_first_teb: a refused commit must not become a TEB */
+        if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &block_size,
+                                               MEM_COMMIT, PAGE_READWRITE )))
+        {
+            horizon_trace( "[VA] TEB commit at %p failed: %08x", ptr, status );
+            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+            return status;
+        }
+#else
         NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &block_size,
                                  MEM_COMMIT, PAGE_READWRITE );
+#endif
     }
     *ret_teb = teb = init_teb( ptr, is_wow64() );
 
@@ -5102,6 +5159,7 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
                                      SIZE_T reserve_size, SIZE_T commit_size, BOOL guard_page )
 {
     struct file_view *view;
+    unsigned int alloc_type = 0;
     NTSTATUS status;
     sigset_t sigset;
     SIZE_T size;
@@ -5113,9 +5171,22 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
     if (size < 1024 * 1024) size = 1024 * 1024;  /* Xlib needs a large stack */
     size = ROUND_SIZE( 0, size, granularity_mask );
 
+#ifdef __SWITCH__
+    /* A WoW64 process keeps its native stacks above 4 GB so the guest has the
+     * low 4 GB to itself. A Horizon process launched with a 32-bit address
+     * space, which a fixed low image base needs, has nothing above 4 GB, and
+     * asking for it fails every thread with STATUS_CONFLICTING_ADDRESSES.
+     * Take the top of the envelope instead, as far from the guest as it goes. */
+    if (limit_low && (void *)limit_low >= host_addr_space_limit)
+    {
+        limit_low = 0;
+        alloc_type = MEM_TOP_DOWN;
+    }
+#endif
+
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
-    status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
+    status = map_view( &view, NULL, size, alloc_type, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
                        limit_low, limit_high, 0 );
     if (status != STATUS_SUCCESS) goto done;
 
