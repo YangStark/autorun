@@ -22,6 +22,7 @@ make -C "$pe" -j8 include/all \
     dlls/wow64win/aarch64-windows/wow64win.dll \
     dlls/ntdll/aarch64-windows/ntdll.dll \
     dlls/win32u/aarch64-windows/win32u.dll \
+    dlls/apisetschema/aarch64-windows/apisetschema.dll \
     $i386_targets
 i686-w64-mingw32-clang -Os -nostdlib -Wl,--entry,_start@0 \
     -Wl,--image-base,0x10000000 -Wl,--dynamicbase \
@@ -61,6 +62,9 @@ mkdir -p "$stage/drive_c/windows/system32" "$stage/drive_c/windows/syswow64" "$s
 for module in winebox64 wow64 wow64win win32u ntdll; do
     cp "$pe/dlls/$module/aarch64-windows/$module.dll" "$stage/drive_c/windows/system32/"
 done
+# The API set schema the runtime maps at startup (load_apiset_dll); the package
+# check requires it, and the packagers built on this stage start from here.
+cp "$pe/dlls/apisetschema/aarch64-windows/apisetschema.dll" "$stage/drive_c/windows/system32/"
 for module in $i386_modules; do
     cp "$pe/dlls/$module/i386-windows/$module.dll" "$stage/drive_c/windows/syswow64/"
 done
