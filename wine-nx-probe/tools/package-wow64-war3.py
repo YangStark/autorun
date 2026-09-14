@@ -120,6 +120,10 @@ wine-nx-runtime.log, ending with "done, all steps worked":
   game's menus do not line up with them (no highlight, clicks landing elsewhere).
 - Lets the intro movie play at startup: removes seenintromovie, which earlier
   setups set to skip it.
+- Makes the game draw with its own OpenGL renderer (Gfx OpenGL) instead of
+  Direct3D. Through Wine's Direct3D the game took about two cores for the frame
+  rate OpenGL gives on one. A war3.args.txt holding -opengl next to war3.exe
+  does the same for one launch.
 - Offers the game only the Switch's own 1280x720 display mode (EmulateModelist
   for war3.exe), so the movies play across the full width.
 - Registers the MP3 decoder l3codeca.acm, for the movies' sound.

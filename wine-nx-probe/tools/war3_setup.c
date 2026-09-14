@@ -6,6 +6,11 @@
  *   any other resolution the game's hit-testing does not line up with them.
  * - No seenintromovie: earlier setups set it, which skipped the intro movie at
  *   startup, and this one removes it so the intro plays.
+ * - Gfx OpenGL, so the game draws with its own OpenGL renderer rather than
+ *   Direct3D. Through Wine's Direct3D each lock of a texture or buffer waited
+ *   for wined3d's command thread in a Sleep(0) loop and every frame read a
+ *   texture back from the GPU: on the Switch that took two cores for the frame
+ *   rate OpenGL gives on one.
  * - EmulateModelist for war3.exe, so Wine offers the game only the screen's own
  *   1280x720 mode. For each movie the game switches to 800x600, which Wine
  *   would fake by scaling it into a 960x720 box in the middle of the screen.
@@ -152,6 +157,7 @@ static BOOL register_dll( const WCHAR *name )
 
 void __stdcall start(void)
 {
+    static const WCHAR war3[] = L"Software\\Blizzard Entertainment\\Warcraft III";
     static const WCHAR video[] = L"Software\\Blizzard Entertainment\\Warcraft III\\Video";
     static const WCHAR misc[] = L"Software\\Blizzard Entertainment\\Warcraft III\\Misc";
     static const WCHAR drivers32[] = L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Drivers32";
@@ -166,6 +172,7 @@ void __stdcall start(void)
     ok &= set_dword( HKEY_CURRENT_USER, video, L"colordepth", 32 );
     ok &= set_dword( HKEY_CURRENT_USER, video, L"refreshrate", 60 );
     ok &= delete_value( HKEY_CURRENT_USER, misc, L"seenintromovie" );
+    ok &= set_dword( HKEY_CURRENT_USER, war3, L"Gfx OpenGL", 1 );
     ok &= set_string( HKEY_CURRENT_USER, war3_driver, L"EmulateModelist", L"Y" );
     ok &= set_string( HKEY_LOCAL_MACHINE, drivers32, L"msacm.l3acm", L"l3codeca.acm" );
 
