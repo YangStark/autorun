@@ -164,26 +164,7 @@ static int horizon_asprintf( char **strp, const char *format, ... )
     return len;
 }
 
-static int horizon_fstatvfs( int fd, struct statvfs *stfs )
-{
-    struct stat st;
-
-    if (fstat( fd, &st ) < 0) return -1;
-    memset( stfs, 0, sizeof(*stfs) );
-    stfs->f_bsize = 512;
-    stfs->f_frsize = 512;
-    stfs->f_blocks = 1024 * 1024;
-    stfs->f_bfree = stfs->f_blocks / 2;
-    stfs->f_bavail = stfs->f_bfree;
-    stfs->f_files = 1024 * 1024;
-    stfs->f_ffree = stfs->f_files / 2;
-    stfs->f_favail = stfs->f_ffree;
-    stfs->f_namemax = 255;
-    return 0;
-}
-
 #define asprintf horizon_asprintf
-#define fstatvfs horizon_fstatvfs
 #endif
 
 #define MAX_DOS_DRIVES 26
@@ -2318,7 +2299,7 @@ static NTSTATUS server_get_name_info( HANDLE handle, FILE_NAME_INFORMATION *info
 }
 
 
-static NTSTATUS get_full_size_info(int fd, FILE_FS_FULL_SIZE_INFORMATION *info) {
+static NTSTATUS get_full_size_info(HANDLE handle, int fd, FILE_FS_FULL_SIZE_INFORMATION *info) {
     struct stat st;
     ULONGLONG bsize;
 
@@ -2328,6 +2309,21 @@ static NTSTATUS get_full_size_info(int fd, FILE_FS_FULL_SIZE_INFORMATION *info) 
     struct statfs stfs;
 #endif
 
+#ifdef __SWITCH__
+    char *unix_name;
+    NTSTATUS status;
+    int ret;
+
+    /* Horizon has no fstatvfs, and its directories no descriptor: ask by unix
+     * name, which libnx answers with the SD card's free and total space. */
+    if ((status = server_get_unix_name( handle, &unix_name ))) return status;
+    if (!(ret = stat( unix_name, &st ))) ret = statvfs( unix_name, &stfs );
+    if (ret < 0) status = errno_to_status( errno );
+    free( unix_name );
+    if (status) return status;
+    if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) return STATUS_INVALID_DEVICE_REQUEST;
+    bsize = stfs.f_frsize;
+#else
     if (fstat( fd, &st ) < 0) return errno_to_status( errno );
     if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) return STATUS_INVALID_DEVICE_REQUEST;
 
@@ -2338,6 +2334,7 @@ static NTSTATUS get_full_size_info(int fd, FILE_FS_FULL_SIZE_INFORMATION *info) 
 #else
     if (fstatfs( fd, &stfs ) < 0) return errno_to_status( errno );
     bsize = stfs.f_bsize;
+#endif
 #endif
     if (bsize == 2048)  /* assume CD-ROM */
     {
@@ -2355,12 +2352,12 @@ static NTSTATUS get_full_size_info(int fd, FILE_FS_FULL_SIZE_INFORMATION *info) 
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS get_full_size_info_ex(int fd, FILE_FS_FULL_SIZE_INFORMATION_EX *info)
+static NTSTATUS get_full_size_info_ex(HANDLE handle, int fd, FILE_FS_FULL_SIZE_INFORMATION_EX *info)
 {
     FILE_FS_FULL_SIZE_INFORMATION full_info;
     NTSTATUS status;
 
-    if ((status = get_full_size_info(fd, &full_info)) != STATUS_SUCCESS)
+    if ((status = get_full_size_info(handle, fd, &full_info)) != STATUS_SUCCESS)
         return status;
 
     info->ActualTotalAllocationUnits = full_info.TotalAllocationUnits.QuadPart;
@@ -8330,6 +8327,17 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
     unsigned int status;
 
     status = server_get_unix_fd( handle, 0, &fd, &needs_close, &fd_type, NULL );
+#ifdef __SWITCH__
+    /* A Horizon directory, such as the drive root GetDiskFreeSpace opens, has
+     * no descriptor, and the Horizon server no get_volume_info: the volume is
+     * examined by the directory's unix name instead. */
+    if (status == STATUS_BAD_DEVICE_TYPE)
+    {
+        fd = -1;
+        fd_type = FD_TYPE_DIR;
+        status = STATUS_SUCCESS;
+    }
+#endif
     if (status == STATUS_BAD_DEVICE_TYPE)
     {
         struct async_irp *async;
@@ -8378,7 +8386,7 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
             FILE_FS_SIZE_INFORMATION *info = buffer;
             FILE_FS_FULL_SIZE_INFORMATION full_info;
 
-            if ((status = get_full_size_info(fd, &full_info)) == STATUS_SUCCESS)
+            if ((status = get_full_size_info(handle, fd, &full_info)) == STATUS_SUCCESS)
             {
                 info->TotalAllocationUnits = full_info.TotalAllocationUnits;
                 info->AvailableAllocationUnits = full_info.CallerAvailableAllocationUnits;
@@ -8402,6 +8410,15 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
                 info->DeviceType = FILE_DEVICE_NAMED_PIPE;
                 status = STATUS_SUCCESS;
             }
+#ifdef __SWITCH__
+            else if (fd == -1)
+            {
+                /* A Horizon directory: what get_device_info gives its files. */
+                info->Characteristics = FILE_DEVICE_IS_MOUNTED;
+                info->DeviceType = FILE_DEVICE_DISK_FILE_SYSTEM;
+                status = STATUS_SUCCESS;
+            }
+#endif
             else status = get_device_info( fd, info );
 
             if (!status)
@@ -8543,7 +8560,7 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
         else
         {
             FILE_FS_FULL_SIZE_INFORMATION *info = buffer;
-            if ((status = get_full_size_info(fd, info)) == STATUS_SUCCESS)
+            if ((status = get_full_size_info(handle, fd, info)) == STATUS_SUCCESS)
                 io->Information = sizeof(*info);
         }
         break;
@@ -8554,7 +8571,7 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
         else
         {
             FILE_FS_FULL_SIZE_INFORMATION_EX *info = buffer;
-            if ((status = get_full_size_info_ex(fd, info)) == STATUS_SUCCESS)
+            if ((status = get_full_size_info_ex(handle, fd, info)) == STATUS_SUCCESS)
                 io->Information = sizeof(*info);
         }
         break;
