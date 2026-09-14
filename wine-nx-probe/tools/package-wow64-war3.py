@@ -119,15 +119,20 @@ wine-nx-runtime.log, ending with "done, all steps worked":
   pointer and the touchscreen are, is always 1280x720; at another resolution the
   game's menus do not line up with them (no highlight, clicks landing elsewhere).
 - Skips the intro movie at startup (seenintromovie).
+- Offers the game only the Switch's own 1280x720 display mode (EmulateModelist
+  for war3.exe), so the movies play across the full width.
 - Registers the MP3 decoder l3codeca.acm, for the movies' sound.
 - Registers DirectShow (quartz.dll, devenum.dll), which the movies play through.
   The first quartz.dll line reports a failure: quartz needs devenum registered,
   so it is registered again after devenum, and that second line is the one that
   counts. The game registers its own video decoder, blizzard.ax.
 
-The movies: WarCraft III's Movies are AVI files, which quartz.dll now reads without
-GStreamer. The picture goes through Wine's GDI video renderer; that path is tested
-in desktop Wine and awaits a run on the Switch.
+The movies: WarCraft III's Movies are AVI files, which quartz.dll reads without
+GStreamer; the picture goes through Wine's GDI video renderer, and build 84 showed
+it on the Switch. For each movie the game switches the screen to 800x600. Wine used
+to fake that mode by scaling it into a 960x720 box in the middle of the screen,
+with a white bar beside it. Since build 85, with the setup program run, only
+1280x720 is offered, so the game keeps it and the movie fills the width.
 
 The rest of the full package is staged too: OpenTTD, the OpenGL, Direct3D 9 and
 audio tests, Notepad and 7-Zip.

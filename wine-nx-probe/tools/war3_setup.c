@@ -5,6 +5,10 @@
  *   screen, where the pointer and the touchscreen are, is always 1280x720; at
  *   any other resolution the game's hit-testing does not line up with them.
  * - seenintromovie, which skips the intro movie at startup.
+ * - EmulateModelist for war3.exe, so Wine offers the game only the screen's own
+ *   1280x720 mode. For each movie the game switches to 800x600, which Wine
+ *   would fake by scaling it into a 960x720 box in the middle of the screen.
+ *   With 800x600 refused, the game keeps 1280x720 and the movie fills the width.
  * - The MP3 decoder l3codeca.acm under Drivers32, for the movies' sound.
  * - DirectShow: quartz.dll and devenum.dll registered as regsvr32 would, since
  *   Wine's first-run setup does not run on the Switch. quartz is registered
@@ -130,6 +134,7 @@ void __stdcall start(void)
     static const WCHAR video[] = L"Software\\Blizzard Entertainment\\Warcraft III\\Video";
     static const WCHAR misc[] = L"Software\\Blizzard Entertainment\\Warcraft III\\Misc";
     static const WCHAR drivers32[] = L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Drivers32";
+    static const WCHAR war3_driver[] = L"Software\\Wine\\AppDefaults\\war3.exe\\X11 Driver";
     BOOL ok = TRUE;
     HRESULT hr;
 
@@ -140,6 +145,7 @@ void __stdcall start(void)
     ok &= set_dword( HKEY_CURRENT_USER, video, L"colordepth", 32 );
     ok &= set_dword( HKEY_CURRENT_USER, video, L"refreshrate", 60 );
     ok &= set_dword( HKEY_CURRENT_USER, misc, L"seenintromovie", 1 );
+    ok &= set_string( HKEY_CURRENT_USER, war3_driver, L"EmulateModelist", L"Y" );
     ok &= set_string( HKEY_LOCAL_MACHINE, drivers32, L"msacm.l3acm", L"l3codeca.acm" );
 
     hr = OleInitialize( NULL );
