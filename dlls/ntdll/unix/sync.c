@@ -2465,9 +2465,20 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
 /******************************************************************
  *		NtYieldExecution (NTDLL.@)
  */
+#ifdef __SWITCH__
+extern void svcSleepThread( int64_t nano );
+#endif
+
 NTSTATUS WINAPI NtYieldExecution(void)
 {
-#ifdef HAVE_SCHED_YIELD
+#ifdef __SWITCH__
+    /* Sleep(0) and SwitchToThread must give up the core: wined3d waits for its
+     * command-stream thread by pausing and sleeping 0, and without a yield that
+     * wait spun a whole core while the thread it waited for got less of one.
+     * The Switch build has no HAVE_SCHED_YIELD; libnx's sched_yield is this call. */
+    svcSleepThread( -1 );  /* YieldType_WithCoreMigration */
+    return STATUS_SUCCESS;
+#elif defined(HAVE_SCHED_YIELD)
 #ifdef RUSAGE_THREAD
     struct rusage u1, u2;
     int ret;
