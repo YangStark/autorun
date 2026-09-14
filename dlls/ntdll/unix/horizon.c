@@ -570,6 +570,10 @@ unsigned int horizon_set_process_machine( unsigned short machine )
 #define HORIZON_SWP_NOREDRAW 0x0008
 #define HORIZON_SWP_SHOWWINDOW 0x0040
 #define HORIZON_SWP_HIDEWINDOW 0x0080
+#define HORIZON_SWP_NOZORDER 0x0004
+#define HORIZON_WS_EX_TOPMOST 0x00000008u
+#define HORIZON_WS_EX_TRANSPARENT 0x00000020u
+#define HORIZON_WS_EX_LAYERED 0x00080000u
 #define HORIZON_SET_WINPOS_PAINT_SURFACE 0x01
 #define HORIZON_COORDS_CLIENT 0
 #define HORIZON_COORDS_WINDOW 1
@@ -6129,6 +6133,83 @@ static int horizon_server_handle_get_window_list( struct horizon_server_connecti
     return ret;
 }
 
+/* server/window.c's link_window on the flat window list, where siblings keep
+ * their z-order, top first: previous is a sibling's handle, or one of these.
+ * SetWindowPos used to leave every window where it was created, so a window
+ * raised over a later one stayed under it for the mouse (WarCraft III's menus
+ * got no hover or clicks). */
+#define HORIZON_LINK_TOP       0u
+#define HORIZON_LINK_BOTTOM    1u
+#define HORIZON_LINK_TOPMOST   0xffffffffu
+#define HORIZON_LINK_NOTOPMOST 0xfffffffeu
+
+static void horizon_server_link_window_locked( struct horizon_user_window *window, unsigned int previous )
+{
+    struct horizon_user_window **ptr, **before = NULL, *after = NULL, *sibling;
+
+    if (previous == HORIZON_LINK_NOTOPMOST)
+    {
+        if (!(window->ex_style & HORIZON_WS_EX_TOPMOST)) return;  /* nothing to do */
+        window->ex_style &= ~HORIZON_WS_EX_TOPMOST;
+        previous = HORIZON_LINK_TOP;
+    }
+    for (ptr = &horizon_windows; *ptr; ptr = &(*ptr)->next)
+    {
+        if (*ptr != window) continue;
+        *ptr = window->next;
+        break;
+    }
+    window->next = NULL;
+
+    if (previous != HORIZON_LINK_TOP && previous != HORIZON_LINK_BOTTOM && previous != HORIZON_LINK_TOPMOST)
+    {
+        after = horizon_server_find_window_locked( previous );
+        window->next = after->next;
+        after->next = window;
+        if (!(after->ex_style & HORIZON_WS_EX_TOPMOST)) window->ex_style &= ~HORIZON_WS_EX_TOPMOST;
+        else
+        {
+            for (sibling = window->next; sibling && sibling->parent != window->parent; sibling = sibling->next) ;
+            if (sibling && (sibling->ex_style & HORIZON_WS_EX_TOPMOST)) window->ex_style |= HORIZON_WS_EX_TOPMOST;
+        }
+        return;
+    }
+
+    if (previous == HORIZON_LINK_BOTTOM) window->ex_style &= ~HORIZON_WS_EX_TOPMOST;
+    if (previous == HORIZON_LINK_TOPMOST) window->ex_style |= HORIZON_WS_EX_TOPMOST;
+    for (ptr = &horizon_windows; *ptr; ptr = &(*ptr)->next)
+    {
+        sibling = *ptr;
+        if (sibling->parent != window->parent) continue;
+        after = sibling;  /* the last sibling so far */
+        if (before || previous == HORIZON_LINK_BOTTOM) continue;
+        /* HWND_TOP puts a window that is not topmost above the first sibling
+         * that is not either, or above its own topmost owner, and so topmost. */
+        if ((window->ex_style & HORIZON_WS_EX_TOPMOST) || !(sibling->ex_style & HORIZON_WS_EX_TOPMOST))
+            before = ptr;
+        else if (sibling->handle == window->owner)
+        {
+            window->ex_style |= HORIZON_WS_EX_TOPMOST;
+            before = ptr;
+        }
+    }
+    if (before)
+    {
+        window->next = *before;
+        *before = window;
+    }
+    else if (after)
+    {
+        window->next = after->next;
+        after->next = window;
+    }
+    else
+    {
+        window->next = horizon_windows;
+        horizon_windows = window;
+    }
+}
+
 static int horizon_server_handle_set_window_pos( struct horizon_server_connection *connection,
                                                  const unsigned char *message,
                                                  const unsigned char *data, unsigned int data_size )
@@ -6136,7 +6217,7 @@ static int horizon_server_handle_set_window_pos( struct horizon_server_connectio
     const struct horizon_set_window_pos_request *request = (const void *)message;
     const struct horizon_rectangle *extra = (const void *)data;
     struct horizon_set_window_pos_reply reply;
-    struct horizon_user_window *window;
+    struct horizon_user_window *window, *previous;
     struct horizon_rectangle old_window, old_client;
     int geometry_changed;
 
@@ -6144,11 +6225,19 @@ static int horizon_server_handle_set_window_pos( struct horizon_server_connectio
     pthread_mutex_lock( &horizon_server_objects_mutex );
     if (!(window = horizon_server_find_window_locked( request->handle )))
         reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    /* A window placed after another must be its sibling. */
+    else if (!(request->swp_flags & HORIZON_SWP_NOZORDER) && window->parent && (int)request->previous > 1 &&
+             request->previous != window->handle &&
+             (!(previous = horizon_server_find_window_locked( request->previous )) ||
+              previous->parent != window->parent))
+        reply.header.error = previous ? HORIZON_STATUS_INVALID_PARAMETER : HORIZON_STATUS_INVALID_HANDLE;
     else if (request->window.right < request->window.left ||
              request->window.bottom < request->window.top)
         reply.header.error = HORIZON_STATUS_INVALID_PARAMETER;
     else
     {
+        if (!(request->swp_flags & HORIZON_SWP_NOZORDER) && window->parent && request->previous != window->handle)
+            horizon_server_link_window_locked( window, request->previous );
         old_window = window->window_rect;
         old_client = window->client_rect;
         window->window_rect = request->window;
@@ -6339,6 +6428,8 @@ static struct horizon_user_window *horizon_server_shallow_window_from_point_lock
         struct horizon_rectangle rect, client;
 
         if (!(window->style & HORIZON_WS_VISIBLE)) continue;
+        if ((window->ex_style & (HORIZON_WS_EX_LAYERED | HORIZON_WS_EX_TRANSPARENT)) ==
+            (HORIZON_WS_EX_LAYERED | HORIZON_WS_EX_TRANSPARENT)) continue;  /* transparent */
         /* Wine's hardware queue stores the shallow top-level window.  The
          * client-side window_from_point() then performs authoritative child
          * and non-client hit testing before dispatch. */
@@ -6347,6 +6438,38 @@ static struct horizon_user_window *horizon_server_shallow_window_from_point_lock
         if (horizon_server_point_in_rect( &rect, x, y )) return window;
     }
     return NULL;
+}
+
+void wine_nx_runtime_trace( const char *msg );  /* weak, defined below */
+
+/* The runtime log names the window under the mouse whenever that changes: a
+ * program that gets no hover or clicks usually has another window there. */
+static void horizon_server_log_mouse_target_locked( const struct horizon_user_window *target, int x, int y,
+                                                    unsigned int capture )
+{
+    static unsigned int last = ~0u;
+    struct horizon_rectangle rect = {0}, client;
+    char name[48], line[256];
+    unsigned int handle = target ? target->handle : 0, i, len = 0;
+
+    if (handle == last) return;
+    last = handle;
+    if (!target)
+    {
+        snprintf( line, sizeof(line), "[INPUT] mouse at %d,%d over no window (capture=%08x)", x, y, capture );
+        wine_nx_runtime_trace( line );
+        return;
+    }
+    if (target->class && target->class->name)
+        for (i = 0; i + 1 < target->class->name_len && len < sizeof(name) - 1; i += 2)
+            name[len++] = target->class->name[i + 1] || target->class->name[i] < 0x20 ||
+                          target->class->name[i] > 0x7e ? '?' : (char)target->class->name[i];
+    name[len] = 0;
+    horizon_server_window_screen_rects_locked( target, &rect, &client );
+    snprintf( line, sizeof(line), "[INPUT] mouse at %d,%d over hwnd=%08x class=%s atom=%04x tid=%u style=%08x "
+              "ex=%08x rect=%d,%d-%d,%d capture=%08x", x, y, handle, len ? name : "-", target->atom, target->tid,
+              target->style, target->ex_style, rect.left, rect.top, rect.right, rect.bottom, capture );
+    wine_nx_runtime_trace( line );
 }
 
 static unsigned int horizon_server_queue_mouse_locked( struct horizon_user_window *window,
@@ -6590,6 +6713,7 @@ static int horizon_server_handle_send_hardware_message( struct horizon_server_co
         if (!target && request->win) target = horizon_server_find_window_locked( request->win );
         if (!target) target = horizon_server_shallow_window_from_point_locked( x, y );
         if (target) target_handle = target->handle;
+        horizon_server_log_mouse_target_locked( target, x, y, input->capture );
 
         if ((flags & HORIZON_MOUSEEVENTF_MOVE) &&
             (status = horizon_server_queue_mouse_locked( target, HORIZON_WM_MOUSEMOVE,
