@@ -333,6 +333,13 @@ static HRESULT vmr_query_accept(struct strmbase_renderer *iface, const AM_MEDIA_
     if (bitmap_header->biCompression == BI_RGB || bitmap_header->biCompression == BI_BITFIELDS)
         return S_OK;
 
+    /* Samples that depend on others, as a splitter's compressed video, are for
+     * a decoder. Graph building offers them to renderers first; asking DirectDraw
+     * would create a Direct3D device (and a GL context on the caller's thread,
+     * which may be the game's rendering thread) only to refuse. */
+    if (mt->bTemporalCompression)
+        return S_FALSE;
+
     if (!ddraw)
     {
         if (FAILED(DirectDrawCreateEx(NULL, (void **)&ddraw, &IID_IDirectDraw7, NULL)))
