@@ -133,6 +133,41 @@ int main(void)
         release.stream = handle; release.timer_thread = NULL; nx_release_stream(&release);
         assert(release.result == S_OK);
     }
-    puts("Audio backend: DMA ownership, ordered playback, ring wrap, silence, reset and buffer errors passed");
+    /* DirectSound (DSOUND_WaveFormat, DSOUND_ReopenDevice): the mix format made
+     * 32-bit float EXTENSIBLE, everything else copied, then Initialize with event
+     * callbacks. A plain WAVEFORMATEX mix format left cbSize 0 there, which
+     * mmdevapi's validate_wfx rejects with E_INVALIDARG. */
+    {
+        WAVEFORMATEXTENSIBLE mix, ds;
+        struct get_mix_format_params mixp = {.flow=eRender, .fmt=&mix};
+        struct is_format_supported_params supported = {.flow=eRender, .share=AUDCLNT_SHAREMODE_SHARED, .fmt_in=&ds.Format};
+        struct create_stream_params ds_create = {.flow=eRender, .share=AUDCLNT_SHAREMODE_SHARED,
+            .flags=AUDCLNT_STREAMFLAGS_NOPERSIST | AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+            .duration=800000, .fmt=&ds.Format, .channel_count=&channels, .stream=&handle};
+        float *source;
+        nx_get_mix_format(&mixp);
+        assert(mixp.result == S_OK && mix.Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE);
+        assert(mix.Format.nChannels == 2 && mix.dwChannelMask == 0x3);
+        ds = mix;
+        ds.SubFormat = nx_subtype_float;
+        ds.Samples.wValidBitsPerSample = ds.Format.wBitsPerSample = 32;
+        ds.Format.nBlockAlign = ds.Format.nChannels * ds.Format.wBitsPerSample / 8;
+        ds.Format.nAvgBytesPerSec = ds.Format.nSamplesPerSec * ds.Format.nBlockAlign;
+        assert(ds.Format.cbSize == sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX));
+        nx_is_format_supported(&supported); assert(supported.result == S_OK);
+        nx_create_stream(&ds_create); assert(ds_create.result == S_OK && handle);
+        assert(nx_stream(handle)->source_tag == WAVE_FORMAT_IEEE_FLOAT);
+        get.stream = put.stream = handle; get.frames = put.written_frames = 480;
+        put.flags = 0;  /* the ring-wrap loop above left AUDCLNT_BUFFERFLAGS_SILENT set */
+        nx_get_render_buffer(&get); assert(get.result == S_OK);
+        source = (float *)data;
+        for (i = 0; i < 960; i++) source[i] = i == 0 ? 0.5f : 0.0f;
+        nx_release_render_buffer(&put); assert(put.result == S_OK && nx_stream(handle)->held == 480);
+        /* float, not read as 32-bit PCM */
+        assert(((short *)nx_stream(handle)->ring)[0] == 16383 && ((short *)nx_stream(handle)->ring)[1] == 0);
+        release.stream = handle; release.timer_thread = NULL; nx_release_stream(&release);
+        assert(release.result == S_OK);
+    }
+    puts("Audio backend: DMA ownership, ordered playback, ring wrap, silence, reset, buffer errors and DirectSound's float format passed");
     return 0;
 }

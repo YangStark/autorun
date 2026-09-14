@@ -79,19 +79,27 @@ static NTSTATUS nx_get_endpoint_ids(void *args)
     p->size = size;
     return STATUS_SUCCESS;
 }
+static const GUID nx_subtype_pcm = {1,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}};
+static const GUID nx_subtype_float = {3,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}};
+/* The sample coding: WAVE_FORMAT_PCM or WAVE_FORMAT_IEEE_FLOAT, looking through
+ * WAVE_FORMAT_EXTENSIBLE to its subtype, or 0 for anything else. DirectSound
+ * mixes in 32-bit float and asks for it as EXTENSIBLE. */
+static unsigned int nx_format_tag(const WAVEFORMATEX *f)
+{
+    const WAVEFORMATEXTENSIBLE *e = (const WAVEFORMATEXTENSIBLE *)f;
+    if (f->wFormatTag == WAVE_FORMAT_PCM || f->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return f->wFormatTag;
+    if (f->wFormatTag != WAVE_FORMAT_EXTENSIBLE || f->cbSize < 22) return 0;
+    if (!memcmp(&e->SubFormat, &nx_subtype_pcm, sizeof(GUID))) return WAVE_FORMAT_PCM;
+    if (!memcmp(&e->SubFormat, &nx_subtype_float, sizeof(GUID))) return WAVE_FORMAT_IEEE_FLOAT;
+    return 0;
+}
 static BOOL nx_format(const WAVEFORMATEX *f)
 {
-    static const GUID pcm = {1,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}};
     unsigned int tag;
     if (!f || !f->nSamplesPerSec || f->nChannels < 1 || f->nChannels > 2) return FALSE;
-    tag = f->wFormatTag;
-    if (tag == WAVE_FORMAT_EXTENSIBLE)
-    {
-        if (f->cbSize < 22 || memcmp(&((const WAVEFORMATEXTENSIBLE *)f)->SubFormat, &pcm, sizeof(pcm))) return FALSE;
-        tag = WAVE_FORMAT_PCM;
-    }
-    return (tag == WAVE_FORMAT_PCM || tag == WAVE_FORMAT_IEEE_FLOAT) &&
-        (f->wBitsPerSample == 8 || f->wBitsPerSample == 16 || f->wBitsPerSample == 24 || f->wBitsPerSample == 32) &&
+    if (!(tag = nx_format_tag(f))) return FALSE;
+    if (tag == WAVE_FORMAT_IEEE_FLOAT && f->wBitsPerSample != 32) return FALSE;
+    return (f->wBitsPerSample == 8 || f->wBitsPerSample == 16 || f->wBitsPerSample == 24 || f->wBitsPerSample == 32) &&
         f->nBlockAlign == f->nChannels * (f->wBitsPerSample / 8) &&
         f->nAvgBytesPerSec == f->nSamplesPerSec * f->nBlockAlign;
 }
@@ -105,13 +113,20 @@ static NTSTATUS nx_is_format_supported(void *args)
 static NTSTATUS nx_get_mix_format(void *args)
 {
     struct get_mix_format_params *p = args;
+    /* EXTENSIBLE, as Wine's other drivers report it: DirectSound copies this
+     * and only changes the subtype and sample size, so a plain WAVEFORMATEX
+     * (cbSize 0) made its Initialize fail with E_INVALIDARG. */
     memset(p->fmt, 0, sizeof(*p->fmt));
-    p->fmt->Format.wFormatTag = WAVE_FORMAT_PCM;
+    p->fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    p->fmt->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
     p->fmt->Format.nChannels = 2;
     p->fmt->Format.nSamplesPerSec = NX_RATE;
     p->fmt->Format.nAvgBytesPerSec = NX_RATE * 4;
     p->fmt->Format.nBlockAlign = 4;
     p->fmt->Format.wBitsPerSample = 16;
+    p->fmt->Samples.wValidBitsPerSample = 16;
+    p->fmt->dwChannelMask = 0x3;  /* SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT */
+    p->fmt->SubFormat = nx_subtype_pcm;
     p->result = p->flow == eRender ? S_OK : AUDCLNT_E_UNSUPPORTED_FORMAT;
     return STATUS_SUCCESS;
 }
@@ -157,7 +172,7 @@ static NTSTATUS nx_create_stream(void *args)
     s->source_rate = p->fmt->nSamplesPerSec;
     s->source_channels = p->fmt->nChannels;
     s->source_bits = p->fmt->wBitsPerSample;
-    s->source_tag = p->fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE ? WAVE_FORMAT_PCM : p->fmt->wFormatTag;
+    s->source_tag = nx_format_tag(p->fmt);
     s->source_frame_bytes = p->fmt->nBlockAlign;
     s->scratch_bytes = (s->capacity * s->source_rate / NX_RATE + 2) * s->source_frame_bytes;
     s->ring = malloc(s->capacity * 4);
