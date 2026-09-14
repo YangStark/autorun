@@ -59,6 +59,7 @@
 #include "horizon_threads.h"
 #include "horizon_registry.h"
 #include "horizon_read_redirect.h"
+#include "horizon_object_dirs.h"
 #include "horizon_free_range.h"
 
 #include <errno.h>
@@ -370,6 +371,8 @@ struct horizon_fd_queue
 #define HORIZON_REQ_UNMAP_VIEW 71
 #define HORIZON_REQ_GET_TOKEN_SID 230
 #define HORIZON_REQ_ALLOCATE_LOCALLY_UNIQUE_ID 252
+#define HORIZON_REQ_OPEN_DIRECTORY 242
+#define HORIZON_REQ_GET_DIRECTORY_ENTRIES 243
 #define HORIZON_REQ_CREATE_KEY 86
 #define HORIZON_REQ_OPEN_KEY 87
 #define HORIZON_REQ_DELETE_KEY 88
@@ -680,7 +683,8 @@ enum horizon_server_object_type
     HORIZON_SERVER_OBJECT_SOCK,
     HORIZON_SERVER_OBJECT_WINSTATION,
     HORIZON_SERVER_OBJECT_DESKTOP,
-    HORIZON_SERVER_OBJECT_MSG_QUEUE
+    HORIZON_SERVER_OBJECT_MSG_QUEUE,
+    HORIZON_SERVER_OBJECT_DIRECTORY
 };
 
 struct horizon_server_request_header
@@ -902,6 +906,22 @@ struct horizon_open_process_reply
     struct horizon_server_reply_header header;
     unsigned int handle;
     char pad[4];
+};
+
+struct horizon_get_directory_entries_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+    unsigned int index;
+    unsigned int max_count;
+};
+
+struct horizon_get_directory_entries_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int total_len;
+    unsigned int count;
+    /* VARARG(entries,directory_entries) */
 };
 
 struct horizon_select_request
@@ -2603,6 +2623,7 @@ struct horizon_server_object
     struct horizon_reg_key *reg_key;
     int std_stream;                 /* 1 stdout, 2 stderr: writes are echoed to the log */
     unsigned int queue_tid;         /* message queue object: its thread, 0 once the thread ended */
+    int directory;                  /* directory object: enum horizon_object_dir */
 };
 
 struct horizon_server_handle_entry
@@ -3714,13 +3735,30 @@ static int horizon_server_name_matches( const struct horizon_server_object *obje
     return !type || object->type == type;
 }
 
-static struct horizon_server_object *horizon_server_find_named_object_any_locked(
-    const struct horizon_object_name *name )
+/* A name relative to a BaseNamedObjects directory handle is kept as a bare name
+ * with root 0, as before the server had directories: kernelbase passes its
+ * handle once NtOpenDirectoryObject works, and code holding no handle still
+ * finds the same object. Callers hold horizon_server_objects_mutex. */
+static unsigned int horizon_server_name_root_locked( unsigned int rootdir )
 {
     struct horizon_server_handle_entry *entry;
 
+    if (rootdir && (entry = horizon_server_find_handle_locked( rootdir )) &&
+        entry->object->type == HORIZON_SERVER_OBJECT_DIRECTORY &&
+        entry->object->directory == HORIZON_OBJECT_DIR_NAMED_OBJECTS)
+        return 0;
+    return rootdir;
+}
+
+static struct horizon_server_object *horizon_server_find_named_object_any_locked(
+    const struct horizon_object_name *name )
+{
+    struct horizon_object_name canonical = *name;
+    struct horizon_server_handle_entry *entry;
+
+    canonical.rootdir = horizon_server_name_root_locked( name->rootdir );
     for (entry = horizon_server_handles; entry; entry = entry->next)
-        if (horizon_server_name_matches( entry->object, 0, name )) return entry->object;
+        if (horizon_server_name_matches( entry->object, 0, &canonical )) return entry->object;
 
     return NULL;
 }
@@ -3728,10 +3766,12 @@ static struct horizon_server_object *horizon_server_find_named_object_any_locked
 static struct horizon_server_object *horizon_server_find_named_object_locked(
     int type, const struct horizon_object_name *name )
 {
+    struct horizon_object_name canonical = *name;
     struct horizon_server_handle_entry *entry;
 
+    canonical.rootdir = horizon_server_name_root_locked( name->rootdir );
     for (entry = horizon_server_handles; entry; entry = entry->next)
-        if (horizon_server_name_matches( entry->object, type, name )) return entry->object;
+        if (horizon_server_name_matches( entry->object, type, &canonical )) return entry->object;
 
     return NULL;
 }
@@ -3745,7 +3785,7 @@ static unsigned int horizon_server_set_object_name( struct horizon_server_object
     if (!object->name) return HORIZON_STATUS_NO_MEMORY;
     memcpy( object->name, name->name, name->name_len );
     object->name_len = name->name_len;
-    object->rootdir = name->rootdir;
+    object->rootdir = horizon_server_name_root_locked( name->rootdir );
     return HORIZON_STATUS_SUCCESS;
 }
 
@@ -4780,6 +4820,69 @@ static int horizon_server_handle_open_named_object( struct horizon_server_connec
     if (reply.header.error == HORIZON_STATUS_SUCCESS)
         reply.header.error = horizon_server_open_named_object_handle( type, &name, &reply.handle );
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+/* NtOpenDirectoryObject: \?? and BaseNamedObjects (horizon_object_dirs.h). */
+static int horizon_server_handle_open_directory( struct horizon_server_connection *connection,
+                                                 const unsigned char *message,
+                                                 const unsigned char *data, unsigned int data_size )
+{
+    const struct horizon_open_named_object_request *request = (const void *)message;
+    struct horizon_open_process_reply reply;
+    struct horizon_server_handle_entry *entry;
+    int dir = request->rootdir ? HORIZON_OBJECT_DIR_NONE : horizon_object_dir_from_path( data, data_size );
+    char name[64];
+    unsigned int i;
+
+    memset( &reply, 0, sizeof(reply) );
+    if (!dir) reply.header.error = HORIZON_STATUS_OBJECT_NAME_NOT_FOUND;
+    else
+    {
+        pthread_mutex_lock( &horizon_server_objects_mutex );
+        if ((entry = horizon_server_create_handle_locked( HORIZON_SERVER_OBJECT_DIRECTORY )))
+        {
+            entry->object->directory = dir;
+            reply.handle = entry->handle;
+        }
+        else reply.header.error = HORIZON_STATUS_NO_MEMORY;
+        pthread_mutex_unlock( &horizon_server_objects_mutex );
+    }
+
+    for (i = 0; i < data_size / 2 && i < sizeof(name) - 1; i++)
+        name[i] = data[2 * i + 1] || data[2 * i] < 0x20 || data[2 * i] > 0x7e ? '?' : data[2 * i];
+    name[i] = 0;
+    horizon_trace( "[HZOBJ] open_directory %s rootdir=0x%x -> handle=0x%x err=0x%x",
+                   name, request->rootdir, reply.handle, reply.header.error );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+/* NtQueryDirectoryObject */
+static int horizon_server_handle_get_directory_entries( struct horizon_server_connection *connection,
+                                                        const unsigned char *message )
+{
+    const struct horizon_get_directory_entries_request *request = (const void *)message;
+    struct horizon_get_directory_entries_reply reply;
+    struct horizon_server_handle_entry *entry;
+    unsigned char data[512];
+    unsigned int size = 0, max = request->header.reply_size;
+    int dir = HORIZON_OBJECT_DIR_NONE;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(entry = horizon_server_find_handle_locked( request->handle )))
+        reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else if (entry->object->type != HORIZON_SERVER_OBJECT_DIRECTORY)
+        reply.header.error = HORIZON_STATUS_OBJECT_TYPE_MISMATCH;
+    else
+        dir = entry->object->directory;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
+    if (!reply.header.error)
+        reply.header.error = horizon_object_dir_entries( dir, request->index, request->max_count,
+                                                         max < sizeof(data) ? max : sizeof(data), data,
+                                                         &size, &reply.count, &reply.total_len );
+    reply.header.reply_size = size;
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), data, size );
 }
 
 static int horizon_server_handle_open_mapping( struct horizon_server_connection *connection,
@@ -10421,6 +10524,13 @@ static void *horizon_server_thread( void *param )
         case HORIZON_REQ_OPEN_EVENT:
             status = horizon_server_handle_open_named_object( connection, message, request_data,
                                                               header->request_size, HORIZON_SERVER_OBJECT_EVENT );
+            break;
+        case HORIZON_REQ_OPEN_DIRECTORY:
+            status = horizon_server_handle_open_directory( connection, message, request_data,
+                                                           header->request_size );
+            break;
+        case HORIZON_REQ_GET_DIRECTORY_ENTRIES:
+            status = horizon_server_handle_get_directory_entries( connection, message );
             break;
         case HORIZON_REQ_CREATE_KEYED_EVENT:
             status = horizon_server_handle_create_keyed_event( connection, request_data, header->request_size );
