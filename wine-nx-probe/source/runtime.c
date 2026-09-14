@@ -1577,6 +1577,8 @@ static void runtime_start_x86_thread( PRTL_THREAD_START_ROUTINE entry, void *arg
     if (!status) call_pe_entry_point( runtime_wow64_initialize );
 }
 
+extern void wine_nx_load_apiset_dll(void);
+
 static NTSTATUS runtime_start_wow64( void *module, void *entry,
                                      RTL_USER_PROCESS_PARAMETERS *params,
                                      const UNICODE_STRING *main_nt_name, BOOL autorun )
@@ -1590,6 +1592,9 @@ static NTSTATUS runtime_start_wow64( void *module, void *entry,
     status = wine_nx_init_wow64_peb( params, module );
     log_line( "[WOW64] PEB32 status=%08x", status );
     if (status) return status;
+    /* Both PEBs point at the one schema, so it goes after the 32-bit PEB. */
+    wine_nx_load_apiset_dll();
+    log_line( "[WOW64] api set schema=%p", teb->Peb->ApiSetMap );
     status = wine_nx_loader_bootstrap( main_nt_name );
     log_line( "[WOW64] native loader bootstrap status=%08x", status );
     if (status) return status;

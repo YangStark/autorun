@@ -31,6 +31,11 @@ shutil.copy2(build / 'wine-nx-runtime.nro', stage / 'wine-nx-runtime.nro')
 for module in ('ntdll', 'wow64', 'wow64win', 'winebox64', 'win32u'):
     shutil.copy2(pe / f'dlls/{module}/aarch64-windows/{module}.dll',
                  stage / 'drive_c/windows/system32' / f'{module}.dll')
+# The API set schema the runtime maps at startup (load_apiset_dll): without it
+# no api-ms-win-* import resolves, as in a UCRT-linked DLL.
+schema = 'dlls/apisetschema/aarch64-windows/apisetschema.dll'
+subprocess.run(['make', '-C', str(pe), '-j8', schema], env=env, check=True)
+shutil.copy2(pe / schema, stage / 'drive_c/windows/system32/apisetschema.dll')
 exe = pe / 'programs/notepad/i386-windows/notepad.exe'
 shutil.copy2(exe, stage / 'drive_c/notepad.exe')
 shutil.copy2(video_exe, stage / 'drive_c/pe32-video-startup.exe')

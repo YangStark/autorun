@@ -2293,7 +2293,9 @@ static void load_apiset_dll(void)
     static WCHAR path[] = {'\\','?','?','\\','C',':','\\','w','i','n','d','o','w','s','\\',
                            's','y','s','t','e','m','3','2','\\',
                            'a','p','i','s','e','t','s','c','h','e','m','a','.','d','l','l',0};
+#ifndef __SWITCH__
     const char *pe_dir = get_pe_dir( current_machine );
+#endif
     const IMAGE_NT_HEADERS *nt;
     const IMAGE_SECTION_HEADER *sec;
     API_SET_NAMESPACE *map;
@@ -2302,19 +2304,29 @@ static void load_apiset_dll(void)
     unsigned int status;
     HANDLE handle, mapping;
     SIZE_T size;
+#ifdef __SWITCH__
+    IO_STATUS_BLOCK io;
+#else
     char *name = NULL;
+#endif
     void *ptr;
     UINT i;
 
     init_unicode_string( &str, path );
     InitializeObjectAttributes( &attr, &str, 0, 0, NULL );
 
+#ifdef __SWITCH__
+    /* Wine's DLLs are in drive_c on the card, not under dll_dir. */
+    status = NtOpenFile( &handle, GENERIC_READ | SYNCHRONIZE, &attr, &io, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                         FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE );
+#else
     if (build_dir) asprintf( &name, "%s/dlls/apisetschema%s/apisetschema.dll", build_dir, pe_dir );
     else asprintf( &name, "%s%s/apisetschema.dll", dll_dir, pe_dir );
     status = open_unix_file( &handle, name, GENERIC_READ | SYNCHRONIZE, &attr, 0,
                              FILE_SHARE_READ | FILE_SHARE_DELETE, FILE_OPEN,
                              FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0 );
     free( name );
+#endif
 
     if (!status)
     {
@@ -2353,6 +2365,15 @@ static void load_apiset_dll(void)
     }
     ERR( "failed to load apiset: %x\n", status );
 }
+
+#ifdef __SWITCH__
+/* The runtime starts programs without start_main_thread; with no schema, no
+ * api-ms-win-* import resolves in the x86 loader. */
+void wine_nx_load_apiset_dll(void)
+{
+    load_apiset_dll();
+}
+#endif
 
 
 /***********************************************************************

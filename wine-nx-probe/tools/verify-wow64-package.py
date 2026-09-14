@@ -31,6 +31,9 @@ ntdll_exports = inspect(stage / "drive_c/windows/system32/ntdll.dll", "--coff-ex
 for hook in ("pWow64SuspendLocalThread", "pWow64PrepareForException"):
     # The bootstrap bypasses init_wow64() and fills these in the PE ntdll.
     assert f"Name: {hook}\n" in ntdll_exports, f"ntdll.dll lacks the WoW64 bootstrap hook {hook}"
+schema = stage / "drive_c/windows/system32/apisetschema.dll"
+# The runtime maps it at startup; without it no api-ms-win-* import resolves.
+assert schema.exists() and "Name: .apiset " in inspect(schema, "--sections"), f"Missing API set schema: {schema}"
 cpu = stage / "drive_c/windows/system32/winebox64.dll"
 exports = set(re.findall(r"^  Name: (.+)$", inspect(cpu, "--coff-exports"), re.M))
 required = {"BTCpuProcessInit", "BTCpuThreadInit", "BTCpuGetBopCode", "BTCpuSimulate",
