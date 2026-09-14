@@ -56,7 +56,15 @@
 #include "x64test.h"
 #include "x64trace.h"
 
-#define NX_ARENA_SIZE (8 * 1024 * 1024)
+/* Translated code lives in code memory from jitCreate, one kernel code memory
+ * object per arena. Atmosphère creates only 10 of those objects for the whole
+ * system (kern_init_slab_setup.cpp, SlabCountKCodeMemory), so 8 MB arenas
+ * stopped translation at 80 MB, and WarCraft III went on in the interpreter
+ * too slowly to draw a frame. Arenas double from 16 MB to 256 MB and take
+ * memory only once needed. */
+#define NX_ARENA_FIRST    (16 * 1024 * 1024)
+#define NX_ARENA_LARGEST  (256 * 1024 * 1024)
+#define NX_ARENA_SMALLEST (1024 * 1024)
 #define NX_MAX_ARENAS 32
 #define NX_LOCK_ADDRESS_SLOTS 8192
 #define NX_MAX_STOP_PAGES 4
@@ -93,6 +101,8 @@ char *ftrace_name = NULL; /* no Box64 trace file; log levels default from it */
 cpu_ext_t cpuext = {0}; /* no optional host instructions: portable across Switch models */
 
 uint64_t wine_nx_box64_dynarec_bytes;
+uint64_t wine_nx_box64_arena_bytes;  /* code memory reserved in all arenas */
+extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 unsigned long long wine_nx_box64_native_entries;
 unsigned int wine_nx_box64_block_tests;  /* hash validations in DBGetBlock */
 static size_t max_block_size;            /* the largest guest block translated */
@@ -121,17 +131,22 @@ static size_t align_up( size_t value, size_t alignment )
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
-/* Called with arena_mutex held. */
-static int create_arena( size_t minimum )
+/* Called with arena_mutex held. Maps an arena of size bytes, or returns 0 with
+ * the reason in *rc. */
+static int map_arena( struct nx_arena *arena, size_t size, unsigned int *rc )
 {
-    struct nx_arena *arena;
-    size_t size = align_up( minimum > NX_ARENA_SIZE ? minimum : NX_ARENA_SIZE, 0x1000 );
-
-    if (arena_count >= NX_MAX_ARENAS) return 0;
-    arena = &arenas[arena_count];
     memset( arena, 0, sizeof(*arena) );
+    *rc = 0;
 #ifdef __SWITCH__
-    if (R_FAILED( jitCreate( &arena->jit, size ) )) return 0;
+    {
+        Result res = jitCreate( &arena->jit, size );
+
+        if (R_FAILED( res ))
+        {
+            *rc = res;
+            return 0;
+        }
+    }
     if (arena->jit.type != JitType_CodeMemory)
     {
         jitClose( &arena->jit );
@@ -139,6 +154,11 @@ static int create_arena( size_t minimum )
     }
     arena->rw = jitGetRwAddr( &arena->jit );
     arena->rx = jitGetRxAddr( &arena->jit );
+    if (!arena->rw || !arena->rx)
+    {
+        jitClose( &arena->jit );
+        return 0;
+    }
 #else
     {
         int fd = memfd_create( "wine-nx-dynarec", 0 );
@@ -161,9 +181,47 @@ static int create_arena( size_t minimum )
         arena->rx = rx;
     }
 #endif
-    if (!arena->rw || !arena->rx) return 0;
     arena->size = size;
+    return 1;
+}
+
+/* Called with arena_mutex held. The next arena doubles the last one, from
+ * NX_ARENA_FIRST up to NX_ARENA_LARGEST, and holds at least minimum bytes;
+ * smaller sizes are tried when the heap has no block that large. When even
+ * NX_ARENA_SMALLEST fails the kernel has no code memory left, and later calls
+ * give up at once instead of asking again for every block. */
+static int create_arena( size_t minimum )
+{
+    static int exhausted;
+    struct nx_arena *arena;
+    size_t smallest = align_up( NX_ARENA_SMALLEST, 0x1000 );
+    size_t floor = align_up( minimum > smallest ? minimum : smallest, 0x1000 );
+    size_t size = NX_ARENA_FIRST;
+    unsigned int i, rc = 0;
+    char message[192];
+
+    if (exhausted || arena_count >= NX_MAX_ARENAS) return 0;
+    for (i = 0; i < arena_count && size < NX_ARENA_LARGEST; i++) size *= 2;
+    if (size < floor) size = floor;
+    arena = &arenas[arena_count];
+    while (!map_arena( arena, size, &rc ))
+    {
+        if (size <= floor)
+        {
+            if (floor == smallest) exhausted = 1;
+            snprintf( message, sizeof(message), "[DYNAREC] no code arena after %u (%llu MB): rc=%#x for %zu KB; "
+                      "new x86 code runs in the interpreter", arena_count,
+                      (unsigned long long)(wine_nx_box64_arena_bytes >> 20), rc, minimum >> 10 );
+            if (&wine_nx_runtime_trace) wine_nx_runtime_trace( message );
+            return 0;
+        }
+        size = align_up( size / 2 > floor ? size / 2 : floor, 0x1000 );
+    }
     arena->starts = calloc( (size / 16 + 7) / 8, 1 );  /* without it, faults are just not described */
+    wine_nx_box64_arena_bytes += size;
+    snprintf( message, sizeof(message), "[DYNAREC] code arena %u: %zu MB (%llu MB in all)", arena_count + 1,
+              size >> 20, (unsigned long long)(wine_nx_box64_arena_bytes >> 20) );
+    if (&wine_nx_runtime_trace) wine_nx_runtime_trace( message );
     __atomic_store_n( &arena_count, arena_count + 1, __ATOMIC_RELEASE );
     return 1;
 }
@@ -304,7 +362,7 @@ static void init_dynarec(void)
     init_box64_env();
     init_jump_tables();
     pthread_mutex_lock( &arena_mutex );
-    dynarec_ready = create_arena( NX_ARENA_SIZE );
+    dynarec_ready = create_arena( 0 );
     pthread_mutex_unlock( &arena_mutex );
     if (!dynarec_ready) box64env.dynarec = 0;
 }

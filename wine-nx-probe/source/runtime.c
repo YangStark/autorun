@@ -804,8 +804,9 @@ static void runtime_report_interpreter(void)
             extern unsigned int wine_nx_box64_invalidations, wine_nx_box64_marked_lookups;
             extern unsigned int wine_nx_box64_callret_clean, wine_nx_box64_callret_dirty;
             extern unsigned int wine_nx_box64_translator_locks, wine_nx_box64_inline_unix_calls;
+            extern uint64_t wine_nx_box64_dynarec_bytes, wine_nx_box64_arena_bytes;
             snprintf( native, sizeof(native), " native_entries=%llu block_tests=%u invalidations=%u marked_lookups=%u"
-                      " callret_clean=%u callret_dirty=%u translator_locks=%u inline_unix=%u",
+                      " callret_clean=%u callret_dirty=%u translator_locks=%u inline_unix=%u code_mb=%llu/%llu",
                       __atomic_load_n( &wine_nx_box64_native_entries, __ATOMIC_RELAXED ),
                       __atomic_load_n( &wine_nx_box64_block_tests, __ATOMIC_RELAXED ),
                       __atomic_load_n( &wine_nx_box64_invalidations, __ATOMIC_RELAXED ),
@@ -813,7 +814,9 @@ static void runtime_report_interpreter(void)
                       __atomic_load_n( &wine_nx_box64_callret_clean, __ATOMIC_RELAXED ),
                       __atomic_load_n( &wine_nx_box64_callret_dirty, __ATOMIC_RELAXED ),
                       __atomic_load_n( &wine_nx_box64_translator_locks, __ATOMIC_RELAXED ),
-                      __atomic_load_n( &wine_nx_box64_inline_unix_calls, __ATOMIC_RELAXED ) );
+                      __atomic_load_n( &wine_nx_box64_inline_unix_calls, __ATOMIC_RELAXED ),
+                      (unsigned long long)(__atomic_load_n( &wine_nx_box64_dynarec_bytes, __ATOMIC_RELAXED ) >> 20),
+                      (unsigned long long)(wine_nx_box64_arena_bytes >> 20) );
         }
 #endif
         /* OpenGL: frames swapped and the time in eglSwapBuffers, calls into opengl32's unix
