@@ -10539,6 +10539,11 @@ static void *horizon_server_thread( void *param )
 
     horizon_server_current = connection;
     connection->request_pipe = horizon_pipe_from_fd( connection->request_fd );
+    /* A client blocks until this thread replies. At the program threads'
+     * priority (59) it waited for a round-robin slice behind whatever else ran
+     * on the core: 0.1-0.9 ms per request in NFSU2. Above them, below the audio
+     * feeder (56), it answers as soon as the client blocks. */
+    svcSetThreadPriority( CUR_THREAD_HANDLE, 0x39 );
     for (;;)
     {
         struct horizon_server_request_header *header = (void *)message;
