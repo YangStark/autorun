@@ -1076,6 +1076,14 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
         if (target[1] != ':' && launcher_keys_path( target, keys_path, sizeof(keys_path) ))
             read_key_map( keys_path );
     }
+    /* Its own Box64 options, read when its first x86 code runs: SPEED2.box64.txt. */
+    {
+        extern char wine_nx_box64_options_path[] __attribute__((weak));
+
+        if (&wine_nx_box64_options_path && target[1] != ':')
+            launcher_sibling_path( target, ".box64.txt", wine_nx_box64_options_path, 512 );
+    }
+
     cmdline_str = dos_path;
     if (target[1] != ':' && launcher_args_path( target, args_path, sizeof(args_path) ) &&
         read_first_line( args_path, args_buf, sizeof(args_buf) ) &&

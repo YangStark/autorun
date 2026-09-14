@@ -38,6 +38,7 @@
 #include <unistd.h>
 #endif
 
+#include "box64_options.h"
 #include "alternate.h"
 #include "box64context.h"
 #include "bridge.h"
@@ -207,6 +208,58 @@ static void init_jump_tables(void)
     jmptbl_oom_entry = (uintptr_t)native_next;
 }
 
+/* The options a program's options file may set (box64_options.h): trade-offs in
+ * the code the dynarec generates. WAIT stays on, as below. */
+static const struct { const char *name; int *value; int min, max; } nx_box64_options[] =
+{
+    { "BOX64_DYNAREC_ALIGNED_ATOMICS", &box64env.dynarec_aligned_atomics, 0, 1 },
+    { "BOX64_DYNAREC_BIGBLOCK", &box64env.dynarec_bigblock, 0, 3 },
+    { "BOX64_DYNAREC_CALLRET", &box64env.dynarec_callret, 0, 2 },
+    { "BOX64_DYNAREC_DF", &box64env.dynarec_df, 0, 1 },
+    { "BOX64_DYNAREC_DIV0", &box64env.dynarec_div0, 0, 1 },
+    { "BOX64_DYNAREC_FASTNAN", &box64env.dynarec_fastnan, 0, 1 },
+    { "BOX64_DYNAREC_FASTROUND", &box64env.dynarec_fastround, 0, 2 },
+    { "BOX64_DYNAREC_FORWARD", &box64env.dynarec_forward, 0, 1024 },
+    { "BOX64_DYNAREC_NATIVEFLAGS", &box64env.dynarec_nativeflags, 0, 1 },
+    { "BOX64_DYNAREC_PAUSE", &box64env.dynarec_pause, 0, 3 },
+    { "BOX64_DYNAREC_SAFEFLAGS", &box64env.dynarec_safeflags, 0, 2 },
+    { "BOX64_DYNAREC_STRONGMEM", &box64env.dynarec_strongmem, 0, 3 },
+    { "BOX64_DYNAREC_WEAKBARRIER", &box64env.dynarec_weakbarrier, 0, 2 },
+    { "BOX64_DYNAREC_X87DOUBLE", &box64env.dynarec_x87double, 0, 2 },
+};
+
+/* Set by the runtime before the first run: the program's .box64.txt. */
+char wine_nx_box64_options_path[512];
+extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+
+static void apply_box64_options(void)
+{
+    char line[256], name[64], message[768];
+    const char *file_name = strrchr( wine_nx_box64_options_path, '/' );
+    size_t used, i;
+    long value;
+    FILE *file;
+
+    if (!wine_nx_box64_options_path[0] || !(file = fopen( wine_nx_box64_options_path, "r" ))) return;
+    used = snprintf( message, sizeof(message), "[BOX64] %s:", file_name ? file_name + 1 : wine_nx_box64_options_path );
+    while (fgets( line, sizeof(line), file ))
+    {
+        if (!nx_box64_option_line( line, name, sizeof(name), &value )) continue;
+        for (i = 0; i < sizeof(nx_box64_options) / sizeof(nx_box64_options[0]); i++)
+            if (!strcmp( name, nx_box64_options[i].name )) break;
+        if (i == sizeof(nx_box64_options) / sizeof(nx_box64_options[0]) ||
+            value < nx_box64_options[i].min || value > nx_box64_options[i].max)
+        {
+            if (used < sizeof(message)) used += snprintf( message + used, sizeof(message) - used, " %s=%ld refused", name, value );
+            continue;
+        }
+        *nx_box64_options[i].value = (int)value;
+        if (used < sizeof(message)) used += snprintf( message + used, sizeof(message) - used, " %s=%ld", name, value );
+    }
+    fclose( file );
+    if (&wine_nx_runtime_trace) wine_nx_runtime_trace( message );
+}
+
 static void init_box64_env(void)
 {
     /* Box64's own defaults for every option, then the CPU this backend
@@ -234,6 +287,7 @@ static void init_box64_env(void)
      * alias does not allow. Keep that optimization disabled. */
     box64env.dynarec_callret = 0;
     box64env.dynarec_wait = 1; /* tracked lock ownership for translation faults */
+    apply_box64_options();
 }
 
 static void init_dynarec(void)
