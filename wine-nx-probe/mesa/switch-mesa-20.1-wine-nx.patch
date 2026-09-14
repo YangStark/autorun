@@ -347,7 +347,7 @@
     return !nouveau_bo_memtype(mt->base.bo);
  }
  
-@@ -366,6 +388,74 @@
+@@ -366,6 +388,78 @@
     return !mt->base.fence_wr || nouveau_fence_wait(mt->base.fence_wr, &nvc0->base.debug);
  }
  
@@ -376,12 +376,16 @@
 +       util_format_is_depth_or_stencil(res->format))
 +      return NULL;
 +
-+   /* PIPE_USAGE_STAGING makes a single-level 2D texture linear, so it maps. */
++   /* PIPE_USAGE_STAGING makes a single-level 2D texture linear, so it maps.
++    * Its sides go up to powers of two from 64: at the exact size of each
++    * upload, libdrm's buffer cache rarely had a buffer to give back, and a game
++    * updating textures every frame allocated and mapped hundreds a second.
++    * The blits copy only the box, so the spare area is never read. */
 +   memset(&templ, 0, sizeof(templ));
 +   templ.target = PIPE_TEXTURE_2D;
 +   templ.format = res->format;
-+   templ.width0 = box->width;
-+   templ.height0 = box->height;
++   templ.width0 = MAX2(util_next_power_of_two(box->width), 64);
++   templ.height0 = MAX2(util_next_power_of_two(box->height), 64);
 +   templ.depth0 = 1;
 +   templ.array_size = 1;
 +   templ.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET;
@@ -422,7 +426,7 @@
  void *
  nvc0_miptree_transfer_map(struct pipe_context *pctx,
                            struct pipe_resource *res,
-@@ -383,9 +473,15 @@
+@@ -383,9 +477,15 @@
     unsigned flags = 0;
  
     if (nvc0_mt_transfer_can_map_directly(mt)) {
@@ -438,7 +442,7 @@
        if (ret &&
            (usage & PIPE_TRANSFER_MAP_DIRECTLY))
           return NULL;
-@@ -414,7 +510,21 @@
+@@ -414,7 +514,21 @@
     }
     tx->nlayers = box->depth;
  
@@ -460,7 +464,7 @@
        tx->base.stride = mt->level[level].pitch;
        tx->base.layer_stride = mt->layer_stride;
        uint32_t offset = box->y * tx->base.stride +
-@@ -434,6 +544,9 @@
+@@ -434,6 +548,9 @@
  
     size = tx->base.layer_stride;
  
@@ -470,7 +474,7 @@
     ret = nouveau_bo_new(dev, NOUVEAU_BO_GART | NOUVEAU_BO_MAP, 0,
                          size * tx->nlayers, NULL, &tx->rect[1].bo);
     if (ret) {
-@@ -498,6 +611,37 @@
+@@ -498,6 +615,37 @@
     struct nv50_miptree *mt = nv50_miptree(tx->base.resource);
     unsigned i;
  
