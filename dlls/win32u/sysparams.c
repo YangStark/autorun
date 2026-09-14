@@ -2384,7 +2384,10 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
         if (!read_source_mode( source->key, ENUM_CURRENT_SETTINGS, &virtual ) || is_detached_mode( &virtual ))
             virtual = physical;
 
-        if ((virtual_modes = get_virtual_modes( current, &physical, host_modes, host_modes_count, &virtual_count )))
+        /* EmulateModelist=Y keeps a driver's single mode the only one, so the
+         * program cannot pick a smaller mode that would be scaled to the screen. */
+        if (emulate_modelist &&
+            (virtual_modes = get_virtual_modes( current, &physical, host_modes, host_modes_count, &virtual_count )))
         {
             modes_count = virtual_count;
             modes = virtual_modes;
