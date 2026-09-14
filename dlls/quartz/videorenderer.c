@@ -505,8 +505,12 @@ HRESULT video_renderer_default_create(IUnknown *outer, IUnknown **out)
 {
     HRESULT hr;
 
-    if (SUCCEEDED(hr = vmr7_create(outer, out)))
+    /* Wine-NX draws with GDI by default. VMR7 goes through DirectDraw, whose
+     * OpenGL surface belongs to a hidden window yet takes the Switch's only
+     * screen, and whose windowed presents are GDI copies to that same screen:
+     * the picture never shows. */
+    if (SUCCEEDED(hr = video_renderer_create(outer, out)))
         return hr;
 
-    return video_renderer_create(outer, out);
+    return vmr7_create(outer, out);
 }
