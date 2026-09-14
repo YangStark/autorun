@@ -1758,6 +1758,8 @@
 @ extern -private __wine_syscall_dispatcher
 @ extern -private wine_nx_pe_teb
 @ extern -private wine_nx_pe_hash_table
+# Where the runtime put KUSER_SHARED_DATA: Horizon cannot always map 0x7ffe0000.
+@ extern -private wine_nx_user_shared_data user_shared_data
 # Set by the Switch WoW64 bootstrap, which bypasses init_wow64().
 @ extern -private -arch=aarch64 pWow64SuspendLocalThread
 @ extern -private -arch=aarch64 pWow64PrepareForException

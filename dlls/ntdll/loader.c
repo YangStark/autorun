@@ -4270,7 +4270,7 @@ static void wine_nx_patch_ntdll_dispatchers(void)
     WINE_MODREF *ntdll;
     void **syscall_dispatcher;
     void **unix_call_dispatcher;
-    void **pe_teb;
+    void **pe_teb, **pe_user_shared_data;
     LIST_ENTRY **pe_hash_table_export;
     unixlib_handle_t *unixlib_handle;
 
@@ -4290,6 +4290,7 @@ static void wine_nx_patch_ntdll_dispatchers(void)
     unix_call_dispatcher = RtlFindExportedRoutineByName( ntdll->ldr.DllBase, "__wine_unix_call_dispatcher" );
     unixlib_handle = RtlFindExportedRoutineByName( ntdll->ldr.DllBase, "__wine_unixlib_handle" );
     pe_teb = RtlFindExportedRoutineByName( ntdll->ldr.DllBase, "wine_nx_pe_teb" );
+    pe_user_shared_data = RtlFindExportedRoutineByName( ntdll->ldr.DllBase, "wine_nx_user_shared_data" );
     pe_hash_table_export = RtlFindExportedRoutineByName( ntdll->ldr.DllBase, "wine_nx_pe_hash_table" );
     if (!pe_hash_table_export || !*pe_hash_table_export)
     {
@@ -4309,6 +4310,8 @@ static void wine_nx_patch_ntdll_dispatchers(void)
     *unix_call_dispatcher = __wine_unix_call_dispatcher;
     *unixlib_handle = __wine_unixlib_handle;
     if (pe_teb) *pe_teb = NtCurrentTeb();
+    /* the page is not always at 0x7ffe0000 on Horizon (virtual_alloc_first_teb) */
+    if (pe_user_shared_data) *pe_user_shared_data = user_shared_data;
     patched = TRUE;
 
     wine_nx_trace( "[LDR] PE ntdll dispatchers patched syscall=%p unix=%p handle=%p teb=%p",
@@ -4316,6 +4319,8 @@ static void wine_nx_patch_ntdll_dispatchers(void)
                    (void *)(ULONG_PTR)*unixlib_handle, pe_teb ? *pe_teb : NULL );
     if (!pe_teb)
         wine_nx_trace( "[LDR] WARNING: PE ntdll lacks wine_nx_pe_teb; replace system32/ntdll.dll with the packaged build" );
+    if (!pe_user_shared_data)
+        wine_nx_trace( "[LDR] WARNING: PE ntdll lacks wine_nx_user_shared_data; it reads KUSER_SHARED_DATA at 0x7ffe0000" );
 
     /* The bootstrap path set peb->ProcessHeap via the shim in ntdll_pe_compat.c
      * (returns sentinel 0x1000). That's fine for our internal loader code which

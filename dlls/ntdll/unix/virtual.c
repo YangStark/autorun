@@ -4686,6 +4686,24 @@ TEB *virtual_alloc_first_teb(void)
      * current (wine_nx_start_user_shared_data_clock), so it stays writable. */
     status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&user_shared_data, 0, &data_size,
                                       MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    if (status)
+    {
+        /* Horizon scatters the heap and alias regions through the address
+         * space at every launch and refuses mappings inside them, so the
+         * Windows address of this page is available or not by luck - on the
+         * 32-bit profile that a fixed low image base needs, it is often not.
+         * Wine itself reaches the page through this pointer, so only a program
+         * reading KUSER_SHARED_DATA at its ABI address loses anything, and
+         * that beats refusing to start. */
+        void *fallback = NULL;
+
+        ERR( "the shared user data address %p is unavailable, status %08x; moving it\n",
+             user_shared_data, status );
+        data_size = page_size;
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), &fallback, 0, &data_size,
+                                          MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+        if (!status) user_shared_data = fallback;
+    }
 #else
     status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&user_shared_data, 0, &data_size,
                                       MEM_RESERVE | MEM_COMMIT, PAGE_READONLY );

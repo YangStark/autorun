@@ -34,6 +34,7 @@ struct pseudo_console
 extern WCHAR *file_name_AtoW( LPCSTR name, BOOL alloc );
 extern DWORD file_name_WtoA( LPCWSTR src, INT srclen, LPSTR dest, INT destlen );
 extern void init_global_data(void);
+extern void init_user_shared_data(void);
 extern void init_startup_info( RTL_USER_PROCESS_PARAMETERS *params );
 extern void init_locale( HMODULE module );
 extern void init_console(void);

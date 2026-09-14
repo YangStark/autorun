@@ -2178,6 +2178,7 @@ NTSTATUS wine_nx_prepare_wow64_ntdll( HMODULE native, HMODULE guest )
         "RtlUserThreadStart", "__wine_syscall_dispatcher", "__wine_unix_call_dispatcher",
         "__wine_unixlib_handle" };
     unsigned int i;
+    ULONG *usd;
     exports = get_module_data_dir( native, IMAGE_DIRECTORY_ENTRY_EXPORT, NULL );
     if (!exports) return STATUS_INVALID_IMAGE_FORMAT;
     for (i = 0; i < ARRAY_SIZE(native_names); i++)
@@ -2186,6 +2187,11 @@ NTSTATUS wine_nx_prepare_wow64_ntdll( HMODULE native, HMODULE guest )
     if (!exports) return STATUS_INVALID_IMAGE_FORMAT;
     for (i = 0; i < ARRAY_SIZE(guest_names); i++)
         if (!find_named_export( guest, exports, guest_names[i] )) return STATUS_PROCEDURE_NOT_FOUND;
+    /* The x86 ntdll reads KUSER_SHARED_DATA through this pointer, and the page is
+     * not always at 0x7ffe0000 on Horizon (virtual_alloc_first_teb). */
+    if ((usd = (void *)find_named_export( guest, exports, "wine_nx_user_shared_data" )) &&
+        (ULONG_PTR)user_shared_data <= 0xffffffff)
+        *usd = PtrToUlong( user_shared_data );
     load_ntdll_functions( native );
     load_ntdll_wow64_functions( guest );
     return STATUS_SUCCESS;

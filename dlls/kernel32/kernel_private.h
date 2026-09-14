@@ -41,6 +41,7 @@ static inline BOOL set_ntstatus( NTSTATUS status )
 }
 
 extern SYSTEM_BASIC_INFORMATION system_info;
+extern const struct _KUSER_SHARED_DATA *user_shared_data;
 
 extern WCHAR *FILE_name_AtoW( LPCSTR name, BOOL alloc );
 extern DWORD FILE_name_WtoA( LPCWSTR src, INT srclen, LPSTR dest, INT destlen );

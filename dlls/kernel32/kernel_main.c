@@ -123,11 +123,26 @@ static void copy_startup_info(void)
     RtlReleasePebLock();
 }
 
+const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
+
+/* Wine-NX cannot always map the page at its Windows address on Horizon; ntdll
+ * exports where it is. */
+static void init_user_shared_data(void)
+{
+    const UNICODE_STRING name = RTL_CONSTANT_STRING( L"ntdll.dll" );
+    const struct _KUSER_SHARED_DATA **ptr;
+    HMODULE ntdll;
+
+    if (LdrGetDllHandle( NULL, 0, &name, &ntdll )) return;
+    if ((ptr = RtlFindExportedRoutineByName( ntdll, "wine_nx_user_shared_data" ))) user_shared_data = *ptr;
+}
+
 /***********************************************************************
  *           KERNEL process initialisation routine
  */
 static BOOL process_attach( HMODULE module )
 {
+    init_user_shared_data();
     RtlSetUnhandledExceptionFilter( UnhandledExceptionFilter );
 
     NtQuerySystemInformation( SystemBasicInformation, &system_info, sizeof(system_info), NULL );

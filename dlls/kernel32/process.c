@@ -40,8 +40,6 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(process);
 
-static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
-
 typedef struct
 {
     LPSTR lpEnvAddress;

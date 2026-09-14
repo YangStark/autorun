@@ -58,6 +58,7 @@
 #include "horizon_win_timers.h"
 #include "horizon_threads.h"
 #include "horizon_registry.h"
+#include "horizon_read_redirect.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -10792,12 +10793,61 @@ __attribute__((weak)) NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void
  * exception. Native Wine faults retain the existing handling path. */
 extern BOOL wine_nx_box64_handle_fault( ULONG_PTR address ) __attribute__((weak));
 
+#if defined(__aarch64__)
+/* KUSER_SHARED_DATA is not always at 0x7ffe0000 on Horizon (virtual_alloc_first_teb).
+ * Wine reads it through user_shared_data, but a program can read the Windows
+ * address directly: serve the read from the real page and carry on. Windows maps
+ * the page read-only, so a write stays an access violation. Each read costs an
+ * exception, so the log shows how often it happens. */
+static BOOL horizon_redirect_user_shared_data( ThreadExceptionDump *ctx )
+{
+    static const ULONG_PTR address = 0x7ffe0000;
+    static unsigned int count;
+    const unsigned char *page = (const unsigned char *)user_shared_data;
+    unsigned int exception_class = ctx->esr >> 26, i;
+    struct horizon_read_regs regs;
+    char buf[160];
+
+    if (!page || (ULONG_PTR)page == address) return FALSE;
+    /* data aborts with a valid FAR (FnV clear) reading the page (WnR clear) */
+    if ((exception_class != 0x24 && exception_class != 0x25) || (ctx->esr & ((1u << 10) | 0x40)) ||
+        ctx->far.x - address >= 0x1000)
+        return FALSE;
+    for (i = 0; i < 29; i++) regs.x[i] = ctx->cpu_gprs[i].x;
+    regs.x[29] = ctx->fp.x;
+    regs.x[30] = ctx->lr.x;
+    regs.sp = ctx->sp.x;
+    regs.pc = ctx->pc.x;
+    for (i = 0; i < 32; i++) regs.v[i] = ctx->fpu_gprs[i].v;
+    if (!horizon_redirect_read( &regs, *(const u32 *)(ULONG_PTR)ctx->pc.x, address, page, 0x1000 ))
+        return FALSE;
+    count++;
+    if (!(count & (count - 1)))
+    {
+        snprintf( buf, sizeof(buf), "[USD] %u reads of 0x7ffe0000 served from %p; last 0x%llx at pc=0x%llx",
+                  count, page, (unsigned long long)ctx->far.x, (unsigned long long)ctx->pc.x );
+        wine_nx_runtime_trace( buf );
+    }
+    for (i = 0; i < 29; i++) ctx->cpu_gprs[i].x = regs.x[i];
+    ctx->fp.x = regs.x[29];
+    ctx->lr.x = regs.x[30];
+    ctx->sp.x = regs.sp;
+    ctx->pc.x = regs.pc;
+    for (i = 0; i < 32; i++) ctx->fpu_gprs[i].v = regs.v[i];
+    return TRUE;
+}
+#endif
+
 void __libnx_exception_handler( ThreadExceptionDump *ctx )
 {
     EXCEPTION_RECORD rec = { 0 };
     DWORD64 esr = ctx->esr;
     NTSTATUS status;
     char buf[256];
+
+#if defined(__aarch64__)
+    if (horizon_redirect_user_shared_data( ctx )) horizon_resume_exception( ctx );
+#endif
 
     rec.ExceptionCode = STATUS_ACCESS_VIOLATION;
     rec.ExceptionAddress = (void *)ctx->pc.x;
