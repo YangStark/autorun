@@ -110,6 +110,7 @@ struct horizon_reg
     struct horizon_reg_key *root;      /* \Registry */
     long long (*now)(void);            /* the time for modified keys */
     void (*signal)( void *event );     /* signal a notification's event and release it */
+    void (*changed)( const struct horizon_reg_key *key ); /* persistence, under the registry lock */
 };
 
 /* What a key information query returns besides its data (enum_key_reply). */
@@ -207,6 +208,7 @@ static inline void horizon_reg_check_notify( struct horizon_reg *reg, struct hor
 static inline void horizon_reg_touch( struct horizon_reg *reg, struct horizon_reg_key *key, unsigned int change )
 {
     key->modif = reg->now();
+    if (reg->changed) reg->changed( key );
     horizon_reg_check_notify( reg, key, change, 1 );
     for (key = key->parent; key; key = key->parent) horizon_reg_check_notify( reg, key, change, 0 );
 }
@@ -285,6 +287,7 @@ static inline int horizon_reg_init( struct horizon_reg *reg, long long (*now)(vo
 {
     static const unsigned short name[] = {'R','e','g','i','s','t','r','y'};
 
+    reg->changed = NULL;
     reg->now = now;
     reg->signal = signal;
     reg->root = horizon_reg_alloc_key( name, sizeof(name), now() );
@@ -644,7 +647,7 @@ static inline unsigned int horizon_reg_set_value( struct horizon_reg *reg, struc
 
     namelen &= ~1u;
     if ((value = horizon_reg_find_value( key, name, namelen, &index )) &&
-        value->type == type && value->len == len && value->data && !memcmp( value->data, data, len ))
+        value->type == type && value->len == len && (!len || (value->data && !memcmp( value->data, data, len ))))
         return HORIZON_REG_SUCCESS;
     if ((key->flags & HORIZON_REG_FLAG_SYMLINK) &&
         (type != HORIZON_REG_LINK ||

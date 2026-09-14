@@ -80,9 +80,27 @@ static int horizon_rename(const char *from, const char *to)
     if (!access(to, F_OK)) { errno = EEXIST; return -1; }
     return rename(from, to);
 }
+static unsigned int hive_writes[2];
+static int fail_write;
+static void (*during_write)(void);
+static FILE *checked_fopen(const char *path, const char *mode)
+{
+    if (!strcmp(mode, "wb"))
+    {
+        /* Disk I/O must never retain the shared server mutex. */
+        assert(!pthread_mutex_trylock(&horizon_server_objects_mutex));
+        pthread_mutex_unlock(&horizon_server_objects_mutex);
+        hive_writes[strstr(path, "user.reg") != NULL]++;
+        if (during_write) { void (*callback)(void) = during_write; during_write = NULL; callback(); }
+        if (fail_write) { errno = EIO; return NULL; }
+    }
+    return fopen(path, mode);
+}
+#define fopen checked_fopen
 #define rename horizon_rename
 #include "../../dlls/ntdll/unix/horizon_registry_server.h"
 #undef rename
+#undef fopen
 #define CHECK_LAYOUT(n) _Static_assert(sizeof(struct horizon_##n) == sizeof(struct n), #n)
 CHECK_LAYOUT(create_key_request); CHECK_LAYOUT(create_key_reply);
 CHECK_LAYOUT(open_key_request); CHECK_LAYOUT(open_key_reply);
@@ -189,7 +207,8 @@ static void test_save_and_load(void)
     snprintf(path, sizeof(path), "%ssystem.reg", registry_dir);
     snprintf(tmp, sizeof(tmp), "%ssystem.reg.tmp", registry_dir);
     snprintf(user_file, sizeof(user_file), "%suser.reg", registry_dir);
-    /* main's set_key_value requests saved each hive */
+    /* main's requests are persisted in one maintenance pass. */
+    horizon_registry_flush();
     assert(!access(path, F_OK) && !access(user_file, F_OK) && access(tmp, F_OK));
 
     key = create_path(clsid, sizeof(clsid) - 2, 0, NULL, 0);
@@ -210,7 +229,7 @@ static void test_save_and_load(void)
     assert(!horizon_reg_set_value(&horizon_registry, key, dword_name, sizeof(dword_name) - 2, HORIZON_REG_DWORD, &dword, 4));
     horizon_reg_release(&horizon_registry, key);
 
-    horizon_registry_save(NULL);  /* over the files main's requests left */
+    horizon_registry_flush();  /* persist the batched mutations */
     assert(access(tmp, F_OK) && !access(path, F_OK));
     read_file(path, text_file, sizeof(text_file));
     assert(strstr(text_file, "WINE REGISTRY Version 2\n;; All keys relative to \\\\Machine\n") == text_file);
@@ -244,12 +263,67 @@ static void test_save_and_load(void)
     assert(!rename(path, tmp));
     reload();
     check_value(machine_key(), clsid, sizeof(clsid) - 2, none, 0, HORIZON_REG_SZ, dll, sizeof(dll));
-    horizon_registry_save(NULL);
+    horizon_registry_changed(machine_key());
+    horizon_registry_flush();
     assert(access(tmp, F_OK) && !access(path, F_OK));
 
     horizon_reg_release(&horizon_registry, horizon_registry.root);
     horizon_registry.root = NULL;
     assert(!unlink(path) && !unlink(user_file) && !rmdir(registry_dir));
+}
+static struct horizon_reg_key *concurrent_key;
+static void mutate_during_write(void)
+{
+    unsigned int value = 999;
+    pthread_mutex_lock(&horizon_server_objects_mutex);
+    assert(!horizon_reg_set_value(&horizon_registry, concurrent_key, none, 0,
+                                  HORIZON_REG_DWORD, &value, sizeof(value)));
+    pthread_mutex_unlock(&horizon_server_objects_mutex);
+}
+static void test_batching(void)
+{
+    static const unsigned short path[] = u"Software\\BatchTest";
+    struct horizon_reg_key *key;
+    unsigned int before[2], i, value;
+    unsigned long long generation;
+    horizon_registry_flush();
+    memcpy(before, hive_writes, sizeof(before));
+    key = create_path(path, sizeof(path) - 2, 0, NULL, 0);
+    for (value = 0; value < 100; value++)
+        assert(!horizon_reg_set_value(&horizon_registry, key, none, 0,
+                                     HORIZON_REG_DWORD, &value, sizeof(value)));
+    assert(!memcmp(before, hive_writes, sizeof(before)));
+    generation = horizon_registry_generation[0];
+    value = 99;
+    assert(!horizon_reg_set_value(&horizon_registry, key, none, 0, HORIZON_REG_DWORD, &value, sizeof(value)));
+    assert(generation == horizon_registry_generation[0]);
+    concurrent_key = key;
+    during_write = mutate_during_write;
+    horizon_registry_flush();
+    assert(hive_writes[0] == before[0] + 1 && hive_writes[1] == before[1]);
+    assert(horizon_registry_saved[0] != horizon_registry_generation[0]);
+    horizon_registry_flush();
+    assert(hive_writes[0] == before[0] + 2);
+    horizon_registry_flush();
+    assert(hive_writes[0] == before[0] + 2);
+    /* Empty unchanged values also avoid a save. */
+    assert(!horizon_reg_set_value(&horizon_registry, key, none, 0, HORIZON_REG_NONE, NULL, 0));
+    generation = horizon_registry_generation[0];
+    assert(!horizon_reg_set_value(&horizon_registry, key, none, 0, HORIZON_REG_NONE, NULL, 0));
+    assert(generation == horizon_registry_generation[0]);
+    fail_write = 1;
+    horizon_registry_flush();
+    assert(horizon_registry_saved[0] != generation);
+    fail_write = 0;
+    horizon_registry_flush();
+    assert(horizon_registry_saved[0] == generation);
+    for (i = 0; i < 2; i++) before[i] = hive_writes[i];
+    assert(!horizon_reg_delete(&horizon_registry, key));
+    assert(!key->parent);
+    horizon_registry_flush();
+    assert(hive_writes[0] == before[0] + 1 && hive_writes[1] == before[1]);
+    horizon_reg_release(&horizon_registry, key);
+    puts("Registry batching: unchanged values, hive-specific delete, retry, concurrent mutation and unlocked I/O passed");
 }
 int main(void)
 {
@@ -288,7 +362,14 @@ int main(void)
     assert(!status());
     set.namelen=100; horizon_server_handle_registry(&connection,(void *)&set,(void *)name,4);
     assert(status()==HORIZON_REG_INVALID_PARAMETER);
+    assert(!hive_writes[0] && !hive_writes[1]); /* requests did no SD writes */
+    assert(horizon_registry_flush_key(0xffffffffu) == HORIZON_STATUS_INVALID_HANDLE);
+    fail_write = 1;
+    assert(horizon_registry_flush_key(key) == 0xc0000001u);
+    fail_write = 0;
+    assert(!horizon_registry_flush_key(key));
     for(i=0;i<handle_count;i++) horizon_server_free_object(handles[i].object);
+    test_batching();
     test_save_and_load();
     puts("Registry server: protocol layouts, HKCU identity, COM/audio seeds, truncated replies, notifications and saved hives passed");
     return 0;

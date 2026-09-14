@@ -983,8 +983,10 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
      * hbloader after exit() is reported as an Atmosphere user-break crash. */
     if (handle == GetCurrentProcess() || handle == NULL)
     {
+        extern int horizon_registry_flush(void);
         extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
         extern void wine_nx_runtime_dump_std_streams(void) __attribute__((weak));
+        horizon_registry_flush();
         if (&wine_nx_runtime_trace)
         {
             char buf[96];

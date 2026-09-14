@@ -175,6 +175,11 @@ static void *log_flusher( void *arg )
         svcSleepThread( 200000000LL );
         runtime_tick_std_streams();
         if (++ticks % 25 == 0) runtime_report_interpreter();
+        if (ticks % 5 == 0)
+        {
+            extern int horizon_registry_flush(void);
+            horizon_registry_flush();
+        }
         if (ticks % 10 == 0) wine_nx_thread_balance();
         runtime_alternate_clean();
         pthread_mutex_lock( &log_mutex );

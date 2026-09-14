@@ -1632,6 +1632,10 @@ static DECLSPEC_NORETURN void exit_thread( int status )
  */
 void exit_process( int status )
 {
+#ifdef __SWITCH__
+    extern int horizon_registry_flush(void);
+    horizon_registry_flush();
+#endif
     wine_pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
     process_exit_wrapper( get_unix_exit_code( status ));
 }

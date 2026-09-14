@@ -1020,6 +1020,10 @@ done:
  */
 NTSTATUS WINAPI NtFlushKey( HANDLE key )
 {
+#ifdef __SWITCH__
+    extern unsigned int horizon_registry_flush_key( unsigned int handle );
+    return horizon_registry_flush_key( wine_server_obj_handle( key ) );
+#endif
     abstime_t timestamp_counter;
     data_size_t size = 0;
     unsigned int ret;

@@ -148,11 +148,24 @@ static void horizon_registry_save_subkeys( FILE *file, const struct horizon_reg_
     }
 }
 
-/* Write a hive to name.tmp and move it over name. Horizon's RenameFile does
- * not replace an existing file, so when the rename fails the old hive is
- * removed first; loading takes name.tmp if the process stops in between. A
- * failed write leaves the last complete hive in place. */
-static void horizon_registry_save_hive( const struct horizon_reg_key *hive, const char *root, const char *name )
+/* Mutations only advance the affected hive's generation. The runtime's
+ * maintenance thread serializes a consistent snapshot under the object lock,
+ * then does every SD operation after releasing it. A concurrent mutation or
+ * failed write leaves that generation dirty for the next pass. */
+static struct horizon_reg_key *horizon_registry_hives[2];
+static unsigned long long horizon_registry_generation[2], horizon_registry_saved[2];
+static pthread_mutex_t horizon_registry_flush_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void horizon_registry_changed( const struct horizon_reg_key *key )
+{
+    for (; key; key = key->parent)
+    {
+        if (key == horizon_registry_hives[0]) { horizon_registry_generation[0]++; return; }
+        if (key == horizon_registry_hives[1]) { horizon_registry_generation[1]++; return; }
+    }
+}
+
+static int horizon_registry_write_snapshot( const char *name, const char *data, size_t size )
 {
     char path[256], tmp[sizeof(path) + 4];
     FILE *file;
@@ -160,32 +173,64 @@ static void horizon_registry_save_hive( const struct horizon_reg_key *hive, cons
 
     snprintf( path, sizeof(path), "%s%s", HORIZON_REGISTRY_DIR, name );
     snprintf( tmp, sizeof(tmp), "%s.tmp", path );
-    if (!(file = fopen( tmp, "wb" ))) return;
-    setvbuf( file, NULL, _IOFBF, 64 * 1024 );
-    fprintf( file, "WINE REGISTRY Version 2\n;; All keys relative to %s\n", root );
-    horizon_registry_save_subkeys( file, hive, NULL );
-    error = ferror( file );
-    if (fclose( file ) || error) return;
-    if (rename( tmp, path ) == -1 && !unlink( path )) rename( tmp, path );
+    if (!access( tmp, F_OK ) && access( path, F_OK ))
+    {
+        if (errno != ENOENT || rename( tmp, path )) return 0;
+    }
+    if (!(file = fopen( tmp, "wb" ))) return 0;
+    error = fwrite( data, 1, size, file ) != size;
+    if (fclose( file )) error = 1;
+    if (error) { unlink( tmp ); return 0; }
+    /* Horizon cannot rename over an existing file. The loader recovers the
+     * complete .tmp if shutdown happens between unlink and the second rename. */
+    if (!rename( tmp, path )) return 1;
+    if (errno != EEXIST) return 0;
+    if (unlink( path )) return 0;
+    return !rename( tmp, path );
 }
 
-/* Save the hive holding key after a mutating request, or both hives when the
- * key is in neither (or deleted). This is intentionally best-effort: a
- * read-only SD card must not make RegSetValue fail. */
-static void horizon_registry_save( const struct horizon_reg_key *key )
+int horizon_registry_flush(void)
 {
-    static const unsigned short machine_name[] = {'M','a','c','h','i','n','e'};
-    static const unsigned short user_name[] = {'U','s','e','r'};
-    static const unsigned short sid_name[] = {'S','-','1','-','5','-','2','1','-','0','-','0','-','0','-','1','0','0','0'};
-    struct horizon_reg_key *machine, *user;
-    unsigned int index;
+    static const char *const names[] = { "system.reg", "user.reg" };
+    static const char *const roots[] = { "\\\\Machine", "\\\\User\\\\S-1-5-21-0-0-0-1000" };
+    unsigned int i;
+    int success = 1;
 
-    machine = horizon_reg_find_subkey( horizon_registry.root, machine_name, sizeof(machine_name), &index );
-    if ((user = horizon_reg_find_subkey( horizon_registry.root, user_name, sizeof(user_name), &index )))
-        user = horizon_reg_find_subkey( user, sid_name, sizeof(sid_name), &index );
-    while (key && key != machine && key != user) key = key->parent;
-    if (machine && (!key || key == machine)) horizon_registry_save_hive( machine, "\\\\Machine", "system.reg" );
-    if (user && (!key || key == user)) horizon_registry_save_hive( user, "\\\\User\\\\S-1-5-21-0-0-0-1000", "user.reg" );
+    /* Only one writer may use the .tmp files or advance saved generations. */
+    pthread_mutex_lock( &horizon_registry_flush_mutex );
+    for (i = 0; i < 2; i++)
+    {
+        char *data = NULL;
+        size_t size = 0;
+        unsigned long long generation;
+        FILE *file;
+        int error = 1, dirty;
+
+        pthread_mutex_lock( &horizon_server_objects_mutex );
+        generation = horizon_registry_generation[i];
+        dirty = horizon_registry_hives[i] && generation != horizon_registry_saved[i];
+        if (dirty)
+        {
+            if ((file = open_memstream( &data, &size )))
+            {
+                fprintf( file, "WINE REGISTRY Version 2\n;; All keys relative to %s\n", roots[i] );
+                horizon_registry_save_subkeys( file, horizon_registry_hives[i], NULL );
+                error = ferror( file );
+                if (fclose( file )) error = 1;
+            }
+        }
+        pthread_mutex_unlock( &horizon_server_objects_mutex );
+        if (!error && horizon_registry_write_snapshot( names[i], data, size ))
+        {
+            pthread_mutex_lock( &horizon_server_objects_mutex );
+            horizon_registry_saved[i] = generation;
+            pthread_mutex_unlock( &horizon_server_objects_mutex );
+        }
+        else if (dirty) success = 0;
+        free( data );
+    }
+    pthread_mutex_unlock( &horizon_registry_flush_mutex );
+    return success;
 }
 
 /* Returns whether path held a registry file. */
@@ -264,6 +309,11 @@ static unsigned int horizon_registry_init(void)
     }
     horizon_registry_load_hive( machine, "system.reg" );
     horizon_registry_load_hive( user, "user.reg" );
+    horizon_registry_hives[0] = machine;
+    horizon_registry_hives[1] = user;
+    memset( horizon_registry_generation, 0, sizeof(horizon_registry_generation) );
+    memset( horizon_registry_saved, 0, sizeof(horizon_registry_saved) );
+    horizon_registry.changed = horizon_registry_changed;
     return 0;
 }
 
@@ -298,6 +348,18 @@ static unsigned int horizon_registry_key( unsigned int handle, struct horizon_re
     *key = entry->object->reg_key;
     if ((*key)->flags & HORIZON_REG_FLAG_DELETED) return HORIZON_REG_KEY_DELETED;
     return 0;
+}
+
+/* RegFlushKey is synchronous even though ordinary mutations are batched. */
+unsigned int horizon_registry_flush_key( unsigned int handle )
+{
+    struct horizon_reg_key *key;
+    unsigned int status;
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    status = horizon_registry_key( handle, &key );
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    if (status) return status;
+    return horizon_registry_flush() ? 0 : 0xc0000001u; /* STATUS_UNSUCCESSFUL */
 }
 
 static int horizon_server_handle_registry( struct horizon_server_connection *connection,
@@ -380,11 +442,9 @@ static int horizon_server_handle_registry( struct horizon_server_connection *con
     {
     case HORIZON_REQ_DELETE_KEY:
         status = horizon_reg_delete( &horizon_registry, key );
-        if (!status) horizon_registry_save( key );
         break;
     case HORIZON_REQ_RENAME_KEY:
         status = horizon_reg_rename( &horizon_registry, key, (const void *)data, data_size );
-        if (!status) horizon_registry_save( key );
         break;
     case HORIZON_REQ_ENUM_KEY:
     {
@@ -408,7 +468,6 @@ static int horizon_server_handle_registry( struct horizon_server_connection *con
         if (req->namelen > data_size || (req->namelen & 1)) status = HORIZON_REG_INVALID_PARAMETER;
         else status = horizon_reg_set_value( &horizon_registry, key, (const void *)data, req->namelen,
                                              req->type, data + req->namelen, data_size - req->namelen );
-        if (!status) horizon_registry_save( key );
         break;
     }
     case HORIZON_REQ_GET_KEY_VALUE:
@@ -424,7 +483,6 @@ static int horizon_server_handle_registry( struct horizon_server_connection *con
     }
     case HORIZON_REQ_DELETE_KEY_VALUE:
         status = horizon_reg_delete_value( &horizon_registry, key, (const void *)data, data_size );
-        if (!status) horizon_registry_save( key );
         break;
     case HORIZON_REQ_SET_REGISTRY_NOTIFICATION:
     {
