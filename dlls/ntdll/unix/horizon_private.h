@@ -26,6 +26,9 @@ extern void wine_nx_thread_affinity_fixed( void ) __attribute__((weak));
 extern void horizon_get_memory_info( unsigned long long *total, unsigned long long *used );
 extern void horizon_get_address_space_limits( void **start, void **limit );
 extern int horizon_get_kernel_regions( void **starts, size_t *sizes, int max );
+/* Around re-protecting every view: the server's session views stay writable. */
+extern void horizon_lock_session_views( void );
+extern void horizon_unlock_session_views( void );
 extern void horizon_trace( const char *fmt, ... );
 extern void horizon_pin_current_thread( ULONG_PTR requested_mask );
 extern void *horizon_anon_mmap_fixed( void *start, size_t size, int prot, int flags );

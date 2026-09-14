@@ -4382,6 +4382,27 @@ static void horizon_server_remove_session_view_locked( unsigned long long base )
     }
 }
 
+/* virtual_set_force_exec re-protects every view from Wine's bookkeeping, where
+ * a client's session view is read-only, but this server copies session updates
+ * into those views: loading a DLL without NX_COMPAT into an NX process (regsvr32
+ * registering blizzard.ax) left them read-only and the next copy faulted in the
+ * server thread. It holds the lock across its loop, so no copy lands until the
+ * views are writable again. Called with virtual_mutex held; the server never
+ * takes virtual_mutex. */
+void horizon_lock_session_views( void )
+{
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+}
+
+void horizon_unlock_session_views( void )
+{
+    struct horizon_session_view *view;
+
+    for (view = horizon_session_views; view; view = view->next)
+        horizon_mprotect( (void *)(ULONG_PTR)view->base, view->size, PROT_READ | PROT_WRITE );
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+}
+
 static unsigned int horizon_server_alloc_user_handle_locked( unsigned short type,
                                                              struct horizon_obj_locator locator,
                                                              unsigned int pid, unsigned int tid,

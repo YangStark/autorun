@@ -5877,6 +5877,10 @@ void virtual_set_force_exec( BOOL enable )
     {
         force_exec_prot = enable;
 
+#ifdef __SWITCH__
+        /* The Horizon server writes into session views Wine records as read-only. */
+        horizon_lock_session_views();
+#endif
         WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
         {
             /* file mappings are always accessible */
@@ -5889,6 +5893,9 @@ void virtual_set_force_exec( BOOL enable )
 
             mprotect_range( view->base, view->size, commit, 0 );
         }
+#ifdef __SWITCH__
+        horizon_unlock_session_views();
+#endif
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
 }
