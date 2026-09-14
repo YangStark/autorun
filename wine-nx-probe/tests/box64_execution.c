@@ -118,7 +118,7 @@ static NTSTATUS read_guest( void *opaque, ULONG address, void *buffer, SIZE_T si
 }
 #ifdef WINE_NX_BOX64_DYNAREC
 extern void wine_nx_box64_invalidate( uintptr_t address, size_t size, int destroy );
-extern unsigned int wine_nx_box64_block_tests;
+extern unsigned int wine_nx_box64_block_tests, wine_nx_box64_translator_locks, wine_nx_box64_inline_unix_calls;
 #endif
 /* Translated code is only revalidated when a change is reported, as winebox64
  * does for NtFlushInstructionCache, so code written over code is reported. */
@@ -141,13 +141,29 @@ static void init_context( I386_CONTEXT *ctx, ULONG pc, ULONG sp )
     memcpy( ctx->ExtendedRegisters, &fx, sizeof(fx) );
 }
 static NTSTATUS native_call( void *opaque, ULONG number, ULONG arguments );
+static BOOL replace_context_once;
 static NTSTATUS native_unix_call( void *opaque, ULONGLONG handle, ULONG code, ULONG arguments )
 {
     struct fixture *f = opaque;
     assert( handle == 0xfedcba9876543210ULL && code == 17 && arguments == 0x10203040 );
     f->calls++;
     f->context->Edi = 0xbadc0de;
+    if (replace_context_once)
+    {
+        /* A whole new context, as NtContinue from a callback would set. */
+        f->context->Eip = BASE + 0x8020;
+        f->context->Esp = BASE + 0x6000;
+        f->context->Eax = 0x1234;
+    }
     return STATUS_INVALID_HANDLE;
+}
+static BOOL replaced_once( void *opaque )
+{
+    BOOL replaced = replace_context_once;
+
+    (void)opaque;
+    replace_context_once = FALSE;
+    return replaced;
 }
 static const struct wine_nx_wow64_host host = {read_guest, native_call, native_unix_call, NULL};
 
@@ -564,6 +580,34 @@ int main(void)
         assert( context.Eax == 5000 && context.Ecx == 0 );
         assert( wine_nx_box64_block_tests - tests_before < 50 );
     }
+    /* Leaving translated code for a gate takes no translator lock: every
+     * thread's system and unix calls used to contend for it, twice a call. */
+    {
+        static const unsigned char gate_loop[] = {
+            0xb9,0xe8,0x03,0,0,                 /* mov ecx, 1000 */
+            0x68,0x40,0x30,0x20,0x10,           /* args */
+            0x6a,17,                            /* code */
+            0x68,0x98,0xba,0xdc,0xfe,           /* high handle word */
+            0x68,0x10,0x32,0x54,0x76,           /* low handle word */
+            0xba,0x10,0x80,0,0x10,              /* Unix-call gate */
+            0xff,0xd2,                          /* call edx */
+            0x49,                               /* dec ecx */
+            0x75,0xe5,                          /* jnz args */
+            0xba,0x20,0x80,0,0x10,0xff,0xe2     /* completion */
+        };
+        unsigned int calls_before = f.calls, locks_before, inline_before;
+
+        put_code( memory, 0xc00, gate_loop, sizeof(gate_loop) );
+        init_context( &context, BASE + 0xc00, BASE + 0x6000 );
+        locks_before = wine_nx_box64_translator_locks;
+        inline_before = wine_nx_box64_inline_unix_calls;
+        assert( !wine_nx_box64_run( &context, 0, &f.gates, &host, &f, BASE + 0x8020, 100000, &executed ) );
+        printf( "gate loop: %u unix calls, %u made in the run loop, %u translator locks\n", f.calls - calls_before,
+                wine_nx_box64_inline_unix_calls - inline_before, wine_nx_box64_translator_locks - locks_before );
+        assert( context.Ecx == 0 && context.Esp == BASE + 0x6000 && context.Edi == 0xbadc0de );
+        assert( f.calls - calls_before == 1000 && wine_nx_box64_inline_unix_calls - inline_before == 1000 );
+        assert( wine_nx_box64_translator_locks - locks_before < 50 );
+    }
 #ifndef __SWITCH__
     /* CALLRET: a RET into a block whose code was reported changed while the call
      * ran lands on the undefined instruction Box64 put at the return site.
@@ -633,6 +677,20 @@ int main(void)
     }
 #endif
 #endif
+    /* A unix call that replaces the whole context (NtContinue from a callback):
+     * the run goes on from the new context, keeping its Eax. */
+    {
+        const struct wine_nx_wow64_host replacing_host = {read_guest, native_call, native_unix_call, replaced_once};
+        unsigned int calls_before = f.calls;
+
+        init_context( &context, BASE + 0x400, BASE + 0x6000 );
+        replace_context_once = TRUE;
+        assert( !wine_nx_box64_run( &context, BASE + 0x3000, &f.gates, &replacing_host, &f,
+                                   BASE + 0x8020, 100, &executed ) );
+        assert( !replace_context_once && f.calls == calls_before + 1 );
+        assert( context.Eip == BASE + 0x8020 && context.Esp == BASE + 0x6000 && context.Eax == 0x1234 );
+    }
+
     /* Instruction-fetch failures are reported without dereferencing the PC. */
     init_context( &context, BASE - 1, BASE + 0x6000 );
     assert( wine_nx_box64_run( &context, 0, &f.gates, &host, &f, 0, 10, &executed ) == STATUS_ACCESS_VIOLATION );

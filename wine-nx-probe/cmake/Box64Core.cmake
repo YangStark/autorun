@@ -115,6 +115,15 @@ function(wine_nx_add_box64_core target)
     # block dirty also flushes the caches, as every other rewrite does; a
     # stale fetch would run the NOP and return into changed code unchecked.
     string(PREPEND dynablock_source "void* DynarecMapWritableAddress(void* addr);\n")
+    # Every system call and unix call ends at a gate, which is on a page the
+    # dynarec may not translate. Box64 finds that out only after taking the
+    # global translator lock, twice per gate (LinkNext, then EmuRun), so every
+    # thread calling out contended for it. The protection check is lock-free
+    # here; Box64 repeats it under the lock for pages that are executable.
+    wine_nx_box64_patch(dynablock_source
+        "    pthread_sigmask(SIG_BLOCK, &critical_prot, &old_sig);\n    if(need_lock) {"
+        "    if((getProtection_fast(addr)&req_prot)!=req_prot)\n        return NULL;\n    pthread_sigmask(SIG_BLOCK, &critical_prot, &old_sig);\n    if(need_lock) {"
+        "refuse untranslatable pages before the translator lock")
     wine_nx_box64_patch(dynablock_source
         "                *(uint32_t*)(db->block+db->callrets[i].offs) = ARCH_UDF;\n        }\n        #endif\n    }\n}"
         "                *(uint32_t*)(db->block+db->callrets[i].offs) = ARCH_UDF;\n            ClearCache(db->block, db->size);\n        }\n        #endif\n    }\n}"
@@ -132,6 +141,12 @@ function(wine_nx_add_box64_core target)
     endif()
     list(REMOVE_ITEM dynarec_sources "${root}/src/dynarec/dynarec.c")
     file(READ "${root}/src/dynarec/dynarec.c" dispatch_source)
+    # A gate or the run's completion address ends the run before the block
+    # lookup: otherwise it fails, and the interpreter starts only for its hook
+    # to stop the run again and unwind with longjmp.
+    wine_nx_box64_patch(dispatch_source "            dynablock_t* block = (skip)?NULL:DBGetBlock(emu, R_RIP, 1, is32bits);"
+        "            extern int wine_nx_box64_stop_at(x64emu_t* emu, uintptr_t pc);\n            if(wine_nx_box64_stop_at(emu, R_RIP))\n                break;\n            dynablock_t* block = (skip)?NULL:DBGetBlock(emu, R_RIP, 1, is32bits);"
+        "end runs at gates without a block lookup")
     wine_nx_box64_patch(dispatch_source "                native_prolog(emu, block->block);"
         "                extern unsigned long long wine_nx_box64_native_entries;\n                __atomic_add_fetch(&wine_nx_box64_native_entries, 1, __ATOMIC_RELAXED);\n                native_prolog(emu, block->block);" "count native dispatch entries")
     set(dispatch_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-dynarec.c")

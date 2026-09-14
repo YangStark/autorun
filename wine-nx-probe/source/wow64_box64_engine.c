@@ -25,6 +25,7 @@
 #ifdef WINE_NX_BOX64_DYNAREC
 extern int wine_nx_box64_dynarec_init(void);
 extern void wine_nx_box64_dynarec_add_stop( uint32_t address );
+extern void wine_nx_box64_dynarec_add_gate( uint32_t address );
 
 static inline uint64_t current_x18(void)
 {
@@ -50,6 +51,10 @@ struct nx_engine
     NTSTATUS status;
     pthread_mutex_t *held_mutex;
     int dynarec;    /* running under Box64's dynarec (EmuRun) rather than Run */
+    I386_CONTEXT *context;          /* the run's context, which unix calls publish to */
+    struct nx_engine *previous;     /* active_engine outside the run */
+    unsigned int native_fpcr;       /* the host's FPCR, restored for unix calls */
+    int context_replaced;           /* a unix call in EmuRun replaced the context */
 };
 
 static __thread struct nx_engine *active_engine;
@@ -105,6 +110,7 @@ static void stop_engine( x64emu_t *emu, NTSTATUS status )
 #endif
 }
 
+
 BOOL wine_nx_box64_handle_fault( ULONG_PTR address )
 {
     if (!active_engine || address > 0xffffffffu) return FALSE;
@@ -125,9 +131,18 @@ BOOL wine_nx_box64_handle_fault( ULONG_PTR address )
  * or LOCK instruction can fault while holding this mutex; release it back on
  * the normal stack after the fault boundary unwinds. No PE callbacks execute
  * while active_engine points at the engine holding the mutex. */
+/* For [PROGRESS]: how often the dynarec's global translator lock was taken. */
+unsigned int wine_nx_box64_translator_locks;
+
 int wine_nx_box64_mutex_lock( pthread_mutex_t *mutex )
 {
-    int ret = pthread_mutex_lock( mutex );
+    int ret;
+
+#ifdef WINE_NX_BOX64_DYNAREC
+    if (mutex == &core_context.mutex_dyndump)
+        __atomic_add_fetch( &wine_nx_box64_translator_locks, 1, __ATOMIC_RELAXED );
+#endif
+    ret = pthread_mutex_lock( mutex );
     if (!ret && active_engine) active_engine->held_mutex = mutex;
     return ret;
 }
@@ -362,6 +377,99 @@ static NTSTATUS export_context( struct nx_engine *engine, I386_CONTEXT *ctx )
     return STATUS_SUCCESS;
 }
 
+#ifdef WINE_NX_BOX64_DYNAREC
+/* For [PROGRESS]: unix calls made without leaving Box64's EmuRun. */
+unsigned int wine_nx_box64_inline_unix_calls;
+
+static void get_integer_state( const I386_CONTEXT *ctx, ULONG state[10] )
+{
+    state[0] = ctx->Eax; state[1] = ctx->Ebx; state[2] = ctx->Ecx; state[3] = ctx->Edx;
+    state[4] = ctx->Esi; state[5] = ctx->Edi; state[6] = ctx->Ebp; state[7] = ctx->Esp;
+    state[8] = ctx->Eip; state[9] = ctx->EFlags;
+}
+
+/* A unix call from translated code, made in EmuRun. Leaving the run for it
+ * (export_context, wine_nx_wow64_dispatch_gate, import_context) copied the FPU
+ * state twice and switched fenv and EmuRun for each of ~250,000 OpenGL calls a
+ * second from Direct3D's drawing thread in NFSU2, about 13% of that thread.
+ * As the dispatch does, the continuation is published first, so a callback or
+ * NtContinue during the call sees the live integer state and control words;
+ * the x87 stack and XMM registers stay in the emulator (the i386 ABI leaves the
+ * x87 stack empty and XMM registers unpreserved across a call). A call that
+ * changed the context goes on from its integer state; one that replaced it is
+ * imported whole by the run loop. FALSE leaves the gate to the loop. */
+static BOOL inline_unix_call( struct nx_engine *engine )
+{
+    x64emu_t *emu = &engine->emu;
+    I386_CONTEXT *ctx = engine->context;
+    ULONG esp = emu->regs[_SP].dword[0], stack[5], published[10], now[10];
+    WORD cw = emu->cw.x16;
+    unsigned int fpcr;
+    NTSTATUS status;
+
+    if (esp > 0xffffffffu - 20u) return FALSE;
+    /* The call to the gate has just stored these. */
+    memcpy( stack, (void *)(uintptr_t)esp, sizeof(stack) );
+    UpdateFlags( emu );
+    ctx->Eax = emu->regs[_AX].dword[0]; ctx->Ebx = emu->regs[_BX].dword[0];
+    ctx->Ecx = emu->regs[_CX].dword[0]; ctx->Edx = emu->regs[_DX].dword[0];
+    ctx->Esi = emu->regs[_SI].dword[0]; ctx->Edi = emu->regs[_DI].dword[0];
+    ctx->Ebp = emu->regs[_BP].dword[0]; ctx->EFlags = emu->eflags.x64;
+    ctx->Eip = stack[0]; ctx->Esp = esp + 20;
+    ctx->FloatSave.ControlWord = cw;
+    memcpy( ctx->ExtendedRegisters + offsetof( XMM_SAVE_AREA32, ControlWord ), &cw, sizeof(cw) );
+    memcpy( ctx->ExtendedRegisters + offsetof( XMM_SAVE_AREA32, MxCsr ), &emu->mxcsr.x32, sizeof(emu->mxcsr.x32) );
+    get_integer_state( ctx, published );
+
+    /* As outside the run: faults are not the guest's, the FPU is the host's. */
+    active_engine = engine->previous;
+    fpcr = __builtin_aarch64_get_fpcr();
+    if (fpcr != engine->native_fpcr) __builtin_aarch64_set_fpcr( engine->native_fpcr );
+    status = engine->host->unix_call( engine->opaque, (ULONGLONG)stack[1] | ((ULONGLONG)stack[2] << 32),
+                                      stack[3], stack[4] );
+    if (fpcr != engine->native_fpcr) __builtin_aarch64_set_fpcr( fpcr );
+    active_engine = engine;
+    __atomic_add_fetch( &wine_nx_box64_inline_unix_calls, 1, __ATOMIC_RELAXED );
+
+    if (engine->host->context_replaced && engine->host->context_replaced( engine->opaque ))
+    {
+        engine->context_replaced = 1;
+        return FALSE;
+    }
+    get_integer_state( ctx, now );
+    if (memcmp( now, published, sizeof(now) ))
+    {
+        emu->regs[_BX].q[0] = ctx->Ebx; emu->regs[_CX].q[0] = ctx->Ecx;
+        emu->regs[_DX].q[0] = ctx->Edx; emu->regs[_SI].q[0] = ctx->Esi;
+        emu->regs[_DI].q[0] = ctx->Edi; emu->regs[_BP].q[0] = ctx->Ebp;
+        emu->regs[_SP].q[0] = ctx->Esp; emu->ip.q[0] = ctx->Eip;
+        emu->eflags.x64 = ctx->EFlags;
+    }
+    else
+    {
+        emu->regs[_SP].q[0] = esp + 20;
+        emu->ip.q[0] = stack[0];
+    }
+    ctx->Eax = status;
+    emu->regs[_AX].q[0] = status;
+    return TRUE;
+}
+
+/* Called by Box64's EmuRun (Box64Core.cmake) before it looks up a block. A
+ * unix call the host takes is made there; other gates and the completion
+ * address end the run, as the interpreter hook would, without a failed lookup
+ * and an interpreter start first. */
+int wine_nx_box64_stop_at( x64emu_t *emu, uintptr_t pc )
+{
+    struct nx_engine *engine = (struct nx_engine *)emu;
+
+    if (!engine->dynarec) return 0;
+    if (pc == engine->gates->unix_call && engine->host->unix_call) return !inline_unix_call( engine );
+    return pc == engine->gates->syscall || pc == engine->gates->unix_call ||
+           (engine->completion && pc == engine->completion);
+}
+#endif
+
 NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
                           const struct wine_nx_wow64_gates *gates,
                           const struct wine_nx_wow64_host *host, void *opaque,
@@ -396,6 +504,7 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
     else if (!(engine = calloc( 1, sizeof(*engine) ))) return STATUS_NO_MEMORY;
     __atomic_add_fetch( &wine_nx_box64_live_engines, 1, __ATOMIC_RELAXED );
     engine->gates = gates; engine->host = host; engine->opaque = opaque;
+    engine->context = context; engine->previous = previous;
     engine->fs_base = fs_base; engine->completion = completion_pc; engine->remaining = budget;
     engine->code_page = 1;
     engine->emu.context = &core_context;
@@ -406,8 +515,8 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
 #ifdef WINE_NX_BOX64_DYNAREC
     use_dynarec = wine_nx_box64_dynarec_init();
     /* Gates hold INT3 sentinels; the dynarec must leave them to the hook. */
-    wine_nx_box64_dynarec_add_stop( gates->syscall );
-    wine_nx_box64_dynarec_add_stop( gates->unix_call );
+    wine_nx_box64_dynarec_add_gate( gates->syscall );
+    wine_nx_box64_dynarec_add_gate( gates->unix_call );
     wine_nx_box64_dynarec_add_stop( completion_pc );
 #endif
     for (;;)
@@ -421,6 +530,9 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
         engine->emu.regs[_R8].q[0] = current_x18();
 #endif
         fegetenv( &native_fenv );
+#ifdef WINE_NX_BOX64_DYNAREC
+        engine->native_fpcr = __builtin_aarch64_get_fpcr();
+#endif
         active_engine = engine;
 #ifdef __SWITCH__
         if (!setjmp( engine->escape ))
@@ -442,6 +554,14 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
             engine->held_mutex = NULL;
         }
         fesetenv( &native_fenv );
+#ifdef WINE_NX_BOX64_DYNAREC
+        if (engine->context_replaced)
+        {
+            /* The replaced context is the state to run from, Eax included. */
+            engine->context_replaced = 0;
+            continue;
+        }
+#endif
         status = export_context( engine, context );
         if (engine->status) status = engine->status;
         if (status || (completion_pc && context->Eip == completion_pc)) break;

@@ -338,6 +338,25 @@ void wine_nx_box64_dynarec_add_stop( uint32_t address )
     pthread_mutex_unlock( &stop_page_mutex );
 }
 
+dynablock_t *CreateEmptyBlock( uintptr_t addr, int is32bits, int is_new );
+
+/* A gate is a stop, and also gets an empty block: translated code jumps to it
+ * through the jump table, whose default entry would take it through
+ * native_next, LinkNext and a failed block lookup first. An empty block's code
+ * goes straight to the epilog, with the gate in x27 as the jump left it. */
+void wine_nx_box64_dynarec_add_gate( uint32_t address )
+{
+    dynablock_t *block;
+
+    wine_nx_box64_dynarec_add_stop( address );
+    if (!address || !dynarec_ready || !isJumpTableDefault64( (void *)(uintptr_t)address )) return;
+    mutex_lock( &my_context->mutex_dyndump );
+    if (isJumpTableDefault64( (void *)(uintptr_t)address ) && (block = CreateEmptyBlock( address, 1, 1 )) &&
+        !addJumpTableIfDefault64( (void *)(uintptr_t)address, block->block ))
+        FreeDynablock( block, 0, 0 );
+    mutex_unlock( &my_context->mutex_dyndump );
+}
+
 /* Called by FillBlock64, which runs under the translator lock. */
 void wine_nx_box64_note_block_size( size_t size )
 {
