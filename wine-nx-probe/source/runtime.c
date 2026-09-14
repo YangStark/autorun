@@ -48,7 +48,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-94"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-98"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -809,12 +809,12 @@ static void runtime_report_interpreter(void)
         extern unsigned int wine_nx_nouveau_pinned_buffers __attribute__((weak));
         extern unsigned int wine_nx_nouveau_wrap_result __attribute__((weak));
         extern unsigned int wine_nx_nouveau_bo_new __attribute__((weak)), wine_nx_nouveau_bo_reused __attribute__((weak));
+        extern unsigned int wine_nx_nouveau_bo_evicted __attribute__((weak));
         extern unsigned long long wine_nx_nouveau_bo_new_ns __attribute__((weak));
         extern unsigned int wine_nx_nouveau_cache_cleans __attribute__((weak));
         extern unsigned long long wine_nx_nouveau_cache_clean_ns __attribute__((weak));
         extern int wine_nx_gl_pinned_memory __attribute__((weak));
         extern unsigned int wine_nx_syscall_counts[] __attribute__((weak));
-        extern unsigned int wine_nx_nouveau_bo_evicted __attribute__((weak));
         static unsigned int calls, last_reads = ~0u, last_frames = ~0u;
         static u64 start;
         unsigned int reads = &wine_nx_file_reads ? __atomic_load_n( &wine_nx_file_reads, __ATOMIC_RELAXED ) : 0;
@@ -909,18 +909,19 @@ static void runtime_report_interpreter(void)
                                  &wine_nx_nouveau_pinned_buffers ? wine_nx_nouveau_pinned_buffers : 0,
                                  &wine_nx_nouveau_wrap_result ? wine_nx_nouveau_wrap_result : 0 );
             /* Buffer objects created for the GPU, taken from the reuse cache instead,
-             * and the time creating them (each costs a heap block and nvservices calls). */
+             * destroyed to make room in it, and the time creating them (each costs a
+             * heap block and nvservices calls). */
             if (&wine_nx_nouveau_bo_new && len > 0 && len < (int)sizeof(gl))
                 len += snprintf( gl + len, sizeof(gl) - len,
                                  " bo_new=%u bo_reuse=%u bo_evict=%u bo_ms=%llu pin_cached=%d cleans=%u clean_ms=%llu",
                                  wine_nx_nouveau_bo_new, wine_nx_nouveau_bo_reused,
+                                 &wine_nx_nouveau_bo_evicted ? wine_nx_nouveau_bo_evicted : 0,
                                  wine_nx_nouveau_bo_new_ns / 1000000,
                                  &wine_nx_nouveau_pin_cached ? wine_nx_nouveau_pin_cached : 0,
                                  &wine_nx_nouveau_cache_cleans ? wine_nx_nouveau_cache_cleans : 0,
                                  &wine_nx_nouveau_cache_clean_ns ? wine_nx_nouveau_cache_clean_ns / 1000000 : 0 );
             if (&wine_nx_gl_profile && len > 0 && len < (int)sizeof(gl)) wine_nx_gl_profile( gl + len, sizeof(gl) - len );
         }
-                                 &wine_nx_nouveau_bo_evicted ? wine_nx_nouveau_bo_evicted : 0,
         /* Gaps in playback: audout ran out of queued frames. */
         if (&wine_nx_audio_underruns && wine_nx_audio_underruns)
             snprintf( audio, sizeof(audio), " audio_under=%u",
@@ -943,6 +944,10 @@ static void runtime_report_interpreter(void)
                   (unsigned long long)heap.uordblks >> 20, heap_free >> 20, systop, native, gl, audio );
         {
             extern void wine_nx_thread_report( void );
+            extern void horizon_memory_pool_stats( char *buffer, size_t size );
+            char pool_stats[192];
+            horizon_memory_pool_stats( pool_stats, sizeof(pool_stats) );
+            log_line( "%s", pool_stats );
             wine_nx_thread_report();
         }
         return;

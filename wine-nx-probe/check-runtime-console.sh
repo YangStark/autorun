@@ -43,4 +43,8 @@ flags="-std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-f
 "$build/thread_profile"
 "${CC:-clang}" $flags "$root/wine-nx-probe/tests/box64_options.c" -o "$build/box64_options"
 "$build/box64_options"
+"${CC:-clang}" $flags "$root/wine-nx-probe/tests/horizon_pool.c" -o "$build/horizon_pool"
+python3 "$root/wine-nx-probe/tests/check_horizon_backings.py"
+"$build/horizon_pool"
+python3 "$root/wine-nx-probe/tests/check_horizon_backings.py"
 python3 "$root/wine-nx-probe/tools/make-7zr-tree.py" "$build/drive_c" >/dev/null

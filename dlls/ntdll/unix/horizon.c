@@ -2837,6 +2837,25 @@ struct horizon_mapping
     struct rb_entry entry;
 };
 
+#include "horizon_pool.h"
+
+/* These freelists are protected by mapping_mutex, like the mapping tree. */
+static struct horizon_backing backing_slots[4096];
+static struct horizon_mapping mapping_slots[8192];
+static struct horizon_object_pool backing_pool = { backing_slots, NULL, sizeof(backing_slots[0]), 4096, 0 };
+static struct horizon_object_pool mapping_pool = { mapping_slots, NULL, sizeof(mapping_slots[0]), 8192, 0 };
+static struct horizon_page_pool backing_pages;
+static unsigned long long backing_direct_allocs;
+
+void horizon_memory_pool_stats( char *buffer, size_t size )
+{
+    pthread_mutex_lock( &mapping_mutex );
+    snprintf( buffer, size, "[MEMPOOL] arena_mb=%llu pooled_allocs=%llu direct_allocs=%llu backing_slots=%zu mapping_slots=%zu",
+              backing_pages.misses * 2, backing_pages.hits, backing_direct_allocs,
+              backing_pool.used, mapping_pool.used );
+    pthread_mutex_unlock( &mapping_mutex );
+}
+
 static int compare_mapping( const void *addr, const struct rb_entry *entry )
 {
     struct horizon_mapping *mapping = RB_ENTRY_VALUE( entry, struct horizon_mapping, entry );
@@ -12145,8 +12164,9 @@ static void free_backing( struct horizon_backing *backing, BOOL write_back )
         write_fd_at( backing->fd, backing->heap_addr, backing->size, backing->file_offset );
     if (backing->code_reservation) remove_reservation( backing->code_reservation );
     if (backing->fd != -1) close( backing->fd );
-    free( backing->heap_addr );
-    free( backing );
+    if (!horizon_pages_free( &backing_pages, backing->heap_addr, backing->size ))
+        free( backing->heap_addr );
+    horizon_object_free( &backing_pool, backing );
 }
 
 static void release_backing( struct horizon_backing *backing )
@@ -12172,7 +12192,7 @@ static struct horizon_mapping *alloc_mapping( void *addr, size_t size, struct ho
                                               size_t source_offset, VirtmemReservation *reservation,
                                               int prot )
 {
-    struct horizon_mapping *mapping = calloc( 1, sizeof(*mapping) );
+    struct horizon_mapping *mapping = horizon_object_alloc( &mapping_pool );
 
     if (!mapping) return NULL;
 
@@ -12305,7 +12325,7 @@ static struct horizon_backing *create_backing_locked( size_t size, int prot, int
 
     if (check_code_memory_syscalls()) return NULL;
 
-    if (!(backing = calloc( 1, sizeof(*backing) )))
+    if (!(backing = horizon_object_alloc( &backing_pool )))
     {
         errno = ENOMEM;
         return NULL;
@@ -12313,10 +12333,15 @@ static struct horizon_backing *create_backing_locked( size_t size, int prot, int
 
     backing->fd = -1;
     backing->size = size;
-    backing->heap_addr = memalign( 0x1000, size );
+    backing->heap_addr = horizon_pages_alloc( &backing_pages, size );
     if (!backing->heap_addr)
     {
-        free( backing );
+        backing->heap_addr = memalign( 0x1000, size );
+        backing_direct_allocs++;
+    }
+    if (!backing->heap_addr)
+    {
+        horizon_object_free( &backing_pool, backing );
         errno = ENOMEM;
         return NULL;
     }
@@ -12389,7 +12414,8 @@ static int map_backing_at_locked( void *addr, size_t size, int prot, int fd, off
 
     if (!(mapping = alloc_mapping( addr, size, backing, 0, NULL, prot )))
     {
-        unmap_code_memory_range( addr, backing->heap_addr, size );
+        /* Never recycle pages if the kernel could not remove their alias. */
+        if (unmap_code_memory_range( addr, backing->heap_addr, size )) return -1;
         backing->code_reservation = NULL;
         remove_reservation_locked( reservation );
         destroy_backing( backing );
@@ -12451,7 +12477,7 @@ static int split_reservation_mapping( struct horizon_mapping *mapping, char *sta
         list_add_mapping( right );
     }
 
-    free( mapping );
+    horizon_object_free( &mapping_pool, mapping );
     return 0;
 }
 
@@ -12477,7 +12503,7 @@ static int split_backing_mapping( struct horizon_mapping *mapping, char *start, 
         if (left)
         {
             release_backing( left->backing );
-            free( left );
+            horizon_object_free( &mapping_pool, left );
         }
         return -1;
     }
@@ -12487,12 +12513,12 @@ static int split_backing_mapping( struct horizon_mapping *mapping, char *start, 
         if (left)
         {
             release_backing( left->backing );
-            free( left );
+            horizon_object_free( &mapping_pool, left );
         }
         if (right)
         {
             release_backing( right->backing );
-            free( right );
+            horizon_object_free( &mapping_pool, right );
         }
         return -1;
     }
@@ -12503,7 +12529,7 @@ static int split_backing_mapping( struct horizon_mapping *mapping, char *start, 
     if (right) list_add_mapping( right );
 
     release_backing( mapping->backing );
-    free( mapping );
+    horizon_object_free( &mapping_pool, mapping );
     return 0;
 }
 
@@ -12540,24 +12566,24 @@ static struct horizon_mapping *split_backing_mapping_metadata( struct horizon_ma
     if (right) list_add_mapping( right );
     list_add_mapping( middle );
     release_backing( mapping->backing );
-    free( mapping );
+    horizon_object_free( &mapping_pool, mapping );
     return middle;
 
 failed:
     if (left)
     {
         release_backing( left->backing );
-        free( left );
+        horizon_object_free( &mapping_pool, left );
     }
     if (middle)
     {
         release_backing( middle->backing );
-        free( middle );
+        horizon_object_free( &mapping_pool, middle );
     }
     if (right)
     {
         release_backing( right->backing );
-        free( right );
+        horizon_object_free( &mapping_pool, right );
     }
     errno = ENOMEM;
     return NULL;
