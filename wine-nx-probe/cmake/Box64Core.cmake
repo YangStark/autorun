@@ -109,6 +109,20 @@ function(wine_nx_add_box64_core target)
         "        //if (db->always_test) SchedYield(); // just calm down...\n        uint32_t hash = X31_hash_code(db->x64_addr, db->x64_size);"
         "        //if (db->always_test) SchedYield(); // just calm down...\n        extern unsigned int wine_nx_box64_block_tests;\n        __atomic_add_fetch(&wine_nx_box64_block_tests, 1, __ATOMIC_RELAXED);\n        uint32_t hash = X31_hash_code(db->x64_addr, db->x64_size);"
         "count block validations")
+    # CALLRET marks a block's return sites ARCH_UDF when the block may have
+    # changed and ARCH_NOP once it is checked, in place: through the writable
+    # alias, since block pointers are executable-alias addresses. Marking a
+    # block dirty also flushes the caches, as every other rewrite does; a
+    # stale fetch would run the NOP and return into changed code unchecked.
+    string(PREPEND dynablock_source "void* DynarecMapWritableAddress(void* addr);\n")
+    wine_nx_box64_patch(dynablock_source
+        "                *(uint32_t*)(db->block+db->callrets[i].offs) = ARCH_UDF;\n        }\n        #endif\n    }\n}"
+        "                *(uint32_t*)(db->block+db->callrets[i].offs) = ARCH_UDF;\n            ClearCache(db->block, db->size);\n        }\n        #endif\n    }\n}"
+        "flush callret marks of dirty blocks")
+    wine_nx_box64_patch(dynablock_source "*(uint32_t*)(db->block+db->callrets[i].offs)"
+        "*(uint32_t*)DynarecMapWritableAddress(db->block+db->callrets[i].offs)" "callret site writes")
+    wine_nx_box64_patch(dynablock_source "*(uint32_t*)(db_new->block+db_new->callrets[i].offs)"
+        "*(uint32_t*)DynarecMapWritableAddress(db_new->block+db_new->callrets[i].offs)" "callret site writes on switch")
     set(dynablock_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-dynablock.c")
     file(WRITE "${dynablock_generated}" "${dynablock_source}")
     list(APPEND dynarec_sources "${dynablock_generated}")
@@ -152,12 +166,28 @@ function(wine_nx_add_box64_core target)
         dynarec_arm64_avx_f3_0f38.c updateflags_arm64_pass.c)
     list(TRANSFORM pass_sources PREPEND "${root}/src/dynarec/arm64/")
     list(APPEND pass_sources "${root}/src/dynarec/dynarec_native_pass.c")
+    # CALLRET pushes a native return pair for each CALL and pops it at the RET.
+    # Pairs of calls that never return stay until a RET misses or the block
+    # exits, which on Linux is a growing 8 MB stack, but a Wine thread here has
+    # 1 MB: past 64 KB, drop them as a missed RET does (the prolog's zero pair
+    # then makes the older RETs miss). x3 is scratch at both CALLs.
+    list(REMOVE_ITEM pass_sources "${root}/src/dynarec/arm64/dynarec_arm64_00.c")
+    file(READ "${root}/src/dynarec/arm64/dynarec_arm64_00.c" opcodes_source)
+    set(callret_depth_guard
+        "                        ADDx_U12(x3, xSP, 0);\n                        SUBx_REG(x3, xSavedSP, x3);\n                        LSRx(x3, x3, 16);\n                        CBZx(x3, 2*4);\n                        SUBx_U12(xSP, xSavedSP, 16);\n")
+    wine_nx_box64_patch(opcodes_source "                        STPx_S7_preindex(x4, x2, xSP, -16);"
+        "${callret_depth_guard}                        STPx_S7_preindex(x4, x2, xSP, -16);" "bound CALL return pairs")
+    wine_nx_box64_patch(opcodes_source "                        STPx_S7_preindex(x4, xRIP, xSP, -16);"
+        "${callret_depth_guard}                        STPx_S7_preindex(x4, xRIP, xSP, -16);" "bound CALL Ed return pairs")
+    set(opcodes_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-dynarec_arm64_00.c")
+    file(WRITE "${opcodes_generated}" "${opcodes_source}")
+    list(APPEND pass_sources "${opcodes_generated}")
 
     # Split code mapping. Blocks are emitted through the writable alias
     # AllocDynarecMap returns; once complete, the pointers the dynarec executes
     # and publishes are moved to the executable alias. Box64's emitted code is
     # position independent, so the bytes are valid at either address.
-    set(split_map_decl "void* DynarecMapExecutableAddress(void* addr);\nvoid DynarecMapClearCache(void* addr, size_t size);\n")
+    set(split_map_decl "void* DynarecMapExecutableAddress(void* addr);\nvoid* DynarecMapWritableAddress(void* addr);\nvoid DynarecMapClearCache(void* addr, size_t size);\n")
     set(to_exec
         "    block->actual_block = DynarecMapExecutableAddress(block->actual_block);\n    block->block = DynarecMapExecutableAddress(block->block);\n    block->jmpnext = DynarecMapExecutableAddress(block->jmpnext);\n")
 
@@ -181,6 +211,8 @@ function(wine_nx_add_box64_core target)
     wine_nx_box64_patch(native_source "    //block->x64_addr = (void*)start;\n    block->x64_size = end-start;"
         "    //block->x64_addr = (void*)start;\n    block->x64_size = end-start;\n    { extern void wine_nx_box64_note_block_size(size_t); wine_nx_box64_note_block_size(block->x64_size); }"
         "record the largest block size")
+    wine_nx_box64_patch(native_source "*(uint32_t*)(block->block+block->callrets[i].offs)"
+        "*(uint32_t*)DynarecMapWritableAddress(block->block+block->callrets[i].offs)" "always-dirty callret site marks")
     set(native_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-dynarec_native.c")
     file(WRITE "${native_generated}" "${native_source}")
 

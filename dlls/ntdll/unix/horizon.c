@@ -11134,6 +11134,7 @@ extern BOOL wine_nx_box64_handle_fault( ULONG_PTR address ) __attribute__((weak)
 /* Dynarec builds: the x86 instruction and registers behind a pc in translated code. */
 extern int wine_nx_box64_describe_native_pc( ULONG_PTR pc, const unsigned long long *x,
                                              char *buf, size_t size ) __attribute__((weak));
+extern int wine_nx_box64_callret_trap( ULONG_PTR *pc ) __attribute__((weak));
 
 #if defined(__aarch64__)
 /* KUSER_SHARED_DATA is not always at 0x7ffe0000 on Horizon (virtual_alloc_first_teb).
@@ -11189,6 +11190,20 @@ void __libnx_exception_handler( ThreadExceptionDump *ctx )
 
 #if defined(__aarch64__)
     if (horizon_redirect_user_shared_data( ctx )) horizon_resume_exception( ctx );
+    /* A translated RET returned natively into a block Box64 marked as possibly
+     * changed, onto an undefined instruction: resume after the mark or at the
+     * dynarec's epilog. Both through x9, as x17 holds the guest's EDI there.
+     * The trap checks the pc is such a mark, whatever the exception class. */
+    if (wine_nx_box64_callret_trap)
+    {
+        ULONG_PTR pc = ctx->pc.x;
+
+        if (wine_nx_box64_callret_trap( &pc ))
+        {
+            ctx->pc.x = pc;
+            horizon_restore_exception_context_x9( ctx );
+        }
+    }
 #endif
 
     rec.ExceptionCode = STATUS_ACCESS_VIOLATION;

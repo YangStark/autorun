@@ -283,9 +283,13 @@ static void init_box64_env(void)
     box64env.pclmulqdq = 0;
     box64env.shaext = 0;
     box64env.sse42 = 0;
-    /* Block invalidation rewrites callret sites in place, which the executable
-     * alias does not allow. Keep that optimization disabled. */
-    box64env.dynarec_callret = 0;
+    /* CALLRET: translated RETs return natively to the code after their CALL.
+     * Level 2 puts a guard instruction at each such return site, which Box64
+     * turns into ARCH_UDF when the block may have changed and back once checked;
+     * those writes go through the writable alias (Box64Core.cmake), and the
+     * trap they cause is wine_nx_box64_callret_trap. Level 1 has no guard and
+     * would return into a stale translation. */
+    box64env.dynarec_callret = 2;
     box64env.dynarec_wait = 1; /* tracked lock ownership for translation faults */
     apply_box64_options();
 }
@@ -443,6 +447,13 @@ void *DynarecMapExecutableAddress( void *addr )
     return arena ? arena->rx + offset : addr;
 }
 
+void *DynarecMapWritableAddress( void *addr )
+{
+    size_t offset;
+    struct nx_arena *arena = find_arena( addr, &offset );
+    return arena ? arena->rw + offset : addr;
+}
+
 void DynarecMapClearCache( void *addr, size_t size )
 {
     size_t offset;
@@ -525,6 +536,78 @@ int wine_nx_box64_describe_native_pc( uintptr_t pc, const unsigned long long *x,
               (unsigned long)x64, (unsigned long)(uintptr_t)db->x64_addr, (unsigned long)db->x64_size,
               db->done ? "" : " (unfinished)", (unsigned)x[10], (unsigned)x[11], (unsigned)x[12],
               (unsigned)x[13], (unsigned)x[14], (unsigned)x[15], (unsigned)x[16], (unsigned)x[17] );
+    return 1;
+}
+
+/* For [PROGRESS]: native returns that hit a marked return site, by outcome. */
+unsigned int wine_nx_box64_callret_clean, wine_nx_box64_callret_dirty;
+extern void arm64_epilog(void);
+/* A return site's two states, as dynarec/dynarec_arch.h defines them for ARM64
+ * (that header needs the code generator's own headers). */
+#define ARCH_NOP 0b11010101000000110010000000011111
+#define ARCH_UDF 0xcafe
+
+static int guest_code_readable( void *addr, uintptr_t size )
+{
+#ifdef __SWITCH__
+    u64 pos = (uintptr_t)addr, end = pos + size;
+
+    while (pos < end)
+    {
+        MemoryInfo info;
+        u32 page;
+
+        if (R_FAILED( svcQueryMemory( &info, &page, pos ) ) || !(info.perm & Perm_R) ||
+            info.type == MemType_Unmapped)
+            return 0;
+        pos = info.addr + info.size;
+    }
+#else
+    (void)addr;
+    (void)size;
+#endif
+    return 1;
+}
+
+/* A native return (CALLRET) landed on a return site its block marked ARCH_UDF
+ * because the block's code may have changed. As Box64's SIGILL handler does: if
+ * the code is unchanged, put the guards back to ARCH_NOP and go on after the
+ * site; otherwise leave the block through the epilog, which stores the guest
+ * registers (x0 holds the emulator, x27 the x86 return address, x28 the frame)
+ * and returns to EmuRun, which translates that address again. Called from the
+ * exception handler, so nothing here locks; a block, its site list and its
+ * code are never freed. Returns 0 when pc is not a marked return site. */
+int wine_nx_box64_callret_trap( uintptr_t *pc )
+{
+    size_t offset;
+    struct nx_arena *arena = find_arena( (void *)*pc, &offset );
+    dynablock_t *db;
+    int i, site = 0;
+
+    if (!arena || offset + 4 > arena->used || *(const uint32_t *)(arena->rw + offset) != ARCH_UDF) return 0;
+    if (!(db = block_at( arena, offset )) || !db->callret_size) return 0;
+    for (i = 0; i < db->callret_size && !site; i++)
+        site = (uintptr_t)db->block + db->callrets[i].offs == *pc && !db->callrets[i].type;
+    if (!site) return 0;
+
+    if (!db->gone && guest_code_readable( db->x64_addr, db->x64_size ) &&
+        X31_hash_code( db->x64_addr, (int)db->x64_size ) == db->hash)
+    {
+        if (db->always_test) protectDB( (uintptr_t)db->x64_addr, 1 );
+        else
+        {
+            for (i = 0; i < db->callret_size; i++)
+                *(uint32_t *)DynarecMapWritableAddress( (char *)db->block + db->callrets[i].offs ) = ARCH_NOP;
+            DynarecMapClearCache( db->block, db->size );
+            protectDBJumpTable( (uintptr_t)db->x64_addr, db->x64_size, db->block, db->jmpnext );
+        }
+        *pc += 4;
+        __atomic_add_fetch( &wine_nx_box64_callret_clean, 1, __ATOMIC_RELAXED );
+        return 1;
+    }
+    dynablock_leave_runtime( db );
+    *pc = (uintptr_t)arm64_epilog;
+    __atomic_add_fetch( &wine_nx_box64_callret_dirty, 1, __ATOMIC_RELAXED );
     return 1;
 }
 

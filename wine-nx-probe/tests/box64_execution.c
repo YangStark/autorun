@@ -16,9 +16,12 @@
 #include <stdlib.h>
 #include <switch.h>
 #else
+#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <ucontext.h>
+#include <unistd.h>
 #endif
 #include "wow64_box64_engine.h"
 #ifdef __SWITCH__
@@ -182,6 +185,62 @@ static NTSTATUS x87_native_call( void *opaque, ULONG number, ULONG arguments )
     return 0;
 }
 static const struct wine_nx_wow64_host x87_host = {read_guest, x87_native_call, NULL, NULL};
+
+#if defined(WINE_NX_BOX64_DYNAREC) && !defined(__SWITCH__)
+extern int wine_nx_box64_callret_trap( uintptr_t *pc );
+extern unsigned int wine_nx_box64_callret_clean, wine_nx_box64_callret_dirty;
+
+/* A native return landing on a return site Box64 marked, resumed as Horizon's
+ * exception handler does (dlls/ntdll/unix/horizon.c). */
+static void callret_trap_handler( int signal, siginfo_t *info, void *context )
+{
+    ucontext_t *uc = context;
+    uintptr_t pc = uc->uc_mcontext.pc;
+
+    (void)info;
+    if (!wine_nx_box64_callret_trap( &pc )) _Exit( 128 + signal );
+    uc->uc_mcontext.pc = pc;
+}
+
+struct code_change
+{
+    unsigned char *memory;
+    unsigned char add;  /* the new immediate of the add after the call; 0 leaves the code */
+};
+
+/* Once the guest sits in the called loop, its native return pending: report a
+ * change to the code after the call, maybe make it, then let the loop end. */
+static void *change_code_after_call( void *param )
+{
+    struct code_change *change = param;
+    unsigned int i;
+
+    for (i = 0; i < 5000 && !*(ULONG *)(change->memory + 0x30a8); i++) usleep( 1000 );
+    assert( i < 5000 );
+    usleep( 20000 );
+    if (change->add) change->memory[0xa00 + 12] = change->add;
+    wine_nx_box64_invalidate( BASE + 0xa00 + 10, 3, 0 );
+    *(ULONG *)(change->memory + 0x30a4) = 1;
+    return NULL;
+}
+
+struct deep_calls
+{
+    struct fixture *f;
+    I386_CONTEXT context;
+    NTSTATUS status;
+};
+
+static void *run_deep_calls( void *param )
+{
+    struct deep_calls *run = param;
+    ULONGLONG executed;
+
+    run->status = wine_nx_box64_run( &run->context, 0, &run->f->gates, &host, run->f, BASE + 0x8020,
+                                     100000000, &executed );
+    return NULL;
+}
+#endif
 static NTSTATUS native_call( void *opaque, ULONG number, ULONG arguments )
 {
     struct fixture *f = opaque;
@@ -505,6 +564,74 @@ int main(void)
         assert( context.Eax == 5000 && context.Ecx == 0 );
         assert( wine_nx_box64_block_tests - tests_before < 50 );
     }
+#ifndef __SWITCH__
+    /* CALLRET: a RET into a block whose code was reported changed while the call
+     * ran lands on the undefined instruction Box64 put at the return site.
+     * Unchanged code goes on there; changed code is translated again. */
+    {
+        static const unsigned char callret_program[] = {
+            0xb8,1,0,0,0,                       /* mov eax, 1 */
+            0xe8,0x0f,0,0,0,                    /* call wait */
+            0x83,0xc0,2,                        /* add eax, 2 */
+            0xa3,0xa0,0x30,0,0x10,              /* mov [BASE+0x30a0], eax */
+            0xba,0x20,0x80,0,0x10,0xff,0xe2,    /* completion */
+            0xc7,0x05,0xa8,0x30,0,0x10,1,0,0,0, /* wait: mov dword [BASE+0x30a8], 1 */
+            0x83,0x3d,0xa4,0x30,0,0x10,0,       /* cmp dword [BASE+0x30a4], 0 */
+            0x74,0xf7,                          /* je cmp */
+            0xc3                                /* ret */
+        };
+        struct sigaction trap = {0}, previous_ill;
+        unsigned int pass, clean = wine_nx_box64_callret_clean, dirty = wine_nx_box64_callret_dirty;
+
+        trap.sa_flags = SA_SIGINFO;
+        trap.sa_sigaction = callret_trap_handler;
+        sigemptyset( &trap.sa_mask );
+        assert( !sigaction( SIGILL, &trap, &previous_ill ) );
+        put_code( memory, 0xa00, callret_program, sizeof(callret_program) );
+        for (pass = 0; pass < 2; pass++)
+        {
+            struct code_change change = { memory, pass ? 5 : 0 };
+            pthread_t thread;
+
+            memset( memory + 0x30a0, 0, 12 );
+            assert( !pthread_create( &thread, NULL, change_code_after_call, &change ) );
+            init_context( &context, BASE + 0xa00, BASE + 0x6000 );
+            assert( !wine_nx_box64_run( &context, 0, &f.gates, &host, &f, BASE + 0x8020, 100000000, &executed ) );
+            assert( !pthread_join( thread, NULL ) );
+            memcpy( &result, memory + 0x30a0, 4 );
+            printf( "callret pass %u: eax=%u, clean returns %u, dirty returns %u\n", pass, (unsigned)result,
+                    wine_nx_box64_callret_clean - clean, wine_nx_box64_callret_dirty - dirty );
+            assert( result == (pass ? 6u : 3u) );
+        }
+        assert( wine_nx_box64_callret_clean - clean == 1 && wine_nx_box64_callret_dirty - dirty == 1 );
+        assert( !sigaction( SIGILL, &previous_ill, NULL ) );
+    }
+    /* A CALL that never returns leaves its native return pair behind: 200000
+     * of them would overflow the 1 MB stack of a Wine thread unbounded. */
+    {
+        static const unsigned char deep_program[] = {
+            0xb9,0x40,0x0d,0x03,0,              /* mov ecx, 200000 */
+            0xe8,1,0,0,0,                       /* call skip */
+            0x90,                               /* nop */
+            0x83,0xc4,4,                        /* skip: add esp, 4 */
+            0x49,                               /* dec ecx */
+            0x75,0xf4,                          /* jnz call */
+            0xba,0x20,0x80,0,0x10,0xff,0xe2     /* completion */
+        };
+        struct deep_calls run = { .f = &f };
+        pthread_attr_t attr;
+        pthread_t thread;
+
+        put_code( memory, 0xb00, deep_program, sizeof(deep_program) );
+        init_context( &run.context, BASE + 0xb00, BASE + 0x6000 );
+        assert( !pthread_attr_init( &attr ) && !pthread_attr_setstacksize( &attr, 0x100000 ) );
+        assert( !pthread_create( &thread, &attr, run_deep_calls, &run ) );
+        assert( !pthread_join( thread, NULL ) );
+        printf( "unreturned calls: status %#x, ecx=%u, esp=%#x\n", (unsigned)run.status,
+                (unsigned)run.context.Ecx, (unsigned)run.context.Esp );
+        assert( !run.status && run.context.Ecx == 0 && run.context.Esp == BASE + 0x6000 );
+    }
+#endif
 #endif
     /* Instruction-fetch failures are reported without dereferencing the PC. */
     init_context( &context, BASE - 1, BASE + 0x6000 );
