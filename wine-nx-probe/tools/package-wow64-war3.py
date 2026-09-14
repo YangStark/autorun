@@ -118,7 +118,8 @@ wine-nx-runtime.log, ending with "done, all steps worked":
 - Sets the game to 1280x720, 32-bit colour, 60 Hz. The Switch screen, where the
   pointer and the touchscreen are, is always 1280x720; at another resolution the
   game's menus do not line up with them (no highlight, clicks landing elsewhere).
-- Skips the intro movie at startup (seenintromovie).
+- Lets the intro movie play at startup: removes seenintromovie, which earlier
+  setups set to skip it.
 - Offers the game only the Switch's own 1280x720 display mode (EmulateModelist
   for war3.exe), so the movies play across the full width.
 - Registers the MP3 decoder l3codeca.acm, for the movies' sound.

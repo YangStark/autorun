@@ -4,7 +4,8 @@
  * - The game's video settings: 1280x720, 32-bit colour, 60 Hz. The Switch
  *   screen, where the pointer and the touchscreen are, is always 1280x720; at
  *   any other resolution the game's hit-testing does not line up with them.
- * - seenintromovie, which skips the intro movie at startup.
+ * - No seenintromovie: earlier setups set it, which skipped the intro movie at
+ *   startup, and this one removes it so the intro plays.
  * - EmulateModelist for war3.exe, so Wine offers the game only the screen's own
  *   1280x720 mode. For each movie the game switches to 800x600, which Wine
  *   would fake by scaling it into a 960x720 box in the middle of the screen.
@@ -105,6 +106,26 @@ static BOOL set_string( HKEY root, const WCHAR *path, const WCHAR *name, const W
     return !status;
 }
 
+/* A value that is not there counts as deleted. */
+static BOOL delete_value( HKEY root, const WCHAR *path, const WCHAR *name )
+{
+    HKEY key;
+    LONG status;
+
+    if (!(status = RegOpenKeyExW( root, path, 0, KEY_SET_VALUE, &key )))
+    {
+        status = RegDeleteValueW( key, name );
+        RegCloseKey( key );
+    }
+    if (status == ERROR_FILE_NOT_FOUND)
+    {
+        report( "delete", name, "ok, was not set, error", (DWORD)status );
+        return TRUE;
+    }
+    report( "delete", name, status ? "failed, error" : "ok, error", (DWORD)status );
+    return !status;
+}
+
 /* What regsvr32 does for a DLL: load it and call its DllRegisterServer. */
 static BOOL register_dll( const WCHAR *name )
 {
@@ -144,7 +165,7 @@ void __stdcall start(void)
     ok &= set_dword( HKEY_CURRENT_USER, video, L"resheight", 720 );
     ok &= set_dword( HKEY_CURRENT_USER, video, L"colordepth", 32 );
     ok &= set_dword( HKEY_CURRENT_USER, video, L"refreshrate", 60 );
-    ok &= set_dword( HKEY_CURRENT_USER, misc, L"seenintromovie", 1 );
+    ok &= delete_value( HKEY_CURRENT_USER, misc, L"seenintromovie" );
     ok &= set_string( HKEY_CURRENT_USER, war3_driver, L"EmulateModelist", L"Y" );
     ok &= set_string( HKEY_LOCAL_MACHINE, drivers32, L"msacm.l3acm", L"l3codeca.acm" );
 
