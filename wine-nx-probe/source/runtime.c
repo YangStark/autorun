@@ -1942,6 +1942,22 @@ int main( int argc, char **argv )
     if (read_bool_file( RUNTIME_DIR "/framebuffer.txt" )) wine_nx_compositor_mode = 0;
     log_line( "[INIT] windows shown by %s (framebuffer.txt)",
               wine_nx_compositor_mode ? "the OpenGL compositor" : "the framebuffer" );
+#ifdef WINE_NX_MESA_SWITCH
+    /* This runtime links mesa-switch (build-mesa-switch.sh); vulkan-probe.txt
+     * reports what its NVK offers, for Vulkan and DXVK (vulkan_probe.c). */
+    {
+        int vulkan_probe = read_bool_file( RUNTIME_DIR "/vulkan-probe.txt" );
+
+        log_line( "[INIT] Mesa from mesa-switch: OpenGL through nvc0, Vulkan through NVK; Vulkan probe %s (vulkan-probe.txt)",
+                  vulkan_probe ? "on" : "off" );
+        if (vulkan_probe)
+        {
+            extern void wine_nx_vulkan_probe( void );
+
+            wine_nx_vulkan_probe();
+        }
+    }
+#endif
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else
     {

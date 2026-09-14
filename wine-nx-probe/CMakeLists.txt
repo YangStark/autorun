@@ -690,6 +690,29 @@ if(WINE_NX_MESA_LIB_DIR)
     # Its libdrm_nouveau maps application memory for GL_AMD_pinned_memory.
     set(SWITCH_DRM_NOUVEAU "${WINE_NX_MESA_LIB_DIR}/libdrm_nouveau.a")
 endif()
+# build-mesa-switch.sh builds danfromtico/mesa-switch: Mesa 26 with OpenGL through
+# nvc0 and loaderless NVK Vulkan, both over its own Horizon backend, so without
+# libdrm_nouveau. This links it in place of the Mesa above, in one archive group
+# because EGL, GL, glapi and Vulkan share Mesa's utility libraries.
+set(WINE_NX_MESA_SWITCH_DIR "" CACHE PATH "Folder with libEGL.a, libGL.a, libglapi.a and libvulkan.a from build-mesa-switch.sh")
+if(WINE_NX_MESA_SWITCH_DIR)
+    message(STATUS "Mesa: mesa-switch, ${WINE_NX_MESA_SWITCH_DIR}")
+    set(SWITCH_EGL -Wl,--start-group)
+    foreach(lib EGL GL glapi vulkan mesa_util_c11 blake3 mesa_util mesa_util_simd xmlconfig)
+        if(EXISTS "${WINE_NX_MESA_SWITCH_DIR}/lib${lib}.a")
+            list(APPEND SWITCH_EGL "${WINE_NX_MESA_SWITCH_DIR}/lib${lib}.a")
+        endif()
+    endforeach()
+    find_library(SWITCH_EXPAT expat HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+    find_library(SWITCH_ZSTD zstd HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+    list(APPEND SWITCH_EGL ${SWITCH_EXPAT} ${SWITCH_ZSTD} ${SWITCH_Z} -Wl,--end-group)
+    set(SWITCH_GLAPI "")
+    set(SWITCH_DRM_NOUVEAU "")
+    target_compile_definitions(wine-nx-runtime PRIVATE WINE_NX_MESA_SWITCH)
+    target_sources(wine-nx-runtime PRIVATE source/vulkan_probe.c)
+    set_source_files_properties(source/vulkan_probe.c PROPERTIES
+        INCLUDE_DIRECTORIES "${WINE_NX_MESA_SWITCH_DIR}/../include")
+endif()
 target_link_libraries(wine-nx-runtime PRIVATE
     ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_HARFBUZZ}
     ${SWITCH_EGL} ${SWITCH_GLAPI} ${SWITCH_DRM_NOUVEAU} stdc++ nx m)
