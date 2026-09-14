@@ -1,9 +1,11 @@
 /*
  * Minimal Nintendo Switch (Horizon) display driver for win32u.
  *
- * Software-only: windows render into ordinary DIB memory (handled by the GDI
- * engine), and the window surface's flush() blits the dirty pixels to the
- * libnx framebuffer via the runtime hooks wine_nx_fb_*().  No GPU.
+ * Windows render into ordinary DIB memory (handled by the GDI engine), and the
+ * window surface's flush() copies the dirty pixels to the runtime's OpenGL
+ * compositor, one layer per window surface (wine-nx-probe/source/compositor.c),
+ * or, with switch/wine/framebuffer.txt, straight to the libnx framebuffer via
+ * the runtime hooks wine_nx_fb_*().
  *
  * The driver reuses the null_user_driver for everything else; only window
  * creation and surface presentation are Switch-specific (see driver.c, which
@@ -28,6 +30,7 @@
 #include "ntuser_private.h"
 #include "win32u_private.h"
 #include "wine/gdi_driver.h"
+#include "../../wine-nx-probe/source/compositor.h"
 
 /* Framebuffer hooks implemented in the runtime (wine-nx-probe/source/runtime.c). */
 extern void *wine_nx_fb_lock( int *width, int *height, int *stride_px );
@@ -40,6 +43,10 @@ extern void  wine_nx_pointer_set_pos( int x, int y );
 extern void  wine_nx_cursor_show( int visible );
 extern void  wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 extern int   wine_nx_runtime_verbose __attribute__((weak));
+/* Whether the runtime's OpenGL compositor presents the screen instead of the
+ * framebuffer (starting it on the first call); each window surface then feeds
+ * a layer of it (wine-nx-probe/source/compositor.h). */
+extern int   wine_nx_compositor_enabled( void );
 
 /* Buttons reported by wine_nx_pointer_poll(). */
 #define WINE_NX_POINTER_LEFT  0x1
@@ -53,6 +60,7 @@ struct wine_nx_surface
     POINT screen_origin;
     RECT clip_rect;
     BOOL has_clip;
+    struct wine_nx_layer *layer;  /* the compositor's copy of the pixels, when it presents */
 };
 
 struct wine_nx_surface_entry
@@ -60,9 +68,12 @@ struct wine_nx_surface_entry
     HWND hwnd;
     RECT screen_rect;
     BOOL visible;
+    struct wine_nx_layer *layer;  /* of the window's current surface */
     struct wine_nx_surface_entry *next;
 };
 
+/* The entries are only ever added to, from the threads of their windows. */
+static pthread_mutex_t wine_nx_surface_entries_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct wine_nx_surface_entry *wine_nx_surface_entries;
 static volatile int wine_nx_input_thread_started;
 static void nxdrv_trace( const char *fmt, int a, int b, int c, int d );
@@ -213,7 +224,8 @@ static BOOL wine_nx_surface_present_screen_rect( struct window_surface *surface,
     return ret;
 }
 
-static struct wine_nx_surface_entry *wine_nx_find_surface_entry( HWND hwnd, BOOL create )
+/* With wine_nx_surface_entries_mutex held. */
+static struct wine_nx_surface_entry *find_surface_entry_locked( HWND hwnd, BOOL create )
 {
     struct wine_nx_surface_entry *entry;
 
@@ -226,6 +238,78 @@ static struct wine_nx_surface_entry *wine_nx_find_surface_entry( HWND hwnd, BOOL
     entry->next = wine_nx_surface_entries;
     wine_nx_surface_entries = entry;
     return entry;
+}
+
+static struct wine_nx_surface_entry *wine_nx_find_surface_entry( HWND hwnd, BOOL create )
+{
+    struct wine_nx_surface_entry *entry;
+
+    pthread_mutex_lock( &wine_nx_surface_entries_mutex );
+    entry = find_surface_entry_locked( hwnd, create );
+    pthread_mutex_unlock( &wine_nx_surface_entries_mutex );
+    return entry;
+}
+
+/* With the compositor, each window shows through the layer of its current
+ * surface. A surface forgets its layer here before destroying it, so a layer
+ * found under the entries mutex stays alive while the mutex is held. */
+static void wine_nx_show_window_layer( HWND hwnd, struct wine_nx_layer *layer, const POINT *origin,
+                                       const RECT *present )
+{
+    struct wine_nx_surface_entry *entry;
+
+    pthread_mutex_lock( &wine_nx_surface_entries_mutex );
+    if ((entry = find_surface_entry_locked( hwnd, TRUE )))
+    {
+        /* A resized window gets a new surface; the old one can outlive this. */
+        if (entry->layer && entry->layer != layer) wine_nx_layer_place( entry->layer, 0, 0, 0, 0 );
+        entry->layer = layer;
+    }
+    wine_nx_layer_place( layer, origin->x, origin->y, present->right, present->bottom );
+    pthread_mutex_unlock( &wine_nx_surface_entries_mutex );
+}
+
+static BOOL wine_nx_hide_window_layer( HWND hwnd )
+{
+    struct wine_nx_surface_entry *entry;
+    BOOL ret = FALSE;
+
+    pthread_mutex_lock( &wine_nx_surface_entries_mutex );
+    if ((entry = find_surface_entry_locked( hwnd, FALSE )) && entry->layer)
+    {
+        wine_nx_layer_place( entry->layer, 0, 0, 0, 0 );
+        ret = TRUE;
+    }
+    pthread_mutex_unlock( &wine_nx_surface_entries_mutex );
+    return ret;
+}
+
+static void wine_nx_forget_layer( struct wine_nx_layer *layer )
+{
+    struct wine_nx_surface_entry *entry;
+
+    pthread_mutex_lock( &wine_nx_surface_entries_mutex );
+    for (entry = wine_nx_surface_entries; entry; entry = entry->next)
+        if (entry->layer == layer) entry->layer = NULL;
+    pthread_mutex_unlock( &wine_nx_surface_entries_mutex );
+}
+
+/* Give the compositor the stacking order of the top-level windows, topmost first. */
+static void wine_nx_restack_layers( void )
+{
+    struct wine_nx_layer *layers[256];
+    struct wine_nx_surface_entry *entry;
+    int count = 0;
+    HWND hwnd;
+
+    pthread_mutex_lock( &wine_nx_surface_entries_mutex );
+    for (hwnd = get_window_relative( get_desktop_window(), GW_CHILD ); hwnd && count < (int)ARRAY_SIZE(layers);
+         hwnd = get_window_relative( hwnd, GW_HWNDNEXT ))
+    {
+        if ((entry = find_surface_entry_locked( hwnd, FALSE )) && entry->layer) layers[count++] = entry->layer;
+    }
+    wine_nx_compositor_restack( layers, count );
+    pthread_mutex_unlock( &wine_nx_surface_entries_mutex );
 }
 
 static BOOL wine_nx_get_cached_screen_rect( HWND hwnd, RECT *rect )
@@ -354,6 +438,13 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
 
     (void)rect;
 
+    /* The compositor keeps every pixel; where the window shows is its placement. */
+    if (nx_surface->layer)
+    {
+        wine_nx_layer_update( nx_surface->layer, color_bits, sw, dirty->left, dirty->top, dirty->right, dirty->bottom );
+        return TRUE;
+    }
+
     /* A queued paint can flush after SWP_HIDEWINDOW.  Keep the DIB contents,
      * but do not put the closed popup back over its restored owner. */
     if (entry && !entry->visible) return TRUE;
@@ -401,8 +492,13 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
 
 static void wine_nx_surface_destroy( struct window_surface *surface )
 {
+    struct wine_nx_surface *nx_surface = wine_nx_surface_from_base( surface );
+
     /* The generic window_surface_release() frees the header storage. */
-    (void)surface;
+    if (!nx_surface->layer) return;
+    wine_nx_forget_layer( nx_surface->layer );
+    wine_nx_layer_destroy( nx_surface->layer );
+    nx_surface->layer = NULL;
 }
 
 static const struct window_surface_funcs wine_nx_surface_funcs =
@@ -650,6 +746,15 @@ BOOL wine_nx_drv_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surfa
 
     *surface = window_surface_create( sizeof(struct wine_nx_surface), &wine_nx_surface_funcs,
                                       hwnd, surface_rect, info, 0 );
+    /* Made with the surface, the layer gets every flush of it. win32u fills a
+     * new surface with white: a window that never paints with GDI, like a
+     * Direct3D game's, would show that white whenever the compositor has the
+     * screen, so it starts black, like the layer. */
+    if (*surface && wine_nx_compositor_enabled())
+    {
+        memset( window_surface_get_color( *surface, info ), 0, info->bmiHeader.biSizeImage );
+        wine_nx_surface_from_base( *surface )->layer = wine_nx_layer_create( width, height );
+    }
     nxdrv_trace( "[NXDRV] CreateWindowSurface rect=%d,%d %dx%d", surface_rect->left, surface_rect->top,
                  width, height );
     nxdrv_trace( "[NXDRV] surface_create -> %d", *surface ? 1 : 0, 0, 0, 0 );
@@ -673,6 +778,8 @@ void wine_nx_drv_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint
     if (swp_flags & SWP_HIDEWINDOW)
     {
         wine_nx_note_surface_hidden( hwnd );
+        /* The compositor shows what was under the window by itself. */
+        if (wine_nx_hide_window_layer( hwnd )) return;
         wine_nx_restore_popup_owner( hwnd, owner_hint, has_old_screen_rect ? &old_screen_rect : NULL );
         wine_nx_fb_present();
         return;
@@ -687,7 +794,7 @@ void wine_nx_drv_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint
             int new_width = new_rects->visible.right - new_rects->visible.left;
             int new_height = new_rects->visible.bottom - new_rects->visible.top;
 
-            if (nx_surface->initial_redraw_done &&
+            if (!nx_surface->layer && nx_surface->initial_redraw_done &&
                 (nx_surface->screen_origin.x != new_rects->visible.left ||
                  nx_surface->screen_origin.y != new_rects->visible.top ||
                  nx_surface->present_rect.right != new_width ||
@@ -704,6 +811,13 @@ void wine_nx_drv_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint
             nx_surface->present_rect.bottom = new_height;
             intersect_rect( &nx_surface->present_rect, &nx_surface->present_rect, &allocation );
             wine_nx_note_surface_present( hwnd, &nx_surface->screen_origin, &nx_surface->present_rect );
+            if (nx_surface->layer)
+            {
+                /* Only the visible part is drawn, never the rest of the allocation. */
+                wine_nx_show_window_layer( hwnd, nx_surface->layer, &nx_surface->screen_origin,
+                                           &nx_surface->present_rect );
+                wine_nx_restack_layers();
+            }
             nxdrv_trace( "[NXDRV] present rect=%d,%d %dx%d",
                          nx_surface->screen_origin.x, nx_surface->screen_origin.y,
                          nx_surface->present_rect.right, nx_surface->present_rect.bottom );

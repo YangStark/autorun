@@ -134,6 +134,14 @@ to fake that mode by scaling it into a 960x720 box in the middle of the screen,
 with a white bar beside it. Since build 85, with the setup program run, only
 1280x720 is offered, so the game keeps it and the movie fills the width.
 
+The screen: windows are shown through OpenGL on the GPU, each in its own layer
+drawn in stacking order, instead of copying their pixels straight to the
+framebuffer. The game's Direct3D still takes the whole screen while it draws, and
+the windows (the movies among them) come back when it stops. The log shows
+"[INIT] windows shown by the OpenGL compositor" and "[NXCOMP]" lines. If windows
+do not show or look wrong, put a file switch/wine/framebuffer.txt containing 1
+on the SD card to go back to the framebuffer.
+
 The rest of the full package is staged too: OpenTTD, the OpenGL, Direct3D 9 and
 audio tests, Notepad and 7-Zip.
 ''')

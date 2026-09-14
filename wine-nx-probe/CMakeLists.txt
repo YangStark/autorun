@@ -599,6 +599,9 @@ add_executable(wine-nx-runtime
     source/audio_unix.c
     source/xinput_unix.c
     source/thread_profile.c
+    source/compositor.c
+    source/compositor_gl.c
+    source/compositor_egl.c
     $<TARGET_OBJECTS:wine-horizon-real>
     $<TARGET_OBJECTS:wine-server-real>
     $<TARGET_OBJECTS:wine-sync-real>

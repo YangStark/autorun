@@ -70,6 +70,14 @@ Also staged: C:\\\\pe32-opengl.exe (red, green and blue frames, then PASS and
 exit_code=0x0000002a), C:\\\\pe32-audio.exe (audout playback), C:\\\\notepad.exe and
 the 7zr benchmark.
 
+The screen: windows are now shown through OpenGL on the GPU, each in its own
+layer drawn in stacking order, instead of copying their pixels straight to the
+framebuffer. A program's own OpenGL (OpenTTD, Direct3D games) still takes the
+whole screen while it draws; the windows come back when it stops. The log shows
+"[INIT] windows shown by the OpenGL compositor" and "[NXCOMP]" lines. If windows
+do not show or look wrong, put a file switch/wine/framebuffer.txt containing 1
+on the SD card to go back to the framebuffer.
+
 wine-nx-runtime.log holds the run. Its [PROGRESS] lines report OpenGL frames,
 the time in eglSwapBuffers and in opengl32 calls, the megabytes Wine copies for
 32-bit buffer mappings (copy_mb), whether the GPU maps the program's own pages

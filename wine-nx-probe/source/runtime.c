@@ -23,6 +23,7 @@
 #include "horizon_private.h"
 #include "launcher_list.h"
 #include "pointer_cursor.h"
+#include "compositor.h"
 #include "std_stream_lines.h"
 #include "thread_profile.h"
 
@@ -47,7 +48,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-84"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-92"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -331,19 +332,65 @@ void wine_nx_fb_unlock(void)
     pthread_mutex_unlock( &wine_nx_fb_mutex );
 }
 
+/* The OpenGL compositor (compositor.c) presents the screen, unless
+ * sdmc:/switch/wine/framebuffer.txt containing 1 keeps the framebuffer. */
+static int wine_nx_compositor_mode = 1;
+extern const struct compositor_backend wine_nx_compositor_egl_backend;
+
+/* Stop driving the text console, which shares the NWindow; for the compositor. */
+void wine_nx_screen_leave_console(void)
+{
+    pthread_mutex_lock( &wine_nx_fb_mutex );
+    if (wine_nx_console_active)
+    {
+        consoleExit( NULL );
+        wine_nx_console_active = 0;
+    }
+    pthread_mutex_unlock( &wine_nx_fb_mutex );
+}
+
+/* Whether the compositor presents the screen, starting it on the first call.
+ * The display driver asks before giving a window surface a layer, and an
+ * OpenGL surface asks before it takes the screen, so the compositor never
+ * starts, and never draws, while a program's OpenGL has the screen. */
+int wine_nx_compositor_enabled(void)
+{
+    static int cursor_synced;
+    int x, y, visible;
+
+    if (!wine_nx_compositor_mode) return 0;
+    /* The console shares the NWindow. Leave it from this Wine thread, as the
+     * framebuffer does, not from the presenter. */
+    if (!wine_nx_compositor_running()) wine_nx_screen_leave_console();
+    if (wine_nx_compositor_start( &wine_nx_compositor_egl_backend, WINE_NX_FB_W, WINE_NX_FB_H )) return 0;
+    if (!__atomic_exchange_n( &cursor_synced, 1, __ATOMIC_ACQ_REL ))
+    {
+        pthread_mutex_lock( &wine_nx_fb_mutex );
+        x = (int)wine_nx_cursor.x;
+        y = (int)wine_nx_cursor.y;
+        visible = wine_nx_cursor_visible;
+        pthread_mutex_unlock( &wine_nx_fb_mutex );
+        wine_nx_compositor_cursor( x, y, visible );
+    }
+    return 1;
+}
+
 /* An OpenGL window surface takes the screen. libnx's framebuffer and EGL cannot
- * both queue buffers to the default NWindow, so the framebuffer is closed while
- * the surface exists; GDI keeps drawing into window surfaces, and the next
- * flush after the surface is gone opens the framebuffer again. Returns NULL
- * while another surface has the screen or the framebuffer is being drawn. */
+ * both queue buffers to the default NWindow, so the framebuffer is closed, or
+ * the compositor gives the screen up, while the surface exists; GDI keeps
+ * drawing into window surfaces, shown again once the surface is gone. Returns
+ * NULL while another surface has the screen or the framebuffer is being drawn. */
 void *wine_nx_gl_acquire_window(void)
 {
+    int compositor = wine_nx_compositor_enabled();
     NWindow *window = NULL;
 
     pthread_mutex_lock( &wine_nx_fb_mutex );
     if (!wine_nx_gl_window && !wine_nx_fb_lock_depth)
     {
-        if (wine_nx_fb_ready)
+        if (compositor)
+            ;  /* suspended below, without this lock, as it waits for the presenter */
+        else if (wine_nx_fb_ready)
         {
             framebufferClose( &wine_nx_fb );
             wine_nx_fb_ready = 0;
@@ -357,21 +404,26 @@ void *wine_nx_gl_acquire_window(void)
             wine_nx_console_active = 0;
         }
         window = nwindowGetDefault();
-        nwindowSetDimensions( window, WINE_NX_FB_W, WINE_NX_FB_H );
         wine_nx_gl_window = 1;
     }
     pthread_mutex_unlock( &wine_nx_fb_mutex );
+    if (window && compositor) wine_nx_compositor_suspend();
+    if (window) nwindowSetDimensions( window, WINE_NX_FB_W, WINE_NX_FB_H );
     log_line( "[NXGL] %s", window ? "screen handed to an OpenGL surface" : "screen busy; OpenGL surface refused" );
     return window;
 }
 
-/* The OpenGL surface is destroyed; the framebuffer may take the screen back. */
+/* The OpenGL surface is destroyed; the framebuffer or the compositor may take
+ * the screen back. */
 void wine_nx_gl_release_window(void)
 {
+    int compositor = wine_nx_compositor_running();
+
     pthread_mutex_lock( &wine_nx_fb_mutex );
     wine_nx_gl_window = 0;
     pthread_mutex_unlock( &wine_nx_fb_mutex );
-    log_line( "[NXGL] screen returned to the framebuffer" );
+    log_line( "[NXGL] screen returned to the %s", compositor ? "compositor" : "framebuffer" );
+    if (compositor) wine_nx_compositor_resume();
 }
 
 /* Each present converts the whole screen, so frames that only move the
@@ -420,7 +472,11 @@ static void wine_nx_cursor_move( int x, int y )
         pointer_cursor_place( &wine_nx_cursor, x, y );
         if (wine_nx_cursor_visible) wine_nx_cursor_moved = 1;
     }
+    x = (int)wine_nx_cursor.x;
+    y = (int)wine_nx_cursor.y;
+    int visible = wine_nx_cursor_visible;
     pthread_mutex_unlock( &wine_nx_fb_mutex );
+    wine_nx_compositor_cursor( x, y, visible );
 }
 
 /* The program showed or hid the mouse cursor. Programs that draw their own,
@@ -433,7 +489,9 @@ void wine_nx_cursor_show( int visible )
         wine_nx_cursor_visible = !!visible;
         wine_nx_cursor_moved = 1;  /* present the change */
     }
+    int x = (int)wine_nx_cursor.x, y = (int)wine_nx_cursor.y;
     pthread_mutex_unlock( &wine_nx_fb_mutex );
+    wine_nx_compositor_cursor( x, y, visible );
 }
 
 /* Buttons reported by wine_nx_pointer_poll(). */
@@ -755,7 +813,8 @@ static void runtime_report_interpreter(void)
         static u64 start;
         unsigned int reads = &wine_nx_file_reads ? __atomic_load_n( &wine_nx_file_reads, __ATOMIC_RELAXED ) : 0;
         unsigned int gl_frames = &wine_nx_gl_swaps ? __atomic_load_n( &wine_nx_gl_swaps, __ATOMIC_RELAXED ) : 0;
-        unsigned int frames = __atomic_load_n( &wine_nx_fb_frames, __ATOMIC_RELAXED ) + gl_frames;
+        unsigned int frames = __atomic_load_n( &wine_nx_fb_frames, __ATOMIC_RELAXED ) + gl_frames +
+                              wine_nx_compositor_frames();
         unsigned long long read_ms = &wine_nx_file_read_100ns
                                      ? __atomic_load_n( &wine_nx_file_read_100ns, __ATOMIC_RELAXED ) / 10000 : 0;
         unsigned int syscalls = &wine_nx_syscalls ? __atomic_load_n( &wine_nx_syscalls, __ATOMIC_RELAXED ) : 0;
@@ -1868,6 +1927,9 @@ int main( int argc, char **argv )
     if (read_bool_file( RUNTIME_DIR "/no-display-devices.txt" )) wine_nx_display_devices = 0;
     log_line( "[INIT] display devices %s (no-display-devices.txt)",
               wine_nx_display_devices ? "registered" : "off" );
+    if (read_bool_file( RUNTIME_DIR "/framebuffer.txt" )) wine_nx_compositor_mode = 0;
+    log_line( "[INIT] windows shown by %s (framebuffer.txt)",
+              wine_nx_compositor_mode ? "the OpenGL compositor" : "the framebuffer" );
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else
     {
