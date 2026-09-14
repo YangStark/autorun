@@ -6218,6 +6218,125 @@ static void horizon_server_link_window_locked( struct horizon_user_window *windo
     }
 }
 
+/* SetParent and GetAncestor's list of parents. Without them SetParent failed,
+ * so a window given an owner that way (a DirectShow video window put in
+ * WarCraft III's movie window) stayed top-level, over its would-be parent. */
+#define HORIZON_REQ_SET_PARENT 151
+#define HORIZON_REQ_GET_WINDOW_PARENTS 152
+
+struct horizon_set_parent_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+    unsigned int parent;
+    char pad[4];
+};
+
+struct horizon_set_parent_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int old_parent;
+    unsigned int full_parent;
+};
+
+struct horizon_get_window_parents_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+};
+
+struct horizon_get_window_parents_reply
+{
+    struct horizon_server_reply_header header;
+    int count;
+    char pad[4];
+};
+
+/* server/window.c's set_parent_window: the window goes to the top of its new
+ * siblings. Moving the desktop, or a window under itself or one of its own
+ * children, is refused. */
+static unsigned int horizon_server_set_parent_locked( struct horizon_user_window *window,
+                                                      struct horizon_user_window *parent )
+{
+    struct horizon_user_window *ptr;
+
+    if (!window->parent) return HORIZON_STATUS_INVALID_PARAMETER;
+    for (ptr = parent; ptr; ptr = ptr->parent ? horizon_server_find_window_locked( ptr->parent ) : NULL)
+        if (ptr == window) return HORIZON_STATUS_INVALID_PARAMETER;
+    window->parent = parent->handle;
+    horizon_server_link_window_locked( window, HORIZON_LINK_TOP );
+    return HORIZON_STATUS_SUCCESS;
+}
+
+/* The window's parents, its own first, up to the desktop: all of them are
+ * counted, and the first max_count stored. */
+static unsigned int horizon_server_window_parents_locked( struct horizon_user_window *window,
+                                                          unsigned int *handles, unsigned int max_count )
+{
+    unsigned int count = 0;
+
+    while (window->parent)
+    {
+        if (count < max_count) handles[count] = window->parent;
+        count++;
+        if (!(window = horizon_server_find_window_locked( window->parent ))) break;
+    }
+    return count;
+}
+
+static int horizon_server_handle_set_parent( struct horizon_server_connection *connection,
+                                             const unsigned char *message )
+{
+    const struct horizon_set_parent_request *request = (const void *)message;
+    struct horizon_set_parent_reply reply;
+    struct horizon_user_window *window, *parent = NULL;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(window = horizon_server_find_window_locked( request->handle )) ||
+        !(parent = horizon_server_find_window_locked( request->parent )))
+        reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else
+    {
+        unsigned int old_parent = window->parent;
+
+        if (!(reply.header.error = horizon_server_set_parent_locked( window, parent )))
+        {
+            reply.old_parent = old_parent;
+            reply.full_parent = parent->handle;
+        }
+    }
+    horizon_trace( "[HZUSER] set_parent hwnd=%08x parent=%08x old=%08x err=%08x\n",
+                   request->handle, request->parent, reply.old_parent, reply.header.error );
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_get_window_parents( struct horizon_server_connection *connection,
+                                                     const unsigned char *message )
+{
+    const struct horizon_get_window_parents_request *request = (const void *)message;
+    struct horizon_get_window_parents_reply reply;
+    struct horizon_user_window *window;
+    unsigned int handles[64], count = 0, returned;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if ((window = horizon_server_find_window_locked( request->handle )))
+        count = horizon_server_window_parents_locked( window, handles, sizeof(handles) / sizeof(*handles) );
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
+    /* As server/window.c: an unknown window has none; the reply holds as many
+     * as fit, and the count of all of them. */
+    reply.count = count;
+    returned = count < sizeof(handles) / sizeof(*handles) ? count : sizeof(handles) / sizeof(*handles);
+    if (returned > request->header.reply_size / sizeof(*handles))
+        returned = request->header.reply_size / sizeof(*handles);
+    reply.header.reply_size = returned * sizeof(*handles);
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), handles,
+                                       reply.header.reply_size );
+}
+
 static int horizon_server_handle_set_window_pos( struct horizon_server_connection *connection,
                                                  const unsigned char *message,
                                                  const unsigned char *data, unsigned int data_size )
@@ -11341,6 +11460,12 @@ static void *horizon_server_thread( void *param )
             break;
         case HORIZON_REQ_SET_WINDOW_OWNER:
             status = horizon_server_handle_set_window_owner( connection, message );
+            break;
+        case HORIZON_REQ_SET_PARENT:
+            status = horizon_server_handle_set_parent( connection, message );
+            break;
+        case HORIZON_REQ_GET_WINDOW_PARENTS:
+            status = horizon_server_handle_get_window_parents( connection, message );
             break;
         case HORIZON_REQ_GET_WINDOW_INFO:
             status = horizon_server_handle_get_window_info( connection, message );
