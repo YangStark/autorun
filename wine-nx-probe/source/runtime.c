@@ -809,6 +809,7 @@ static void runtime_report_interpreter(void)
         extern unsigned long long wine_nx_nouveau_cache_clean_ns __attribute__((weak));
         extern int wine_nx_gl_pinned_memory __attribute__((weak));
         extern unsigned int wine_nx_syscall_counts[] __attribute__((weak));
+        extern unsigned int wine_nx_nouveau_bo_evicted __attribute__((weak));
         static unsigned int calls, last_reads = ~0u, last_frames = ~0u;
         static u64 start;
         unsigned int reads = &wine_nx_file_reads ? __atomic_load_n( &wine_nx_file_reads, __ATOMIC_RELAXED ) : 0;
@@ -906,7 +907,7 @@ static void runtime_report_interpreter(void)
              * and the time creating them (each costs a heap block and nvservices calls). */
             if (&wine_nx_nouveau_bo_new && len > 0 && len < (int)sizeof(gl))
                 len += snprintf( gl + len, sizeof(gl) - len,
-                                 " bo_new=%u bo_reuse=%u bo_ms=%llu pin_cached=%d cleans=%u clean_ms=%llu",
+                                 " bo_new=%u bo_reuse=%u bo_evict=%u bo_ms=%llu pin_cached=%d cleans=%u clean_ms=%llu",
                                  wine_nx_nouveau_bo_new, wine_nx_nouveau_bo_reused,
                                  wine_nx_nouveau_bo_new_ns / 1000000,
                                  &wine_nx_nouveau_pin_cached ? wine_nx_nouveau_pin_cached : 0,
@@ -914,6 +915,7 @@ static void runtime_report_interpreter(void)
                                  &wine_nx_nouveau_cache_clean_ns ? wine_nx_nouveau_cache_clean_ns / 1000000 : 0 );
             if (&wine_nx_gl_profile && len > 0 && len < (int)sizeof(gl)) wine_nx_gl_profile( gl + len, sizeof(gl) - len );
         }
+                                 &wine_nx_nouveau_bo_evicted ? wine_nx_nouveau_bo_evicted : 0,
         /* Gaps in playback: audout ran out of queued frames. */
         if (&wine_nx_audio_underruns && wine_nx_audio_underruns)
             snprintf( audio, sizeof(audio), " audio_under=%u",

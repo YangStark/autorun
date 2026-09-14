@@ -1,38 +1,39 @@
 --- a/source/nouveau.c
 +++ b/source/nouveau.c
-@@ -337,19 +337,176 @@
+@@ -337,22 +337,196 @@
  	return ret;
  }
  
 -static void
 -nouveau_bo_del(struct nouveau_bo *bo)
+-{
+-	CALLED();
+-	struct nouveau_bo_priv *nvbo = nouveau_bo(bo);
+-	struct nouveau_device_priv *nvdev = nouveau_device(bo->device);
 +/* Wine-NX: a bo costs a heap allocation, two nvservices ioctls and a GPU
 + * address space mapping, and Mesa creates and destroys them per transfer. Keep
 + * freed ones for reuse, capped so the process heap stays available. */
-+#define NOUVEAU_BO_CACHE_ENTRIES 16
-+#define NOUVEAU_BO_CACHE_BYTES   (16u << 20)
++#define NOUVEAU_BO_CACHE_ENTRIES 64
++#define NOUVEAU_BO_CACHE_BYTES   (64u << 20)
 +#define NOUVEAU_BO_CACHE_MAX_BO  (8u << 20)
-+
+ 
+-	nouveau_bo_fence_wait(bo, 0);
+-	nvAddressSpaceUnmap(&nvdev->addr_space, bo->offset);
 +static Mutex nouveau_bo_cache_lock;
 +static struct nouveau_bo_priv *nouveau_bo_cache[NOUVEAU_BO_CACHE_ENTRIES];
 +static unsigned int nouveau_bo_cache_count;
 +static uint64_t nouveau_bo_cache_bytes;
 +
-+/* Reported by Wine-NX's [PROGRESS]: bos created, bos taken from the cache, and
-+ * the time spent creating them. */
-+unsigned int wine_nx_nouveau_bo_new, wine_nx_nouveau_bo_reused;
++/* Reported by Wine-NX's [PROGRESS]: bos created, bos taken from the cache, bos
++ * the cache let go to make room, and the time spent creating them. */
++unsigned int wine_nx_nouveau_bo_new, wine_nx_nouveau_bo_reused, wine_nx_nouveau_bo_evicted;
 +uint64_t wine_nx_nouveau_bo_new_ns;
 +
 +static void
 +nouveau_bo_destroy(struct nouveau_bo_priv *nvbo)
- {
--	CALLED();
--	struct nouveau_bo_priv *nvbo = nouveau_bo(bo);
--	struct nouveau_device_priv *nvdev = nouveau_device(bo->device);
++{
 +	struct nouveau_device_priv *nvdev = nouveau_device(nvbo->base.device);
- 
--	nouveau_bo_fence_wait(bo, 0);
--	nvAddressSpaceUnmap(&nvdev->addr_space, bo->offset);
++
 +	nouveau_bo_fence_wait(&nvbo->base, 0);
 +	nvAddressSpaceUnmap(&nvdev->addr_space, nvbo->base.offset);
  	nvMapClose(&nvbo->map);
@@ -40,8 +41,8 @@
 +	if (nvbo->map_addr && !nvbo->user_memory)
  		free(nvbo->map_addr);
  	free(nvbo);
-+}
-+
+ }
+ 
 +/* A cached bo keeps its memory, its nvmap handle and its GPU address; only the
 + * fence of its last use is still pending, and its next user waits for that. */
 +static struct nouveau_bo_priv *
@@ -52,14 +53,18 @@
 +	unsigned int i;
 +
 +	mutexLock(&nouveau_bo_cache_lock);
-+	for (i = 0; i < nouveau_bo_cache_count; i++) {
++	/* The newest match, as the sizes in use come back soonest. The cache stays
++	 * in the order its bos were put, oldest first. */
++	for (i = nouveau_bo_cache_count; i-- > 0;) {
 +		struct nouveau_bo_priv *entry = nouveau_bo_cache[i];
 +
 +		if (entry->base.device != dev || entry->base.size != size ||
 +		    entry->base.flags != flags || entry->kind != kind || entry->align < align)
 +			continue;
 +		nvbo = entry;
-+		nouveau_bo_cache[i] = nouveau_bo_cache[--nouveau_bo_cache_count];
++		nouveau_bo_cache_count--;
++		memmove(nouveau_bo_cache + i, nouveau_bo_cache + i + 1,
++			(nouveau_bo_cache_count - i) * sizeof(*nouveau_bo_cache));
 +		nouveau_bo_cache_bytes -= size;
 +		break;
 +	}
@@ -70,19 +75,32 @@
 +static bool
 +nouveau_bo_cache_put(struct nouveau_bo_priv *nvbo)
 +{
++	struct nouveau_bo_priv *evicted[NOUVEAU_BO_CACHE_ENTRIES];
++	unsigned int count = 0, i;
++
 +	if (nvbo->user_memory || nvbo->base.size > NOUVEAU_BO_CACHE_MAX_BO)
 +		return false;
 +
 +	mutexLock(&nouveau_bo_cache_lock);
-+	if (nouveau_bo_cache_count == NOUVEAU_BO_CACHE_ENTRIES ||
-+	    nouveau_bo_cache_bytes + nvbo->base.size > NOUVEAU_BO_CACHE_BYTES) {
-+		mutexUnlock(&nouveau_bo_cache_lock);
-+		return false;
++	/* The oldest make room. Turning the new bo away instead let a cache full of
++	 * sizes no one asked for again refuse every bo freed after it. */
++	while (nouveau_bo_cache_count == NOUVEAU_BO_CACHE_ENTRIES ||
++	       nouveau_bo_cache_bytes + nvbo->base.size > NOUVEAU_BO_CACHE_BYTES) {
++		evicted[count] = nouveau_bo_cache[0];
++		nouveau_bo_cache_bytes -= evicted[count++]->base.size;
++		nouveau_bo_cache_count--;
++		memmove(nouveau_bo_cache, nouveau_bo_cache + 1,
++			nouveau_bo_cache_count * sizeof(*nouveau_bo_cache));
 +	}
 +	nvbo->base.map = NULL;
 +	nouveau_bo_cache[nouveau_bo_cache_count++] = nvbo;
 +	nouveau_bo_cache_bytes += nvbo->base.size;
++	wine_nx_nouveau_bo_evicted += count;
 +	mutexUnlock(&nouveau_bo_cache_lock);
++
++	/* Destroying one calls nvservices, so not with the lock held. */
++	for (i = 0; i < count; i++)
++		nouveau_bo_destroy(evicted[i]);
 +	return true;
 +}
 +
@@ -134,7 +152,7 @@
 +/* Wine-NX: a bo over page-aligned memory the caller owns (GL_AMD_pinned_memory).
 + * nvservices maps the pages for the GPU in place: nothing is copied, and the
 + * memory is left to the caller once the bo is gone. */
-+int
+ int
 +nouveau_bo_wrap_user(struct nouveau_device *dev, uint32_t flags, void *ptr,
 +		     uint64_t size, struct nouveau_bo **pbo)
 +{
@@ -182,10 +200,13 @@
 +	nvbo->fence.id = UINT32_MAX;
 +	*pbo = bo;
 +	return 0;
- }
- 
- int
-@@ -364,6 +521,8 @@
++}
++
++int
+ nouveau_bo_new(struct nouveau_device *dev, uint32_t flags, uint32_t align,
+ 	       uint64_t size, union nouveau_bo_config *config,
+ 	       struct nouveau_bo **pbo)
+@@ -364,6 +538,8 @@
  	struct nouveau_bo *bo = &nvbo->base;
  	Result rc;
  
@@ -194,7 +215,7 @@
  	if (align < 0x1000)
  		align = 0x1000;
  	size = (size + 0xFFF) &~ 0xFFF;
-@@ -375,6 +534,26 @@
+@@ -375,6 +551,26 @@
  	if (config)
  		kind = (NvKind)config->nvc0.memtype;
  
@@ -221,7 +242,7 @@
  	TRACE("Allocating BO of size %ld, align %d, flags 0x%x and kind 0x%x\n", size, align, flags, kind);
  	void* mem = memalign(0x1000, size);
  	if (!mem)
-@@ -410,7 +589,10 @@
+@@ -410,7 +606,10 @@
  	bo->flags = flags;
  	nvbo->map_addr = mem;
  	nvbo->fence.id = UINT32_MAX;
