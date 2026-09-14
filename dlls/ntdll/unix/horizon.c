@@ -10903,6 +10903,9 @@ __attribute__((weak)) NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void
  * stack, so unwinding to an active user-mode setjmp does not strand a kernel
  * exception. Native Wine faults retain the existing handling path. */
 extern BOOL wine_nx_box64_handle_fault( ULONG_PTR address ) __attribute__((weak));
+/* Dynarec builds: the x86 instruction and registers behind a pc in translated code. */
+extern int wine_nx_box64_describe_native_pc( ULONG_PTR pc, const unsigned long long *x,
+                                             char *buf, size_t size ) __attribute__((weak));
 
 #if defined(__aarch64__)
 /* KUSER_SHARED_DATA is not always at 0x7ffe0000 on Horizon (virtual_alloc_first_teb).
@@ -10987,6 +10990,24 @@ void __libnx_exception_handler( ThreadExceptionDump *ctx )
     if (status)
     {
         unsigned int exception_class = esr >> 26;
+        unsigned long long x[31];
+        unsigned int i, j;
+
+        /* The fault is fatal from here: log every register, and the x86 side of translated code. */
+        for (i = 0; i < 29; i++) x[i] = ctx->cpu_gprs[i].x;
+        x[29] = ctx->fp.x;
+        x[30] = ctx->lr.x;
+        for (i = 4; i <= 30; i += 9)
+        {
+            int len = snprintf( buf, sizeof(buf), "[EXC]" );
+
+            for (j = i; j < i + 9 && j <= 30; j++)
+                len += snprintf( buf + len, sizeof(buf) - len, " x%u=0x%llx", j, x[j] );
+            wine_nx_runtime_trace( buf );
+        }
+        if (wine_nx_box64_describe_native_pc &&
+            wine_nx_box64_describe_native_pc( ctx->pc.x, x, buf, sizeof(buf) ))
+            wine_nx_runtime_trace( buf );
         /* ESR.FnV invalidates FAR. Never consume instruction aborts or faults
          * outside the active interpreter's 32-bit guest address space. */
         if ((exception_class == 0x24 || exception_class == 0x25) && !(esr & (1u << 10)) &&

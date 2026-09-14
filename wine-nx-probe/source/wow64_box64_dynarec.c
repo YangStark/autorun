@@ -69,6 +69,7 @@ struct nx_arena
     uint8_t *rx;
     size_t size;
     size_t used;
+    uint8_t *starts;  /* a bit per 16 bytes, set where an allocation begins */
 };
 
 static struct nx_arena arenas[NX_MAX_ARENAS];
@@ -161,6 +162,7 @@ static int create_arena( size_t minimum )
 #endif
     if (!arena->rw || !arena->rx) return 0;
     arena->size = size;
+    arena->starts = calloc( (size / 16 + 7) / 8, 1 );  /* without it, faults are just not described */
     __atomic_store_n( &arena_count, arena_count + 1, __ATOMIC_RELEASE );
     return 1;
 }
@@ -363,6 +365,7 @@ uintptr_t AllocDynarecMap( uintptr_t x64_addr, size_t size, int is_new )
         return 0;
     }
     result = (uintptr_t)arena->rw + arena->used;
+    if (arena->starts) arena->starts[arena->used / 16 >> 3] |= 1 << (arena->used / 16 & 7);
     arena->used += size;
     __atomic_add_fetch( &wine_nx_box64_dynarec_bytes, size, __ATOMIC_RELAXED );
     pthread_mutex_unlock( &arena_mutex );
@@ -405,6 +408,65 @@ int wine_nx_box64_is_translated_pc( uintptr_t pc )
     struct nx_arena *arena = find_arena( (void *)pc, &offset );
 
     return arena && offset < arena->used;
+}
+
+/* For the exception handler: names the x86 instruction behind a native pc in
+ * translated code, with the guest registers a block keeps in x10-x17. It runs
+ * on the libnx exception stack without locks, which is safe because
+ * allocations are never freed: a start bit, once set, stays, and a block's
+ * dynablock_t lies inside its own allocation. Returns 0 outside the code. */
+/* The allocation starts with a pointer to its dynablock_t, written through the
+ * writable alias; Box64Core.cmake moves the block's own code pointers
+ * (actual_block, block, jmpnext) to the executable alias once it is emitted. */
+static dynablock_t *block_at( const struct nx_arena *arena, size_t offset )
+{
+    size_t bit = offset / 16, first = bit > (1u << 20) / 16 ? bit - (1u << 20) / 16 : 0;  /* no block spans a megabyte */
+    uintptr_t start, actual;
+    dynablock_t *db;
+
+    if (!arena->starts || offset >= arena->used) return NULL;
+    while (!(arena->starts[bit >> 3] & (1 << (bit & 7))))
+    {
+        if (bit == first) return NULL;
+        bit--;
+    }
+    start = (uintptr_t)arena->rw + bit * 16;
+    db = *(dynablock_t **)start;
+    if ((uintptr_t)db - start >= arena->used - bit * 16) return NULL;
+    actual = (uintptr_t)db->actual_block;
+    if (actual != (uintptr_t)arena->rx + bit * 16 && actual != start) return NULL;
+    return db;
+}
+
+int wine_nx_box64_describe_native_pc( uintptr_t pc, const unsigned long long *x, char *buf, size_t size )
+{
+    size_t offset;
+    struct nx_arena *arena = find_arena( (void *)pc, &offset );
+    uintptr_t x64 = 0;
+    dynablock_t *db;
+
+    if (!arena) return 0;
+    if (!arena->starts || offset >= arena->used)
+    {
+        snprintf( buf, size, "[BOX64 FAULT] pc=%lx in the code arena but %s", (unsigned long)pc,
+                  arena->starts ? "past its allocations" : "without a block map (out of memory?)" );
+        return 1;
+    }
+    if (!(db = block_at( arena, offset )))
+    {
+        snprintf( buf, size, "[BOX64 FAULT] pc=%lx in translated code, no block found for it eax=%08x ecx=%08x "
+                  "edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x", (unsigned long)pc,
+                  (unsigned)x[10], (unsigned)x[11], (unsigned)x[12], (unsigned)x[13],
+                  (unsigned)x[14], (unsigned)x[15], (unsigned)x[16], (unsigned)x[17] );
+        return 1;
+    }
+    if (db->done) x64 = getX64Address( db, (uintptr_t)arena->rx + offset );
+    snprintf( buf, size, "[BOX64 FAULT] x86=%08lx block=%08lx+%lx%s eax=%08x ecx=%08x edx=%08x ebx=%08x "
+              "esp=%08x ebp=%08x esi=%08x edi=%08x",
+              (unsigned long)x64, (unsigned long)(uintptr_t)db->x64_addr, (unsigned long)db->x64_size,
+              db->done ? "" : " (unfinished)", (unsigned)x[10], (unsigned)x[11], (unsigned)x[12],
+              (unsigned)x[13], (unsigned)x[14], (unsigned)x[15], (unsigned)x[16], (unsigned)x[17] );
+    return 1;
 }
 
 #ifdef JMPTABL_SHIFT4

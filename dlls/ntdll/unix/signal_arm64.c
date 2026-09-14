@@ -428,8 +428,9 @@ NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
     if (trace_syscall)
     {
         char buf[128];
-        snprintf( buf, sizeof(buf), "[SYSCALL] id=0x%04x t=%u f=%u args=%u handler=%p",
-                  syscall_id, table_idx, func_idx, arg_bytes, handler );
+        snprintf( buf, sizeof(buf), "[SYSCALL] id=0x%04x t=%u f=%u args=%u handler=%p tid=%04x",
+                  syscall_id, table_idx, func_idx, arg_bytes, handler,
+                  (unsigned)HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
         wine_nx_runtime_trace( buf );
     }
 
@@ -474,8 +475,9 @@ NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
     if (trace_syscall)
     {
         char buf[128];
-        snprintf( buf, sizeof(buf), "[SYSCALL] id=0x%04x done status=0x%08x",
-                  syscall_id, (unsigned)result );
+        snprintf( buf, sizeof(buf), "[SYSCALL] id=0x%04x done status=0x%08x tid=%04x",
+                  syscall_id, (unsigned)result,
+                  (unsigned)HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
         wine_nx_runtime_trace( buf );
     }
 
