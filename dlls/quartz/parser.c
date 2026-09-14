@@ -21,7 +21,12 @@
 HRESULT avi_splitter_create(IUnknown *outer, IUnknown **out)
 {
     static const GUID CLSID_wg_avi_splitter = {0x272bfbfb,0x50d0,0x4078,{0xb6,0x00,0x1e,0x95,0x9c,0x30,0x13,0x37}};
-    return CoCreateInstance(&CLSID_wg_avi_splitter, outer, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)out);
+    HRESULT hr;
+
+    if (SUCCEEDED(hr = CoCreateInstance(&CLSID_wg_avi_splitter, outer, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)out)))
+        return hr;
+    /* Without winegstreamer, as where there is no GStreamer, read AVI files ourselves. */
+    return native_avi_splitter_create(outer, out);
 }
 
 HRESULT mpeg1_splitter_create(IUnknown *outer, IUnknown **out)

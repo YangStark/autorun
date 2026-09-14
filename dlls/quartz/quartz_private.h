@@ -63,6 +63,7 @@ HRESULT mpeg_audio_codec_create(IUnknown *outer, IUnknown **out);
 HRESULT mpeg_layer3_decoder_create(IUnknown *outer, IUnknown **out);
 HRESULT mpeg_video_codec_create(IUnknown *outer, IUnknown **out);
 HRESULT mpeg1_splitter_create(IUnknown *outer, IUnknown **out);
+HRESULT native_avi_splitter_create(IUnknown *outer, IUnknown **out);
 HRESULT system_clock_create(IUnknown *outer, IUnknown **out);
 HRESULT seeking_passthrough_create(IUnknown *outer, IUnknown **out);
 HRESULT video_renderer_create(IUnknown *outer, IUnknown **out);

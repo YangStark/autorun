@@ -5,6 +5,7 @@ DELAYIMPORTS = ddraw
 
 SOURCES = \
 	acmwrapper.c \
+	avisplit.c \
 	avidec.c \
 	control_tlb.idl \
 	decoder.c \
