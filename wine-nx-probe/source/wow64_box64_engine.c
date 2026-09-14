@@ -2,6 +2,7 @@
 #include <fenv.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,8 +53,15 @@ struct nx_engine
 };
 
 static __thread struct nx_engine *active_engine;
-/* Engines are per run and freed before any gate is dispatched, so a thread
- * exiting through NtTerminateThread owns none. Reported by the lifecycle log. */
+/* A run's engine. Allocating and freeing one per run cost Direct3D's command
+ * thread in NFSU2 ~17% of its time (a run per OpenGL call, behind malloc's
+ * lock), so each thread keeps two: one for an outer run and one for a run
+ * nested in a callback. A slot stays busy if its run is left by a longjmp;
+ * runs then allocate, as deeper ones do. */
+#define NX_CACHED_ENGINES 2
+static __thread struct nx_engine cached_engines[NX_CACHED_ENGINES];
+static __thread unsigned char cached_engine_busy[NX_CACHED_ENGINES];
+/* Engines in use, reported by the lifecycle log. */
 LONG wine_nx_box64_live_engines;
 /* Throughput, logged periodically by the runtime. */
 ULONGLONG wine_nx_box64_executed_total, wine_nx_box64_runs_total;
@@ -364,6 +372,7 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
     struct nx_engine *engine, *previous = active_engine;
     NTSTATUS status;
     fenv_t native_fenv;
+    unsigned int slot;
     int i;
 #ifdef WINE_NX_BOX64_DYNAREC
     int use_dynarec;
@@ -373,7 +382,18 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
         !gates->unix_call || gates->syscall == gates->unix_call || !budget ||
         completion_pc == gates->syscall || completion_pc == gates->unix_call)
         return STATUS_INVALID_PARAMETER;
-    if (!(engine = calloc( 1, sizeof(*engine) ))) return STATUS_NO_MEMORY;
+    for (slot = 0; slot < NX_CACHED_ENGINES && cached_engine_busy[slot]; slot++) continue;
+    if (slot < NX_CACHED_ENGINES)
+    {
+        cached_engine_busy[slot] = 1;
+        engine = &cached_engines[slot];
+        /* As calloc did, but Box64's scratch area is only scratch: 1.6 of the
+         * 4 KB zeroed on every run (memset was 6% of the command thread). */
+        memset( engine, 0, offsetof( struct nx_engine, emu.scratch ) );
+        memset( &engine->emu.scratch[N_SCRATCH], 0,
+                sizeof(*engine) - offsetof( struct nx_engine, emu.scratch[N_SCRATCH] ) );
+    }
+    else if (!(engine = calloc( 1, sizeof(*engine) ))) return STATUS_NO_MEMORY;
     __atomic_add_fetch( &wine_nx_box64_live_engines, 1, __ATOMIC_RELAXED );
     engine->gates = gates; engine->host = host; engine->opaque = opaque;
     engine->fs_base = fs_base; engine->completion = completion_pc; engine->remaining = budget;
@@ -425,15 +445,20 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
         status = export_context( engine, context );
         if (engine->status) status = engine->status;
         if (status || (completion_pc && context->Eip == completion_pc)) break;
-        /* No callbacks: hand the saved context back across the PE/Unix boundary. */
-        if (!host->syscall && !host->unix_call) break;
+        /* A gate the host has no callback for goes back across the PE/Unix
+         * boundary: run_guest takes unix calls here and leaves system calls,
+         * which need wow64.dll, to BTCpuSimulate. */
+        if (!(context->Eip == gates->unix_call ? host->unix_call != NULL
+                                               : context->Eip == gates->syscall && host->syscall != NULL))
+            break;
         status = wine_nx_wow64_dispatch_gate( context, gates, host, opaque );
         if (status) break;
     }
     if (executed) *executed = engine->executed;
     __atomic_add_fetch( &wine_nx_box64_executed_total, engine->executed, __ATOMIC_RELAXED );
     __atomic_add_fetch( &wine_nx_box64_runs_total, 1, __ATOMIC_RELAXED );
-    free( engine );
+    if (slot < NX_CACHED_ENGINES) cached_engine_busy[slot] = 0;
+    else free( engine );
     __atomic_sub_fetch( &wine_nx_box64_live_engines, 1, __ATOMIC_RELAXED );
     return status;
 }

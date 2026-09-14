@@ -255,6 +255,8 @@ static void init_dynarec(void)
  * could be created; the engine then interprets. */
 int wine_nx_box64_dynarec_init(void)
 {
+    /* Every run asks; once set, dynarec_ready stays. */
+    if (dynarec_ready) return 1;
     pthread_once( &init_once, init_dynarec );
     return dynarec_ready;
 }
@@ -262,9 +264,12 @@ int wine_nx_box64_dynarec_init(void)
 void wine_nx_box64_dynarec_add_stop( uint32_t address )
 {
     uintptr_t page = address & ~0xfffu;
-    unsigned int i;
+    unsigned int i, count = __atomic_load_n( &stop_page_count, __ATOMIC_ACQUIRE );
 
     if (!address) return;
+    /* Every run registers the same gates, so they are nearly always listed
+     * already; pages are only ever added, each before the count covers it. */
+    for (i = 0; i < count; i++) if (stop_pages[i] == page) return;
     pthread_mutex_lock( &stop_page_mutex );
     for (i = 0; i < stop_page_count; i++) if (stop_pages[i] == page) break;
     if (i == stop_page_count && stop_page_count < NX_MAX_STOP_PAGES)

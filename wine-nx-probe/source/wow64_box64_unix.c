@@ -12,9 +12,31 @@ static NTSTATUS read_guest( void *opaque, ULONG address, void *buffer, SIZE_T si
     status = NtReadVirtualMemory( NtCurrentProcess(), ULongToPtr(address), buffer, size, &read );
     return status ? status : read == size ? STATUS_SUCCESS : STATUS_PARTIAL_COPY;
 }
+extern NTSTATUS wine_nx_call_ntdll_wow64( unixlib_handle_t handle, ULONG code, ULONG args );
+
+/* The x86 unix call gate, taken without leaving the run. BTCpuSimulate's own
+ * dispatch returned to PE code only to make another unix call to
+ * call_guest_unix, then a third back into run_guest to go on: about 180,000
+ * times a second from Direct3D's drawing thread in NFSU2, once per OpenGL call. */
+static NTSTATUS unix_guest( void *opaque, ULONGLONG handle, ULONG code, ULONG arguments )
+{
+    return wine_nx_call_ntdll_wow64( (unixlib_handle_t)handle, code, arguments );
+}
+
+/* As BTCpuSimulate's: WoW64 replaced the whole context (NtContinue, an
+ * exception or APC) while the call ran. */
+static BOOL context_replaced( void *opaque )
+{
+    WOW64_CPURESERVED *cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
+    BOOL replaced = cpu && (cpu->Flags & WOW64_CPURESERVED_FLAG_RESET_STATE);
+
+    if (replaced) cpu->Flags &= ~WOW64_CPURESERVED_FLAG_RESET_STATE;
+    return replaced;
+}
+
 static NTSTATUS run_guest( void *args )
 {
-    static const struct wine_nx_wow64_host host = { read_guest, NULL, NULL, NULL };
+    static const struct wine_nx_wow64_host host = { read_guest, NULL, unix_guest, context_replaced };
 #ifdef __SWITCH__
     static unsigned int trace_runs;
 #endif
@@ -73,7 +95,6 @@ static NTSTATUS run_guest( void *args )
         return status;
     }
 }
-extern NTSTATUS wine_nx_call_ntdll_wow64( unixlib_handle_t handle, ULONG code, ULONG args );
 static NTSTATUS call_guest_unix( void *args )
 {
     struct winebox64_unix_params *p = args;
