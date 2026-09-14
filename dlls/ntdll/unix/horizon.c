@@ -5461,8 +5461,16 @@ static int horizon_server_handle_create_class( struct horizon_server_connection 
         }
         else reply.header.error = horizon_server_add_atom_locked( name, name_len, atom, &base_atom );
     }
-    if (!reply.header.error && horizon_server_find_class_locked( atom, request->instance ))
-        reply.header.error = HORIZON_STATUS_OBJECT_NAME_COLLISION;
+    if (!reply.header.error)
+    {
+        struct horizon_user_class *existing = horizon_server_find_class_locked( atom, request->instance );
+
+        /* As Wine's server: callers such as quartz's video window check for this
+         * error to reuse a class they registered before; a local and a global
+         * class may share a name. */
+        if (existing && !existing->local == !request->local)
+            reply.header.error = 0xc0010582u;  /* ERROR_CLASS_ALREADY_EXISTS */
+    }
     if (!reply.header.error &&
         (request->cls_extra < 0 || request->cls_extra > 4096 ||
          request->win_extra < 0 || request->win_extra > 4096 ||
