@@ -157,6 +157,74 @@ static void test_buttons_between_takes(void)
     assert( t.held == L && !t.pressed && !t.released );
 }
 
+/* A Quake III style loop: each frame the message pump polls and hands the
+ * position to Wine, then, later in the frame, the game reads it, turns by its
+ * offset from the centre and warps back there; a background thread polls
+ * every 16 ms in between. Returns the motion the game saw, and the smallest
+ * and largest per-frame turn after the first frame. */
+static double run_warp_loop( int keep_motion, int stick_x, int seconds, int *min_turn, int *max_turn )
+{
+    enum { CX = 640, CY = 360, FRAME_MS = 27, READ_MS = 12, POLL_MS = 16 };
+    struct pointer_cursor c = cursor_at( CX, CY );
+    unsigned long long last_poll = 0;
+    int sent_x = CX, sent_y = CY, t, seen = 0, frame = 0;
+
+    *min_turn = 1 << 30;
+    *max_turn = 0;
+    for (t = 1; t <= seconds * 1000; t++)
+    {
+        if (t % POLL_MS == 5)  /* the background thread */
+        {
+            pointer_cursor_step( &c, stick_x, 0, (t - last_poll) * MS );
+            last_poll = t;
+        }
+        if (t % FRAME_MS == 0)  /* the pump: poll, then take */
+        {
+            pointer_cursor_step( &c, stick_x, 0, (t - last_poll) * MS );
+            last_poll = t;
+            sent_x = (int)c.x;
+            sent_y = (int)c.y;
+        }
+        if (t % FRAME_MS == READ_MS)  /* GetCursorPos, then SetCursorPos to the centre */
+        {
+            int turn = sent_x - CX;
+
+            seen += turn;
+            if (frame++ && t > FRAME_MS * 2)
+            {
+                if (turn < *min_turn) *min_turn = turn;
+                if (turn > *max_turn) *max_turn = turn;
+            }
+            if (keep_motion) pointer_cursor_warp( &c, sent_x, sent_y, CX, CY );
+            else pointer_cursor_place( &c, CX, CY );
+            sent_x = CX;
+            sent_y = CY;
+        }
+    }
+    return seen;
+}
+
+static void test_warp_keeps_unsent_motion(void)
+{
+    int slow = (int)(POINTER_CURSOR_DEAD_ZONE + (POINTER_CURSOR_STICK_MAX - POINTER_CURSOR_DEAD_ZONE) * 0.15);
+    int min_turn, max_turn;
+    double seen;
+
+    /* Full tilt: 1000 px/s for 3 s, a steady 27 px each 27 ms frame. */
+    seen = run_warp_loop( 1, 32767, 3, &min_turn, &max_turn );
+    assert( fabs( seen - 3000 ) < 40 );
+    assert( min_turn >= 26 && max_turn <= 28 );
+    /* Dropping it at the warp loses the polls that land between the take and
+     * the warp, and the turn stops and goes: what the Switch showed. */
+    seen = run_warp_loop( 0, 32767, 3, &min_turn, &max_turn );
+    assert( seen < 2500 && max_turn - min_turn > 10 );
+
+    /* A slight tilt, 22.5 px/s, well under a pixel a frame, still turns. */
+    seen = run_warp_loop( 1, slow, 4, &min_turn, &max_turn );
+    assert( fabs( seen - 90 ) < 3 && max_turn <= 1 );
+    assert( run_warp_loop( 0, slow, 4, &min_turn, &max_turn ) < 10 );
+}
+
 int main(void)
 {
     test_buttons_between_takes();
@@ -167,7 +235,8 @@ int main(void)
     test_slow_tilt_accumulates_subpixels();
     test_stall_and_edges();
     test_paint_restores_pixels();
-    puts( "pointer cursor: buttons between takes, dead zone, speed curve, time scaling, edges and sprite "
-          "restore passed" );
+    test_warp_keeps_unsent_motion();
+    puts( "pointer cursor: buttons between takes, dead zone, speed curve, time scaling, edges, sprite "
+          "restore and motion kept across warps passed" );
     return 0;
 }

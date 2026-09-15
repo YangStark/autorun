@@ -58,6 +58,19 @@ static inline int pointer_cursor_step( struct pointer_cursor *c, int stick_x, in
     return (int)c->x != old_x || (int)c->y != old_y;
 }
 
+/* The program moved the cursor to x, y (SetCursorPos) after Wine was last
+ * handed sent_x, sent_y. Stick motion since then, its sub-pixel part included,
+ * carries on from the new position, as mouse motion Windows has not applied yet
+ * does: Quake III's mouse look warps the cursor to its window's centre every
+ * frame, and dropping that motion made the view move, stop and move again.
+ * Returns nonzero when the whole-pixel position is not x, y, so it still has
+ * to be sent. */
+static inline int pointer_cursor_warp( struct pointer_cursor *c, int sent_x, int sent_y, int x, int y )
+{
+    pointer_cursor_place( c, x + (c->x - sent_x), y + (c->y - sent_y) );
+    return (int)c->x != x || (int)c->y != y;
+}
+
 /* Buttons seen by the polls since the last take: the latest state, and every
  * button that went down or up in between. Polls can outpace the message loop
  * that takes them, and a click shorter than that gap must not be lost. */

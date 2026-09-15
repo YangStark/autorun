@@ -50,7 +50,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-107"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-108"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -276,6 +276,8 @@ static int wine_nx_pointer_ready;
 /* What the polls saw since the last wine_nx_pointer_take(). */
 static struct pointer_buttons wine_nx_pointer_buttons;
 static int wine_nx_pointer_moved;
+/* The position Wine last had, from a take or the program's SetCursorPos. */
+static int wine_nx_pointer_sent_x = WINE_NX_FB_W / 2, wine_nx_pointer_sent_y = WINE_NX_FB_H / 2;
 
 /* Take the screen from the text console and bring up a linear framebuffer. */
 int wine_nx_fb_init(void)
@@ -636,8 +638,8 @@ int wine_nx_pointer_take( int *x, int *y, unsigned int *buttons, unsigned int *p
     int moved;
 
     pthread_mutex_lock( &wine_nx_pointer_mutex );
-    *x = (int)wine_nx_pointer.x;
-    *y = (int)wine_nx_pointer.y;
+    *x = wine_nx_pointer_sent_x = (int)wine_nx_pointer.x;
+    *y = wine_nx_pointer_sent_y = (int)wine_nx_pointer.y;
     taken = pointer_buttons_take( &wine_nx_pointer_buttons );
     moved = wine_nx_pointer_moved;
     wine_nx_pointer_moved = 0;
@@ -649,11 +651,15 @@ int wine_nx_pointer_take( int *x, int *y, unsigned int *buttons, unsigned int *p
     return moved;
 }
 
-/* Follow a position set by the application (SetCursorPos). */
+/* Follow a position set by the application (SetCursorPos), keeping the stick
+ * motion Wine has not been handed yet (pointer_cursor_warp). */
 void wine_nx_pointer_set_pos( int x, int y )
 {
     pthread_mutex_lock( &wine_nx_pointer_mutex );
-    pointer_cursor_place( &wine_nx_pointer, x, y );
+    wine_nx_pointer_moved = pointer_cursor_warp( &wine_nx_pointer, wine_nx_pointer_sent_x,
+                                                 wine_nx_pointer_sent_y, x, y );
+    wine_nx_pointer_sent_x = x;
+    wine_nx_pointer_sent_y = y;
     x = (int)wine_nx_pointer.x;
     y = (int)wine_nx_pointer.y;
     pthread_mutex_unlock( &wine_nx_pointer_mutex );
