@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Stage WarCraft III's needs over the full package: the setup program and the
+"""Stage WarCraft III's needs over a Wine package: the setup program and the
 DLLs the game and its movies load, not the game itself.
 
 The game belongs to whoever owns it: copy the installation into
 switch/wine/drive_c/WarCraft III on the card. WINE_NX_WAR3_BASE names the
-package to stage over (default build-switch-wow64-dynarec/full-sd-card/switch/wine,
-from package-wow64-full.py)."""
+package to stage over (default build-switch-wow64-dynarec/d3d9-sd-card/switch/wine).
+package-wow64-full.py runs this as its last checkpoint and makes the one
+archive, so this makes none."""
 from pathlib import Path
-from zipfile import ZipFile, ZIP_DEFLATED
 import functools
 import os
 import re
@@ -18,7 +18,7 @@ import sys
 probe = Path(__file__).resolve().parents[1]
 pe = probe / 'build-wine-wow64-pe'
 build = probe / 'build-switch-wow64-dynarec'
-base = Path(os.environ.get('WINE_NX_WAR3_BASE', build / 'full-sd-card/switch/wine'))
+base = Path(os.environ.get('WINE_NX_WAR3_BASE', build / 'd3d9-sd-card/switch/wine'))
 stage_root = build / 'war3-sd-card'
 stage = stage_root / 'switch/wine'
 tools = probe / 'toolchains/llvm-mingw-20260505-ucrt-macos-universal/bin'
@@ -160,22 +160,4 @@ for exe in (setup, pe / 'dlls/quartz/i386-windows/quartz.dll', pe / 'dlls/l3code
     imports = {n for n in imports if not n.startswith(('api-ms-', 'ext-ms-'))}
     assert imports <= present, f'{exe.name} imports not staged: {imports - present}'
 assert (syswow64 / 'quartz.dll').read_bytes() == (pe / 'dlls/quartz/i386-windows/quartz.dll').read_bytes()
-
-archive = build / f'wine-nx-war3-full-dynarec-{marker}.zip'
-overlay = build / f'wine-nx-war3-overlay-{marker}.zip'
-staged_files = [f for f in sorted(stage.rglob('*'))
-                if f.is_file() and f.name != '.DS_Store' and f.suffix != '.log']
-with ZipFile(archive, 'w', ZIP_DEFLATED) as z:
-    for f in staged_files:
-        z.write(f, f.relative_to(stage_root))
-# A card that already holds this build's full package needs only what this adds
-# or changes.
-with ZipFile(overlay, 'w', ZIP_DEFLATED) as z:
-    for f in staged_files:
-        old_file = base / f.relative_to(stage)
-        if not old_file.is_file() or old_file.read_bytes() != f.read_bytes():
-            z.write(f, f.relative_to(stage_root))
-for path in (archive, overlay):
-    with ZipFile(path) as z:
-        assert z.testzip() is None
-    print(f'{path} ({path.stat().st_size / 2**20:.1f} MiB, {len(ZipFile(path).namelist())} files)')
+print(stage_root)
