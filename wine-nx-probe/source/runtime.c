@@ -886,8 +886,9 @@ static void runtime_report_interpreter(void)
 #endif
         /* OpenGL: frames swapped and the time in eglSwapBuffers, calls into opengl32's unix
          * side and their time, megabytes copied to 32-bit buffer mappings, persistent
-         * mappings refused, whether pinned memory works (1) or was refused (-1), and
-         * the slowest opengl32 functions of the last 10 seconds. */
+         * mappings refused, whether pinned memory works (1), was refused (-1) or is not
+         * needed because a 32-bit address space keeps every mapping below 4 GB (2),
+         * and the slowest opengl32 functions of the last 10 seconds. */
         if (gl_frames || (&wine_nx_gl_calls && wine_nx_gl_calls))
         {
             int len = snprintf( gl, sizeof(gl), " gl_frames=%u swap_ms=%llu gl_calls=%u gl_ms=%llu copy_mb=%llu persistent_fail=%u pinned=%d",

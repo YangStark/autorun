@@ -1560,7 +1560,8 @@ static void fs_hack_setup_gamma_shader( struct wgl_context *ctx, const struct op
 
 #ifdef __SWITCH__
 /* 1 once GL_AMD_pinned_memory mapped a 32-bit page for the GPU, -1 when it
- * refused one and persistent maps stay hidden; reported by [PROGRESS]. */
+ * refused one and persistent maps stay hidden, 2 when a 32-bit address space
+ * makes it unnecessary (driver_maps_fit_wow64); reported by [PROGRESS]. */
 int wine_nx_gl_pinned_memory;
 /* Also reported by [PROGRESS]: bytes copied between GL buffer mappings above
  * 4 GB and their 32-bit copies, and persistent mappings refused. */
@@ -1590,7 +1591,8 @@ static BOOL pinned_memory_works( const struct opengl_funcs *funcs )
     GLuint name;
     int i;
 
-    if (wine_nx_gl_pinned_memory) return wine_nx_gl_pinned_memory > 0;
+    if (wine_nx_gl_pinned_memory == 1) return TRUE;
+    if (wine_nx_gl_pinned_memory < 0) return FALSE;
 
     if (!gen_buffers || !bind_buffer || !buffer_data || !delete_buffers || !funcs->p_glGetError)
     {
@@ -1622,6 +1624,30 @@ static BOOL pinned_memory_works( const struct opengl_funcs *funcs )
         wine_nx_runtime_trace( message );
     }
     return error == GL_NO_ERROR;
+}
+
+extern void horizon_get_address_space_limits( void **start, void **limit );
+
+/* In a 32-bit address space every mapping the driver makes lies below 4 GB, and
+ * wow64_map_buffer hands such a pointer to the program as it is, persistent
+ * maps included: buffer storage then needs no pinned memory to emulate it.
+ * Without it, WineD3D maps no buffer from its own thread and waits for the
+ * command stream on each map (NFSU2 on Mesa 26, a third of its main thread). */
+static BOOL driver_maps_fit_wow64(void)
+{
+    static int fit = -1;
+    void *start, *limit;
+
+    if (fit >= 0) return fit;
+    horizon_get_address_space_limits( &start, &limit );
+    fit = (ULONG_PTR)limit <= 0x100000000;
+    if (fit)
+    {
+        if (!wine_nx_gl_pinned_memory) wine_nx_gl_pinned_memory = 2;
+        if (&wine_nx_runtime_trace)
+            wine_nx_runtime_trace( "[NXGL] 32-bit address space: 32-bit programs get buffer storage through the driver's own mappings" );
+    }
+    return fit;
 }
 #endif
 
@@ -1729,7 +1755,8 @@ static void make_context_current( TEB *teb, const struct opengl_funcs *funcs, HD
     if (is_win64 && ctx->buffers && !initialize_vk_device( teb, ctx )
 #ifdef __SWITCH__
         && !(ctx->use_pinned_memory = is_extension_supported( ctx, "GL_AMD_pinned_memory" )
-                                      && pinned_memory_works( funcs )))
+                                      && pinned_memory_works( funcs ))
+        && !driver_maps_fit_wow64())
 #else
         && !(ctx->use_pinned_memory = is_extension_supported( ctx, "GL_AMD_pinned_memory" )))
 #endif
