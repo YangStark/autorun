@@ -591,6 +591,8 @@ target_link_libraries(wine-nx-ntdll-file-smoke PRIVATE nx)
 add_executable(wine-nx-runtime
     source/runtime.c
     source/launcher.c
+    source/launcher_console.c
+    source/launcher_ui.c
     source/runtime_platform.c
     source/sd_cache.c
     source/wow64_box64_bridge.c
@@ -741,7 +743,15 @@ if(WINE_NX_MESA_SWITCH_DIR)
     )
     target_sources(wine-nx-runtime PRIVATE $<TARGET_OBJECTS:wine-winevulkan-unix-real>)
 endif()
+# The launcher (source/launcher.c) draws with SDL2 and SDL2_ttf; SDL's GL
+# functions come through eglGetProcAddress, so it works over either Mesa.
+find_library(SWITCH_SDL2 SDL2 HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+find_library(SWITCH_SDL2_TTF SDL2_ttf HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+set_source_files_properties(source/launcher.c source/launcher_ui.c PROPERTIES
+    INCLUDE_DIRECTORIES "$ENV{DEVKITPRO}/portlibs/switch/include/SDL2"
+    COMPILE_DEFINITIONS _REENTRANT)
 target_link_libraries(wine-nx-runtime PRIVATE
+    ${SWITCH_SDL2_TTF} ${SWITCH_SDL2}
     ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_HARFBUZZ}
     ${SWITCH_EGL} ${SWITCH_GLAPI} ${SWITCH_DRM_NOUVEAU} stdc++ nx m)
 

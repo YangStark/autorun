@@ -75,6 +75,47 @@ static void test_scrolling(void)
     assert( launcher_first_visible( 0, 0, 0, 36 ) == 0 );
 }
 
+static void test_dos_paths(void)
+{
+    char dos[32];
+
+    assert( launcher_dos_path( "sdmc:/switch/wine/drive_c/openttd/openttd.exe", dos, sizeof(dos) ) );
+    assert( !strcmp( dos, "C:\\openttd\\openttd.exe" ) );
+    assert( launcher_dos_path( "sdmc:/switch/wine/drive_c", dos, sizeof(dos) ) && !strcmp( dos, "C:\\" ) );
+    assert( launcher_dos_path( "sdmc:/switch/wine/drive_c/", dos, sizeof(dos) ) && !strcmp( dos, "C:\\" ) );
+    assert( launcher_dos_path( "sdmc:/SWITCH/wine/DRIVE_C/x.exe", dos, sizeof(dos) ) && !strcmp( dos, "C:\\x.exe" ) );
+    /* Beside drive_c, not in it. */
+    assert( launcher_dos_path( "sdmc:/switch/wine/drive_c2/x.exe", dos, sizeof(dos) ) );
+    assert( !strcmp( dos, "Z:\\switch\\wine\\drive_c2\\x.exe" ) );
+    assert( launcher_dos_path( "sdmc:/games/Game/", dos, sizeof(dos) ) && !strcmp( dos, "Z:\\games\\Game" ) );
+    assert( launcher_dos_path( "sdmc:/", dos, sizeof(dos) ) && !strcmp( dos, "Z:\\" ) );
+    assert( launcher_dos_path( "sdmc:", dos, sizeof(dos) ) && !strcmp( dos, "Z:\\" ) );
+    assert( !launcher_dos_path( "romfs:/x.exe", dos, sizeof(dos) ) && !launcher_dos_path( "sdmcx:/a", dos, sizeof(dos) ) );
+    assert( !launcher_dos_path( "sdmc:/a/very/long/path/that/does/not/fit.exe", dos, sizeof(dos) ) );
+}
+
+static void test_grid(void)
+{
+    /* 23 programs, 5 columns x 2 rows: pages of 10, the last with 3. */
+    assert( launcher_grid_move( 0, 23, 5, 2, 1, 0 ) == 1 );
+    assert( launcher_grid_move( 4, 23, 5, 2, 1, 0 ) == 10 );   /* right edge: next page, same row */
+    assert( launcher_grid_move( 9, 23, 5, 2, 1, 0 ) == 15 );
+    assert( launcher_grid_move( 19, 23, 5, 2, 1, 0 ) == 22 );  /* no second row there: the last */
+    assert( launcher_grid_move( 22, 23, 5, 2, 1, 0 ) == 22 );  /* the end */
+    assert( launcher_grid_move( 10, 23, 5, 2, -1, 0 ) == 4 );
+    assert( launcher_grid_move( 15, 23, 5, 2, -1, 0 ) == 9 );
+    assert( launcher_grid_move( 0, 23, 5, 2, -1, 0 ) == 0 );
+    assert( launcher_grid_move( 2, 23, 5, 2, 0, 1 ) == 7 );
+    assert( launcher_grid_move( 7, 23, 5, 2, 0, 1 ) == 7 );    /* the page's last row */
+    assert( launcher_grid_move( 7, 23, 5, 2, 0, -1 ) == 2 );
+    assert( launcher_grid_move( 21, 23, 5, 2, 0, 1 ) == 21 );  /* no row below on the last page */
+    assert( launcher_grid_move( 4, 8, 5, 2, 0, 1 ) == 7 );     /* a short row below: its last program */
+    assert( launcher_grid_move( 0, 0, 5, 2, 1, 0 ) == 0 );
+    assert( launcher_grid_page( 3, 23, 10, 1 ) == 13 && launcher_grid_page( 13, 23, 10, 1 ) == 22 );
+    assert( launcher_grid_page( 22, 23, 10, 1 ) == 22 && launcher_grid_page( 22, 23, 10, -1 ) == 12 );
+    assert( launcher_grid_page( 5, 23, 10, -1 ) == 5 && launcher_grid_page( 0, 0, 10, 1 ) == 0 );
+}
+
 int main(void)
 {
     test_names();
@@ -82,7 +123,9 @@ int main(void)
     test_program_args();
     test_order_and_find();
     test_scrolling();
-    puts( "launcher list: program names, args.txt matching, program argument files, order, preselection and "
-          "scrolling passed" );
+    test_dos_paths();
+    test_grid();
+    puts( "launcher list: program names, args.txt matching, program argument files, order, preselection, "
+          "scrolling, DOS paths and grid moves passed" );
     return 0;
 }

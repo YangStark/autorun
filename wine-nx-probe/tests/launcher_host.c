@@ -1,0 +1,222 @@
+/*
+ * Host run of the launcher (source/launcher.c) with SDL on the Mac, to see
+ * every screen and check its actions without a Switch.
+ *
+ * Run it in a folder whose "sdmc:" holds switch/wine/drive_c (paths on the card
+ * are relative there). A script of steps drives it, one step per line:
+ *   key NAME    press a key (up, down, left, right, a, b, x, y, plus, minus, l, r)
+ *   tap X Y     tap the touch screen
+ *   wait N      let N frames pass
+ *   shot FILE   save the next frame as a PNG
+ *   type TEXT   the text the next keyboard prompt returns
+ *
+ * Build (see check-launcher-host.sh):
+ *   clang -std=gnu11 -I source $(sdl2-config --cflags) tests/launcher_host.c source/launcher.c
+ *     source/launcher_ui.c $(sdl2-config --libs) -lSDL2_ttf -lpng
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <png.h>
+
+#include "launcher.h"
+#include "launcher_ui.h"
+
+static char script[256][300];
+static int script_count, script_pos, wait_frames, frames;
+static char prompt_text[512];
+static int prompt_set;
+static const char *font_path;
+static unsigned char *font_data;
+
+int launcher_platform_font( const void **data, size_t *size )
+{
+    FILE *file = fopen( font_path, "rb" );
+    long length;
+
+    if (!file) return 0;
+    fseek( file, 0, SEEK_END );
+    length = ftell( file );
+    fseek( file, 0, SEEK_SET );
+    font_data = malloc( length );
+    if (fread( font_data, 1, length, file ) != (size_t)length) length = 0;
+    fclose( file );
+    *data = font_data;
+    *size = length;
+    return length > 0;
+}
+
+int launcher_platform_prompt( const char *header, const char *initial, char *out, size_t size )
+{
+    printf( "prompt '%s' initial '%s' -> %s\n", header, initial, prompt_set ? prompt_text : "(cancelled)" );
+    if (!prompt_set) return 0;
+    snprintf( out, size, "%s", prompt_text );
+    prompt_set = 0;
+    return 1;
+}
+
+void wine_nx_runtime_trace( const char *msg )
+{
+    printf( "%s\n", msg );
+}
+
+static int machine_of( const char *path, unsigned short *machine )
+{
+    unsigned char header[0x40], nt[6];
+    FILE *file = fopen( path, "rb" );
+    int ok = 0;
+
+    if (!file) return 1;
+    if (fread( header, 1, sizeof(header), file ) == sizeof(header) && header[0] == 'M' && header[1] == 'Z' &&
+        !fseek( file, header[0x3c] | (header[0x3d] << 8) | (header[0x3e] << 16), SEEK_SET ) &&
+        fread( nt, 1, sizeof(nt), file ) == sizeof(nt) && !memcmp( nt, "PE\0\0", 4 ))
+    {
+        *machine = nt[4] | (nt[5] << 8);
+        ok = *machine == 0x014c || *machine == 0xaa64;
+    }
+    fclose( file );
+    return !ok;
+}
+
+static void save_png( SDL_Renderer *renderer, const char *name )
+{
+    int w = 1280, h = 720;
+    unsigned char *pixels = malloc( w * h * 4 );
+    png_image image;
+
+    if (SDL_RenderReadPixels( renderer, NULL, SDL_PIXELFORMAT_RGBA32, pixels, w * 4 ))
+    {
+        printf( "read pixels failed: %s\n", SDL_GetError() );
+        free( pixels );
+        return;
+    }
+    memset( &image, 0, sizeof(image) );
+    image.version = PNG_IMAGE_VERSION;
+    image.width = w;
+    image.height = h;
+    image.format = PNG_FORMAT_RGBA;
+    if (!png_image_write_to_file( &image, name, 0, pixels, 0, NULL )) printf( "writing %s failed\n", name );
+    else printf( "frame %d saved to %s\n", frames, name );
+    free( pixels );
+}
+
+static void push_key( SDL_Keycode key )
+{
+    SDL_Event event;
+
+    memset( &event, 0, sizeof(event) );
+    event.type = SDL_KEYDOWN;
+    event.key.keysym.sym = key;
+    SDL_PushEvent( &event );
+}
+
+static void push_tap( int x, int y )
+{
+    SDL_Event event;
+
+    memset( &event, 0, sizeof(event) );
+    event.type = SDL_FINGERDOWN;
+    event.tfinger.x = x / 1280.0f;
+    event.tfinger.y = y / 720.0f;
+    SDL_PushEvent( &event );
+    event.type = SDL_FINGERUP;
+    SDL_PushEvent( &event );
+}
+
+static SDL_Keycode key_code( const char *name )
+{
+    static const struct { const char *name; SDL_Keycode key; } keys[] =
+    {
+        { "up", SDLK_UP }, { "down", SDLK_DOWN }, { "left", SDLK_LEFT }, { "right", SDLK_RIGHT },
+        { "a", SDLK_RETURN }, { "b", SDLK_ESCAPE }, { "x", SDLK_x }, { "y", SDLK_y }, { "plus", SDLK_PLUS },
+        { "minus", SDLK_MINUS }, { "l", SDLK_PAGEUP }, { "r", SDLK_PAGEDOWN },
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
+        if (!strcmp( name, keys[i].name )) return keys[i].key;
+    fprintf( stderr, "unknown key %s\n", name );
+    exit( 2 );
+}
+
+/* Each frame runs the script until a step needs a later frame. */
+static void on_frame( SDL_Renderer *renderer )
+{
+    frames++;
+    if (wait_frames > 0)
+    {
+        wait_frames--;
+        return;
+    }
+    while (script_pos < script_count)
+    {
+        char *line = script[script_pos++], arg[256];
+        int x, y;
+
+        if (sscanf( line, "key %255s", arg ) == 1)
+        {
+            push_key( key_code( arg ) );
+            wait_frames = 1;
+            return;
+        }
+        if (sscanf( line, "tap %d %d", &x, &y ) == 2)
+        {
+            push_tap( x, y );
+            wait_frames = 1;
+            return;
+        }
+        if (sscanf( line, "wait %d", &x ) == 1)
+        {
+            wait_frames = x;
+            return;
+        }
+        if (sscanf( line, "shot %255s", arg ) == 1)
+        {
+            save_png( renderer, arg );
+            continue;
+        }
+        if (!strncmp( line, "type ", 5 ))
+        {
+            snprintf( prompt_text, sizeof(prompt_text), "%s", line + 5 );
+            prompt_set = 1;
+            continue;
+        }
+    }
+    if (script_pos >= script_count && wait_frames <= 0)
+    {
+        /* The script is over and the launcher still runs: quit it. */
+        SDL_Event event = { .type = SDL_QUIT };
+        SDL_PushEvent( &event );
+    }
+}
+
+int main( int argc, char **argv )
+{
+    struct wine_nx_launcher_options options = { "sdmc:/switch/wine", "nx-host-test", machine_of, 1, 0, 0, 0 };
+    char target[512] = "", line[300];
+    FILE *file;
+    int chosen;
+
+    if (argc < 3)
+    {
+        fprintf( stderr, "usage: %s FONT SCRIPT [TARGET]\n", argv[0] );
+        return 2;
+    }
+    font_path = argv[1];
+    if (!(file = fopen( argv[2], "r" ))) return 2;
+    while (script_count < 256 && fgets( line, sizeof(line), file ))
+    {
+        line[strcspn( line, "\r\n" )] = 0;
+        if (line[0] && line[0] != '#') snprintf( script[script_count++], sizeof(script[0]), "%s", line );
+    }
+    fclose( file );
+    if (argc > 3) snprintf( target, sizeof(target), "%s", argv[3] );
+
+    ui_present_hook = on_frame;
+    chosen = wine_nx_launcher_run( &options, target, sizeof(target) );
+    printf( "launcher returned %d target '%s' verbose %d profile %d framebuffer %d after %d frames\n",
+            chosen, target, options.verbose, options.profile, options.framebuffer, frames );
+    free( font_data );
+    return 0;
+}

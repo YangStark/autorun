@@ -10,7 +10,10 @@
 #include <string.h>
 #include <strings.h>
 
+#include <stdio.h>
+
 #define LAUNCHER_MAX_ENTRIES 256
+#define LAUNCHER_DRIVE_C "sdmc:/switch/wine/drive_c"
 
 struct launcher_entry
 {
@@ -18,6 +21,34 @@ struct launcher_entry
     char dos[256];           /* C:\... */
     unsigned short machine;  /* IMAGE_FILE_MACHINE_* */
 };
+
+/* The DOS path of a file on the card, as Wine-NX's drives map it (dlls/ntdll/unix/file.c):
+ * C: is drive_c and Z: the card's root. Returns 0 for a path elsewhere or too long. */
+static inline int launcher_dos_path( const char *path, char *out, size_t size )
+{
+    size_t drive_c_len = strlen( LAUNCHER_DRIVE_C ), len;
+    const char *rest;
+    char letter;
+    int n;
+
+    if (!strncasecmp( path, LAUNCHER_DRIVE_C, drive_c_len ) && (!path[drive_c_len] || path[drive_c_len] == '/'))
+    {
+        letter = 'C';
+        rest = path + drive_c_len;
+    }
+    else if (!strncmp( path, "sdmc:/", 6 ) || !strcmp( path, "sdmc:" ))
+    {
+        letter = 'Z';
+        rest = path + 5;
+    }
+    else return 0;
+    while (*rest == '/') rest++;
+    n = snprintf( out, size, "%c:\\%s", letter, rest );
+    if (n <= 0 || (size_t)n >= size) return 0;
+    for (len = 3; out[len]; len++) if (out[len] == '/') out[len] = '\\';
+    while (len > 3 && out[len - 1] == '\\') out[--len] = 0;
+    return 1;
+}
 
 static inline int launcher_is_exe( const char *name )
 {
@@ -89,6 +120,45 @@ static inline int launcher_find( const struct launcher_entry *entries, int count
     for (i = 0; i < count; i++)
         if (!strcasecmp( entries[i].path, target ) || !strcasecmp( entries[i].dos, target )) return i;
     return 0;
+}
+
+/* Move the selection in a grid shown a page (columns x rows) at a time. Left and
+ * right go on to the neighbouring page at the same row, up and down stay on the page. */
+static inline int launcher_grid_move( int selection, int count, int columns, int rows, int dx, int dy )
+{
+    int per_page = columns * rows, page = selection / per_page;
+    int row = selection % per_page / columns, column = selection % per_page % columns, next;
+
+    if (count <= 0) return 0;
+    if (dx > 0)
+    {
+        if (column + 1 < columns && selection + 1 < count) return selection + 1;
+        next = (page + 1) * per_page + row * columns;
+        if ((page + 1) * per_page < count) return next < count ? next : count - 1;
+    }
+    else if (dx < 0)
+    {
+        if (column > 0) return selection - 1;
+        if (page > 0) return (page - 1) * per_page + row * columns + columns - 1;
+    }
+    else if (dy > 0 && row + 1 < rows && selection + columns < count) return selection + columns;
+    else if (dy > 0 && row + 1 < rows && (page * per_page + (row + 1) * columns) < count) return count - 1;
+    else if (dy < 0 && row > 0) return selection - columns;
+    return selection;
+}
+
+/* The same place on the next (direction 1) or previous (-1) page, or the last program. */
+static inline int launcher_grid_page( int selection, int count, int per_page, int direction )
+{
+    int last_page, page, next;
+
+    if (count <= 0) return 0;
+    last_page = (count - 1) / per_page;
+    page = selection / per_page + direction;
+    if (page < 0) page = 0;
+    if (page > last_page) page = last_page;
+    next = page * per_page + selection % per_page;
+    return next < count ? next : count - 1;
 }
 
 /* The first visible row, moved only as far as needed to show "selected". */

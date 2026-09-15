@@ -21,7 +21,9 @@
 #include "wine/server.h"
 #include "unix_private.h"
 #include "horizon_private.h"
+#include "launcher.h"
 #include "launcher_list.h"
+#include "launcher_settings.h"
 #include "pointer_cursor.h"
 #include "compositor.h"
 #include "std_stream_lines.h"
@@ -48,7 +50,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-105"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-107"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -66,9 +68,6 @@ extern const char *wine_nx_loader_last_open_path(void);
 extern NTSTATUS wine_nx_loader_last_open_status(void);
 extern const char *wine_nx_loader_last_export_diag(void);
 extern int wine_nx_sd_cache_install(void);
-extern int wine_nx_launcher_run( const char *drive_c, const char *runtime_dir, const char *build,
-                                 int (*machine_of)( const char *path, unsigned short *machine ),
-                                 int *verbose, int *profile, char *target, size_t target_size );
 
 static FILE *log_file;
 
@@ -236,6 +235,9 @@ int wine_nx_runtime_verbose;
 /* The sampling profiler's [PROF] lines (thread_profile.c): sdmc:/switch/wine/profile.txt
  * containing 1, which the launcher's X toggles like Y does verbose.txt. */
 static int runtime_profile;
+/* Set by d3d9=dxvk in the program's own settings (launcher_settings.h): its DLL
+ * path looks in C:\dxvk before system32, so DXVK's d3d9.dll loads in place of Wine's. */
+static int runtime_d3d9_dxvk;
 
 /* libdrm_nouveau's switch for CPU-cacheable pinned GPU memory, cleared by
  * sdmc:/switch/wine/gl-uncached.txt containing 1. */
@@ -1136,13 +1138,6 @@ static int join_path( char *out, size_t size, const char *dir, const char *name 
     return ret > 0 && (size_t)ret < size;
 }
 
-static int path_starts_with( const char *path, const char *prefix )
-{
-    size_t len = strlen( prefix );
-
-    return !strncmp( path, prefix, len );
-}
-
 static void slash_to_backslash( char *path )
 {
     for (; *path; path++) if (*path == '/') *path = '\\';
@@ -1150,8 +1145,6 @@ static void slash_to_backslash( char *path )
 
 static int target_to_dos_path( const char *target, char *dos_path, size_t size )
 {
-    const char *drive_c = WINE_DRIVE_C "/";
-    const char *relative;
     int ret;
 
     if (strlen( target ) > 2 && target[1] == ':')
@@ -1162,12 +1155,9 @@ static int target_to_dos_path( const char *target, char *dos_path, size_t size )
         return 1;
     }
 
-    if (path_starts_with( target, drive_c ))
-    {
-        relative = target + strlen( drive_c );
-        ret = snprintf( dos_path, size, "C:\\%s", relative );
-    }
-    else ret = snprintf( dos_path, size, "C:\\%s", path_basename( target ) );
+    /* A file on the card: C: is drive_c and Z: the card's root, as file.c maps them. */
+    if (!strncmp( target, "sdmc:", 5 )) return launcher_dos_path( target, dos_path, size );
+    ret = snprintf( dos_path, size, "C:\\%s", path_basename( target ) );
 
     if (ret <= 0 || (size_t)ret >= size) return 0;
     slash_to_backslash( dos_path );
@@ -1245,8 +1235,10 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     if (!target_to_dos_path( target, dos_path, dos_path_size )) return NULL;
     dos_dirname( dos_path, current_dir, sizeof(current_dir) );
     snprintf( nt_path, sizeof(nt_path), "\\??\\%s", dos_path );
-    snprintf( dll_path, sizeof(dll_path), "%s;C:\\windows\\system32;C:\\windows;C:\\",
-              current_dir );
+    /* DXVK's d3d9.dll in C:\dxvk comes before Wine's in system32; one next to
+     * the program still comes first. */
+    snprintf( dll_path, sizeof(dll_path), "%s;%sC:\\windows\\system32;C:\\windows;C:\\",
+              current_dir, runtime_d3d9_dxvk ? "C:\\dxvk;" : "" );
     /* The current directory ends in a backslash, as RtlSetCurrentDirectory_U
      * stores it; relative paths are appended to it directly. */
     if ((chars = strlen( current_dir )) && current_dir[chars - 1] != '\\' && chars + 1 < sizeof(current_dir))
@@ -1969,11 +1961,42 @@ int main( int argc, char **argv )
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else
     {
+        struct wine_nx_launcher_options options =
+        {
+            .runtime_dir = RUNTIME_DIR,
+            .build = WINE_NX_RUNTIME_BUILD,
+            .machine_of = launcher_machine,
+#ifdef WINE_NX_MESA_SWITCH
+            .vulkan = 1,
+#endif
+            .verbose = wine_nx_runtime_verbose,
+            .profile = runtime_profile,
+            .framebuffer = !wine_nx_compositor_mode,
+        };
+        int chosen;
+
         /* Without a program on the command line, let the user choose one;
-         * target.txt only preselects the last choice. */
+         * target.txt only preselects the last choice. The launcher draws with
+         * SDL, so the console gives up the screen until it returns. */
         read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );
-        if (!wine_nx_launcher_run( WINE_DRIVE_C, RUNTIME_DIR, WINE_NX_RUNTIME_BUILD, launcher_machine,
-                                   &wine_nx_runtime_verbose, &runtime_profile, target, sizeof(target) ))
+        pthread_mutex_lock( &log_mutex );
+        if (log_file) fflush( log_file );
+        pthread_mutex_unlock( &log_mutex );
+        consoleExit( NULL );
+        wine_nx_console_active = 0;
+        chosen = wine_nx_launcher_run( &options, target, sizeof(target) );
+        /* The console stays off from here: after SDL's EGL surface let the
+         * screen go, libnx's console was set up but could not dequeue a buffer,
+         * and its first line aborted in framebufferBegin (build 106). The log
+         * goes to the file until the compositor or the framebuffer, which set
+         * up every buffer as EGL does, takes the screen. */
+        pthread_mutex_lock( &log_mutex );
+        if (log_file) fflush( log_file );
+        pthread_mutex_unlock( &log_mutex );
+        wine_nx_runtime_verbose = options.verbose;
+        runtime_profile = options.profile;
+        wine_nx_compositor_mode = !options.framebuffer;
+        if (!chosen)
         {
             log_line( "[LAUNCHER] closed without starting a program" );
             pthread_mutex_lock( &log_mutex );
@@ -1985,12 +2008,41 @@ int main( int argc, char **argv )
         autorun = 1;
     }
 
+    /* The program's own settings, written by the launcher next to it, over the global files. */
+    {
+        struct launcher_settings settings;
+        struct launcher_kv kv;
+        char settings_path[520];
+
+        if (target[1] != ':' && launcher_settings_path( target, settings_path, sizeof(settings_path) ) &&
+            launcher_kv_load( &kv, settings_path ) && kv.size)
+        {
+            launcher_settings_read( &kv, &settings );
+            if (settings.verbose >= 0) wine_nx_runtime_verbose = settings.verbose;
+            if (settings.profile >= 0) runtime_profile = settings.profile;
+            if (settings.framebuffer >= 0) wine_nx_compositor_mode = !settings.framebuffer;
+#ifdef WINE_NX_MESA_SWITCH
+            runtime_d3d9_dxvk = settings.dxvk;
+#endif
+            log_line( "[SETTINGS] %s: verbose %s, profiler %s, windows %s, Direct3D 9 %s", settings_path,
+                      settings.verbose < 0 ? "global" : settings.verbose ? "on" : "off",
+                      settings.profile < 0 ? "global" : settings.profile ? "on" : "off",
+                      settings.framebuffer < 0 ? "global" : settings.framebuffer ? "framebuffer" : "compositor",
+#ifdef WINE_NX_MESA_SWITCH
+                      settings.dxvk ? "DXVK from C:\\dxvk" : "Wine" );
+#else
+                      settings.dxvk ? "Wine (DXVK needs the Vulkan runtime)" : "Wine" );
+#endif
+        }
+    }
+
     log_line( "wine-nx-runtime: generic Wine ntdll PE loader path" );
     log_line( "[BUILD] %s", WINE_NX_RUNTIME_BUILD );
     log_line( "[SDCACHE] %s", sd_cache ? "sdmc reads cached: 128 KB chunks, 8 per file, 32 MB in all"
                                       : "no sdmc device; reads are not cached" );
     log_line( "[INIT] verbose traces %s (verbose.txt)", wine_nx_runtime_verbose ? "on" : "off" );
     log_line( "[INIT] profiler %s (profile.txt)", runtime_profile ? "on" : "off" );
+    log_line( "[INIT] windows shown by %s", wine_nx_compositor_mode ? "the OpenGL compositor" : "the framebuffer" );
     /* After the launcher, where X may have turned it on or off. */
     if (runtime_profile)
     {
