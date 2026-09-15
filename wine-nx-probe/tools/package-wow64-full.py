@@ -157,6 +157,9 @@ with ZipFile(archive, 'w', ZIP_DEFLATED) as z:
     for f in sorted(stage.rglob('*')):
         if f.is_file() and f.name != '.DS_Store' and f.suffix != '.log':
             z.write(f, f.relative_to(stage_root))
+        # Empty folders are places to copy things into, such as drive_c/WarCraft III.
+        elif f.is_dir() and not any(f.iterdir()):
+            z.write(f, f.relative_to(stage_root))
 with ZipFile(archive) as z:
     assert z.testzip() is None
 print(archive)
