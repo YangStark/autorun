@@ -22386,6 +22386,7 @@ VkResult VKAPI_CALL vkWriteSamplerDescriptorsEXT(VkDevice device, uint32_t sampl
     USE_VK_EXT(VK_EXT_metal_surface) \
     USE_VK_EXT(VK_KHR_wayland_surface) \
     USE_VK_EXT(VK_KHR_xlib_surface) \
-    USE_VK_EXT(VK_MVK_macos_surface)
+    USE_VK_EXT(VK_MVK_macos_surface) \
+    USE_VK_EXT(VK_NN_vi_surface)
 
 #endif /* __WINE_VULKAN_H */

@@ -44,6 +44,34 @@ static PFN_vkEnumerateInstanceExtensionProperties p_vkEnumerateInstanceExtension
 static void *vulkan_handle;
 static struct vulkan_funcs vulkan_funcs;
 
+#if defined(__SWITCH__) && defined(WINE_NX_MESA_SWITCH)
+/* mesa-switch's loaderless NVK (build-mesa-switch.sh) is linked into the Switch
+ * runtime, which has no dynamic linker. */
+extern PFN_vkVoidFunction wine_nx_vkGetDeviceProcAddr( VkDevice device, const char *name ) __asm__("vkGetDeviceProcAddr");
+extern PFN_vkVoidFunction wine_nx_vkGetInstanceProcAddr( VkInstance instance, const char *name ) __asm__("vkGetInstanceProcAddr");
+#endif
+
+#ifdef __SWITCH__
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdio.h>
+
+/* [NXVK] lines in the runtime's log: this build keeps no TRACE output. */
+extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+
+static void nx_vk_trace( const char *format, ... )
+{
+    char buffer[320];
+    va_list args;
+
+    if (!&wine_nx_runtime_trace) return;
+    va_start( args, format );
+    vsnprintf( buffer, sizeof(buffer), format, args );
+    va_end( args );
+    wine_nx_runtime_trace( buffer );
+}
+#endif
+
 WINE_DECLARE_DEBUG_CHANNEL(fps);
 
 static const struct vulkan_driver_funcs *driver_funcs;
@@ -237,6 +265,10 @@ static struct fence *fence_from_handle( VkFence handle )
     return CONTAINING_RECORD( obj, struct fence, obj );
 }
 
+#ifdef __SWITCH__
+static LONG nx_host_import_logs;  /* [NXVK] lines about the first imports only */
+#endif
+
 static VkResult allocate_external_host_memory( struct vulkan_device *device, VkMemoryAllocateInfo *alloc_info, uint32_t mem_flags,
                                                VkImportMemoryHostPointerInfoEXT *import_info )
 {
@@ -263,6 +295,8 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
                                                               mapping, &props )))
     {
         ERR( "vkGetMemoryHostPointerPropertiesEXT failed: %d\n", res );
+        alloc_size = 0;
+        NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &alloc_size, MEM_RELEASE );
         return res;
     }
 
@@ -282,6 +316,12 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
         if (i == physical_device->memory_properties.memoryTypeCount)
         {
             FIXME( "Not found compatible memory type\n" );
+#ifdef __SWITCH__
+            if (__atomic_add_fetch( &nx_host_import_logs, 1, __ATOMIC_RELAXED ) <= 8)
+                nx_vk_trace( "[NXVK] no memory type takes host pointers (types %#x) with type %u's flags %#x: "
+                             "allocated without a 32-bit mapping", props.memoryTypeBits,
+                             alloc_info->memoryTypeIndex, mem_flags );
+#endif
             alloc_size = 0;
             NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &alloc_size, MEM_RELEASE );
         }
@@ -295,6 +335,11 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
         import_info->pNext = alloc_info->pNext;
         alloc_info->pNext = import_info;
         alloc_info->allocationSize = (alloc_info->allocationSize + align) & ~align;
+#ifdef __SWITCH__
+        if (__atomic_add_fetch( &nx_host_import_logs, 1, __ATOMIC_RELAXED ) <= 8)
+            nx_vk_trace( "[NXVK] %llu bytes of memory type %u imported from the 32-bit mapping %p",
+                         (unsigned long long)alloc_info->allocationSize, alloc_info->memoryTypeIndex, mapping );
+#endif
     }
 
     return VK_SUCCESS;
@@ -538,7 +583,13 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
     instance->p_vkGetPhysicalDeviceMemoryProperties( host_physical_device, &physical_device->memory_properties );
 
     if ((res = instance->p_vkEnumerateDeviceExtensionProperties( host_physical_device, NULL, &count, NULL ))) return res;
-    if (!(properties = calloc( count, sizeof(*properties) ))) return res;
+    if (!(properties = calloc( count, sizeof(*properties) )))
+    {
+#ifdef __SWITCH__
+        nx_vk_trace( "[NXVK] no memory for %u host device extensions; the client sees none", count );
+#endif
+        return res;
+    }
     if ((res = instance->p_vkEnumerateDeviceExtensionProperties( host_physical_device, NULL, &count, properties ))) goto done;
 
     TRACE( "Host physical device extensions:\n" );
@@ -581,7 +632,7 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
 
         instance->p_vkGetPhysicalDeviceProperties2KHR( host_physical_device, &props );
         physical_device->external_memory_align = host_mem_props.minImportedHostPointerAlignment;
-        if (physical_device->external_memory_align) WARN( "Not using VK_EXT_external_memory_host for memory mapping\n" );
+        if (!physical_device->external_memory_align) WARN( "Not using VK_EXT_external_memory_host for memory mapping\n" );
         else TRACE( "Using VK_EXT_external_memory_host for memory mapping with alignment: %u\n", physical_device->external_memory_align );
     }
 
@@ -598,6 +649,23 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
 #define USE_VK_EXT(x) client_physical_device->extensions.has_ ## x = extensions.has_ ## x;
     ALL_VK_CLIENT_DEVICE_EXTS
 #undef USE_VK_EXT
+
+#ifdef __SWITCH__
+    {
+        struct vulkan_device_extensions bit = {0};
+        const unsigned char *raw = (const unsigned char *)&bit;
+        unsigned int byte = 0;
+
+        bit.has_VK_KHR_swapchain = 1;
+        while (byte < sizeof(bit) && !raw[byte]) byte++;
+        nx_vk_trace( "[NXVK] physical device client %p: %u host extensions, VK_KHR_swapchain host %u mapped %u client %u; "
+                     "its bit at extensions+%u mask %#x, extensions at client+%u, %u bytes; external_memory_align %u",
+                     client_physical_device, count, physical_device->extensions.has_VK_KHR_swapchain,
+                     extensions.has_VK_KHR_swapchain, client_physical_device->extensions.has_VK_KHR_swapchain,
+                     byte, byte < sizeof(bit) ? raw[byte] : 0, (unsigned)offsetof(struct VkPhysicalDevice_T, extensions),
+                     (unsigned)sizeof(bit), physical_device->external_memory_align );
+    }
+#endif
 
 done:
     free( properties );
@@ -893,6 +961,8 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
     VkDevice host_device, client_device = *client_device_ptr;
     const VkCreateInfoWineDeviceCallback *callback_info;
     unsigned int queue_count, props_count, i;
+    /* create_info may point at this until the host device is created */
+    VkPhysicalDeviceFeatures features = {0};
     struct vulkan_device *device;
     struct mempool pool = {0};
     VkResult res;
@@ -916,7 +986,6 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
     device->queue_props = (void *)(device->queues + queue_count);
 
 {
-        VkPhysicalDeviceFeatures features = {0};
         VkPhysicalDeviceFeatures2 *features2;
 
         /* Enable shaderStorageImageWriteWithoutFormat for fshack
@@ -984,6 +1053,23 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
 failed:
     if (res)
     {
+#ifdef __SWITCH__
+        {
+            VkPhysicalDeviceFeatures supported = {0};
+            const VkBool32 *want = (const VkBool32 *)create_info->pEnabledFeatures, *have = (const VkBool32 *)&supported;
+            char names[160] = "", unsupported[96] = "";
+            int len = 0, flen = 0;
+
+            instance->p_vkGetPhysicalDeviceFeatures( physical_device->host.physical_device, &supported );
+            for (i = 0; want && i < sizeof(supported) / sizeof(VkBool32); i++)
+                if (want[i] && !have[i] && flen < (int)sizeof(unsupported) - 4)
+                    flen += snprintf( unsupported + flen, sizeof(unsupported) - flen, " %u", i );
+            for (i = 0; i < create_info->enabledExtensionCount && len < (int)sizeof(names) - 2; i++)
+                len += snprintf( names + len, sizeof(names) - len, " %s", create_info->ppEnabledExtensionNames[i] );
+            nx_vk_trace( "[NXVK] device creation failed, res %d; host extensions:%s; enabled features the GPU lacks (VkPhysicalDeviceFeatures indices):%s",
+                         res, names, flen ? unsupported : " none" );
+        }
+#endif
         WARN( "Failed to create device, res %d\n", res );
         free( device );
     }
@@ -1055,7 +1141,7 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
     struct vulkan_physical_device *physical_device = device->physical_device;
     struct vulkan_instance *instance = device->physical_device->instance;
-    VkImportMemoryHostPointerInfoEXT host_pointer_info, *pointer_info = NULL;
+    VkImportMemoryHostPointerInfoEXT host_pointer_info = {0}, *pointer_info = NULL;
     VkExportMemoryWin32HandleInfoKHR export_win32 = {.dwAccess = GENERIC_ALL};
     VkImportMemoryWin32HandleInfoKHR *import_win32 = NULL;
     VkDeviceMemory host_device_memory = VK_NULL_HANDLE;
@@ -1107,8 +1193,19 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
     if (physical_device->external_memory_align && (mem_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !pointer_info &&
         (res = allocate_external_host_memory( device, alloc_info, mem_flags, &host_pointer_info )))
         return res;
+    /* The 32-bit mapping the host imports, if any: vkMapMemory hands it out, and
+     * it is released once the host memory is freed. */
+    mapping = host_pointer_info.pHostPointer;
 
-    if (!(memory = calloc( 1, sizeof(*memory) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!(memory = calloc( 1, sizeof(*memory) )))
+    {
+        if (mapping)
+        {
+            SIZE_T alloc_size = 0;
+            NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &alloc_size, MEM_RELEASE );
+        }
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
 
     if (import_win32)
     {
@@ -1206,6 +1303,11 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
 failed:
     WARN( "Failed to allocate memory, res %d\n", res );
     if (host_device_memory) device->p_vkFreeMemory( device->host.device, host_device_memory, NULL );
+    if (mapping)
+    {
+        SIZE_T alloc_size = 0;
+        NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &alloc_size, MEM_RELEASE );
+    }
     if (memory->semaphore) device->p_vkDestroySemaphore( device->host.device, memory->semaphore, NULL );
     d3dkmt_destroy_resource( memory->local );
     d3dkmt_destroy_mutex( memory->mutex );
@@ -1363,6 +1465,9 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
 #ifdef _WIN64
     if (NtCurrentTeb()->WowTebOffset && res == VK_SUCCESS && (UINT_PTR)*data >> 32)
     {
+#ifdef __SWITCH__
+        nx_vk_trace( "[NXVK] Vulkan mapping %p does not fit a 32-bit pointer; no imported low mapping", *data );
+#endif
         FIXME( "returned mapping %p does not fit 32-bit pointer\n", *data );
         device->p_vkUnmapMemory( device->host.device, memory->obj.host.device_memory );
         *data = NULL;
@@ -4055,6 +4160,15 @@ static void vulkan_init_once(void)
     const char *env = getenv( "WINE_DISABLE_FULLSCREEN_HACK" );
     fshack_enabled = !env || !atoi( env );
 
+#if defined(__SWITCH__) && defined(WINE_NX_MESA_SWITCH)
+    {
+        static int static_vulkan;
+
+        vulkan_handle = &static_vulkan;
+        p_vkGetDeviceProcAddr = wine_nx_vkGetDeviceProcAddr;
+        p_vkGetInstanceProcAddr = wine_nx_vkGetInstanceProcAddr;
+    }
+#else
 #ifdef SONAME_LIBVULKAN
     vulkan_handle = dlopen( SONAME_LIBVULKAN, RTLD_NOW );
     if (!vulkan_handle) ERR( "Failed to load %s\n", SONAME_LIBVULKAN );
@@ -4075,6 +4189,7 @@ static void vulkan_init_once(void)
     LOAD_FUNCPTR( vkGetDeviceProcAddr );
     LOAD_FUNCPTR( vkGetInstanceProcAddr );
 #undef LOAD_FUNCPTR
+#endif
 
     driver_funcs = &lazydrv_funcs;
     vulkan_funcs.p_vkGetInstanceProcAddr = p_vkGetInstanceProcAddr;

@@ -1084,6 +1084,10 @@ extern const unixlib_entry_t wine_nx_crypt32_wow64_unix_funcs[];
 extern const unsigned int wine_nx_crypt32_wow64_unix_count;
 extern const unixlib_entry_t wine_nx_xinput_wow64_unix_funcs[];
 extern const unsigned int wine_nx_xinput_wow64_unix_count;
+#ifdef WINE_NX_MESA_SWITCH
+extern const unixlib_entry_t wine_nx_winevulkan_wow64_unix_funcs[];
+extern const unsigned int wine_nx_winevulkan_wow64_unix_count;
+#endif
 
 static const struct
 {
@@ -1099,6 +1103,10 @@ static const struct
     /* xinput1_4 builds xinput1_3's main.c; xinput9_1_0 loads xinput1_4 */
     { "xinput1_3.dll", wine_nx_xinput_wow64_unix_funcs, &wine_nx_xinput_wow64_unix_count },
     { "xinput1_4.dll", wine_nx_xinput_wow64_unix_funcs, &wine_nx_xinput_wow64_unix_count },
+#ifdef WINE_NX_MESA_SWITCH
+    /* runtimes linked with mesa-switch: Vulkan through its NVK */
+    { "winevulkan.dll", wine_nx_winevulkan_wow64_unix_funcs, &wine_nx_winevulkan_wow64_unix_count },
+#endif
 };
 
 /* The x86 unix call gate passes on whatever handle a 32-bit DLL presents, so

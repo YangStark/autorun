@@ -1030,6 +1030,9 @@ static void load_display_driver(void)
             extern void wine_nx_drv_SetCursor( HWND, HCURSOR );
             extern UINT wine_nx_drv_UpdateDisplayDevices( const struct gdi_device_manager *, void * );
             extern UINT wine_nx_drv_OpenGLInit( UINT, const struct opengl_funcs *, const struct opengl_driver_funcs ** );
+#ifdef WINE_NX_MESA_SWITCH
+            extern UINT wine_nx_drv_VulkanInit( UINT, void *, const struct vulkan_driver_funcs ** );
+#endif
             extern int wine_nx_display_devices __attribute__((weak));
             null_user_driver.pCreateWindow         = wine_nx_drv_CreateWindow;
             null_user_driver.pCreateWindowSurface  = wine_nx_drv_CreateWindowSurface;
@@ -1038,6 +1041,10 @@ static void load_display_driver(void)
             null_user_driver.pSetCursorPos         = wine_nx_drv_SetCursorPos;
             null_user_driver.pSetCursor            = wine_nx_drv_SetCursor;
             null_user_driver.pOpenGLInit           = wine_nx_drv_OpenGLInit;
+#ifdef WINE_NX_MESA_SWITCH
+            /* mesa-switch's NVK, presenting through VK_NN_vi_surface (winnx_vulkan.c) */
+            null_user_driver.pVulkanInit           = wine_nx_drv_VulkanInit;
+#endif
             /* The device manager walks the registry, which the Switch did not
              * have when this driver was written; the Horizon server has one
              * now, and programs ask after the display devices it registers.

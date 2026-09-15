@@ -136,11 +136,13 @@ UNEXPOSED_EXTENSIONS = {
     "VK_KHR_wayland_surface",
     "VK_KHR_xlib_surface",
     "VK_MVK_macos_surface",
+    "VK_NN_vi_surface",
 }
 
 UNEXPOSED_PLATFORMS = {
     "macos",
     "metal",
+    "vi",
     "wayland",
     "xlib",
 }

@@ -712,6 +712,34 @@ if(WINE_NX_MESA_SWITCH_DIR)
     target_sources(wine-nx-runtime PRIVATE source/vulkan_probe.c)
     set_source_files_properties(source/vulkan_probe.c PROPERTIES
         INCLUDE_DIRECTORIES "${WINE_NX_MESA_SWITCH_DIR}/../include")
+
+    # Vulkan for Windows programs: win32u's Vulkan over NVK, the display driver's
+    # VK_NN_vi_surface (dlls/win32u/winnx_vulkan.c), and winevulkan's unix side
+    # with its tables renamed like opengl32's (source/winevulkan_unix.c).
+    target_sources(wine-win32u-real PRIVATE ../dlls/win32u/winnx_vulkan.c)
+    target_compile_definitions(wine-win32u-real PRIVATE WINE_NX_MESA_SWITCH)
+    target_compile_definitions(wine-virtual-real PRIVATE WINE_NX_MESA_SWITCH)
+    add_library(wine-winevulkan-unix-real OBJECT
+        ../dlls/winevulkan/vulkan.c
+        ../dlls/winevulkan/vulkan_thunks.c
+        source/winevulkan_unix.c
+    )
+    target_compile_definitions(wine-winevulkan-unix-real PRIVATE
+        ${WINE_SWITCH_NTDLL_DEFS}
+        __wine_unix_call_funcs=wine_nx_winevulkan_unix_funcs
+        __wine_unix_call_wow64_funcs=wine_nx_winevulkan_wow64_unix_funcs
+    )
+    target_compile_options(wine-winevulkan-unix-real PRIVATE
+        -std=gnu11
+        -Werror=implicit-function-declaration
+        -ffunction-sections
+        -fdata-sections
+    )
+    target_include_directories(wine-winevulkan-unix-real PRIVATE
+        ${WINE_SWITCH_WIN32U_INCLUDES}
+        "${CMAKE_CURRENT_SOURCE_DIR}/../dlls/winevulkan"
+    )
+    target_sources(wine-nx-runtime PRIVATE $<TARGET_OBJECTS:wine-winevulkan-unix-real>)
 endif()
 target_link_libraries(wine-nx-runtime PRIVATE
     ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_HARFBUZZ}
