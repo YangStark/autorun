@@ -39,6 +39,25 @@
 #include "kbd.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
+
+#ifdef __SWITCH__
+#include <stdio.h>
+
+extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+
+void nx_window_trace( const char *format, ... )
+{
+    static LONG lines;
+    char buffer[256];
+    va_list args;
+
+    if (!&wine_nx_runtime_trace || __atomic_add_fetch( &lines, 1, __ATOMIC_RELAXED ) > 64) return;
+    va_start( args, format );
+    vsnprintf( buffer, sizeof(buffer), format, args );
+    va_end( args );
+    wine_nx_runtime_trace( buffer );
+}
+#endif
 WINE_DECLARE_DEBUG_CHANNEL(keyboard);
 
 static const WCHAR keyboard_layouts_keyW[] =
@@ -2031,6 +2050,11 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
     if (!ret) return FALSE;
     if (prev) *prev = previous;
     if (previous == hwnd) goto done;
+#ifdef __SWITCH__
+    nx_window_trace( "[NXWIN] thread %04x activates hwnd %p (style %#x), previous %p, mouse %u focus %u",
+                     (int)GetCurrentThreadId(), hwnd, hwnd ? (int)get_window_long( hwnd, GWL_STYLE ) : 0,
+                     previous, mouse, focus );
+#endif
 
     if (hwnd)
     {
@@ -2058,7 +2082,13 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
                 for (phwnd = list; *phwnd; phwnd++)
                 {
                     if (get_window_thread( *phwnd, NULL ) == old_thread)
+                    {
+#ifdef __SWITCH__
+                        nx_window_trace( "[NXWIN] WM_ACTIVATEAPP 0 to hwnd %p (thread %04x -> %04x)",
+                                         *phwnd, (int)old_thread, (int)new_active_thread_id );
+#endif
                         send_message( *phwnd, WM_ACTIVATEAPP, 0, new_active_thread_id );
+                    }
                 }
             }
             if (new_thread)
@@ -2066,7 +2096,13 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
                 for (phwnd = list; *phwnd; phwnd++)
                 {
                     if (get_window_thread( *phwnd, NULL ) == new_thread)
+                    {
+#ifdef __SWITCH__
+                        nx_window_trace( "[NXWIN] WM_ACTIVATEAPP 1 to hwnd %p (thread %04x -> %04x)",
+                                         *phwnd, (int)old_thread, (int)new_thread );
+#endif
                         send_message( *phwnd, WM_ACTIVATEAPP, 1, old_thread );
+                    }
                 }
             }
             free( list );

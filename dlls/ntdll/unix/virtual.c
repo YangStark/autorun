@@ -2542,9 +2542,11 @@ static void *alloc_free_area_in_range( struct alloc_area *area, char *base, char
                 if (alloc_start >= intersect_start)
                 {
                     if ((result = anon_mmap_fixed( alloc_start, area->size, area->unix_prot, 0 )) != alloc_start)
+                    {
                         ERR("Could not map in reserved area, alloc_start %p, size %p.\n",
                                 alloc_start, (void *)area->size);
-                    return result;
+                    }
+                    else return result;
                 }
             }
 
@@ -2578,8 +2580,10 @@ static void *alloc_free_area_in_range( struct alloc_area *area, char *base, char
             if (alloc_start + area->size <= intersect_end)
             {
                 if ((result = anon_mmap_fixed( alloc_start, area->size, area->unix_prot, 0 )) != alloc_start)
+                {
                     ERR("Could not map in reserved area, alloc_start %p, size %p.\n", alloc_start, (void *)area->size);
-                return result;
+                }
+                else return result;
             }
         }
         base = intersect_end;
@@ -2880,13 +2884,21 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             WARN("Allocation failed, clearing native views.\n");
 
             clear_native_views();
-            if (!is_win64) increase_try_map_step = FALSE;
 #ifdef __SWITCH__
+            /* is_win64 describes Wine's native build, not the guest address
+             * range. On Horizon, a 64-bit Wine build also serves the small
+             * map shared with libnx stacks and JIT code. Exponential probes
+             * can skip a usable gap entirely; the bounded retry must visit
+             * every aligned candidate before reporting STATUS_NO_MEMORY. */
+            BOOL saved_increase_step = increase_try_map_step;
+            if ((ULONG_PTR)end <= limit_4g) increase_try_map_step = FALSE;
             ptr = alloc_free_area( start, end, host_size, top_down, unix_prot, align_mask );
+            increase_try_map_step = saved_increase_step;
 #else
+            if (!is_win64) increase_try_map_step = FALSE;
             ptr = alloc_free_area( (void *)limit_low, (void *)limit_high, size, top_down, unix_prot, align_mask );
-#endif
             if (!is_win64) increase_try_map_step = TRUE;
+#endif
             if (!ptr) return STATUS_NO_MEMORY;
         }
     }
@@ -4308,6 +4320,56 @@ static void *alloc_virtual_heap( SIZE_T size )
     return anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
 }
 
+#ifdef __SWITCH__
+/* The small Horizon map is shared with libnx's randomly placed stacks, JIT
+ * aliases and section anchors. Protect the low guest range before those are
+ * created, as Wine's preloader does on other hosts. These are PROT_NONE host
+ * reservations, not guest views or committed RAM: Wine can allocate inside
+ * them, and unmap_area restores the reservation when a guest view is freed. */
+static void horizon_reserve_guest_address_space(void)
+{
+    struct range_entry *range;
+    struct reserved_area *area;
+    size_t total = 0, largest = 0;
+    void *stack_start, *stack_end;
+    char *reserve_end = (char *)0x40000000;
+    char msg[192];
+
+    if ((ULONG_PTR)host_addr_space_limit > limit_4g) return;
+    if (!horizon_get_stack_region( &stack_start, &stack_end ))
+    {
+        wine_nx_runtime_trace( "[VA] early guest reservations disabled: native stack region unavailable" );
+        return;
+    }
+    /* virtmemFindStack cannot use arbitrary ASLR addresses. Leave at least
+     * the upper half of its permitted region outside our reservations.
+     * Build 103 reserved the entire small stack region, preventing native
+     * worker threads from starting even though high addresses were free. */
+    reserve_end = min( reserve_end, (char *)ROUND_ADDR( (ULONG_PTR)stack_start +
+                       ((ULONG_PTR)stack_end - (ULONG_PTR)stack_start) / 2, granularity_mask ) );
+    snprintf( msg, sizeof(msg), "[VA] native stack region %p-%p; guest reservation ceiling %p",
+              stack_start, stack_end, reserve_end );
+    wine_nx_runtime_trace( msg );
+    for (range = free_ranges; range != free_ranges_end; range++)
+    {
+        char *start = max( (char *)range->base, (char *)address_space_start );
+        char *end = min( (char *)range->end, reserve_end );
+
+        /* free_ranges excludes the kernel heap/alias regions and Wine's
+         * system views. reserve_area also preserves existing native maps. */
+        if (start < end) reserve_area( start, end );
+    }
+    LIST_FOR_EACH_ENTRY( area, &reserved_areas, struct reserved_area, entry )
+    {
+        total += area->size;
+        largest = max( largest, area->size );
+    }
+    snprintf( msg, sizeof(msg), "[VA] early guest reservations: %lu MB, largest %lu MB; protected from native mappings",
+              (unsigned long)(total >> 20), (unsigned long)(largest >> 20) );
+    wine_nx_runtime_trace( msg );
+}
+#endif
+
 /***********************************************************************
  *           virtual_init
  */
@@ -4420,6 +4482,10 @@ void virtual_init(void)
                 horizon_trace( "[VA] kept Wine out of %p-%p", start, end );
         }
     }
+#endif
+
+#ifdef __SWITCH__
+    horizon_reserve_guest_address_space();
 #endif
 
     /* make the DOS area accessible (except the low 64K) to hide bugs in broken apps like Excel 2003 */
@@ -6054,6 +6120,60 @@ void virtual_set_large_address_space(void)
  *
  * NtAllocateVirtualMemory[Ex] implementation.
  */
+#ifdef __SWITCH__
+/* What fills a 32-bit program's address space: Wine's views by kind, the
+ * largest ones, and the kernel's own map of the low 4 GB. */
+static void wine_nx_log_views(void)
+{
+    struct { void *base; size_t size, committed; unsigned int protect; } top[12] = {{0}};
+    size_t image = 0, file = 0, system = 0, anon = 0, anon_committed = 0;
+    unsigned int count = 0, i, j;
+    struct file_view *view;
+    sigset_t sigset;
+    char msg[256];
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+    {
+        size_t committed = 0, off;
+
+        if ((ULONG_PTR)view->base >= 0x100000000ull) continue;
+        count++;
+        if (view->protect & VPROT_SYSTEM) system += view->size;
+        else if (view->protect & SEC_IMAGE) image += view->size;
+        else if (view->protect & SEC_FILE) file += view->size;
+        else
+        {
+            for (off = 0; off < view->size; off += page_size)
+                if (get_page_vprot( (char *)view->base + off ) & VPROT_COMMITTED) committed += page_size;
+            anon += view->size;
+            anon_committed += committed;
+        }
+        for (i = 0; i < ARRAY_SIZE(top) && top[i].size >= view->size; i++) ;
+        if (i == ARRAY_SIZE(top)) continue;
+        for (j = ARRAY_SIZE(top) - 1; j > i; j--) top[j] = top[j - 1];
+        top[i].base = view->base;
+        top[i].size = view->size;
+        top[i].committed = committed;
+        top[i].protect = view->protect;
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+    snprintf( msg, sizeof(msg), "[VA] %u views below 4 GB: anonymous %lu MB (%lu MB committed), images %lu MB, "
+              "file mappings %lu MB, system %lu MB", count, (unsigned long)(anon >> 20),
+              (unsigned long)(anon_committed >> 20), (unsigned long)(image >> 20), (unsigned long)(file >> 20),
+              (unsigned long)(system >> 20) );
+    wine_nx_runtime_trace( msg );
+    for (i = 0; i < ARRAY_SIZE(top) && top[i].size; i++)
+    {
+        snprintf( msg, sizeof(msg), "[VA] view %p %lu KB, %lu KB committed, protect %#x", top[i].base,
+                  (unsigned long)(top[i].size >> 10), (unsigned long)(top[i].committed >> 10), top[i].protect );
+        wine_nx_runtime_trace( msg );
+    }
+    horizon_log_low_address_space();
+}
+#endif
+
 static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG type, ULONG protect,
                                          ULONG_PTR limit_low, ULONG_PTR limit_high,
                                          ULONG_PTR align, ULONG attributes )
@@ -6174,7 +6294,26 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
         *size_ptr = size;
     }
     else if (status == STATUS_NO_MEMORY)
+    {
         ERR( "out of memory for allocation, base %p size %08lx\n", base, size );
+#ifdef __SWITCH__
+        /* Unix ERR lines never reach the runtime log, and a 32-bit program that
+         * runs out of address space fails far from here. */
+        if (&wine_nx_runtime_trace)
+        {
+            static LONG logs;
+            char msg[160];
+
+            if (__atomic_add_fetch( &logs, 1, __ATOMIC_RELAXED ) <= 32)
+            {
+                snprintf( msg, sizeof(msg), "[VA] out of address space: %lu KB (type %#x) at %p below %p",
+                          (unsigned long)(size >> 10), (unsigned int)type, base, (void *)limit_high );
+                wine_nx_runtime_trace( msg );
+                if (logs == 1) wine_nx_log_views();
+            }
+        }
+#endif
+    }
 
     return status;
 }

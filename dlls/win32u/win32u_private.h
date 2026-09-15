@@ -326,6 +326,8 @@ extern HICON get_window_icon_info( HWND hwnd, UINT type, HICON icon, ICONINFO *r
 /* ntdll/unix/env.c also exports init_startup_info; rename win32u's to avoid a
  * symbol clash when both unix sides are statically linked into one binary. */
 #define init_startup_info win32u_init_startup_info
+/* [NXWIN] activation and show-state lines in the runtime log, first 64 only. */
+extern void nx_window_trace( const char *format, ... ) __attribute__((format(printf, 1, 2)));
 #endif
 extern void init_startup_info(void);
 

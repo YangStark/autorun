@@ -70,6 +70,19 @@ static void nx_vk_trace( const char *format, ... )
     va_end( args );
     wine_nx_runtime_trace( buffer );
 }
+
+extern void horizon_get_address_space_limits( void **start, void **limit );
+
+static BOOL driver_maps_fit_wow64(void)
+{
+    static int fit = -1;
+    void *start, *limit;
+
+    if (fit >= 0) return fit;
+    horizon_get_address_space_limits( &start, &limit );
+    fit = (ULONG_PTR)limit <= 0x100000000;
+    return fit;
+}
 #endif
 
 WINE_DECLARE_DEBUG_CHANNEL(fps);
@@ -267,6 +280,47 @@ static struct fence *fence_from_handle( VkFence handle )
 
 #ifdef __SWITCH__
 static LONG nx_host_import_logs;  /* [NXVK] lines about the first imports only */
+
+/* The program's Vulkan memory, logged every 256 allocations and on failures:
+ * DXVK sub-allocates, so an allocator that churns or fails shows nowhere else. */
+static LONG nx_memory_allocs, nx_memory_frees, nx_memory_imports, nx_memory_failure_logs;
+static LONGLONG nx_memory_alloc_bytes, nx_memory_free_bytes;
+
+static void nx_memory_note_alloc( VkDeviceSize size, BOOL imported )
+{
+    const LONG allocs = __atomic_add_fetch( &nx_memory_allocs, 1, __ATOMIC_RELAXED );
+    const LONGLONG bytes = __atomic_add_fetch( &nx_memory_alloc_bytes, (LONGLONG)size, __ATOMIC_RELAXED );
+    LONGLONG freed;
+
+    if (imported) __atomic_add_fetch( &nx_memory_imports, 1, __ATOMIC_RELAXED );
+    if (allocs % 256) return;
+    freed = __atomic_load_n( &nx_memory_free_bytes, __ATOMIC_RELAXED );
+    nx_vk_trace( "[NXVK] memory: %d allocations of %lld MB, %d frees of %lld MB, %lld MB live, "
+                 "%d with imported 32-bit mappings", (int)allocs, bytes >> 20,
+                 (int)__atomic_load_n( &nx_memory_frees, __ATOMIC_RELAXED ), freed >> 20,
+                 (bytes - freed) >> 20, (int)__atomic_load_n( &nx_memory_imports, __ATOMIC_RELAXED ) );
+}
+
+static BOOL nx_memory_log_failure(void)
+{
+    return __atomic_add_fetch( &nx_memory_failure_logs, 1, __ATOMIC_RELAXED ) <= 32;
+}
+
+/* On NVK every memory type is host visible, so importing each allocation from a
+ * 32-bit mapping mirrors all of a program's GPU memory into its 2 GB address
+ * space: NFSU2 ran out of it loading a race. In a 32-bit address space the
+ * driver's memory lies in the kernel's heap region, below 4 GB and outside
+ * Wine's views, so its own mappings reach the program at no address space cost. */
+static BOOL nx_driver_maps_preferred(void)
+{
+    static LONG logged;
+
+    if (!driver_maps_fit_wow64()) return FALSE;
+    if (__atomic_add_fetch( &logged, 1, __ATOMIC_RELAXED ) == 1)
+        nx_vk_trace( "[NXVK] 32-bit address space: Vulkan memory uses the driver's own mappings, "
+                     "not imports into the program's address space" );
+    return TRUE;
+}
 #endif
 
 static VkResult allocate_external_host_memory( struct vulkan_device *device, VkMemoryAllocateInfo *alloc_info, uint32_t mem_flags,
@@ -281,13 +335,19 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
     SIZE_T alloc_size = alloc_info->allocationSize;
     static int once;
     void *mapping = NULL;
+    NTSTATUS status;
     VkResult res;
 
     if (!once++) FIXME( "Using VK_EXT_external_memory_host\n" );
 
-    if (NtAllocateVirtualMemory( GetCurrentProcess(), &mapping, zero_bits, &alloc_size, MEM_COMMIT, PAGE_READWRITE ))
+    if ((status = NtAllocateVirtualMemory( GetCurrentProcess(), &mapping, zero_bits, &alloc_size, MEM_COMMIT, PAGE_READWRITE )))
     {
         ERR( "NtAllocateVirtualMemory failed\n" );
+#ifdef __SWITCH__
+        if (nx_memory_log_failure())
+            nx_vk_trace( "[NXVK] no 32-bit mapping for %llu bytes of memory type %u: status %#x",
+                         (unsigned long long)alloc_info->allocationSize, alloc_info->memoryTypeIndex, (unsigned int)status );
+#endif
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
 
@@ -1191,8 +1251,27 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
     /* For host visible memory, we try to use VK_EXT_external_memory_host on wow64 to ensure that mapped pointer is 32-bit. */
     mem_flags = physical_device->memory_properties.memoryTypes[alloc_info->memoryTypeIndex].propertyFlags;
     if (physical_device->external_memory_align && (mem_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !pointer_info &&
+#ifdef __SWITCH__
+        !nx_driver_maps_preferred() &&
+#endif
         (res = allocate_external_host_memory( device, alloc_info, mem_flags, &host_pointer_info )))
+    {
+#ifdef __SWITCH__
+        /* In a 32-bit address space every mapping the driver makes lies below
+         * 4 GB, so when no 32-bit range is left to import (DXVK's 64 MB chunks
+         * in NFSU2), the driver's own mapping can go to the program instead. */
+        static LONG fallback_logs;
+
+        if (res == VK_ERROR_OUT_OF_HOST_MEMORY && driver_maps_fit_wow64())
+        {
+            if (__atomic_add_fetch( &fallback_logs, 1, __ATOMIC_RELAXED ) <= 8)
+                nx_vk_trace( "[NXVK] 32-bit address space full: %llu bytes of memory type %u use the driver's own mapping",
+                             (unsigned long long)alloc_info->allocationSize, alloc_info->memoryTypeIndex );
+        }
+        else
+#endif
         return res;
+    }
     /* The 32-bit mapping the host imports, if any: vkMapMemory hands it out, and
      * it is released once the host memory is freed. */
     mapping = host_pointer_info.pHostPointer;
@@ -1296,12 +1375,21 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
     memory->size = alloc_info->allocationSize;
     memory->vm_map = mapping;
     instance->p_insert_object( instance, &memory->obj.obj );
+#ifdef __SWITCH__
+    nx_memory_note_alloc( memory->size, mapping != NULL );
+#endif
 
     *ret = memory->obj.client.device_memory;
     return VK_SUCCESS;
 
 failed:
     WARN( "Failed to allocate memory, res %d\n", res );
+#ifdef __SWITCH__
+    if (nx_memory_log_failure())
+        nx_vk_trace( "[NXVK] vkAllocateMemory of %llu bytes of memory type %u failed: %d%s",
+                     (unsigned long long)alloc_info->allocationSize, alloc_info->memoryTypeIndex, res,
+                     mapping ? " (with an imported 32-bit mapping)" : "" );
+#endif
     if (host_device_memory) device->p_vkFreeMemory( device->host.device, host_device_memory, NULL );
     if (mapping)
     {
@@ -1339,6 +1427,10 @@ static void win32u_vkFreeMemory( VkDevice client_device, VkDeviceMemory client_m
 
     device->p_vkFreeMemory( device->host.device, memory->obj.host.device_memory, NULL );
     instance->p_remove_object( instance, &memory->obj.obj );
+#ifdef __SWITCH__
+    __atomic_add_fetch( &nx_memory_frees, 1, __ATOMIC_RELAXED );
+    __atomic_add_fetch( &nx_memory_free_bytes, (LONGLONG)memory->size, __ATOMIC_RELAXED );
+#endif
 
     if (memory->vm_map)
     {
@@ -1462,6 +1554,14 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
         TRACE( "Using placed mapping %p\n", memory->vm_map );
     }
 
+#ifdef __SWITCH__
+    {
+        static LONG map_logs;
+
+        if (res == VK_SUCCESS && !memory->vm_map && __atomic_add_fetch( &map_logs, 1, __ATOMIC_RELAXED ) <= 8)
+            nx_vk_trace( "[NXVK] driver mapping %p for %llu bytes", *data, (unsigned long long)memory->size );
+    }
+#endif
 #ifdef _WIN64
     if (NtCurrentTeb()->WowTebOffset && res == VK_SUCCESS && (UINT_PTR)*data >> 32)
     {
@@ -2632,6 +2732,33 @@ static BOOL surface_get_fshack_dpi( struct surface *surface )
     return fshack_enabled && dpi != raw ? raw : 0;
 }
 
+#ifdef __SWITCH__
+/* The Switch screen shows buffers of its own size (1280x720 handheld), the only
+ * size tico-dolphin gives it. A swapchain of another size, such as 800x600 for a
+ * game in full screen, gets host images of the screen's size instead, and the
+ * program's images are scaled into them by the fullscreen hack's compute blit.
+ * Its host swapchain does not depend on DPI, so it never needs recreating. */
+static BOOL nx_scaled_host_extent( const VkSurfaceCapabilitiesKHR *capabilities, const VkExtent2D *extent,
+                                   VkExtent2D *host_extent )
+{
+    const VkExtent2D *screen = &capabilities->currentExtent;
+
+    if (screen->width == 0xffffffff || !screen->width || !screen->height) return FALSE;
+    if (screen->width == extent->width && screen->height == extent->height) return FALSE;
+    *host_extent = *screen;
+    return TRUE;
+}
+#endif
+
+static BOOL swapchain_fshack_changed( struct swapchain *swapchain, struct surface *surface )
+{
+#ifdef __SWITCH__
+    return FALSE;
+#else
+    return swapchain->fshack_dpi != surface_get_fshack_dpi( surface );
+#endif
+}
+
 static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwapchainCreateInfoKHR *create_info,
                                              const VkAllocationCallbacks *allocator, VkSwapchainKHR *ret )
 {
@@ -2678,6 +2805,21 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
 
     if (!(swapchain = calloc( 1, sizeof(*swapchain) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
+#ifdef __SWITCH__
+    if (nx_scaled_host_extent( &capabilities, &create_info_host.imageExtent, &swapchain->host_extents ))
+    {
+        swapchain->fshack_dpi = 1;
+        create_info_host.imageExtent = swapchain->host_extents;
+        create_info_host.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
+        /* Transfer source for the [NXVK] read-back of the scaled frame. */
+        create_info_host.imageUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        nx_vk_trace( "[NXVK] swapchain %ux%u format %d scaled into %ux%u screen buffers (%s)",
+                     create_info->imageExtent.width, create_info->imageExtent.height, create_info->imageFormat,
+                     swapchain->host_extents.width, swapchain->host_extents.height,
+                     create_info->presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo" );
+    }
+    else
+#endif
     if ((swapchain->fshack_dpi = surface_get_fshack_dpi( surface )))
     {
         VkSurfaceCapabilitiesKHR caps = {0};
@@ -2795,7 +2937,7 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     acquire_info_host.fence = fence ? fence->host.fence : 0;
     res = device->p_vkAcquireNextImage2KHR( device->host.device, &acquire_info_host, image_index );
 
-    if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface ))
+    if (!res && swapchain_fshack_changed( swapchain, surface ))
     {
         WARN( "window %p swapchain %p needs fullscreen hack VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
         return VK_SUBOPTIMAL_KHR;
@@ -2827,7 +2969,7 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
                                               semaphore ? semaphore->host.semaphore : 0, fence ? fence->host.fence : 0,
                                               image_index );
 
-    if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface ))
+    if (!res && swapchain_fshack_changed( swapchain, surface ))
     {
         WARN( "window %p swapchain %p needs fullscreen hack VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
         return VK_SUBOPTIMAL_KHR;
@@ -2951,6 +3093,20 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
     device->p_vkCmdBindDescriptorSets( hack->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                        swapchain->pipeline_layout, 0, 1, &hack->descriptor_set, 0, NULL );
 
+#ifdef __SWITCH__
+    {
+        /* Keep the aspect ratio: the image is centred, and the sampler's black
+         * border fills the bars. texcoord = (id + 0.5 - offset) / extents. */
+        float scale = min( (float)swapchain->host_extents.width / swapchain->extents.width,
+                           (float)swapchain->host_extents.height / swapchain->extents.height );
+        float width = swapchain->extents.width * scale, height = swapchain->extents.height * scale;
+
+        constants[0] = (swapchain->host_extents.width - width) / 2 - 0.5f;
+        constants[1] = (swapchain->host_extents.height - height) / 2 - 0.5f;
+        constants[2] = width;
+        constants[3] = height;
+    }
+#else
     /* vec2: blit dst offset in real coords */
     constants[0] = 0;
     constants[1] = 0;
@@ -2962,6 +3118,7 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
     /* vec2: blit dst extents in real coords */
     constants[2] = swapchain->host_extents.width;
     constants[3] = swapchain->host_extents.height;
+#endif
     device->p_vkCmdPushConstants( hack->cmd, swapchain->pipeline_layout,
                                   VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants );
 
@@ -3011,6 +3168,150 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
     return VK_SUCCESS;
 }
 
+#ifdef __SWITCH__
+/* Counted in the runtime's [PROGRESS] frames. */
+unsigned int wine_nx_vk_presents;
+static LONG nx_present_logs;
+
+static void nx_vk_note_present( const VkSwapchainKHR *client_swapchains, uint32_t count, VkResult res )
+{
+    const unsigned int presents = __atomic_add_fetch( &wine_nx_vk_presents, 1, __ATOMIC_RELAXED );
+    struct swapchain *swapchain;
+    RECT client_rect = {0};
+    HWND hwnd;
+
+    if (res == VK_SUCCESS && presents > 4 && presents % 1800) return;
+    if (res != VK_SUCCESS && __atomic_add_fetch( &nx_present_logs, 1, __ATOMIC_RELAXED ) > 32) return;
+    if (!count) return;
+    swapchain = swapchain_from_handle( client_swapchains[0] );
+    hwnd = swapchain->surface->hwnd;
+    get_surface_rect( hwnd, &client_rect, NtUserGetDpiForWindow( hwnd ) );
+    nx_vk_trace( "[NXVK] present %u: result %d, swapchain %ux%u, hwnd %p client %s, style %#x%s, foreground %p",
+                 presents, res, swapchain->extents.width, swapchain->extents.height, hwnd,
+                 wine_dbgstr_rect( &client_rect ), (int)get_window_long( hwnd, GWL_STYLE ),
+                 is_iconic( hwnd ) ? " (minimized)" : "", NtUserGetForegroundWindow() );
+}
+
+static LONG nx_scaled_presents;
+
+/* Submits the scaling blit. On a few presents it also copies the scaled screen
+ * buffer back and logs what reaches the screen: the centre, a bar pixel, and
+ * how many samples are not black or are white (pe32-d3d9's triangle). */
+static void nx_submit_scaled( struct vulkan_queue *queue, VkSubmitInfo *submit_info, struct swapchain *swapchain,
+                              struct fs_hack_image *hack, struct mempool *pool )
+{
+    const LONG presents = __atomic_add_fetch( &nx_scaled_presents, 1, __ATOMIC_RELAXED );
+    struct vulkan_device *device = queue->device;
+    const VkExtent2D extent = swapchain->host_extents;
+    VkBufferCreateInfo buffer_info = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    VkMemoryAllocateInfo alloc_info = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    VkCommandBufferAllocateInfo cmd_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    VkCommandBufferBeginInfo begin_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkImageMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    VkBufferImageCopy copy = {0};
+    VkPhysicalDeviceMemoryProperties properties;
+    VkMemoryRequirements requirements;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE, *cmds;
+    VkFence fence = VK_NULL_HANDLE;
+    unsigned int x, y, samples = 0, lit = 0, white = 0;
+    const DWORD *pixels;
+    VkResult res;
+    void *map;
+
+    if (presents != 30 && presents != 90 && presents % 1800)
+    {
+        device->p_vkQueueSubmit( queue->host.queue, 1, submit_info, VK_NULL_HANDLE );
+        return;
+    }
+
+    buffer_info.size = (VkDeviceSize)extent.width * extent.height * 4;
+    buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if ((res = device->p_vkCreateBuffer( device->host.device, &buffer_info, NULL, &buffer ))) goto failed;
+    device->p_vkGetBufferMemoryRequirements( device->host.device, buffer, &requirements );
+    device->physical_device->instance->p_vkGetPhysicalDeviceMemoryProperties( device->physical_device->host.physical_device,
+                                                                             &properties );
+    for (alloc_info.memoryTypeIndex = 0; alloc_info.memoryTypeIndex < properties.memoryTypeCount; alloc_info.memoryTypeIndex++)
+        if ((requirements.memoryTypeBits & (1u << alloc_info.memoryTypeIndex)) &&
+            (properties.memoryTypes[alloc_info.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+            break;
+    alloc_info.allocationSize = requirements.size;
+    if ((res = device->p_vkAllocateMemory( device->host.device, &alloc_info, NULL, &memory ))) goto failed;
+    if ((res = device->p_vkBindBufferMemory( device->host.device, buffer, memory, 0 ))) goto failed;
+
+    cmd_info.commandPool = swapchain->cmd_pools[hack->cmd_queue_idx];
+    cmd_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmd_info.commandBufferCount = 1;
+    if ((res = device->p_vkAllocateCommandBuffers( device->host.device, &cmd_info, &cmd ))) goto failed;
+    device->p_vkBeginCommandBuffer( cmd, &begin_info );
+    barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = hack->swapchain_image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    device->p_vkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    0, 0, NULL, 0, NULL, 1, &barrier );
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageExtent.width = extent.width;
+    copy.imageExtent.height = extent.height;
+    copy.imageExtent.depth = 1;
+    device->p_vkCmdCopyImageToBuffer( cmd, hack->swapchain_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy );
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.dstAccessMask = 0;
+    device->p_vkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                    0, 0, NULL, 0, NULL, 1, &barrier );
+    if ((res = device->p_vkEndCommandBuffer( cmd ))) goto failed;
+    if ((res = device->p_vkCreateFence( device->host.device, &fence_info, NULL, &fence ))) goto failed;
+
+    if (!(cmds = mem_alloc( pool, (submit_info->commandBufferCount + 1) * sizeof(*cmds) ))) { res = VK_ERROR_OUT_OF_HOST_MEMORY; goto failed; }
+    memcpy( cmds, submit_info->pCommandBuffers, submit_info->commandBufferCount * sizeof(*cmds) );
+    cmds[submit_info->commandBufferCount] = cmd;
+    submit_info->pCommandBuffers = cmds;
+    submit_info->commandBufferCount++;
+    if ((res = device->p_vkQueueSubmit( queue->host.queue, 1, submit_info, fence ))) goto done;
+    if ((res = device->p_vkWaitForFences( device->host.device, 1, &fence, VK_TRUE, 5000000000ull )))
+    {
+        /* Still queued: leave its objects alive rather than free them under the GPU. */
+        nx_vk_trace( "[NXVK] scaled present %d read back failed: %d", (int)presents, res );
+        return;
+    }
+    if ((res = device->p_vkMapMemory( device->host.device, memory, 0, VK_WHOLE_SIZE, 0, &map ))) goto done;
+
+    pixels = map;
+    for (y = 0; y < extent.height; y += 8)
+        for (x = 0; x < extent.width; x += 8)
+        {
+            const DWORD pixel = pixels[y * extent.width + x] & 0xffffff;
+            samples++;
+            if (pixel) lit++;
+            if ((pixel & 0xf0f0f0) == 0xf0f0f0) white++;
+        }
+    nx_vk_trace( "[NXVK] scaled present %d read back %ux%u: centre %06x, left bar %06x, %u of %u samples lit, %u white",
+                 (int)presents, extent.width, extent.height,
+                 (unsigned int)(pixels[extent.height / 2 * extent.width + extent.width / 2] & 0xffffff),
+                 (unsigned int)(pixels[extent.height / 2 * extent.width + 4] & 0xffffff), lit, samples, white );
+    device->p_vkUnmapMemory( device->host.device, memory );
+    goto done;
+
+failed:
+    device->p_vkQueueSubmit( queue->host.queue, 1, submit_info, VK_NULL_HANDLE );
+done:
+    if (res) nx_vk_trace( "[NXVK] scaled present %d read back failed: %d", (int)presents, res );
+    if (fence) device->p_vkDestroyFence( device->host.device, fence, NULL );
+    if (cmd) device->p_vkFreeCommandBuffers( device->host.device, swapchain->cmd_pools[hack->cmd_queue_idx], 1, &cmd );
+    if (buffer) device->p_vkDestroyBuffer( device->host.device, buffer, NULL );
+    if (memory) device->p_vkFreeMemory( device->host.device, memory, NULL );
+}
+#endif
+
 static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentInfoKHR *client_present_info )
 {
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -3025,6 +3326,10 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     struct mempool pool = {0};
     uint32_t blit_count = 0;
     VkSemaphore blit_sema;
+#ifdef __SWITCH__
+    struct swapchain *blit_swapchain = NULL;
+    struct fs_hack_image *blit_hack = NULL;
+#endif
 
     TRACE( "queue %p, present_info %p\n", queue, present_info );
 
@@ -3038,6 +3343,10 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
 
         if (!swapchain->fshack_dpi) continue;
         blit_sema = hack->blit_finished;
+#ifdef __SWITCH__
+        blit_swapchain = swapchain;
+        blit_hack = hack;
+#endif
 
         if (!hack->cmd || hack->cmd_queue_idx != queue->info.queueFamilyIndex)
         {
@@ -3096,7 +3405,11 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         submit_info.pCommandBuffers = blit_cmds;
         submit_info.signalSemaphoreCount = 1;
         submit_info.pSignalSemaphores = &blit_sema;
+#ifdef __SWITCH__
+        nx_submit_scaled( queue, &submit_info, blit_swapchain, blit_hack, &pool );
+#else
         device->p_vkQueueSubmit( queue->host.queue, 1, &submit_info, VK_NULL_HANDLE );
+#endif
 
         present_info->waitSemaphoreCount = 1;
         present_info->pWaitSemaphores = &blit_sema;
@@ -3132,6 +3445,9 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             if (!res) res = VK_SUBOPTIMAL_KHR;
         }
     }
+#ifdef __SWITCH__
+    nx_vk_note_present( client_swapchains, present_info->swapchainCount, res );
+#endif
 
     if (TRACE_ON( fps ))
     {

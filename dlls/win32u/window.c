@@ -4815,6 +4815,10 @@ static BOOL show_window( HWND hwnd, INT cmd )
      * manager.  Maximize its ownerless overlapped top-level window while
      * leaving popups, dialogs and child controls under application control. */
     nx_fullscreen = !(style & (WS_CHILD | WS_POPUP)) && !get_window_relative( hwnd, GW_OWNER );
+    if (!(style & WS_CHILD))
+        nx_window_trace( "[NXWIN] thread %04x shows hwnd %p with %d (style %#x, visible %d%s)",
+                         (int)GetCurrentThreadId(), hwnd, cmd, (int)style, was_visible,
+                         is_iconic( hwnd ) ? ", minimized" : "" );
     if (nx_fullscreen && (cmd == SW_SHOW || cmd == SW_SHOWNORMAL || cmd == SW_SHOWDEFAULT))
         cmd = SW_SHOWMAXIMIZED;
 #endif

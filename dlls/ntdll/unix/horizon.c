@@ -373,6 +373,8 @@ struct horizon_fd_queue
 #define HORIZON_REQ_MAP_VIEW 67
 #define HORIZON_REQ_MAP_IMAGE_VIEW 68
 #define HORIZON_REQ_UNMAP_VIEW 71
+#define HORIZON_REQ_GET_MAPPING_COMMITTED_RANGE 72
+#define HORIZON_REQ_ADD_MAPPING_COMMITTED_RANGE 73
 #define HORIZON_REQ_GET_TOKEN_SID 230
 #define HORIZON_REQ_ALLOCATE_LOCALLY_UNIQUE_ID 252
 #define HORIZON_REQ_OPEN_DIRECTORY 242
@@ -497,6 +499,7 @@ struct horizon_fd_queue
 #define HORIZON_STATUS_PIPE_DISCONNECTED 0xc00000b0u
 #define HORIZON_STATUS_NOT_IMPLEMENTED 0xc0000002u
 #define HORIZON_STATUS_INVALID_HANDLE 0xc0000008u
+#define HORIZON_STATUS_NOT_MAPPED_VIEW 0xc0000019u
 #define HORIZON_STATUS_INVALID_PARAMETER 0xc000000du
 #define HORIZON_STATUS_INVALID_IMAGE_FORMAT 0xc000007bu
 #define HORIZON_STATUS_NO_SUCH_FILE 0xc000000fu
@@ -1322,6 +1325,39 @@ struct horizon_unmap_view_request
     char pad[4];
     unsigned long long base;
 };
+
+struct horizon_get_mapping_committed_range_request
+{
+    struct horizon_server_request_header header;
+    char pad[4];
+    unsigned long long base;
+    long long offset;
+};
+
+struct horizon_get_mapping_committed_range_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned long long size;
+    int committed;
+    char pad[4];
+};
+
+struct horizon_add_mapping_committed_range_request
+{
+    struct horizon_server_request_header header;
+    char pad[4];
+    unsigned long long base;
+    long long offset;
+    unsigned long long size;
+};
+
+/* Wine's server_protocol.h layouts. */
+_Static_assert( offsetof(struct horizon_get_mapping_committed_range_request, offset) == 24,
+                "get_mapping_committed_range_request layout" );
+_Static_assert( offsetof(struct horizon_get_mapping_committed_range_reply, committed) == 16,
+                "get_mapping_committed_range_reply layout" );
+_Static_assert( offsetof(struct horizon_add_mapping_committed_range_request, size) == 32,
+                "add_mapping_committed_range_request layout" );
 
 struct horizon_pe_image_info
 {
@@ -2669,6 +2705,7 @@ struct horizon_server_object
     struct horizon_server_object *file_completion; /* file: the port its I/O results go to, referenced */
     unsigned long long file_completion_key;
     unsigned int file_completion_flags;  /* FILE_SKIP_* */
+    struct horizon_memfile *mapping_memfile; /* mapping: a section with no file, kept by file_fd */
 };
 
 struct horizon_server_handle_entry
@@ -2826,6 +2863,15 @@ struct horizon_backing
     BOOL write_back;
 };
 
+/* What a mapping of a section with no file is (horizon_memfile.h). */
+enum horizon_section_state
+{
+    SECTION_NONE,     /* not one: a reservation, or backed memory */
+    SECTION_ALIASED,  /* a range of a view, its pages mapped from the section's anchors */
+    SECTION_HOLE,     /* a range of a view, unmapped while PROT_NONE */
+    SECTION_ANCHOR,   /* section pages code-mapped for views to map from */
+};
+
 struct horizon_mapping
 {
     void *addr;
@@ -2834,10 +2880,14 @@ struct horizon_mapping
     int prot;
     struct horizon_backing *backing;
     VirtmemReservation *reservation;
+    struct horizon_memfile *section;  /* SECTION_ALIASED and SECTION_HOLE */
+    size_t section_offset;
+    unsigned char section_state;
     struct rb_entry entry;
 };
 
 #include "horizon_pool.h"
+#include "horizon_memfile.h"
 
 /* These freelists are protected by mapping_mutex, like the mapping tree. */
 static struct horizon_backing backing_slots[4096];
@@ -2846,13 +2896,18 @@ static struct horizon_object_pool backing_pool = { backing_slots, NULL, sizeof(b
 static struct horizon_object_pool mapping_pool = { mapping_slots, NULL, sizeof(mapping_slots[0]), 8192, 0 };
 static struct horizon_page_pool backing_pages;
 static unsigned long long backing_direct_allocs;
+/* Views of sections with no file (horizon_mmap_section), under mapping_mutex. */
+static unsigned long long section_view_maps, section_anchor_bytes;
+static unsigned int section_anchors, section_failures;
 
 void horizon_memory_pool_stats( char *buffer, size_t size )
 {
     pthread_mutex_lock( &mapping_mutex );
-    snprintf( buffer, size, "[MEMPOOL] arena_mb=%llu pooled_allocs=%llu direct_allocs=%llu backing_slots=%zu mapping_slots=%zu",
+    snprintf( buffer, size, "[MEMPOOL] arena_mb=%llu pooled_allocs=%llu direct_allocs=%llu backing_slots=%zu mapping_slots=%zu"
+              " section_views=%llu anchors=%u anchor_mb=%llu section_failures=%u",
               backing_pages.misses * 2, backing_pages.hits, backing_direct_allocs,
-              backing_pool.used, mapping_pool.used );
+              backing_pool.used, mapping_pool.used, section_view_maps, section_anchors,
+              section_anchor_bytes >> 20, section_failures );
     pthread_mutex_unlock( &mapping_mutex );
 }
 
@@ -3006,6 +3061,161 @@ static void horizon_set_reent_errno( struct _reent *r, int error )
 {
     if (r) r->_errno = error;
     else errno = error;
+}
+
+/* The descriptors of sections with no file (horizon_memfile.h). */
+static int horizon_memfile_open_r( struct _reent *r, void *fdptr, const char *path, int flags, int mode )
+{
+    (void)fdptr;
+    (void)path;
+    (void)flags;
+    (void)mode;
+    horizon_set_reent_errno( r, ENOSYS );
+    return -1;
+}
+
+/* newlib calls this once the last descriptor duplicated from one is closed;
+ * views keep the memory for as long as they need it. */
+static int horizon_memfile_close_r( struct _reent *r, void *fdptr )
+{
+    struct horizon_memfile *file = *(struct horizon_memfile **)fdptr;
+
+    (void)r;
+    if (file) horizon_memfile_unref( file );
+    *(struct horizon_memfile **)fdptr = NULL;
+    return 0;
+}
+
+static ssize_t horizon_memfile_write_r( struct _reent *r, void *fdptr, const char *ptr, size_t len )
+{
+    struct horizon_memfile *file = *(struct horizon_memfile **)fdptr;
+    ssize_t ret;
+
+    if (!file) ret = -EBADF;
+    else ret = horizon_memfile_write( file, ptr, len );
+    if (ret >= 0) return ret;
+    horizon_set_reent_errno( r, -ret );
+    return -1;
+}
+
+static ssize_t horizon_memfile_read_r( struct _reent *r, void *fdptr, char *ptr, size_t len )
+{
+    struct horizon_memfile *file = *(struct horizon_memfile **)fdptr;
+    ssize_t ret;
+
+    if (!file) ret = -EBADF;
+    else ret = horizon_memfile_read( file, ptr, len );
+    if (ret >= 0) return ret;
+    horizon_set_reent_errno( r, -ret );
+    return -1;
+}
+
+static off_t horizon_memfile_seek_r( struct _reent *r, void *fdptr, off_t pos, int dir )
+{
+    struct horizon_memfile *file = *(struct horizon_memfile **)fdptr;
+    off_t ret;
+
+    if (!file) ret = -EBADF;
+    else ret = horizon_memfile_seek( file, pos, dir );
+    if (ret >= 0) return ret;
+    horizon_set_reent_errno( r, -ret );
+    return -1;
+}
+
+static int horizon_memfile_fstat_r( struct _reent *r, void *fdptr, struct stat *st )
+{
+    struct horizon_memfile *file = *(struct horizon_memfile **)fdptr;
+
+    if (!file)
+    {
+        horizon_set_reent_errno( r, EBADF );
+        return -1;
+    }
+    horizon_memfile_stat( file, st );
+    return 0;
+}
+
+static int horizon_memfile_ftruncate_r( struct _reent *r, void *fdptr, off_t len )
+{
+    struct horizon_memfile *file = *(struct horizon_memfile **)fdptr;
+    int ret;
+
+    if (!file) ret = -EBADF;
+    else ret = horizon_memfile_truncate( file, len );
+    if (!ret) return 0;
+    horizon_set_reent_errno( r, -ret );
+    return -1;
+}
+
+static const devoptab_t horizon_memfile_devoptab =
+{
+    .name        = "winemem",
+    .structSize  = sizeof(struct horizon_memfile *),
+    .open_r      = horizon_memfile_open_r,
+    .close_r     = horizon_memfile_close_r,
+    .write_r     = horizon_memfile_write_r,
+    .read_r      = horizon_memfile_read_r,
+    .seek_r      = horizon_memfile_seek_r,
+    .fstat_r     = horizon_memfile_fstat_r,
+    .ftruncate_r = horizon_memfile_ftruncate_r,
+};
+
+static pthread_mutex_t horizon_memfile_device_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int horizon_memfile_device = -1;
+
+/* The kernel side of views of sections (horizon_section_anchor and below). */
+static void *horizon_section_anchor( void *source, size_t size, void **token );
+static int horizon_section_unanchor( void *addr, void *source, size_t size, void *token );
+static int horizon_section_alias( void *dst, void *src, size_t size );
+static int horizon_section_unalias( void *dst, void *src, size_t size );
+
+static const struct horizon_memfile_ops horizon_section_ops =
+{
+    horizon_section_anchor,
+    horizon_section_unanchor,
+    horizon_section_alias,
+    horizon_section_unalias,
+};
+
+/* A descriptor on size zeroed bytes, whole pages, or -1 with errno set. */
+static int horizon_memfile_create( unsigned long long size, int reserve )
+{
+    struct horizon_memfile *file;
+    int fd;
+
+    pthread_mutex_lock( &horizon_memfile_device_mutex );
+    if (horizon_memfile_device == -1)
+    {
+        horizon_memfile_device = FindDevice( "winemem:" );
+        if (horizon_memfile_device == -1)
+            horizon_memfile_device = AddDevice( &horizon_memfile_devoptab );
+    }
+    pthread_mutex_unlock( &horizon_memfile_device_mutex );
+
+    if (horizon_memfile_device == -1)
+    {
+        errno = EMFILE;
+        return -1;
+    }
+    if (!(file = horizon_memfile_alloc( size, reserve, &horizon_section_ops ))) return -1;
+    if ((fd = __alloc_handle( horizon_memfile_device )) == -1)
+    {
+        horizon_memfile_unref( file );
+        errno = EMFILE;
+        return -1;
+    }
+    *(struct horizon_memfile **)__get_handle( fd )->fileStruct = file;
+    return fd;
+}
+
+/* The section behind a descriptor from horizon_memfile_create, or NULL. */
+static struct horizon_memfile *horizon_memfile_from_fd( int fd )
+{
+    __handle *handle;
+
+    if (fd < 0 || horizon_memfile_device == -1 || !(handle = __get_handle( fd ))) return NULL;
+    if (handle->device != (unsigned int)horizon_memfile_device || !handle->fileStruct) return NULL;
+    return *(struct horizon_memfile **)handle->fileStruct;
 }
 
 static int horizon_pipe_open_r( struct _reent *r, void *fdptr, const char *path, int flags, int mode )
@@ -10112,6 +10322,18 @@ void horizon_lifecycle_report( const char *tag, unsigned int tid, int code )
     wine_nx_runtime_trace( buf );
 }
 
+BOOL horizon_get_stack_region( void **start, void **limit )
+{
+    u64 base, size;
+
+    if (R_FAILED( svcGetInfo( &base, InfoType_StackRegionAddress, CUR_PROCESS_HANDLE, 0 ) ) ||
+        R_FAILED( svcGetInfo( &size, InfoType_StackRegionSize, CUR_PROCESS_HANDLE, 0 ) ) ||
+        !size || base + size <= base) return FALSE;
+    *start = (void *)base;
+    *limit = (void *)(base + size);
+    return TRUE;
+}
+
 void horizon_get_address_space_limits( void **start, void **limit )
 {
     u64 base = 0, size = 0;
@@ -10137,14 +10359,18 @@ void horizon_get_address_space_limits( void **start, void **limit )
 #endif
 
 static int horizon_server_handle_create_mapping( struct horizon_server_connection *connection,
-                                                 const unsigned char *message )
+                                                 const unsigned char *message,
+                                                 const unsigned char *data, unsigned int data_size )
 {
     const struct horizon_create_mapping_request *request = (const void *)message;
     struct horizon_create_mapping_reply reply;
     struct horizon_server_handle_entry *file_entry;
     struct horizon_server_handle_entry *mapping_entry = NULL;
     struct horizon_pe_image_info image_info;
+    struct horizon_object_name name;
     unsigned long long mapping_size = request->size;
+    unsigned int mapping_flags = request->flags;
+    unsigned int file_access = request->file_access;
     char *mapping_name = NULL;
     int fd = -1;
 #ifdef __SWITCH__
@@ -10154,16 +10380,42 @@ static int horizon_server_handle_create_mapping( struct horizon_server_connectio
     memset( &reply, 0, sizeof(reply) );
     memset( &image_info, 0, sizeof(image_info) );
 
-    pthread_mutex_lock( &horizon_server_objects_mutex );
-    file_entry = horizon_server_find_handle_locked( request->file_handle );
-    if (!file_entry) reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
-    else if (file_entry->object->type != HORIZON_SERVER_OBJECT_FILE || file_entry->object->file_fd == -1)
-        reply.header.error = HORIZON_STATUS_OBJECT_TYPE_MISMATCH;
-    else if ((fd = dup( file_entry->object->file_fd )) == -1)
-        reply.header.error = horizon_server_errno_status( errno );
-    else if (file_entry->object->file_name && !(mapping_name = strdup( file_entry->object->file_name )))
-        reply.header.error = HORIZON_STATUS_NO_MEMORY;
-    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    if ((reply.header.error = horizon_server_parse_object_attributes( data, data_size, &name )))
+    {
+    }
+    else if (!request->file_handle)
+    {
+        /* wineserver backs a section with no file with a temporary file. Views
+         * here are copies read and written back through the descriptor, so
+         * memory stands in for that file (horizon_memfile.h). */
+        unsigned long long rounded = (mapping_size + 0xfff) & ~0xfffull;
+
+        if (!(mapping_flags = horizon_anonymous_section_flags( request->flags, &reply.header.error )))
+        {
+        }
+        else if (!mapping_size || rounded < mapping_size)
+            reply.header.error = HORIZON_STATUS_INVALID_PARAMETER;
+        else if ((fd = horizon_memfile_create( rounded, !!(mapping_flags & HORIZON_SEC_RESERVE) )) == -1)
+            reply.header.error = horizon_server_errno_status( errno );
+        else
+        {
+            mapping_size = rounded;
+            file_access = FILE_READ_DATA | FILE_WRITE_DATA;
+        }
+    }
+    else
+    {
+        pthread_mutex_lock( &horizon_server_objects_mutex );
+        file_entry = horizon_server_find_handle_locked( request->file_handle );
+        if (!file_entry) reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+        else if (file_entry->object->type != HORIZON_SERVER_OBJECT_FILE || file_entry->object->file_fd == -1)
+            reply.header.error = HORIZON_STATUS_OBJECT_TYPE_MISMATCH;
+        else if ((fd = dup( file_entry->object->file_fd )) == -1)
+            reply.header.error = horizon_server_errno_status( errno );
+        else if (file_entry->object->file_name && !(mapping_name = strdup( file_entry->object->file_name )))
+            reply.header.error = HORIZON_STATUS_NO_MEMORY;
+        pthread_mutex_unlock( &horizon_server_objects_mutex );
+    }
 
     if (!reply.header.error && (request->flags & HORIZON_SEC_IMAGE))
     {
@@ -10185,19 +10437,28 @@ static int horizon_server_handle_create_mapping( struct horizon_server_connectio
 
     if (!reply.header.error)
     {
+        unsigned int status = HORIZON_STATUS_SUCCESS;
+
         pthread_mutex_lock( &horizon_server_objects_mutex );
-        if ((mapping_entry = horizon_server_create_handle_locked( HORIZON_SERVER_OBJECT_MAPPING )))
+        if (name.name_len)
+            status = horizon_server_create_named_object_handle_locked( HORIZON_SERVER_OBJECT_MAPPING, &name,
+                                                                      &mapping_entry );
+        else if (!(mapping_entry = horizon_server_create_handle_locked( HORIZON_SERVER_OBJECT_MAPPING )))
+            status = HORIZON_STATUS_NO_MEMORY;
+
+        if (status == HORIZON_STATUS_SUCCESS)
         {
             mapping_entry->object->file_fd = fd;
             mapping_entry->object->file_name = mapping_name;
-            mapping_entry->object->file_access = request->file_access;
+            mapping_entry->object->file_access = file_access;
             mapping_entry->object->file_options = 0;
-            mapping_entry->object->mapping_flags = request->flags;
+            mapping_entry->object->mapping_flags = mapping_flags;
             mapping_entry->object->mapping_access = request->access;
-            mapping_entry->object->mapping_file_access = request->file_access;
+            mapping_entry->object->mapping_file_access = file_access;
             mapping_entry->object->mapping_size = mapping_size;
             mapping_entry->object->mapping_has_image = !!(request->flags & HORIZON_SEC_IMAGE);
             mapping_entry->object->mapping_image = image_info;
+            mapping_entry->object->mapping_memfile = horizon_memfile_from_fd( fd );
             reply.handle = mapping_entry->handle;
 #ifdef __SWITCH__
             dbg_has_image = mapping_entry->object->mapping_has_image;
@@ -10205,13 +10466,15 @@ static int horizon_server_handle_create_mapping( struct horizon_server_connectio
             mapping_name = NULL;
             fd = -1;
         }
-        else reply.header.error = HORIZON_STATUS_NO_MEMORY;
+        /* As in wineserver, a section that already has the name is returned as it is. */
+        else if (mapping_entry) reply.handle = mapping_entry->handle;
+        reply.header.error = status;
         pthread_mutex_unlock( &horizon_server_objects_mutex );
     }
 
 #ifdef __SWITCH__
-    horizon_trace( "[HZ] create_mapping done err=0x%x flags=0x%x has_image=%d handle=0x%x",
-                   reply.header.error, request->flags, dbg_has_image, reply.handle );
+    horizon_trace( "[HZ] create_mapping done err=0x%x flags=0x%x file=0x%x has_image=%d handle=0x%x",
+                   reply.header.error, request->flags, request->file_handle, dbg_has_image, reply.handle );
 #endif
 
     if (fd != -1) close( fd );
@@ -10340,11 +10603,34 @@ static int horizon_server_handle_map_image_view( struct horizon_server_connectio
     return horizon_server_write_status( connection->reply_fd, status );
 }
 
+/* wineserver keeps every view of a mapping; this server keeps the views of
+ * sections with no file, whose committed ranges its clients ask about. */
+struct horizon_section_view
+{
+    struct horizon_section_view *next;
+    unsigned long long base;
+    unsigned long long size;
+    unsigned long long start;
+    struct horizon_memfile *memfile;  /* referenced */
+};
+
+static struct horizon_section_view *horizon_section_views;  /* horizon_server_objects_mutex */
+
+static struct horizon_section_view *horizon_server_find_section_view_locked( unsigned long long base )
+{
+    struct horizon_section_view *view;
+
+    for (view = horizon_section_views; view; view = view->next)
+        if (view->base == base) return view;
+    return NULL;
+}
+
 static int horizon_server_handle_map_view( struct horizon_server_connection *connection,
                                            const unsigned char *message )
 {
     const struct horizon_map_view_request *request = (const void *)message;
     struct horizon_server_handle_entry *entry;
+    struct horizon_section_view *view;
     unsigned int status = HORIZON_STATUS_SUCCESS;
 
     pthread_mutex_lock( &horizon_server_objects_mutex );
@@ -10354,6 +10640,27 @@ static int horizon_server_handle_map_view( struct horizon_server_connection *con
         status = HORIZON_STATUS_OBJECT_TYPE_MISMATCH;
     else if (entry->object->mapping_is_session)
         status = horizon_server_note_session_view_locked( request->base, request->start, request->size );
+    else if (entry->object->mapping_memfile)
+    {
+        const unsigned long long start = request->start, mapping_size = entry->object->mapping_size;
+
+        /* wineserver's map_view checks; the section's size is whole pages. */
+        if (request->start < 0 || start >= mapping_size || start + request->size < start ||
+            start + request->size > mapping_size)
+            status = HORIZON_STATUS_INVALID_PARAMETER;
+        else if (!(view = calloc( 1, sizeof(*view) )))
+            status = HORIZON_STATUS_NO_MEMORY;
+        else
+        {
+            view->base = request->base;
+            view->size = request->size;
+            view->start = start;
+            view->memfile = entry->object->mapping_memfile;
+            horizon_memfile_ref( view->memfile );
+            view->next = horizon_section_views;
+            horizon_section_views = view;
+        }
+    }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
     return horizon_server_write_status( connection->reply_fd, status );
@@ -10363,11 +10670,62 @@ static int horizon_server_handle_unmap_view( struct horizon_server_connection *c
                                              const unsigned char *message )
 {
     const struct horizon_unmap_view_request *request = (const void *)message;
+    struct horizon_section_view **ptr, *view;
 
     pthread_mutex_lock( &horizon_server_objects_mutex );
     horizon_server_remove_session_view_locked( request->base );
+    for (ptr = &horizon_section_views; (view = *ptr); ptr = &view->next)
+    {
+        if (view->base != request->base) continue;
+        *ptr = view->next;
+        horizon_memfile_unref( view->memfile );
+        free( view );
+        break;
+    }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
     return horizon_server_write_status( connection->reply_fd, HORIZON_STATUS_SUCCESS );
+}
+
+/* Which pages of a SEC_RESERVE section's view are committed: Wine sizes
+ * VirtualQuery regions and checks VirtualProtect ranges with this. */
+static int horizon_server_handle_get_mapping_committed_range( struct horizon_server_connection *connection,
+                                                              const unsigned char *message )
+{
+    const struct horizon_get_mapping_committed_range_request *request = (const void *)message;
+    struct horizon_get_mapping_committed_range_reply reply;
+    struct horizon_section_view *view;
+    unsigned long long size = 0;
+    int committed = 0;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(view = horizon_server_find_section_view_locked( request->base )))
+        reply.header.error = HORIZON_STATUS_NOT_MAPPED_VIEW;
+    else if (!(reply.header.error = horizon_memfile_committed_range( view->memfile, view->start, view->size,
+                                                                     request->offset, &size, &committed )))
+    {
+        reply.size = size;
+        reply.committed = committed;
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+static int horizon_server_handle_add_mapping_committed_range( struct horizon_server_connection *connection,
+                                                              const unsigned char *message )
+{
+    const struct horizon_add_mapping_committed_range_request *request = (const void *)message;
+    struct horizon_section_view *view;
+    unsigned int status;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(view = horizon_server_find_section_view_locked( request->base )))
+        status = HORIZON_STATUS_NOT_MAPPED_VIEW;
+    else
+        status = horizon_memfile_add_committed( view->memfile, view->start, view->size,
+                                                request->offset, request->size );
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_status( connection->reply_fd, status );
 }
 
 #include "horizon_registry_server.h"
@@ -11474,7 +11832,8 @@ static void *horizon_server_thread( void *param )
                                                                  header->request_size );
             break;
         case HORIZON_REQ_CREATE_MAPPING:
-            status = horizon_server_handle_create_mapping( connection, message );
+            status = horizon_server_handle_create_mapping( connection, message, request_data,
+                                                           header->request_size );
             break;
         case HORIZON_REQ_OPEN_MAPPING:
             status = horizon_server_handle_open_mapping( connection, message, request_data,
@@ -11494,6 +11853,12 @@ static void *horizon_server_thread( void *param )
             break;
         case HORIZON_REQ_UNMAP_VIEW:
             status = horizon_server_handle_unmap_view( connection, message );
+            break;
+        case HORIZON_REQ_GET_MAPPING_COMMITTED_RANGE:
+            status = horizon_server_handle_get_mapping_committed_range( connection, message );
+            break;
+        case HORIZON_REQ_ADD_MAPPING_COMMITTED_RANGE:
+            status = horizon_server_handle_add_mapping_committed_range( connection, message );
             break;
         case HORIZON_REQ_CREATE_TIMER:
             status = horizon_server_handle_create_timer( connection, message, request_data, header->request_size );
@@ -12016,6 +12381,42 @@ static BOOL horizon_overlaps_kernel_region( void *addr, size_t size )
     return FALSE;
 }
 
+void horizon_log_low_address_space( void )
+{
+    unsigned long long type_mb[32] = {0}, gaps[6] = {0}, gap_addr[6] = {0}, addr = 0;
+    char line[512];
+    int len, i, j;
+
+    while (addr < 0x100000000ull)
+    {
+        MemoryInfo info;
+        u32 page_info;
+        unsigned long long end;
+
+        if (R_FAILED( svcQueryMemory( &info, &page_info, addr ) ) || !info.size) break;
+        end = info.addr + info.size;
+        if (end > 0x100000000ull) end = 0x100000000ull;
+        if (end <= addr) break;
+        type_mb[(info.type & 0xff) < 32 ? (info.type & 0xff) : 31] += end - addr;
+        if ((info.type & 0xff) == MemType_Unmapped)
+        {
+            for (i = 0; i < 6 && gaps[i] >= end - addr; i++) ;
+            for (j = 5; j > i; j--) { gaps[j] = gaps[j - 1]; gap_addr[j] = gap_addr[j - 1]; }
+            if (i < 6) { gaps[i] = end - addr; gap_addr[i] = addr; }
+        }
+        addr = end;
+    }
+    len = snprintf( line, sizeof(line), "[VA] kernel map of the low 4 GB (MB by memory type):" );
+    for (i = 0; i < 32; i++)
+        if (type_mb[i] >> 20)
+            len += snprintf( line + len, sizeof(line) - len, " %#x:%llu", i, type_mb[i] >> 20 );
+    wine_nx_runtime_trace( line );
+    len = snprintf( line, sizeof(line), "[VA] largest free ranges:" );
+    for (i = 0; i < 6 && gaps[i]; i++)
+        len += snprintf( line + len, sizeof(line) - len, " %llu MB at 0x%llx", gaps[i] >> 20, gap_addr[i] );
+    wine_nx_runtime_trace( line );
+}
+
 /* The regions for virtual_init to keep Wine's free-area search out of. */
 int horizon_get_kernel_regions( void **starts, size_t *sizes, int max )
 {
@@ -12074,10 +12475,21 @@ static struct horizon_mapping *find_overlap_mapping( void *addr, size_t size )
 
 static int read_fd_at( int fd, void *buffer, size_t size, off_t offset )
 {
+    struct horizon_memfile *section = horizon_memfile_from_fd( fd );
     char *ptr = buffer;
-    int work_fd = dup( fd );
+    int work_fd;
 
-    if (work_fd == -1) return -1;
+    /* A section with no file: one copy under its lock, at the offset, leaving
+     * the position that duplicated descriptors share alone. */
+    if (section)
+    {
+        ssize_t ret = horizon_memfile_pread( section, buffer, size, offset );
+
+        if (ret >= 0) return 0;
+        errno = -ret;
+        return -1;
+    }
+    if ((work_fd = dup( fd )) == -1) return -1;
     if (lseek( work_fd, offset, SEEK_SET ) == (off_t)-1)
     {
         int saved_errno = errno;
@@ -12118,9 +12530,17 @@ static int read_fd_at( int fd, void *buffer, size_t size, off_t offset )
 
 static void write_fd_at( int fd, const void *buffer, size_t size, off_t offset )
 {
+    struct horizon_memfile *section = horizon_memfile_from_fd( fd );
     const char *ptr = buffer;
-    int work_fd = dup( fd );
+    int work_fd;
 
+    if (section)
+    {
+        if (horizon_memfile_pwrite( section, buffer, size, offset ) < 0)
+            WARN( "failed to write back a view of a section at offset %#lx.\n", (unsigned long)offset );
+        return;
+    }
+    work_fd = dup( fd );
     if (work_fd == -1)
     {
         WARN( "failed to duplicate Horizon file mapping fd: %s.\n", strerror(errno) );
@@ -12443,42 +12863,49 @@ static int split_reservation_mapping( struct horizon_mapping *mapping, char *sta
     char *mapping_start = mapping->addr;
     char *mapping_end = mapping_start + mapping->size;
     char *end = start + size;
+    struct horizon_mapping *left = NULL, *right = NULL;
 
-    list_remove_mapping( mapping );
-    remove_reservation( mapping->reservation );
-
+    /* Prepare both replacements while the old reservation still excludes
+     * native allocations. Dropping it first briefly exposed the entire
+     * early guest arena to libnx, and allocation failures lost its metadata. */
     if (mapping_start < start)
     {
         VirtmemReservation *reservation = reserve_fixed_range( mapping_start, start - mapping_start );
-        struct horizon_mapping *left;
-
-        if (!reservation) return -1;
+        if (!reservation) goto failed;
         if (!(left = alloc_mapping( mapping_start, start - mapping_start, NULL, 0, reservation, PROT_NONE )))
         {
             remove_reservation( reservation );
             errno = ENOMEM;
-            return -1;
+            goto failed;
         }
-        list_add_mapping( left );
     }
 
     if (end < mapping_end)
     {
         VirtmemReservation *reservation = reserve_fixed_range( end, mapping_end - end );
-        struct horizon_mapping *right;
-
-        if (!reservation) return -1;
+        if (!reservation) goto failed;
         if (!(right = alloc_mapping( end, mapping_end - end, NULL, 0, reservation, PROT_NONE )))
         {
             remove_reservation( reservation );
             errno = ENOMEM;
-            return -1;
+            goto failed;
         }
-        list_add_mapping( right );
     }
 
+    list_remove_mapping( mapping );
+    if (left) list_add_mapping( left );
+    if (right) list_add_mapping( right );
+    remove_reservation( mapping->reservation );
     horizon_object_free( &mapping_pool, mapping );
     return 0;
+
+failed:
+    if (left)
+    {
+        remove_reservation( left->reservation );
+        horizon_object_free( &mapping_pool, left );
+    }
+    return -1;
 }
 
 static int split_backing_mapping( struct horizon_mapping *mapping, char *start, size_t size )
@@ -12627,6 +13054,263 @@ static int protect_code_mapping( struct horizon_mapping *mapping, int prot )
     return 0;
 }
 
+/* Views of sections with no file (horizon_memfile.h) show the section's own
+ * pages: an anchor code-maps them once, and svcMapProcessMemory maps anchored
+ * pages at each view's address as well. */
+static int check_section_syscalls(void)
+{
+    if (check_code_memory_syscalls()) return -1;
+    if (!envIsSyscallHinted(0x74) || !envIsSyscallHinted(0x75))
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    return 0;
+}
+
+/* The first failures of the kernel side of section views, in the runtime log. */
+static void section_failure( const char *what, void *addr, void *source, size_t size, int error )
+{
+    char line[192];
+
+    if (++section_failures > 16) return;
+    snprintf( line, sizeof(line), "[HMAP] section %s failed: %p from %p, 0x%zx bytes, errno %d",
+              what, addr, source, size, error );
+    wine_nx_runtime_trace( line );
+}
+
+/* Anchors are in the mapping tree, so nothing is mapped over them, and their
+ * addresses stay reserved while the pages are there. */
+static void *horizon_section_anchor( void *source, size_t size, void **token )
+{
+    VirtmemReservation *reservation = NULL;
+    struct horizon_mapping *mapping;
+    void *addr;
+
+    virtmemLock();
+    if ((addr = virtmemFindCodeMemory( size, 0x1000 ))) reservation = reserve_fixed_range_locked( addr, size );
+    virtmemUnlock();
+    if (!reservation)
+    {
+        section_failure( "anchor address", addr, source, size, ENOMEM );
+        errno = ENOMEM;
+        return NULL;
+    }
+    if (!(mapping = alloc_mapping( addr, size, NULL, 0, reservation, PROT_READ | PROT_WRITE )))
+    {
+        remove_reservation( reservation );
+        section_failure( "anchor slot", addr, source, size, ENOMEM );
+        errno = ENOMEM;
+        return NULL;
+    }
+    if (map_code_memory_range( addr, source, size, PROT_READ | PROT_WRITE, ENOMEM ))
+    {
+        const int saved_errno = errno;
+
+        remove_reservation( reservation );
+        horizon_object_free( &mapping_pool, mapping );
+        section_failure( "anchor", addr, source, size, saved_errno );
+        errno = saved_errno;
+        return NULL;
+    }
+    mapping->section_state = SECTION_ANCHOR;
+    list_add_mapping( mapping );
+    section_anchors++;
+    section_anchor_bytes += size;
+    *token = mapping;
+    return addr;
+}
+
+static int horizon_section_unanchor( void *addr, void *source, size_t size, void *token )
+{
+    struct horizon_mapping *mapping = token;
+
+    if (unmap_code_memory_range( addr, source, size ))
+    {
+        section_failure( "unanchor", addr, source, size, errno );
+        return -1;
+    }
+    list_remove_mapping( mapping );
+    remove_reservation( mapping->reservation );
+    horizon_object_free( &mapping_pool, mapping );
+    section_anchors--;
+    section_anchor_bytes -= size;
+    return 0;
+}
+
+static int horizon_section_alias( void *dst, void *src, size_t size )
+{
+    Result rc = svcMapProcessMemory( dst, envGetOwnProcessHandle(), (u64)(ULONG_PTR)src, size );
+
+    if (R_FAILED(rc))
+    {
+        horizon_trace( "[HMAP] section alias failed dst=%p src=%p size=0x%lx rc=0x%x",
+                       dst, src, (unsigned long)size, rc );
+        WARN( "svcMapProcessMemory(%p, %p, %zu) failed %#x.\n", dst, src, size, rc );
+        section_failure( "alias", dst, src, size, (int)rc );
+        errno = ENOMEM;
+        return -1;
+    }
+    return 0;
+}
+
+static int horizon_section_unalias( void *dst, void *src, size_t size )
+{
+    Result rc = svcUnmapProcessMemory( dst, envGetOwnProcessHandle(), (u64)(ULONG_PTR)src, size );
+
+    if (R_FAILED(rc))
+    {
+        horizon_trace( "[HMAP] section unalias failed dst=%p src=%p size=0x%lx rc=0x%x",
+                       dst, src, (unsigned long)size, rc );
+        WARN( "svcUnmapProcessMemory(%p, %p, %zu) failed %#x.\n", dst, src, size, rc );
+        section_failure( "unalias", dst, src, size, (int)rc );
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+/* A range of a view of a section: its pages aliased from the section's
+ * anchors, or a hole while it is PROT_NONE. Each range holds a reference to
+ * the section, so views keep the memory after the section's handle and
+ * descriptors are closed. The caller reserved the address, and counts an
+ * aliased range as a user of its anchors. */
+static struct horizon_mapping *alloc_section_range( void *addr, size_t size, struct horizon_memfile *section,
+                                                    size_t offset, int prot, unsigned char state,
+                                                    VirtmemReservation *reservation )
+{
+    struct horizon_mapping *mapping = alloc_mapping( addr, size, NULL, 0, reservation, prot );
+
+    if (!mapping)
+    {
+        errno = ENOMEM;
+        return NULL;
+    }
+    mapping->section = section;
+    mapping->section_offset = offset;
+    mapping->section_state = state;
+    horizon_memfile_ref( section );
+    return mapping;
+}
+
+/* Metadata only, once the range's pages are gone from its address and its
+ * reservation is removed: an aliased range stops using its anchors. */
+static void free_section_range( struct horizon_mapping *mapping )
+{
+    if (mapping->section_state == SECTION_ALIASED)
+        horizon_memfile_use( mapping->section, mapping->section_offset, mapping->size, -1 );
+    horizon_memfile_unref( mapping->section );
+    horizon_object_free( &mapping_pool, mapping );
+}
+
+/* A piece of a range being split, reserved on its own. An aliased piece of an
+ * aliased range uses the anchors its parent uses. */
+static struct horizon_mapping *section_range_piece( struct horizon_mapping *parent, char *addr, size_t size,
+                                                    unsigned char state, int prot, BOOL count_use )
+{
+    size_t offset = parent->section_offset + (addr - (char *)parent->addr);
+    VirtmemReservation *reservation = reserve_fixed_range( addr, size );
+    struct horizon_mapping *piece;
+
+    if (!reservation) return NULL;
+    if (!(piece = alloc_section_range( addr, size, parent->section, offset, prot, state, reservation )))
+    {
+        remove_reservation( reservation );
+        return NULL;
+    }
+    if (count_use) horizon_memfile_use( piece->section, offset, size, 1 );
+    return piece;
+}
+
+/* Gives [start, start + size) of a view range a new state: SECTION_ALIASED,
+ * SECTION_HOLE, or SECTION_NONE to leave the address space. The kernel goes
+ * first, so a refusal changes nothing; pieces count their use before the old
+ * range stops counting, so no anchor a piece needs is removed in between. */
+static int change_section_range( struct horizon_mapping *mapping, char *start, size_t size,
+                                 unsigned char state, int prot )
+{
+    char *mapping_start = mapping->addr;
+    char *mapping_end = mapping_start + mapping->size;
+    char *end = start + size;
+    struct horizon_memfile *section = mapping->section;
+    const size_t offset = mapping->section_offset + (start - mapping_start);
+    const BOOL aliased = mapping->section_state == SECTION_ALIASED;
+    struct horizon_mapping *left = NULL, *middle = NULL, *right = NULL;
+    int saved_errno;
+
+    if (mapping->section_state == state) return 0;
+
+    if (aliased)
+    {
+        if (horizon_memfile_alias( section, start, offset, size, 0 )) return -1;
+    }
+    else if (state == SECTION_ALIASED)
+    {
+        if (horizon_memfile_map( section, start, offset, size )) return -1;
+    }
+
+    list_remove_mapping( mapping );
+    remove_reservation( mapping->reservation );
+    if (mapping_start < start &&
+        !(left = section_range_piece( mapping, mapping_start, start - mapping_start,
+                                      mapping->section_state, mapping->prot, aliased )))
+        goto failed;
+    if (state != SECTION_NONE && !(middle = section_range_piece( mapping, start, size, state, prot, FALSE )))
+        goto failed;
+    if (end < mapping_end &&
+        !(right = section_range_piece( mapping, end, mapping_end - end,
+                                       mapping->section_state, mapping->prot, aliased )))
+        goto failed;
+
+    if (left) list_add_mapping( left );
+    if (middle) list_add_mapping( middle );
+    if (right) list_add_mapping( right );
+    free_section_range( mapping );
+    return 0;
+
+failed:
+    /* Out of mapping slots or reservations: put the range back as it was. */
+    saved_errno = errno;
+    if (left)
+    {
+        remove_reservation( left->reservation );
+        free_section_range( left );
+    }
+    if (middle)
+    {
+        middle->section_state = SECTION_HOLE;  /* its use, if any, is undone below */
+        remove_reservation( middle->reservation );
+        free_section_range( middle );
+    }
+    if (aliased) horizon_memfile_alias( section, start, offset, size, 1 );
+    else if (state == SECTION_ALIASED)
+    {
+        horizon_memfile_alias( section, start, offset, size, 0 );
+        horizon_memfile_use( section, offset, size, -1 );
+    }
+    if (!(mapping->reservation = reserve_fixed_range( mapping_start, mapping_end - mapping_start )))
+        WARN( "lost the reservation of a view of a section at %p-%p.\n", mapping_start, mapping_end );
+    list_add_mapping( mapping );
+    errno = saved_errno;
+    return -1;
+}
+
+/* Horizon cannot change the protection of process memory mapped from other
+ * pages, so an aliased range stays read-write; only PROT_NONE takes its pages
+ * away, and anything else maps them back. */
+static int protect_section_range( struct horizon_mapping *mapping, char *start, size_t size, int prot )
+{
+    static int reported;
+
+    if (prot != PROT_NONE && prot != (PROT_READ | PROT_WRITE) && !reported)
+    {
+        reported = 1;
+        wine_nx_runtime_trace( "[HMAP] views of sections with no file stay read-write: Horizon cannot "
+                               "change the protection of memory mapped from other pages" );
+    }
+    return change_section_range( mapping, start, size, prot == PROT_NONE ? SECTION_HOLE : SECTION_ALIASED, prot );
+}
+
 static int unmap_range_locked( void *addr, size_t size )
 {
     char *start = addr;
@@ -12641,7 +13325,16 @@ static int unmap_range_locked( void *addr, size_t size )
         char *unmap_end = min( end, mapping_end );
         size_t unmap_size = unmap_end - unmap_start;
 
-        if (mapping->reservation)
+        if (mapping->section_state == SECTION_ANCHOR)
+        {
+            errno = EBUSY;  /* pages views of a section are mapped from */
+            return -1;
+        }
+        if (mapping->section)
+        {
+            if (change_section_range( mapping, unmap_start, unmap_size, SECTION_NONE, 0 )) return -1;
+        }
+        else if (mapping->reservation)
         {
             if (split_reservation_mapping( mapping, unmap_start, unmap_size )) return -1;
         }
@@ -12676,7 +13369,16 @@ static int protect_range_locked( void *addr, size_t size, int prot )
         protect_end = min( end, mapping_end );
         protect_size = protect_end - start;
 
-        if (mapping->reservation)
+        if (mapping->section_state == SECTION_ANCHOR)
+        {
+            errno = ENOMEM;
+            return -1;
+        }
+        if (mapping->section)
+        {
+            if (protect_section_range( mapping, start, protect_size, prot )) return -1;
+        }
+        else if (mapping->reservation)
         {
             if (prot != PROT_NONE)
             {
@@ -12757,6 +13459,10 @@ static int add_reservation_mapping_locked( void *start, size_t size )
 static void *horizon_mmap_fixed( void *start, size_t size, int prot, int flags, int fd, off_t offset )
 {
     BOOL anonymous = fd == -1;
+    VirtmemReservation *transition;
+    void *requested = start;
+    const char *stage = "transition reservation";
+    int saved_errno;
 
     size = page_align_size( size );
     if (!start || (ULONG_PTR)start & 0xfff || !size)
@@ -12766,28 +13472,54 @@ static void *horizon_mmap_fixed( void *start, size_t size, int prot, int flags, 
     }
 
     pthread_mutex_lock( &mapping_mutex );
+    /* Keep the target unavailable to native allocators while old mappings
+     * are removed and the replacement is installed. libnx permits temporary
+     * overlapping reservations; the final mapping owns its own reservation. */
+    if (!(transition = reserve_fixed_range( start, size ))) goto failed;
+    stage = "unmap";
     if (unmap_range_locked( start, size ))
     {
-        pthread_mutex_unlock( &mapping_mutex );
-        return MAP_FAILED;
+        goto failed;
     }
 
     if (anonymous && prot == PROT_NONE)
     {
         int ret;
 
+        stage = "reserve unmapped range";
         virtmemLock();
         ret = add_reservation_mapping_locked( start, size );
         virtmemUnlock();
         if (ret) start = MAP_FAILED;
     }
-    else if (map_backing_at( start, size, prot, fd, offset, flags, EINVAL ))
+    else
     {
-        start = MAP_FAILED;
+        stage = "map backing";
+        if (map_backing_at( start, size, prot, fd, offset, flags, EINVAL )) start = MAP_FAILED;
     }
 
+    if (start == MAP_FAILED) goto failed;
+    remove_reservation( transition );
     pthread_mutex_unlock( &mapping_mutex );
     return start;
+
+failed:
+    saved_errno = errno;
+    if (transition) remove_reservation( transition );
+    pthread_mutex_unlock( &mapping_mutex );
+    {
+        static LONG failures;
+        char msg[224];
+
+        if (__atomic_add_fetch( &failures, 1, __ATOMIC_RELAXED ) <= 16)
+        {
+            snprintf( msg, sizeof(msg), "[HMAP] fixed replacement failed: %s addr=%p size=0x%lx prot=%#x errno=%d",
+                      stage, requested, (unsigned long)size, prot, saved_errno );
+            wine_nx_runtime_trace( msg );
+        }
+    }
+    errno = saved_errno;
+    return MAP_FAILED;
 }
 
 void *horizon_anon_mmap_fixed( void *start, size_t size, int prot, int flags )
@@ -12867,13 +13599,97 @@ void *horizon_anon_mmap_alloc( size_t size, int prot )
     return horizon_mmap_alloc( size, prot, MAP_PRIVATE | MAP_ANON, -1, 0 );
 }
 
+/* A view of a section with no file: its pages are the section's. */
+static void *horizon_mmap_section( void *start, size_t size, int prot, int flags,
+                                   struct horizon_memfile *section, off_t offset )
+{
+    const unsigned char state = prot == PROT_NONE ? SECTION_HOLE : SECTION_ALIASED;
+    VirtmemReservation *reservation = NULL;
+    struct horizon_mapping *mapping;
+    void *addr = NULL;
+
+    size = page_align_size( size );
+    if (!size || ((ULONG_PTR)start & 0xfff) || offset < 0 || (offset & 0xfff))
+    {
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+
+    pthread_mutex_lock( &mapping_mutex );
+    if ((flags & MAP_FIXED) && (!start || unmap_range_locked( start, size )))
+    {
+        if (!start) errno = EINVAL;
+        goto failed;
+    }
+    if (start && !find_overlap_mapping( start, size ) && (reservation = reserve_fixed_range( start, size )))
+        addr = start;
+    else if (start && (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)))
+    {
+        errno = (flags & MAP_FIXED) ? ENOMEM : EEXIST;
+        goto failed;
+    }
+    else
+    {
+        virtmemLock();
+        if ((addr = virtmemFindCodeMemory( size, 0x1000 ))) reservation = reserve_fixed_range_locked( addr, size );
+        virtmemUnlock();
+        if (!reservation)
+        {
+            errno = ENOMEM;
+            goto failed;
+        }
+    }
+
+    if (state == SECTION_ALIASED && horizon_memfile_map( section, addr, offset, size ))
+    {
+        const int saved_errno = errno;
+
+        remove_reservation( reservation );
+        errno = saved_errno;
+        goto failed;
+    }
+    if (!(mapping = alloc_section_range( addr, size, section, offset, prot, state, reservation )))
+    {
+        if (state == SECTION_ALIASED)
+        {
+            horizon_memfile_alias( section, addr, offset, size, 0 );
+            horizon_memfile_use( section, offset, size, -1 );
+        }
+        remove_reservation( reservation );
+        errno = ENOMEM;
+        goto failed;
+    }
+    list_add_mapping( mapping );
+    section_view_maps++;
+    pthread_mutex_unlock( &mapping_mutex );
+    return addr;
+
+failed:
+    pthread_mutex_unlock( &mapping_mutex );
+    return MAP_FAILED;
+}
+
 void *horizon_mmap( void *start, size_t size, int prot, int flags, int fd, off_t offset )
 {
+    struct horizon_memfile *section;
+
     if (flags & MAP_ANON) fd = -1;
     else if (fd == -1)
     {
         errno = EINVAL;
         return MAP_FAILED;
+    }
+    else if ((flags & MAP_SHARED) && (section = horizon_memfile_from_fd( fd )))
+    {
+        static int reported;
+
+        if (!check_section_syscalls()) return horizon_mmap_section( start, size, prot, flags, section, offset );
+        if (!reported)
+        {
+            reported = 1;
+            wine_nx_runtime_trace( "[HMAP] views of sections with no file are copies: the loader does not "
+                                   "grant svcMapProcessMemory" );
+        }
     }
 
     if (flags & MAP_FIXED) return horizon_mmap_fixed( start, size, prot, flags, fd, offset );

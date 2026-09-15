@@ -48,7 +48,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-101"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-105"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -799,6 +799,7 @@ static void runtime_report_interpreter(void)
         extern unsigned int wine_nx_sd_reads, wine_nx_sd_hits;
         extern unsigned long long wine_nx_sd_read_ns;
         extern unsigned int wine_nx_gl_swaps __attribute__((weak)), wine_nx_gl_calls __attribute__((weak));
+        extern unsigned int wine_nx_vk_presents __attribute__((weak));
         extern unsigned int wine_nx_gl_persistent_failures __attribute__((weak));
         extern unsigned long long wine_nx_gl_swap_time __attribute__((weak)), wine_nx_gl_call_time __attribute__((weak));
         extern unsigned long long wine_nx_gl_copy_bytes __attribute__((weak));
@@ -820,7 +821,8 @@ static void runtime_report_interpreter(void)
         unsigned int reads = &wine_nx_file_reads ? __atomic_load_n( &wine_nx_file_reads, __ATOMIC_RELAXED ) : 0;
         unsigned int gl_frames = &wine_nx_gl_swaps ? __atomic_load_n( &wine_nx_gl_swaps, __ATOMIC_RELAXED ) : 0;
         unsigned int frames = __atomic_load_n( &wine_nx_fb_frames, __ATOMIC_RELAXED ) + gl_frames +
-                              wine_nx_compositor_frames();
+                              wine_nx_compositor_frames() +
+                              (&wine_nx_vk_presents ? __atomic_load_n( &wine_nx_vk_presents, __ATOMIC_RELAXED ) : 0);
         unsigned long long read_ms = &wine_nx_file_read_100ns
                                      ? __atomic_load_n( &wine_nx_file_read_100ns, __ATOMIC_RELAXED ) / 10000 : 0;
         unsigned int syscalls = &wine_nx_syscalls ? __atomic_load_n( &wine_nx_syscalls, __ATOMIC_RELAXED ) : 0;
@@ -2049,8 +2051,10 @@ int main( int argc, char **argv )
                   total >> 20, used >> 20 );
     }
     wine_nx_start_user_shared_data_clock();
+    log_line( "[INIT] shared data clock initialized" );
 
     server_init_process();
+    log_line( "[INIT] server process initialized" );
     status = runtime_init_process_done();
     if (status)
     {

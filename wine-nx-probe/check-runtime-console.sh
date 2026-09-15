@@ -37,6 +37,9 @@ flags="-std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-f
 "$build/completion"
 "${CC:-clang}" $flags "$root/wine-nx-probe/tests/horizon_free_range.c" -o "$build/free_range"
 "$build/free_range"
+python3 "$root/wine-nx-probe/tests/check_horizon_va_search.py"
+python3 "$root/wine-nx-probe/tests/check_horizon_guest_reserve.py"
+python3 "$root/wine-nx-probe/tests/check_horizon_reservation_transition.py"
 "${CC:-clang}" $flags -I"$root/include" "$root/wine-nx-probe/tests/xinput_nx_pad.c" -o "$build/xinput_pad"
 "$build/xinput_pad"
 "${CC:-clang}" $flags "$root/wine-nx-probe/tests/thread_profile.c" -o "$build/thread_profile"
@@ -47,4 +50,7 @@ flags="-std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-f
 python3 "$root/wine-nx-probe/tests/check_horizon_backings.py"
 "$build/horizon_pool"
 python3 "$root/wine-nx-probe/tests/check_horizon_backings.py"
+"${CC:-clang}" $flags -pthread "$root/wine-nx-probe/tests/horizon_memfile.c" -o "$build/horizon_memfile"
+"$build/horizon_memfile"
+python3 "$root/wine-nx-probe/tests/check_horizon_sections.py"
 python3 "$root/wine-nx-probe/tools/make-7zr-tree.py" "$build/drive_c" >/dev/null

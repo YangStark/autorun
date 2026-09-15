@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""Run horizon.c's code for views of sections with no file against a host
+stand-in for the Horizon kernel (horizon_memfile_host.h) that really shares
+pages between addresses: a view mapped over a reservation the way Wine maps
+one, another placed anywhere and overlapping it, the descriptor closed before
+either is unmapped, a range taken away with PROT_NONE and given back, anchors
+nothing may unmap or map over, kernel refusals that must change nothing, and
+views unmapped in pieces. After each step, the mapping tree must not overlap
+and every entry must hold exactly its own reservation."""
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parents[2]
+s = (root / 'dlls/ntdll/unix/horizon.c').read_text()
+
+def function(name):
+    # The definition, not a prototype: the parameters end in ")" before "{".
+    m = re.search('^' + re.escape(name) + r'[^;{]*?\)\s*\n\{', s, re.M | re.S)
+    assert m, name
+    i = m.end()
+    depth = 1
+    while depth:
+        depth += (s[i] == '{') - (s[i] == '}')
+        i += 1
+    return s[m.start():i] + '\n'
+
+def block(pattern):
+    return re.search(pattern, s, re.M | re.S).group(0) + '\n'
+
+fixture = r'''
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include "wine/rbtree.h"
+#include "horizon_pool.h"
+#include "horizon_memfile_host.h"
+#include "horizon_memfile.h"
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+typedef int BOOL;
+#define TRUE 1
+#define FALSE 0
+typedef unsigned long ULONG_PTR;
+typedef unsigned int u32;
+typedef unsigned long long u64;
+typedef u32 Result;
+typedef u32 Handle;
+#define R_FAILED(rc) ((rc) != 0)
+#define WARN(...) ((void)0)
+#define horizon_trace(...) ((void)0)
+#define max(a,b) ((a) > (b) ? (a) : (b))
+#define min(a,b) ((a) < (b) ? (a) : (b))
+
+static pthread_mutex_t mapping_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int traces;
+static void wine_nx_runtime_trace( const char *msg ) { (void)msg; traces++; }
+static int check_code_memory_syscalls(void) { return 0; }
+static int envIsSyscallHinted( unsigned int number ) { (void)number; return 1; }
+static Handle envGetOwnProcessHandle(void) { return 1; }
+static int get_effective_horizon_prot( int prot ) { return prot; }
+
+/* libnx's reservations: they must never overlap. */
+typedef struct VirtmemReservation { void *addr; size_t size; struct VirtmemReservation *next; } VirtmemReservation;
+static VirtmemReservation *reservations;
+static int reservation_count;
+static char *code_pool;
+static size_t code_pool_used;
+static void virtmemLock(void) {}
+static void virtmemUnlock(void) {}
+static VirtmemReservation *virtmemAddReservation( void *addr, size_t size )
+{
+    VirtmemReservation *reservation;
+
+    for (reservation = reservations; reservation; reservation = reservation->next)
+        assert( !host_ranges_overlap( reservation->addr, reservation->size, addr, size ) );
+    reservation = calloc( 1, sizeof(*reservation) );
+    reservation->addr = addr;
+    reservation->size = size;
+    reservation->next = reservations;
+    reservations = reservation;
+    reservation_count++;
+    return reservation;
+}
+static void virtmemRemoveReservation( VirtmemReservation *reservation )
+{
+    VirtmemReservation **ptr;
+
+    for (ptr = &reservations; *ptr != reservation; ptr = &(*ptr)->next) assert( *ptr );
+    *ptr = reservation->next;
+    free( reservation );
+    reservation_count--;
+}
+static void *virtmemFindCodeMemory( size_t size, size_t align )
+{
+    void *addr = code_pool + code_pool_used;
+
+    (void)align;
+    code_pool_used += (size + HOST_PAGE - 1) / HOST_PAGE * HOST_PAGE + HOST_PAGE;
+    assert( code_pool_used <= 256 * HOST_PAGE );
+    return addr;
+}
+
+/* The kernel calls, through the stand-in. */
+static int map_code_memory_range( void *addr, void *source, size_t size, int prot, int map_errno )
+{
+    (void)prot;
+    if (host_anchor( addr, source, size )) return 0;
+    errno = map_errno;
+    return -1;
+}
+static int unmap_code_memory_range( void *addr, void *source, size_t size )
+{
+    return host_unanchor( addr, source, size );
+}
+static Result svcMapProcessMemory( void *dst, Handle process, u64 src, u64 size )
+{
+    assert( process == 1 );
+    return host_alias( dst, (void *)(uintptr_t)src, size ) ? 1 : 0;
+}
+static Result svcUnmapProcessMemory( void *dst, Handle process, u64 src, u64 size )
+{
+    assert( process == 1 );
+    return host_unalias( dst, (void *)(uintptr_t)src, size ) ? 1 : 0;
+}
+'''
+fixture += block(r'^enum horizon_section_state\n\{.*?^\};')
+for name in ['horizon_backing', 'horizon_mapping']:
+    fixture += block(r'^struct ' + name + r'\n\{.*?^\};')
+a = s.index('static struct horizon_backing backing_slots[')
+b = s.index('void horizon_memory_pool_stats(', a)
+fixture += s[a:b]
+fixture += function('static int compare_mapping(')
+fixture += block(r'^static struct rb_tree mappings = .*?;')
+fixture += r'''
+/* Backed memory and its protection are other tests' business. */
+static int split_backing_mapping( struct horizon_mapping *m, char *start, size_t size )
+{ (void)m; (void)start; (void)size; abort(); }
+static struct horizon_mapping *split_backing_mapping_metadata( struct horizon_mapping *m, char *start, size_t size )
+{ (void)m; (void)start; (void)size; abort(); }
+static int protect_code_mapping( struct horizon_mapping *m, int prot ) { (void)m; (void)prot; abort(); }
+static int map_backing_at( void *addr, size_t size, int prot, int fd, off_t offset, int flags, int map_errno )
+{ (void)addr; (void)size; (void)prot; (void)fd; (void)offset; (void)flags; (void)map_errno; abort(); }
+'''
+for name in ['static void list_add_mapping(', 'static void list_remove_mapping(',
+             'static struct horizon_mapping *find_overlap_mapping(', 'static struct horizon_mapping *alloc_mapping(',
+             'static VirtmemReservation *reserve_fixed_range_locked(', 'static VirtmemReservation *reserve_fixed_range(',
+             'static void remove_reservation_locked(', 'static void remove_reservation(',
+             'static int split_reservation_mapping(', 'static size_t page_align_size(',
+             'static void section_failure(', 'static void *horizon_section_anchor(', 'static int horizon_section_unanchor(',
+             'static int horizon_section_alias(', 'static int horizon_section_unalias(']:
+    fixture += function(name)
+fixture += block(r'^static const struct horizon_memfile_ops horizon_section_ops =\n\{.*?^\};')
+for name in ['static struct horizon_mapping *alloc_section_range(', 'static void free_section_range(',
+             'static struct horizon_mapping *section_range_piece(', 'static int change_section_range(',
+             'static int protect_section_range(', 'static int unmap_range_locked(',
+             'static int protect_range_locked(', 'static void *horizon_mmap_section(']:
+    fixture += function(name)
+fixture += r'''
+#define P HOST_PAGE
+#define RW (PROT_READ | PROT_WRITE)
+
+static void check_tree(void)
+{
+    struct rb_entry *entry;
+    struct horizon_mapping *prev = NULL;
+    int count = 0;
+
+    for (entry = rb_head( mappings.root ); entry; entry = rb_next( entry ))
+    {
+        struct horizon_mapping *mapping = RB_ENTRY_VALUE( entry, struct horizon_mapping, entry );
+
+        assert( mapping->reservation && mapping->reservation->addr == mapping->addr &&
+                mapping->reservation->size == mapping->size );
+        assert( !mapping->section == (mapping->section_state == SECTION_NONE || mapping->section_state == SECTION_ANCHOR) );
+        if (prev) assert( (char *)prev->addr + prev->size <= (char *)mapping->addr );
+        prev = mapping;
+        count++;
+    }
+    assert( count == reservation_count );
+}
+
+static struct horizon_mapping *entry_at( void *addr )
+{
+    return find_overlap_mapping( addr, 1 );
+}
+
+static struct horizon_mapping *any_anchor(void)
+{
+    struct rb_entry *entry;
+
+    for (entry = rb_head( mappings.root ); entry; entry = rb_next( entry ))
+    {
+        struct horizon_mapping *mapping = RB_ENTRY_VALUE( entry, struct horizon_mapping, entry );
+        if (mapping->section_state == SECTION_ANCHOR) return mapping;
+    }
+    return NULL;
+}
+
+/* What Wine does before mapping a view over its address with MAP_FIXED. */
+static void reserve_view( void *addr, size_t size )
+{
+    struct horizon_mapping *mapping = alloc_mapping( addr, size, NULL, 0, reserve_fixed_range( addr, size ), PROT_NONE );
+
+    list_add_mapping( mapping );
+}
+
+int main(void)
+{
+    struct horizon_memfile *file, *reserved;
+    unsigned char *views, *a, *b, *c, buffer[8];
+    struct horizon_mapping *anchor;
+    int before_reservations, before_anchors;
+
+    code_pool = host_reserve( 256 * P );
+    views = host_reserve( 64 * P );
+    assert( (file = horizon_memfile_alloc( 8 * P, 0, &horizon_section_ops )) );
+
+    /* a: pages 1-4 over Wine's reservation; b: pages 3-6 wherever. */
+    reserve_view( views, 4 * P );
+    a = horizon_mmap_section( views, 4 * P, RW, MAP_FIXED | MAP_SHARED, file, 1 * P );
+    assert( a == views && entry_at( a )->section_state == SECTION_ALIASED );
+    check_tree();
+    assert( (b = horizon_mmap_section( NULL, 4 * P, RW, MAP_SHARED, file, 3 * P )) != MAP_FAILED );
+    check_tree();
+    b[0] = 0x11;
+    assert( a[2 * P] == 0x11 );
+    a[3 * P + 1] = 0x22;
+    assert( b[P + 1] == 0x22 );
+    b[2 * P] = 0x66;  /* page 5, only b's */
+    errno = 0;
+    assert( horizon_mmap_section( a, P, RW, MAP_FIXED_NOREPLACE | MAP_SHARED, file, 0 ) == MAP_FAILED && errno == EEXIST );
+
+    /* The descriptor goes before the views. */
+    horizon_memfile_unref( file );
+    b[1] = 0x12;
+    assert( a[2 * P + 1] == 0x12 );
+
+    /* a's page 2 goes PROT_NONE; written meanwhile, it comes back with the data. */
+    assert( !protect_range_locked( a + P, P, PROT_NONE ) );
+    assert( entry_at( a + P )->section_state == SECTION_HOLE && entry_at( a )->section_state == SECTION_ALIASED &&
+            entry_at( a + 2 * P )->section_state == SECTION_ALIASED );
+    check_tree();
+    assert( horizon_memfile_pwrite( file, "hole", 4, 2 * P ) == 4 );
+    assert( !protect_range_locked( a + P, P, RW ) );
+    assert( entry_at( a + P )->section_state == SECTION_ALIASED && !memcmp( a + P, "hole", 4 ) );
+    check_tree();
+    a[P + 4] = 0x44;
+    assert( horizon_memfile_pread( file, (char *)buffer, 1, 2 * P + 4 ) == 1 && buffer[0] == 0x44 );
+
+    /* Read-only asks leave the pages read-write, said once. */
+    assert( !protect_range_locked( a, 4 * P, PROT_READ ) && !protect_range_locked( a, 4 * P, PROT_READ ) );
+    assert( traces == 1 );
+    a[0] = 1;
+
+    /* Anchors: nothing unmaps, reprotects or maps over them. */
+    assert( (anchor = any_anchor()) );
+    errno = 0;
+    assert( unmap_range_locked( anchor->addr, P ) == -1 && errno == EBUSY );
+    assert( protect_range_locked( anchor->addr, P, PROT_NONE ) == -1 );
+    errno = 0;
+    assert( horizon_mmap_section( anchor->addr, P, RW, MAP_FIXED | MAP_SHARED, file, 0 ) == MAP_FAILED &&
+            errno == EBUSY );
+    check_tree();
+
+    /* The kernel refuses to take a range away: it stays as it was. */
+    host_fail_unalias = 1;
+    assert( unmap_range_locked( a + 2 * P, P ) == -1 );
+    assert( protect_range_locked( a + 3 * P, P, PROT_NONE ) == -1 );
+    host_fail_unalias = 0;
+    assert( entry_at( a + 2 * P )->section_state == SECTION_ALIASED && a[2 * P] == 0x11 );
+    check_tree();
+
+    /* The kernel refuses a new view's first piece: nothing is left behind. */
+    before_reservations = reservation_count;
+    before_anchors = host_live_anchors();
+    host_fail_alias_countdown = 1;
+    errno = 0;
+    assert( horizon_mmap_section( NULL, 2 * P, RW, MAP_SHARED, file, 6 * P ) == MAP_FAILED && errno == ENOMEM );
+    host_fail_alias_countdown = 0;
+    assert( reservation_count == before_reservations && host_live_anchors() == before_anchors );
+    check_tree();
+
+    /* b loses its second page, then everything in one call across its pieces;
+     * page 5's anchor goes with it and its data stays. */
+    assert( !unmap_range_locked( b + P, P ) );
+    assert( !entry_at( b + P ) && entry_at( b )->section_state == SECTION_ALIASED );
+    check_tree();
+    assert( !unmap_range_locked( b, 4 * P ) );
+    check_tree();
+    assert( host_live_anchors() == 1 );
+    assert( horizon_memfile_pread( file, (char *)buffer, 1, 5 * P ) == 1 && buffer[0] == 0x66 );
+
+    /* a goes across its three entries: the last reference frees the memory. */
+    assert( !unmap_range_locked( a, 4 * P ) );
+    assert( !mappings.root && !reservation_count && !host_live_anchors() && !host_alias_count );
+    assert( host_pages_live == 0 );
+
+    /* A view mapped PROT_NONE has no pages until it is made accessible. */
+    assert( (reserved = horizon_memfile_alloc( 2 * P, 1, &horizon_section_ops )) );
+    assert( (c = horizon_mmap_section( NULL, 2 * P, PROT_NONE, MAP_SHARED, reserved, 0 )) != MAP_FAILED );
+    assert( entry_at( c )->section_state == SECTION_HOLE && !host_live_anchors() );
+    assert( !protect_range_locked( c, 2 * P, RW ) && host_live_anchors() == 1 );
+    c[P] = 0x77;
+    assert( horizon_memfile_pread( reserved, (char *)buffer, 1, P ) == 1 && buffer[0] == 0x77 );
+    check_tree();
+    assert( !unmap_range_locked( c, 2 * P ) );
+    horizon_memfile_unref( reserved );
+    assert( !mappings.root && !reservation_count && !host_live_anchors() && host_pages_live == 0 );
+
+    puts( "Section views in horizon.c: Wine's fixed maps and placed maps, overlapping writes, close before unmap, "
+          "PROT_NONE and back, anchors kept from others, kernel refusals and unmapping in pieces passed" );
+    return 0;
+}
+'''
+with tempfile.TemporaryDirectory() as tmp:
+    c = Path(tmp) / 'sections.c'
+    c.write_text(fixture)
+    exe = Path(tmp) / 'sections'
+    subprocess.run(['cc', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-unused-variable',
+                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-pthread',
+                    '-I' + str(root / 'include'), '-I' + str(root / 'dlls/ntdll/unix'),
+                    '-I' + str(root / 'wine-nx-probe/tests'), str(c), '-o', str(exe)], check=True)
+    subprocess.run([str(exe)], check=True)

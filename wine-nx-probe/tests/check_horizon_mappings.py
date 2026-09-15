@@ -28,7 +28,7 @@ def function(source, name):
 
 mapping_struct = re.search(r'^struct horizon_mapping\n\{.*?^\};', horizon, re.M | re.S).group(0)
 tree = re.search(r'^static struct rb_tree mappings = .*?;', horizon, re.M).group(0)
-flags = '\n'.join(re.findall(r'^#define MAP_(?:FIXED|FIXED_NOREPLACE|ANON|FAILED|PRIVATE)\b.*$', mman, re.M))
+flags = '\n'.join(re.findall(r'^#define MAP_(?:FIXED|FIXED_NOREPLACE|ANON|FAILED|PRIVATE|SHARED)\b.*$', mman, re.M))
 
 fixture = r'''
 #include <assert.h>
@@ -47,6 +47,14 @@ stubs = r'''
 static const char *path_taken;
 static void *tryfixed_result;
 static int tryfixed_errno;
+/* Views of sections with no file have their own test (check_horizon_sections.py). */
+struct horizon_memfile;
+static struct horizon_memfile *horizon_memfile_from_fd( int fd ) { (void)fd; return NULL; }
+static int check_section_syscalls(void) { return -1; }
+static void wine_nx_runtime_trace( const char *msg ) { (void)msg; }
+static void *horizon_mmap_section( void *start, size_t size, int prot, int flags,
+                                   struct horizon_memfile *section, off_t offset )
+{ (void)start; (void)size; (void)prot; (void)flags; (void)section; (void)offset; abort(); }
 static void *horizon_mmap_fixed( void *start, size_t size, int prot, int flags, int fd, off_t offset )
 {
     path_taken = "fixed";
