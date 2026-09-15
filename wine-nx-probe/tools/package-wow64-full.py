@@ -6,7 +6,7 @@ preselected in the launcher.
 
 Each checkpoint packager runs over the previous one's stage, so the result holds
 every program they stage; the build number comes from the runtime's marker.
-Need for Speed Underground 2's DLLs are staged on top, with what they import."""
+The Need for Speed games' DLLs are staged on top, with what they import."""
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 import functools
@@ -40,11 +40,12 @@ shutil.rmtree(stage_root, ignore_errors=True)
 shutil.copytree(build / 'war3-sd-card/switch/wine', stage,
                 ignore=shutil.ignore_patterns('*.log', '.DS_Store', 'BUILD-*-README.txt'))
 
-# What SPEED2.EXE imports that no checkpoint stages, and what the XtendedInput
-# dinput8.dll in the game's folder imports (it loads the real dinput8.dll from
-# syswow64). quartz delay-loads ddraw too. Their imports, and the DLLs that
+# What the Need for Speed games import that no checkpoint stages: NFSU2's
+# SPEED2.EXE, and the XtendedInput dinput8.dll in its folder (which loads the
+# real dinput8.dll from syswow64), and Most Wanted's speed.exe, which adds
+# d3dx9_26. quartz delay-loads ddraw too. Their imports, and the DLLs that
 # exports they use forward to, come along.
-NFSU2_DLLS = 'ddraw dinput8 netapi32 shfolder tapi32 dbghelp vcruntime140 xinput1_4'.split()
+NFS_DLLS = 'ddraw dinput8 netapi32 shfolder tapi32 dbghelp vcruntime140 xinput1_4 d3dx9_26'.split()
 pe = probe / 'build-wine-wow64-pe'
 toolchain = probe / 'toolchains/llvm-mingw-20260505-ucrt-macos-universal/bin'
 env = dict(os.environ, PATH=f'{toolchain}:/opt/homebrew/opt/bison/bin:' + os.environ['PATH'])
@@ -78,7 +79,7 @@ def need(name):
     staged.add(name)
     queue.append(name)
 
-for name in NFSU2_DLLS:
+for name in NFS_DLLS:
     need(dll_name(name))
 while queue:
     for block in re.findall(r'^Import \{\n(.*?)^\}', readobj('--coff-imports', syswow64 / queue.pop()), re.M | re.S):
@@ -89,7 +90,7 @@ while queue:
         symbols = set(re.findall(r'Symbol: (\S+) \(', block))
         for symbol in sorted(symbols & forwards_of(module).keys()):
             need(dll_name(forwards_of(module)[symbol]))
-for name in NFSU2_DLLS:
+for name in NFS_DLLS:
     assert 'Arch: i386\n' in readobj('--file-headers', syswow64 / dll_name(name)), name
 
 # The launcher lists every program in drive_c; target.txt only preselects one.
@@ -130,11 +131,11 @@ Also staged: C:\\\\pe32-opengl.exe (red, green and blue frames, then PASS and
 exit_code=0x0000002a), C:\\\\pe32-audio.exe (audout playback), C:\\\\notepad.exe and
 the 7zr benchmark.
 
-Need for Speed Underground 2: the DLLs SPEED2.EXE imports are staged (ddraw,
-dinput8, netapi32, shfolder, tapi32 and what they import), with dbghelp,
-vcruntime140 and xinput1_4 for an XtendedInput dinput8.dll in the game's folder.
-SPEED2.EXE cannot be moved in memory, so start it through a forwarder set to a
-32-bit address space.
+Need for Speed Underground 2 and Most Wanted: the DLLs SPEED2.EXE and speed.exe
+import are staged (ddraw, dinput8, netapi32, shfolder, tapi32, d3dx9_26 and what
+they import), with dbghelp, vcruntime140 and xinput1_4 for an XtendedInput
+dinput8.dll in the game's folder. Neither executable can be moved in memory, so
+start them through a forwarder set to a 32-bit address space.
 
 The screen: windows are now shown through OpenGL on the GPU, each in its own
 layer drawn in stacking order, instead of copying their pixels straight to the

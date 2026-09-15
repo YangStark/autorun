@@ -57,4 +57,5 @@ python3 "$root/wine-nx-probe/tests/check_horizon_backings.py"
 "${CC:-clang}" $flags -pthread "$root/wine-nx-probe/tests/horizon_memfile.c" -o "$build/horizon_memfile"
 "$build/horizon_memfile"
 python3 "$root/wine-nx-probe/tests/check_horizon_sections.py"
+python3 "$root/wine-nx-probe/tests/check_horizon_image_info.py"
 python3 "$root/wine-nx-probe/tools/make-7zr-tree.py" "$build/drive_c" >/dev/null

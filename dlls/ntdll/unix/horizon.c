@@ -3940,19 +3940,13 @@ static unsigned long long horizon_get_le64( const unsigned char *ptr )
            ((unsigned long long)horizon_get_le32( ptr + 4 ) << 32);
 }
 
-static unsigned int horizon_round_up_u32( unsigned int value, unsigned int align )
-{
-    if (!align) return value;
-    return (value + align - 1) & ~(align - 1);
-}
-
 static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe_image_info *info )
 {
     unsigned char dos[64], nt[24];
     unsigned char *headers = NULL;
     unsigned int status = HORIZON_STATUS_SUCCESS;
     unsigned int pe_offset, opt_size, section_count, headers_size;
-    unsigned int size_of_image, section_alignment, size_of_headers;
+    unsigned int size_of_image, section_alignment, size_of_headers, align_mask;
     unsigned int i;
     unsigned short machine, characteristics, dll_charact;
     struct stat st;
@@ -4017,7 +4011,18 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     info->stack_size = machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? horizon_get_le32( headers + 72 ) : horizon_get_le64( headers + 72 );
     info->stack_commit = machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? horizon_get_le32( headers + 76 ) : horizon_get_le64( headers + 80 );
     info->entry_point = horizon_get_le32( headers + 16 );
-    info->map_size = size_of_image;
+    /* As wineserver's get_image_params (server/mapping.c) and Windows: the image
+     * is mapped in whole units of its section alignment, at least a page. A
+     * SizeOfImage that ends inside the last section's page, as NFS Most Wanted
+     * Black Edition's speed.exe has, would otherwise leave that section looking
+     * too large for the image. */
+    align_mask = section_alignment - 1 > 0xfff ? section_alignment - 1 : 0xfff;
+    info->map_size = (size_of_image + align_mask) & ~align_mask;
+    if (info->map_size < size_of_image)
+    {
+        status = HORIZON_STATUS_INVALID_IMAGE_FORMAT;
+        goto done;
+    }
     info->alignment = section_alignment;
     info->zerobits = 0;
     info->subsystem = horizon_get_le16( headers + 68 );
@@ -4030,19 +4035,22 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     info->machine = machine;
     info->loader_flags = horizon_get_le32( headers + (machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? 88 : 104) );
     info->header_size = size_of_headers;
-    info->header_map_size = horizon_round_up_u32( size_of_headers, 0x1000 );
+    /* The headers are mapped up to the first section, as wineserver does. */
+    info->header_map_size = info->map_size;
     info->file_size = st.st_size > 0xffffffffll ? 0xffffffffu : (unsigned int)st.st_size;
     info->checksum = horizon_get_le32( headers + 64 );
 
     if (dll_charact & HORIZON_IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE)
         info->image_flags |= HORIZON_IMAGE_FLAGS_IMAGE_DYNAMICALLY_RELOCATED;
-    if (section_alignment < 0x1000)
+    if (section_alignment & 0xfff)
         info->image_flags |= HORIZON_IMAGE_FLAGS_IMAGE_MAPPED_FLAT;
 
     for (i = 0; i < section_count; i++)
     {
         const unsigned char *section = headers + opt_size + i * 40;
 
+        if (horizon_get_le32( section + 12 ) < info->header_map_size)
+            info->header_map_size = horizon_get_le32( section + 12 );
         if (horizon_get_le32( section + 36 ) & HORIZON_IMAGE_SCN_CNT_CODE)
             info->contains_code = 1;
     }
