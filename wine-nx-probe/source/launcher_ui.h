@@ -2,7 +2,8 @@
  * Drawing and input for the launcher, on SDL2's renderer: themes with animated
  * backgrounds, text, panels, the header and the footer of button hints, a list
  * of settings rows, dialogs, and controller, keyboard and touch input. Its look
- * follows dolphin-nx's launcher.
+ * follows the launcher of dolphin-nx by NaGaa95
+ * (https://github.com/NaGaa95/dolphin-nx); the code is Wine-NX's own.
  */
 #ifndef WINE_NX_LAUNCHER_UI_H
 #define WINE_NX_LAUNCHER_UI_H

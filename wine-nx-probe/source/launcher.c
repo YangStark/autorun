@@ -1115,7 +1115,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 enum settings_row
 {
     SET_THEME, SET_ANIMATIONS, SET_COLUMNS, SET_ROWS, SET_HIDDEN, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_VERSION,
-    SETTINGS_ROWS
+    SET_CREDITS, SETTINGS_ROWS
 };
 
 static void save_look( struct launcher *l )
@@ -1136,6 +1136,77 @@ static void save_look( struct launcher *l )
     launcher_kv_set( &l->look, "browse", l->browse_dir );
     runtime_file( l, "launcher.txt", path, sizeof(path) );
     launcher_kv_save( &l->look, path );
+}
+
+/* What Wine-NX is built from and on; README.md's Credits section has the same list. */
+static const struct { const char *name, *value, *help; } credits[] =
+{
+    { "Wine", "WineHQ, LGPL-2.1+",
+      "https://www.winehq.org\nThe Windows API, the loader, WoW64 and the Direct3D, OpenGL and Vulkan layers." },
+    { "Box64", "ptitSeb, MIT",
+      "https://github.com/ptitSeb/box64\nRuns 32-bit x86 code: its interpreter and ARM64 dynarec are the WoW64 CPU." },
+    { "DXVK", "Philip Rebohle, zlib",
+      "https://github.com/doitsujin/dxvk\nDirect3D 9 over Vulkan, for programs set to d3d9=dxvk." },
+    { "Mesa", "Mesa3D, MIT",
+      "https://mesa3d.org\nOpenGL through nvc0 and Vulkan through NVK on the Switch GPU." },
+    { "mesa-switch", "danfromtico, NaGaa95 and others",
+      "https://github.com/danfromtico/mesa-switch\nThe Switch port of Mesa 26, with nvc0 and NVK, that the runtime links." },
+    { "Switch Mesa and libdrm_nouveau", "fincs, Subv, Jules Blok, MIT",
+      "devkitPro's Switch ports of Mesa 20.1 and libdrm_nouveau, the earlier OpenGL path." },
+    { "libnx", "switchbrew, ISC",
+      "https://github.com/switchbrew/libnx\nThe Horizon system library the runtime is written against." },
+    { "devkitPro", "devkitA64 and portlibs",
+      "https://devkitpro.org\nThe toolchain and the Switch builds of the libraries below." },
+    { "SDL2 and SDL2_ttf", "Sam Lantinga, zlib",
+      "https://www.libsdl.org\nThe launcher's drawing, input and text." },
+    { "FreeType", "FreeType Project, FTL",
+      "https://freetype.org\nFont rendering for the launcher." },
+    { "HarfBuzz", "HarfBuzz authors, MIT",
+      "https://harfbuzz.github.io\nText shaping for the launcher." },
+    { "libpng, zlib, bzip2", "libpng, zlib and BSD licenses",
+      "https://www.libpng.org  https://zlib.net  https://sourceware.org/bzip2\nProgram icons and compressed data." },
+    { "llvm-mingw", "Martin Storsjo, Apache-2.0",
+      "https://github.com/mstorsjo/llvm-mingw\nBuilds Wine's and DXVK's Windows DLLs (LLVM, libc++, mingw-w64)." },
+    { "7-Zip", "Igor Pavlov, LGPL-2.1",
+      "https://www.7-zip.org\n7zr.exe, the benchmark and archive test program on the card." },
+    { "dolphin-nx", "NaGaa95, launcher design",
+      "https://github.com/NaGaa95/dolphin-nx\nThis launcher's look follows dolphin-nx's launcher; its code is Wine-NX's own." },
+    { "Atmosphere", "Atmosphere-NX, reference",
+      "https://github.com/Atmosphere-NX/Atmosphere\nIts kernel source is how Wine-NX learns what Horizon's memory calls allow." },
+    { "tico-dolphin", "ticohq, reference",
+      "https://github.com/ticohq/tico-dolphin\nJIT and exception handling on Horizon." },
+    { "WineBox64 NX", "Ibnuard, reference",
+      "https://github.com/Ibnuard/winebox64_nx\nA proof of concept running x86-64 Wine under Box64 on Horizon; "
+      "reference for Wine-NX's Box64 and libnx integration." },
+    { "sphaira", "ITotalJustice, NaGaa95",
+      "https://github.com/NaGaa95/sphaira\nForwarders that start Wine-NX with a 32-bit address space." },
+};
+#define CREDIT_COUNT (sizeof(credits) / sizeof(credits[0]))
+
+static void credits_screen( struct launcher *l )
+{
+    struct ui_row rows[CREDIT_COUNT];
+    struct ui_list list = {0};
+    size_t i;
+
+    memset( rows, 0, sizeof(rows) );
+    for (i = 0; i < CREDIT_COUNT; i++)
+    {
+        snprintf( rows[i].label, sizeof(rows[i].label), "%s", credits[i].name );
+        snprintf( rows[i].value, sizeof(rows[i].value), "%s", credits[i].value );
+        rows[i].help = credits[i].help;
+    }
+    for (;;)
+    {
+        enum ui_action action = ui_list_run( &l->ui, &list, "Credits", NULL, rows, CREDIT_COUNT, 0 );
+
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return;
+        if (action == UI_ACTION_CHOOSE)
+        {
+            ui_message( &l->ui, rows[list.selection].label, rows[list.selection].help );
+            ui_start_screen( &l->ui );
+        }
+    }
 }
 
 static void settings_menu( struct launcher *l )
@@ -1180,6 +1251,10 @@ static void settings_menu( struct launcher *l )
         snprintf( rows[SET_VERSION].value, sizeof(rows[0].value), "%s", l->options->build );
         rows[SET_VERSION].disabled = 1;
         rows[SET_VERSION].adjustable = 0;
+        snprintf( rows[SET_CREDITS].label, sizeof(rows[0].label), "Credits" );
+        snprintf( rows[SET_CREDITS].value, sizeof(rows[0].value), "Wine, Box64, DXVK, Mesa..." );
+        rows[SET_CREDITS].help = "The projects Wine-NX is built from, and its launcher's design by dolphin-nx.";
+        rows[SET_CREDITS].adjustable = 0;
 
         action = ui_list_run( ui, &list, "Settings", NULL, rows, SETTINGS_ROWS, 0 );
         if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return;
@@ -1208,6 +1283,10 @@ static void settings_menu( struct launcher *l )
             runtime_file( l, "framebuffer.txt", path, sizeof(path) );
             write_line( path, l->options->framebuffer ? "1" : "0" );
             break;
+        case SET_CREDITS:
+            credits_screen( l );
+            ui_start_screen( ui );
+            continue;
         }
         save_look( l );
     }

@@ -778,7 +778,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX Probe" "Codex" "0.1.0" "${NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX Probe" "ticoverse.com" "0.1.0" "${NACP_FILE}"
         VERBATIM
     )
 
@@ -793,7 +793,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${PE_SMOKE_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX PE Smoke" "Codex" "0.1.0" "${PE_SMOKE_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX PE Smoke" "ticoverse.com" "0.1.0" "${PE_SMOKE_NACP_FILE}"
         VERBATIM
     )
 
@@ -808,7 +808,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${PE_REAL_REPORT_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX PE Real Report" "Codex" "0.1.0" "${PE_REAL_REPORT_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX PE Real Report" "ticoverse.com" "0.1.0" "${PE_REAL_REPORT_NACP_FILE}"
         VERBATIM
     )
 
@@ -823,7 +823,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${PE_REAL_RUN_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX PE Real Run" "Codex" "0.1.0" "${PE_REAL_RUN_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX PE Real Run" "ticoverse.com" "0.1.0" "${PE_REAL_RUN_NACP_FILE}"
         VERBATIM
     )
 
@@ -838,7 +838,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${PE_NTDLL_SMOKE_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX PE NTDLL Smoke" "Codex" "0.1.0" "${PE_NTDLL_SMOKE_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX PE NTDLL Smoke" "ticoverse.com" "0.1.0" "${PE_NTDLL_SMOKE_NACP_FILE}"
         VERBATIM
     )
 
@@ -853,7 +853,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${NTDLL_SMOKE_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX NTDLL Smoke" "Codex" "0.1.0" "${NTDLL_SMOKE_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX NTDLL Smoke" "ticoverse.com" "0.1.0" "${NTDLL_SMOKE_NACP_FILE}"
         VERBATIM
     )
 
@@ -868,7 +868,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${NTDLL_FILE_SMOKE_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX NTDLL File Smoke" "Codex" "0.1.0" "${NTDLL_FILE_SMOKE_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX NTDLL File Smoke" "ticoverse.com" "0.1.0" "${NTDLL_FILE_SMOKE_NACP_FILE}"
         VERBATIM
     )
 
@@ -883,7 +883,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${RUNTIME_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX Runtime" "Codex" "0.1.0" "${RUNTIME_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX Runtime" "ticoverse.com" "0.1.0" "${RUNTIME_NACP_FILE}"
         VERBATIM
     )
 
