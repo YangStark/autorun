@@ -471,6 +471,8 @@ enum wined3d_shader_backend
 struct wined3d_settings
 {
     unsigned int cs_multithreaded;
+    unsigned int cs_spin_count;
+    unsigned int explicit_buffer_flush;
     unsigned int max_gl_version;
     unsigned short pci_vendor_id;
     unsigned short pci_device_id;

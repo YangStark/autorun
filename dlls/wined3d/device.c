@@ -1433,7 +1433,8 @@ bool wined3d_device_gl_create_bo(struct wined3d_device_gl *device_gl, struct win
     bo->binding = binding;
     bo->usage = usage;
     bo->flags = flags;
-    bo->b.coherent = coherent;
+    bo->b.coherent = coherent && !(wined3d_settings.explicit_buffer_flush
+            && gl_info->supported[ARB_BUFFER_STORAGE]);
     list_init(&bo->b.users);
     bo->command_fence_id = 0;
     bo->b.buffer_offset = buffer_offset;

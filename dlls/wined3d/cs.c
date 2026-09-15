@@ -3582,7 +3582,7 @@ static DWORD WINAPI wined3d_cs_run(void *ctx)
             if (wined3d_cs_queue_is_empty(cs, queue))
             {
                 YieldProcessor();
-                if (++spin_count >= WINED3D_CS_SPIN_COUNT)
+                if (++spin_count >= wined3d_settings.cs_spin_count)
                 {
                     if (poll)
                         poll = WINED3D_CS_QUERY_POLL_INTERVAL - 1;

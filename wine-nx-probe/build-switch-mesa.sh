@@ -31,8 +31,10 @@ apply_once() {
 mkdir -p "$out"
 rsync -a --delete "$src/" "$out/src/"
 apply_once "$out/src" "$root/wine-nx-probe/mesa/switch-mesa-20.1-wine-nx.patch"
+apply_once "$out/src" "$root/wine-nx-probe/mesa/switch-mesa-explicit-flush.patch"
 rsync -a --delete --exclude .git "$drm_src/" "$out/libdrm_nouveau/"
 apply_once "$out/libdrm_nouveau" "$root/wine-nx-probe/mesa/libdrm_nouveau-wine-nx.patch"
+apply_once "$out/libdrm_nouveau" "$root/wine-nx-probe/mesa/libdrm_nouveau-explicit-flush.patch"
 docker run --rm --platform linux/arm64 -v "$out:/mesa" -w /mesa/src "$image" bash -lc '
     set -e
     [ -f ../build/build.ninja ] || /opt/devkitpro/meson-cross.sh switch ../crossfile.txt ../build -Db_ndebug=true

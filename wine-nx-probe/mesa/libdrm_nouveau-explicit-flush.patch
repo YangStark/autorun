@@ -1,0 +1,118 @@
+--- a/source/nouveau.c
++++ b/source/nouveau.c
+@@ -354,11 +354,27 @@
+ unsigned int wine_nx_nouveau_bo_new, wine_nx_nouveau_bo_reused, wine_nx_nouveau_bo_evicted;
+ uint64_t wine_nx_nouveau_bo_new_ns;
+ 
++/* Pins are few (typically 2-5). Only storage creation/destruction and the
++ * explicit-flush handshake walk this list; each range flush is O(1). */
++static Mutex nouveau_pin_lock;
++static struct nouveau_bo_priv *nouveau_pins;
++
+ static void
+ nouveau_bo_destroy(struct nouveau_bo_priv *nvbo)
+ {
+ 	struct nouveau_device_priv *nvdev = nouveau_device(nvbo->base.device);
+ 
++	if (nvbo->user_memory) {
++		struct nouveau_bo_priv **link;
++		mutexLock(&nouveau_pin_lock);
++		for (link = &nouveau_pins; *link; link = &(*link)->pin_next) {
++			if (*link == nvbo) {
++				*link = nvbo->pin_next;
++				break;
++			}
++		}
++		mutexUnlock(&nouveau_pin_lock);
++	}
+ 	nouveau_bo_fence_wait(&nvbo->base, 0);
+ 	nvAddressSpaceUnmap(&nvdev->addr_space, nvbo->base.offset);
+ 	nvMapClose(&nvbo->map);
+@@ -454,23 +470,53 @@
+  * whether the GPU reads pinned buffers correctly without the clean below. */
+ int wine_nx_nouveau_skip_clean;
+ 
+-/* Writes the bo's cache lines back so the GPU reads what the CPU wrote. It
+- * walks the whole bo: NFSU2's pinned Direct3D buffers took ~2 ms per clean.
+- * Only the CPU-to-GPU direction: nothing invalidates after the GPU writes,
+- * which pinned buffers (upload sources) never need. */
++/* Explicit mappings clean at glFlushMappedBufferRange, after the application
++ * has written and before its commands can read the range. Coherent mappings
++ * retain the full submission clean because their writes aren't reported. */
++uint64_t wine_nx_nouveau_cache_clean_bytes;
++
++void
++wine_nx_nouveau_cpu_clean_range(void *ptr, size_t size)
++{
++	uint64_t start;
++	if (!size || wine_nx_nouveau_skip_clean)
++		return;
++	start = armTicksToNs(armGetSystemTick());
++	armDCacheClean(ptr, size);
++	__atomic_fetch_add(&wine_nx_nouveau_cache_clean_ns,
++	                  armTicksToNs(armGetSystemTick()) - start, __ATOMIC_RELAXED);
++	__atomic_fetch_add(&wine_nx_nouveau_cache_clean_bytes, size, __ATOMIC_RELAXED);
++	__atomic_fetch_add(&wine_nx_nouveau_cache_cleans, 1, __ATOMIC_RELAXED);
++}
++
++int
++wine_nx_nouveau_bo_set_explicit_flush(void *ptr, int enabled)
++{
++	struct nouveau_bo_priv *nvbo;
++	int found = 0;
++	mutexLock(&nouveau_pin_lock);
++	for (nvbo = nouveau_pins; nvbo; nvbo = nvbo->pin_next) {
++		if (nvbo->map_addr != ptr)
++			continue;
++		/* Publish the initial storage contents once before skipping automatic
++		 * cleans. Subsequent writes are published by explicit range flushes. */
++		if (enabled && nvbo->cacheable)
++			wine_nx_nouveau_cpu_clean_range(ptr, nvbo->base.size);
++		__atomic_store_n(&nvbo->explicit_flush, enabled, __ATOMIC_RELEASE);
++		found = 1;
++	}
++	mutexUnlock(&nouveau_pin_lock);
++	return found;
++}
++
+ void
+ nouveau_bo_cpu_clean(struct nouveau_bo *bo)
+ {
+ 	struct nouveau_bo_priv *nvbo = nouveau_bo(bo);
+-	uint64_t start;
+-
+-	if (!nvbo->cacheable || !nvbo->map_addr || wine_nx_nouveau_skip_clean)
++	if (!nvbo->cacheable || !nvbo->map_addr ||
++	    __atomic_load_n(&nvbo->explicit_flush, __ATOMIC_ACQUIRE))
+ 		return;
+-
+-	start = armTicksToNs(armGetSystemTick());
+-	armDCacheClean(nvbo->map_addr, bo->size);
+-	wine_nx_nouveau_cache_clean_ns += armTicksToNs(armGetSystemTick()) - start;
+-	wine_nx_nouveau_cache_cleans++;
++	wine_nx_nouveau_cpu_clean_range(nvbo->map_addr, bo->size);
+ }
+ 
+ /* Wine-NX: a bo over page-aligned memory the caller owns (GL_AMD_pinned_memory).
+@@ -522,6 +568,10 @@
+ 	nvbo->kind = NvKind_Pitch;
+ 	nvbo->align = 0x1000;
+ 	nvbo->fence.id = UINT32_MAX;
++	mutexLock(&nouveau_pin_lock);
++	nvbo->pin_next = nouveau_pins;
++	nouveau_pins = nvbo;
++	mutexUnlock(&nouveau_pin_lock);
+ 	*pbo = bo;
+ 	return 0;
+ }
+--- a/source/private.h
++++ b/source/private.h
+@@ -58,6 +58,8 @@
+ 	int user_memory; /* map_addr belongs to the caller (nouveau_bo_wrap_user) */
+ 	NvKind kind;     /* what it was allocated for, to match cached bos */
+ 	uint32_t align;
++	struct nouveau_bo_priv *pin_next;
++	int explicit_flush;
+ 	int cacheable;   /* CPU caches it: clean before the GPU reads (Wine-NX) */
+ };
+ 

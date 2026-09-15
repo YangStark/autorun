@@ -2625,6 +2625,14 @@ static HRESULT WINAPI DECLSPEC_HOTPATCH d3d9_device_SetRenderState(IDirect3DDevi
 
     TRACE("iface %p, state %#x, value %#lx.\n", iface, state, value);
 
+    /* Primary state is owned by the application thread on these devices.
+     * Recording must still capture redundant sets, and RESZ is a command. */
+    if (!device->multithreaded && !device->recording
+            && (unsigned int)state < ARRAY_SIZE(device->stateblock_state->rs)
+            && !(state == D3DRS_POINTSIZE && value == D3D9_RESZ_CODE)
+            && device->stateblock_state->rs[state] == value)
+        return D3D_OK;
+
     wined3d_mutex_lock();
     wined3d_stateblock_set_render_state(device->update_state, wined3d_render_state_from_d3d(state), value);
     if (state == D3DRS_POINTSIZE && value == D3D9_RESZ_CODE)
@@ -2924,6 +2932,12 @@ static HRESULT WINAPI d3d9_device_SetTextureStageState(IDirect3DDevice9Ex *iface
         return D3D_OK;
     }
 
+    if (!device->multithreaded && !device->recording
+            && stage < ARRAY_SIZE(device->stateblock_state->texture_states)
+            && tss_lookup[state] != WINED3D_TSS_INVALID
+            && device->stateblock_state->texture_states[stage][tss_lookup[state]] == value)
+        return D3D_OK;
+
     wined3d_mutex_lock();
     wined3d_stateblock_set_texture_stage_state(device->update_state, stage, tss_lookup[state], value);
     wined3d_mutex_unlock();
@@ -2966,6 +2980,12 @@ static HRESULT WINAPI DECLSPEC_HOTPATCH d3d9_device_SetSamplerState(IDirect3DDev
 
     if (sampler >= D3DVERTEXTEXTURESAMPLER0 && sampler <= D3DVERTEXTEXTURESAMPLER3)
         sampler -= D3DVERTEXTEXTURESAMPLER0 - WINED3D_VERTEX_SAMPLER_OFFSET;
+
+    if (!device->multithreaded && !device->recording
+            && sampler < ARRAY_SIZE(device->stateblock_state->sampler_states)
+            && (unsigned int)state < ARRAY_SIZE(device->stateblock_state->sampler_states[0])
+            && device->stateblock_state->sampler_states[sampler][state] == value)
+        return D3D_OK;
 
     wined3d_mutex_lock();
     wined3d_stateblock_set_sampler_state(device->update_state, sampler, wined3d_sampler_state_from_d3d(state), value);
@@ -4735,6 +4755,7 @@ HRESULT device_init(struct d3d9_device *device, struct d3d9 *parent, struct wine
         WINED3D_FEATURE_LEVEL_5,
     };
 
+    device->multithreaded = !!(flags & D3DCREATE_MULTITHREADED);
     output_idx = adapter;
     if (output_idx >= parent->wined3d_output_count)
         return D3DERR_INVALIDCALL;

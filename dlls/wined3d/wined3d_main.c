@@ -118,6 +118,7 @@ CRITICAL_SECTION wined3d_command_cs = {&wined3d_command_cs_debug, -1, 0, 0, 0, 0
 struct wined3d_settings wined3d_settings =
 {
     .cs_multithreaded = WINED3D_CSMT_ENABLE,
+    .cs_spin_count = WINED3D_CS_SPIN_COUNT,
     .max_gl_version = MAKEDWORD_VERSION(4, 4),
     .pci_vendor_id = PCI_VENDOR_NONE,
     .pci_device_id = PCI_DEVICE_NONE,
@@ -344,6 +345,8 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
 
     if (hkey || appkey || env)
     {
+        get_config_key_dword(hkey, appkey, env, "cs_spin_count", &wined3d_settings.cs_spin_count);
+        get_config_key_dword(hkey, appkey, env, "explicit_buffer_flush", &wined3d_settings.explicit_buffer_flush);
         if (!get_config_key_dword(hkey, appkey, env, "csmt", &wined3d_settings.cs_multithreaded))
             ERR_(winediag)("Setting multithreaded command stream to %#x.\n", wined3d_settings.cs_multithreaded);
         if (!get_config_key_dword(hkey, appkey, env, "MaxVersionGL", &tmpvalue))

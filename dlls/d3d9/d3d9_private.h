@@ -96,6 +96,7 @@ struct d3d9_device
     struct wined3d_device_context *immediate_context;
     unsigned int adapter_ordinal;
     struct d3d9 *d3d_parent;
+    BOOL multithreaded;
 
     struct fvf_declaration *fvf_decls;
     UINT fvf_decl_count, fvf_decl_size;

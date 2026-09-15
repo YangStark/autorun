@@ -2681,6 +2681,8 @@ GLuint wined3d_context_gl_allocate_vram_chunk_buffer(struct wined3d_context_gl *
     flags = wined3d_device_gl_get_memory_type_flags(pool) | GL_DYNAMIC_STORAGE_BIT;
     if (flags & (GL_MAP_READ_BIT | GL_MAP_WRITE_BIT))
         flags |= GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+    if (wined3d_settings.explicit_buffer_flush)
+        flags &= ~GL_MAP_COHERENT_BIT;
     GL_EXTCALL(glBufferStorage(binding, size, NULL, flags));
 
     checkGLcall("buffer object creation");
@@ -2706,6 +2708,8 @@ static void *wined3d_allocator_chunk_gl_map(struct wined3d_allocator_chunk_gl *c
         GLenum binding = wined3d_device_gl_get_memory_type_binding(chunk_gl->memory_type);
 
         flags |= GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+        if (wined3d_settings.explicit_buffer_flush)
+            flags &= ~GL_MAP_COHERENT_BIT;
         if (!(flags & GL_MAP_READ_BIT))
             flags |= GL_MAP_UNSYNCHRONIZED_BIT;
         if (flags & GL_MAP_WRITE_BIT)
@@ -2826,6 +2830,8 @@ map:
         if (gl_flags & GL_MAP_WRITE_BIT)
             gl_flags |= GL_MAP_FLUSH_EXPLICIT_BIT;
         gl_flags |= GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+        if (wined3d_settings.explicit_buffer_flush)
+            gl_flags &= ~GL_MAP_COHERENT_BIT;
 
         bo->b.map_ptr = GL_EXTCALL(glMapBufferRange(bo->binding, 0, bo->size, gl_flags));
     }
@@ -2966,7 +2972,8 @@ void wined3d_context_gl_flush_bo_address(struct wined3d_context_gl *context_gl,
 
     TRACE("context_gl %p, data %s, size %Iu.\n", context_gl, debug_const_bo_address(data), size);
 
-    range.offset = (uintptr_t)data->addr;
+    /* flush_bo_ranges() already adds data->addr and the suballocation offset. */
+    range.offset = 0;
     range.size = size;
 
     flush_bo_ranges(context_gl, data, 1, &range);

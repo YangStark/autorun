@@ -814,6 +814,8 @@ static void runtime_report_interpreter(void)
         extern unsigned long long wine_nx_nouveau_bo_new_ns __attribute__((weak));
         extern unsigned int wine_nx_nouveau_cache_cleans __attribute__((weak));
         extern unsigned long long wine_nx_nouveau_cache_clean_ns __attribute__((weak));
+        extern unsigned long long wine_nx_nouveau_cache_clean_bytes __attribute__((weak));
+        extern unsigned int wine_nx_gl_explicit_flushes __attribute__((weak));
         extern int wine_nx_gl_pinned_memory __attribute__((weak));
         extern unsigned int wine_nx_syscall_counts[] __attribute__((weak));
         static unsigned int calls, last_reads = ~0u, last_frames = ~0u;
@@ -826,7 +828,7 @@ static void runtime_report_interpreter(void)
         unsigned long long read_ms = &wine_nx_file_read_100ns
                                      ? __atomic_load_n( &wine_nx_file_read_100ns, __ATOMIC_RELAXED ) / 10000 : 0;
         unsigned int syscalls = &wine_nx_syscalls ? __atomic_load_n( &wine_nx_syscalls, __ATOMIC_RELAXED ) : 0;
-        char native[256] = "", gl[384] = "", audio[32] = "", systop[64] = "";
+        char native[256] = "", gl[512] = "", audio[32] = "", systop[64] = "";
 
         if (!start) start = now;
         if (++calls % 2 || (reads == last_reads && frames == last_frames)) return;
@@ -916,13 +918,15 @@ static void runtime_report_interpreter(void)
              * heap block and nvservices calls). */
             if (&wine_nx_nouveau_bo_new && len > 0 && len < (int)sizeof(gl))
                 len += snprintf( gl + len, sizeof(gl) - len,
-                                 " bo_new=%u bo_reuse=%u bo_evict=%u bo_ms=%llu pin_cached=%d cleans=%u clean_ms=%llu",
+                                 " bo_new=%u bo_reuse=%u bo_evict=%u bo_ms=%llu pin_cached=%d cleans=%u clean_ms=%llu clean_mb=%llu range_flushes=%u",
                                  wine_nx_nouveau_bo_new, wine_nx_nouveau_bo_reused,
                                  &wine_nx_nouveau_bo_evicted ? wine_nx_nouveau_bo_evicted : 0,
                                  wine_nx_nouveau_bo_new_ns / 1000000,
                                  &wine_nx_nouveau_pin_cached ? wine_nx_nouveau_pin_cached : 0,
                                  &wine_nx_nouveau_cache_cleans ? wine_nx_nouveau_cache_cleans : 0,
-                                 &wine_nx_nouveau_cache_clean_ns ? wine_nx_nouveau_cache_clean_ns / 1000000 : 0 );
+                                 &wine_nx_nouveau_cache_clean_ns ? wine_nx_nouveau_cache_clean_ns / 1000000 : 0,
+                                 &wine_nx_nouveau_cache_clean_bytes ? wine_nx_nouveau_cache_clean_bytes / (1024 * 1024) : 0,
+                                 &wine_nx_gl_explicit_flushes ? wine_nx_gl_explicit_flushes : 0 );
             if (&wine_nx_gl_profile && len > 0 && len < (int)sizeof(gl)) wine_nx_gl_profile( gl + len, sizeof(gl) - len );
         }
         /* Gaps in playback: audout ran out of queued frames. */
@@ -1207,6 +1211,7 @@ static const char runtime_environment[] =
     "SystemRoot=C:\\windows\0"
     "TEMP=C:\\windows\\temp\0"
     "TMP=C:\\windows\\temp\0"
+    "WINE_D3D_CONFIG=cs_spin_count=64,explicit_buffer_flush=1\0"
     "windir=C:\\windows\0";
 
 /* Horizon has no console device: the standard handles are files next to the

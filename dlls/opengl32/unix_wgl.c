@@ -184,6 +184,11 @@ struct buffer
     void *vm_ptr;
     SIZE_T vm_size;
     BOOL pinned;
+#ifdef __SWITCH__
+    BOOL explicit_flush;
+    size_t map_length;
+    GLbitfield map_access;
+#endif
 
     /* members of Vulkan-backed buffer storages */
     struct vk_device *vk_device;
@@ -1563,10 +1568,15 @@ static void fs_hack_setup_gamma_shader( struct wgl_context *ctx, const struct op
  * refused one and persistent maps stay hidden, 2 when a 32-bit address space
  * makes it unnecessary (driver_maps_fit_wow64); reported by [PROGRESS]. */
 int wine_nx_gl_pinned_memory;
+
+/* Optional libdrm hooks: older libraries retain whole-buffer submission cleans. */
+extern int wine_nx_nouveau_bo_set_explicit_flush( void *ptr, int enabled ) __attribute__((weak));
+extern void wine_nx_nouveau_cpu_clean_range( void *ptr, size_t size ) __attribute__((weak));
 /* Also reported by [PROGRESS]: bytes copied between GL buffer mappings above
  * 4 GB and their 32-bit copies, and persistent mappings refused. */
 unsigned long long wine_nx_gl_copy_bytes;
 unsigned int wine_nx_gl_persistent_failures;
+unsigned int wine_nx_gl_explicit_flushes;
 
 /* The driver fills in the table at startup with what it resolved then; Wine
  * resolves the rest when a program first asks for one (wrap_wglGetProcAddress),
@@ -2961,13 +2971,34 @@ static void flush_buffer( TEB *teb, struct buffer *buffer, size_t offset, size_t
     {
         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
         .memory = buffer->vk_memory,
-        .offset = (char *)buffer->map_ptr - (char *)buffer->host_ptr + offset,
         .size = length,
     };
     VkResult vr;
 
+#ifdef __SWITCH__
+    if (buffer->pinned)
+    {
+        if (!buffer->map_ptr || !(buffer->map_access & GL_MAP_FLUSH_EXPLICIT_BIT))
+        {
+            set_gl_error( teb, GL_INVALID_OPERATION );
+            return;
+        }
+        if (offset > buffer->map_length || length > buffer->map_length - offset)
+        {
+            set_gl_error( teb, GL_INVALID_VALUE );
+            return;
+        }
+        if (buffer->explicit_flush && length)
+        {
+            wine_nx_nouveau_cpu_clean_range( (char *)buffer->map_ptr + offset, length );
+            __atomic_add_fetch( &wine_nx_gl_explicit_flushes, 1, __ATOMIC_RELAXED );
+        }
+        return;
+    }
+#endif
     if (!buffer->vk_memory) return;
 
+    memory_range.offset = (char *)buffer->map_ptr - (char *)buffer->host_ptr + offset;
     vr = buffer->vk_device->p_vkFlushMappedMemoryRanges( buffer->vk_device->vk_device, 1, &memory_range );
     if (vr) ERR( "vkFlushMappedMemoryRanges failed: %x\n", vr );
 }
@@ -3045,6 +3076,9 @@ static struct buffer *create_buffer_storage( TEB *teb, GLenum target, GLuint nam
                 __atomic_add_fetch( &wine_nx_gl_persistent_failures, 1, __ATOMIC_RELAXED );
             }
         }
+        if (!(flags & GL_MAP_COHERENT_BIT) && wine_nx_nouveau_bo_set_explicit_flush
+                && wine_nx_nouveau_cpu_clean_range)
+            buffer->explicit_flush = wine_nx_nouveau_bo_set_explicit_flush( buffer->vm_ptr, TRUE );
 #endif
         rb_put( &ctx->buffers->map, &buffer->name, &buffer->entry );
         TRACE( "created buffer %p with pinned memory %p\n", buffer, buffer->vm_ptr );
@@ -3161,6 +3195,23 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
 
     if (buffer && buffer->pinned)
     {
+#ifdef __SWITCH__
+        if (offset < 0 || (size_t)offset > buffer->size || length > buffer->size - offset)
+        {
+            set_gl_error( teb, GL_INVALID_VALUE );
+            return NULL;
+        }
+        /* A client that writes without explicit flushes needs the conservative
+         * submission clean again. WineD3D uses FLUSH_EXPLICIT for every write. */
+        if (buffer->explicit_flush && (access & GL_MAP_WRITE_BIT)
+                && !(access & GL_MAP_FLUSH_EXPLICIT_BIT))
+        {
+            wine_nx_nouveau_bo_set_explicit_flush( buffer->vm_ptr, FALSE );
+            buffer->explicit_flush = FALSE;
+        }
+        buffer->map_length = length;
+        buffer->map_access = access;
+#endif
         buffer->map_ptr = (char *)buffer->vm_ptr + offset;
         TRACE( "returning pinned ptr %p\n", buffer->map_ptr );
         return buffer->map_ptr;

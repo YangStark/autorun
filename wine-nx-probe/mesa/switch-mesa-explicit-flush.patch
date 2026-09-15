@@ -1,0 +1,46 @@
+--- a/src/gallium/drivers/nouveau/nouveau_buffer.c
++++ b/src/gallium/drivers/nouveau/nouveau_buffer.c
+@@ -523,6 +523,23 @@
+ 
+ 
+ 
++#ifdef __SWITCH__
++void wine_nx_nouveau_cpu_clean_range(void *ptr, size_t size);
++
++static void
++nouveau_buffer_flush_pinned(struct nouveau_transfer *tx, unsigned offset, unsigned size)
++{
++   struct nv04_resource *buf = nv04_resource(tx->base.resource);
++
++   /* glBufferSubData also writes pinned storage, via a driver transfer rather
++    * than Wine's persistent pointer. Staged transfers are uploaded by the GPU. */
++   if ((tx->base.usage & PIPE_TRANSFER_WRITE) && !tx->map &&
++       (buf->status & NOUVEAU_BUFFER_STATUS_PINNED))
++      wine_nx_nouveau_cpu_clean_range((uint8_t *)buf->bo->map + buf->offset +
++                                      tx->base.box.x + offset, size);
++}
++#endif
++
+ static void
+ nouveau_buffer_transfer_flush_region(struct pipe_context *pipe,
+                                      struct pipe_transfer *transfer,
+@@ -533,6 +550,9 @@
+ 
+    if (tx->map)
+       nouveau_transfer_write(nouveau_context(pipe), tx, box->x, box->width);
++#ifdef __SWITCH__
++   nouveau_buffer_flush_pinned(tx, box->x, box->width);
++#endif
+ 
+    util_range_add(&buf->base, &buf->valid_buffer_range,
+                   tx->base.box.x + box->x,
+@@ -557,6 +577,9 @@
+       if (!(tx->base.usage & PIPE_TRANSFER_FLUSH_EXPLICIT)) {
+          if (tx->map)
+             nouveau_transfer_write(nv, tx, 0, tx->base.box.width);
++#ifdef __SWITCH__
++         nouveau_buffer_flush_pinned(tx, 0, tx->base.box.width);
++#endif
+ 
+          util_range_add(&buf->base, &buf->valid_buffer_range,
+                         tx->base.box.x, tx->base.box.x + tx->base.box.width);
