@@ -43,9 +43,15 @@ shutil.copytree(build / 'war3-sd-card/switch/wine', stage,
 # What the Need for Speed games import that no checkpoint stages: NFSU2's
 # SPEED2.EXE, and the XtendedInput dinput8.dll in its folder (which loads the
 # real dinput8.dll from syswow64), and Most Wanted's speed.exe, which adds
-# d3dx9_26. quartz delay-loads ddraw too. Their imports, and the DLLs that
-# exports they use forward to, come along.
-NFS_DLLS = 'ddraw dinput8 netapi32 shfolder tapi32 dbghelp vcruntime140 xinput1_4 d3dx9_26'.split()
+# d3dx9_26, with the scripts\NFS_XtendedInput.asi its ASI loader loads, which
+# adds msvcp140, which loads concrt140 when it starts. quartz delay-loads ddraw
+# too. Their imports, and the DLLs that exports they use forward to, come along.
+NFS_DLLS = 'ddraw dinput8 netapi32 shfolder tapi32 dbghelp vcruntime140 msvcp140 concrt140 xinput1_4 d3dx9_26'.split()
+# Fallout New Vegas (GOG) imports xinput1_3 and d3dx9_38, and its Galaxy.dll and
+# GalaxyWrp.dll import the 2012 runtimes. d3dx9 loads images through
+# windowscodecs, which it delay-imports, so no import walk reaches it.
+FALLOUT_DLLS = 'xinput1_3 msvcp110 msvcr110 d3dx9_38 windowscodecs'.split()
+GAME_DLLS = NFS_DLLS + FALLOUT_DLLS
 pe = probe / 'build-wine-wow64-pe'
 toolchain = probe / 'toolchains/llvm-mingw-20260505-ucrt-macos-universal/bin'
 env = dict(os.environ, PATH=f'{toolchain}:/opt/homebrew/opt/bison/bin:' + os.environ['PATH'])
@@ -79,7 +85,7 @@ def need(name):
     staged.add(name)
     queue.append(name)
 
-for name in NFS_DLLS:
+for name in GAME_DLLS:
     need(dll_name(name))
 while queue:
     for block in re.findall(r'^Import \{\n(.*?)^\}', readobj('--coff-imports', syswow64 / queue.pop()), re.M | re.S):
@@ -90,7 +96,7 @@ while queue:
         symbols = set(re.findall(r'Symbol: (\S+) \(', block))
         for symbol in sorted(symbols & forwards_of(module).keys()):
             need(dll_name(forwards_of(module)[symbol]))
-for name in NFS_DLLS:
+for name in GAME_DLLS:
     assert 'Arch: i386\n' in readobj('--file-headers', syswow64 / dll_name(name)), name
 
 # The launcher lists every program in drive_c; target.txt only preselects one.
@@ -133,9 +139,14 @@ the 7zr benchmark.
 
 Need for Speed Underground 2 and Most Wanted: the DLLs SPEED2.EXE and speed.exe
 import are staged (ddraw, dinput8, netapi32, shfolder, tapi32, d3dx9_26 and what
-they import), with dbghelp, vcruntime140 and xinput1_4 for an XtendedInput
-dinput8.dll in the game's folder. Neither executable can be moved in memory, so
-start them through a forwarder set to a 32-bit address space.
+they import), with dbghelp, msvcp140, vcruntime140 and xinput1_4 for XtendedInput:
+NFSU2's dinput8.dll and Most Wanted's NFS_XtendedInput.asi. Neither executable
+can be moved in memory, so start them through a forwarder set to a 32-bit
+address space.
+
+Fallout New Vegas (GOG): xinput1_3, d3dx9_38 and the windowscodecs that loads its
+textures are staged, with msvcp110 and msvcr110 for Galaxy.dll and GalaxyWrp.dll.
+Its executable relocates, so it needs no forwarder.
 
 The screen: windows are now shown through OpenGL on the GPU, each in its own
 layer drawn in stacking order, instead of copying their pixels straight to the
