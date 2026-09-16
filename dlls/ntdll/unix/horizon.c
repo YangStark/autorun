@@ -13164,6 +13164,23 @@ static int check_code_memory_syscalls(void)
     return 0;
 }
 
+/* What the kernel has at an address, for a failure that needs explaining:
+ * svcMapProcessCodeMemory wants a free destination and plain read-write heap
+ * as the source, and svcSetProcessMemoryPermission wants code that was never
+ * written to, so the state of both says which rule was broken. */
+static void describe_memory( void *addr, char *buffer, size_t size )
+{
+    MemoryInfo info;
+    u32 page_info;
+
+    if (R_SUCCEEDED( svcQueryMemory( &info, &page_info, (u64)(ULONG_PTR)addr ) ))
+        snprintf( buffer, size, "%#llx/%#llx type=%#x perm=%#x attr=%#x",
+                  (unsigned long long)info.addr, (unsigned long long)info.size,
+                  info.type, info.perm, info.attr );
+    else
+        snprintf( buffer, size, "unknown" );
+}
+
 static int set_code_memory_perm( void *addr, void *source, size_t size, int prot, BOOL source_accessible )
 {
     int effective_prot = get_effective_horizon_prot( prot );
@@ -13177,8 +13194,12 @@ static int set_code_memory_perm( void *addr, void *source, size_t size, int prot
                                         get_horizon_perm( effective_prot ) );
     if (R_FAILED(rc))
     {
-        horizon_trace( "[HMAP] set_perm failed addr=%p source=%p size=0x%lx prot=0x%x rc=0x%x",
-                       addr, source, (unsigned long)size, prot, rc );
+        char at[96], from[96];
+
+        describe_memory( addr, at, sizeof(at) );
+        describe_memory( source, from, sizeof(from) );
+        horizon_trace( "[HMAP] set_perm failed addr=%p source=%p size=0x%lx prot=0x%x rc=0x%x at %s from %s",
+                       addr, source, (unsigned long)size, prot, rc, at, from );
         WARN( "svcSetProcessMemoryPermission(%p, %zu, %#x) failed %#x.\n",
               addr, size, prot, rc );
         errno = EINVAL;
@@ -13201,10 +13222,23 @@ static int map_code_memory_range( void *addr, void *source, size_t size, int pro
     rc = svcMapProcessCodeMemory( envGetOwnProcessHandle(), (u64)addr, (u64)source, size );
     if (R_FAILED(rc))
     {
-        horizon_trace( "[HMAP] map_code failed addr=%p source=%p size=0x%lx prot=0x%x rc=0x%x",
-                       addr, source, (unsigned long)size, prot, rc );
+        char at[96], from[96];
+
+        describe_memory( addr, at, sizeof(at) );
+        describe_memory( source, from, sizeof(from) );
+        horizon_trace( "[HMAP] map_code failed addr=%p source=%p size=0x%lx prot=0x%x rc=0x%x at %s from %s",
+                       addr, source, (unsigned long)size, prot, rc, at, from );
         WARN( "svcMapProcessCodeMemory(%p, %p, %zu) failed %#x.\n", addr, source, size, rc );
-        errno = map_errno;
+        /* Say what the kernel refused rather than that the arguments were
+         * wrong: a caller told EINVAL retries the same mapping for ever,
+         * while EEXIST and ENOMEM both send it somewhere else. */
+        if (R_MODULE(rc) == Module_Kernel && R_DESCRIPTION(rc) == KernelError_InvalidMemoryState)
+            errno = EEXIST;
+        else if (R_MODULE(rc) == Module_Kernel &&
+                 (R_DESCRIPTION(rc) == KernelError_ResourceExhausted ||
+                  R_DESCRIPTION(rc) == KernelError_OutOfMemory))
+            errno = ENOMEM;
+        else errno = map_errno;
         return -1;
     }
     note_alias_source( source, addr, size, TRUE );
@@ -13228,6 +13262,12 @@ static int unmap_code_memory_range( void *addr, void *source, size_t size )
     rc = svcUnmapProcessCodeMemory( envGetOwnProcessHandle(), (u64)addr, (u64)source, size );
     if (R_FAILED(rc))
     {
+        char at[96], from[96];
+
+        describe_memory( addr, at, sizeof(at) );
+        describe_memory( source, from, sizeof(from) );
+        horizon_trace( "[HMAP] unmap_code failed addr=%p source=%p size=0x%lx rc=0x%x at %s from %s",
+                       addr, source, (unsigned long)size, rc, at, from );
         WARN( "svcUnmapProcessCodeMemory(%p, %p, %zu) failed %#x.\n", addr, source, size, rc );
         errno = EINVAL;
         return -1;
