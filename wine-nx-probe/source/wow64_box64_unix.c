@@ -34,6 +34,92 @@ static BOOL context_replaced( void *opaque )
     return replaced;
 }
 
+#ifdef __SWITCH__
+extern void wine_nx_runtime_trace( const char * );
+extern int wine_nx_image_at( const void *, void **, char *, size_t ) __attribute__((weak));
+
+/* This runs after the engine has exported its final context and unwound.
+ * The continuation printed during native block compilation can be stale;
+ * use the final guest stack to identify an indirect call or return to NULL. */
+static void trace_guest_address( const char *tag, const char *kind, ULONG slot, ULONG address )
+{
+    char module[64], message[256];
+    unsigned char code[16];
+    void *base;
+    unsigned int i, len;
+
+    if (!wine_nx_image_at || !wine_nx_image_at( ULongToPtr(address), &base, module, sizeof(module) )) return;
+    len = snprintf( message, sizeof(message), "[%s] %s[%08x]=%08x %s+%lx",
+                    tag, kind, (unsigned int)slot, (unsigned int)address, module[0] ? module : "exe",
+                    (unsigned long)(address - (ULONG_PTR)base) );
+    /* Return addresses point after CALL: preserve the preceding bytes for
+     * disassembly even when the matching DLL is unavailable on the host. */
+    if (address >= sizeof(code) && !read_guest( NULL, address - sizeof(code), code, sizeof(code) ))
+    {
+        len += snprintf( message + len, sizeof(message) - len, " preceding=" );
+        for (i = 0; i < sizeof(code); i++)
+            len += snprintf( message + len, sizeof(message) - len, "%02x", code[i] );
+    }
+    wine_nx_runtime_trace( message );
+}
+
+static void trace_guest_context( const char *tag, const I386_CONTEXT *ctx, unsigned int frames )
+{
+    char message[256];
+    ULONG words[4], frame, pair[2];
+    unsigned int i, j;
+    NTSTATUS status;
+
+    if (!ctx) return;
+    snprintf( message, sizeof(message), "[%s] eip=%08x esp=%08x ebp=%08x eax=%08x ebx=%08x "
+              "ecx=%08x edx=%08x esi=%08x edi=%08x flags=%08x",
+              tag, (unsigned)ctx->Eip, (unsigned)ctx->Esp, (unsigned)ctx->Ebp, (unsigned)ctx->Eax,
+              (unsigned)ctx->Ebx, (unsigned)ctx->Ecx, (unsigned)ctx->Edx, (unsigned)ctx->Esi,
+              (unsigned)ctx->Edi, (unsigned)ctx->EFlags );
+    wine_nx_runtime_trace( message );
+    trace_guest_address( tag, "pc", ctx->Eip, ctx->Eip );
+    for (i = 0; i < 8 && (ULONGLONG)ctx->Esp + (i + 1) * sizeof(words) <= 0x100000000ull; i++)
+    {
+        ULONG slot = ctx->Esp + i * sizeof(words);
+        if ((status = read_guest( NULL, slot, words, sizeof(words) )))
+        {
+            snprintf( message, sizeof(message), "[%s] stack %08x unreadable status=%08x",
+                      tag, (unsigned)slot, (unsigned)status );
+            wine_nx_runtime_trace( message );
+            break;
+        }
+        snprintf( message, sizeof(message), "[%s] stack %08x: %08x %08x %08x %08x",
+                  tag, (unsigned)slot, (unsigned)words[0], (unsigned)words[1], (unsigned)words[2], (unsigned)words[3] );
+        wine_nx_runtime_trace( message );
+        for (j = 0; j < 4; j++) trace_guest_address( tag, "stack candidate", slot + j * sizeof(ULONG), words[j] );
+    }
+    frame = ctx->Ebp;
+    for (i = 0; i < frames && frame && frame >= ctx->Esp && frame - ctx->Esp <= 0x100000 && !(frame & 3); i++)
+    {
+        if (read_guest( NULL, frame, pair, sizeof(pair) )) break;
+        trace_guest_address( tag, "frame", frame + sizeof(ULONG), pair[1] );
+        if (pair[0] <= frame) break;
+        frame = pair[0];
+    }
+}
+
+static void trace_fault_context( const I386_CONTEXT *ctx )
+{
+    static unsigned int reports;
+    if (ctx && __atomic_add_fetch( &reports, 1, __ATOMIC_RELAXED ) <= 4)
+        trace_guest_context( "BOX64FAULT", ctx, 8 );
+}
+
+/* A successful process exit can also be a startup failure. The syscall gate
+ * has published the guest context before NtTerminateProcess calls this. */
+void wine_nx_box64_trace_exit( const I386_CONTEXT *ctx )
+{
+    static unsigned int reports;
+    if (ctx && __atomic_add_fetch( &reports, 1, __ATOMIC_RELAXED ) <= 1)
+        trace_guest_context( "BOX64EXIT", ctx, 32 );
+}
+#endif
+
 static NTSTATUS run_guest( void *args )
 {
     static const struct wine_nx_wow64_host host = { read_guest, NULL, unix_guest, context_replaced };
@@ -90,6 +176,7 @@ static NTSTATUS run_guest( void *args )
                       (unsigned)status, p->context ? (unsigned)p->context->Eip : 0,
                       p->context ? (unsigned)p->context->Eax : 0, (unsigned long long)p->executed );
             wine_nx_runtime_trace( message );
+            trace_fault_context( p->context );
         }
 #endif
         return status;

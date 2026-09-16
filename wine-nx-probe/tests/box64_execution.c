@@ -695,9 +695,29 @@ int main(void)
     init_context( &context, BASE - 1, BASE + 0x6000 );
     assert( wine_nx_box64_run( &context, 0, &f.gates, &host, &f, 0, 10, &executed ) == STATUS_ACCESS_VIOLATION );
 
-    /* These faults occur in real interpreter dereferences, after the checked
-     * instruction fetch. Recovering multiple faults also verifies the POSIX
-     * signal mask is restored and the Box64 atomic mutex is never stranded. */
+    /* Compilation may inspect a path the guest never takes. The conditional
+     * jump skips prefixes ending at an inaccessible page; a compiler fault
+     * must fall back to interpretation, not become a guest exception. */
+    {
+        unsigned char branch[16] = {0x85,0xc0,0x0f,0x85}; /* test eax,eax; jnz */
+        const ULONG start = BASE + SIZE - 0x1010;
+        const ULONG target = BASE + 0x8020;
+        const int32_t displacement = target - (start + 8);
+
+        memcpy( branch + 4, &displacement, sizeof(displacement) );
+        memset( branch + 8, 0x66, sizeof(branch) - 8 );
+        put_code( memory, start - BASE, branch, sizeof(branch) );
+        assert( !protect_fault_page( FALSE ) );
+        init_context( &context, start, BASE + 0x6000 );
+        context.Eax = 1;
+        assert( !wine_nx_box64_run( &context, 0, &f.gates, &host, &f,
+                                   target, 10, &executed ) );
+        assert( context.Eip == target && context.Eax == 1 );
+        assert( !protect_fault_page( TRUE ) );
+        puts( "Compiler read-ahead across an inaccessible page: untaken path skipped" );
+    }
+    /* These faults occur in actual guest operations. Recovering multiple
+     * faults verifies the signal mask is restored and no mutex is stranded. */
     int faults_before_operands = native_faults;
     assert( !protect_fault_page( FALSE ) );
     {
@@ -724,7 +744,14 @@ int main(void)
     assert( wine_nx_box64_run( &context, 0, &f.gates, &host, &f, 0, 10,
                                &executed ) == STATUS_ACCESS_VIOLATION );
     assert( COUNT_IS(executed, 1) && context.Eip == BASE + SIZE - 0x1001 );
-    assert( native_faults == faults_before_operands + 5 && !protect_fault_page( TRUE ) );
+#ifdef WINE_NX_BOX64_DYNAREC
+    /* The inaccessible immediate faults in compilation, then in the fallback
+     * interpreter. Only that second fault is a guest access violation. */
+    assert( native_faults == faults_before_operands + 6 );
+#else
+    assert( native_faults == faults_before_operands + 5 );
+#endif
+    assert( !protect_fault_page( TRUE ) );
     {
         static const unsigned char recovered[] = {
             0xb8,29,0,0,0,                 /* mov eax,29 */

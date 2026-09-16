@@ -115,12 +115,34 @@ BOOL wine_nx_box64_handle_fault( ULONG_PTR address )
 {
     if (!active_engine || address > 0xffffffffu) return FALSE;
 #ifdef WINE_NX_BOX64_DYNAREC
-    /* Cancel while FillBlock64's stack helper is still alive, and only when
-     * this engine owns the global translator lock. */
-    if (active_engine->held_mutex == &core_context.mutex_dyndump)
+    extern void *current_helper;
+
+    /* A compiler can read past the code the guest will actually execute.
+     * Follow Box64's signal handler: discard the unfinished block while its
+     * helper is alive, then return through the compiler's recovery frame.
+     * It releases the translator lock and falls back to the interpreter.
+     * A real operand/fetch fault there still exits through the guest boundary.
+     * The lock alone is insufficient: hash validation also runs under it,
+     * outside FillBlock64's live recovery frame. */
+    if (active_engine->held_mutex == &core_context.mutex_dyndump && current_helper)
     {
         extern void CancelBlock64(int);
+        extern void cancelFillBlock(void);
+#ifdef __SWITCH__
+        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+        static unsigned int reports;
+
+        if (wine_nx_runtime_trace && __atomic_add_fetch( &reports, 1, __ATOMIC_RELAXED ) <= 8)
+        {
+            char msg[192];
+            snprintf( msg, sizeof(msg), "[BOX64] compiler read fault at %08lx; interpreting from x86=%08x esp=%08x",
+                      (unsigned long)address, (unsigned int)active_engine->emu.ip.q[0],
+                      (unsigned int)active_engine->emu.regs[_SP].q[0] );
+            wine_nx_runtime_trace( msg );
+        }
+#endif
         CancelBlock64( 0 );
+        cancelFillBlock();
     }
 #endif
     stop_engine( &active_engine->emu, STATUS_ACCESS_VIOLATION );

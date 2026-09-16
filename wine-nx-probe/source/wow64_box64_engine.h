@@ -6,7 +6,8 @@
 
 /* Experimental interpreter entry. Guest pointers are identity mapped; the
  * host exception handler must call wine_nx_box64_handle_fault for unresolved
- * data aborts. A nonzero completion PC
+ * data aborts. Compiler read faults discard the translation and retry through
+ * the interpreter. A nonzero completion PC
  * is for embedding/tests, not a guest-accessible native function pointer.
  * Supports integer/segment/SSE transfer with default MXCSR; x87/AVX and
  * nonempty x87 state are rejected explicitly. This is not a full CPU backend.
@@ -19,7 +20,8 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
                           ULONG completion_pc, ULONGLONG budget, ULONGLONG *executed );
 
 /* Called only for unresolved native memory faults. Returns FALSE for a native
- * address or an inactive interpreter; for a 32-bit address during Run it exits
+ * address or an inactive interpreter; during block compilation it returns to
+ * Box64's interpreter fallback. For a 32-bit address during Run it exits
  * the active run with STATUS_ACCESS_VIOLATION. Horizon calls this after libnx
  * has returned from the kernel exception, Linux test hosts from a signal
  * handler. The context is diagnostic: partial instruction effects may remain,
