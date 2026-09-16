@@ -785,6 +785,16 @@ INT DIALOG_DoDialogBox( HWND hwnd, HWND owner )
 
     if (!(dlgInfo = DIALOG_get_info( hwnd, FALSE ))) return -1;
 
+    /* This loop is where a program waits for an answer it may never get: on
+     * Horizon a box put up over a program drawing with OpenGL is not drawn at
+     * all, and the program looks frozen in its last frame. Name the box. */
+    {
+        WCHAR caption[80];
+
+        if (!GetWindowTextW( hwnd, caption, ARRAY_SIZE( caption ) )) caption[0] = 0;
+        ERR( "modal dialog %p %s, owner %p\n", hwnd, debugstr_w(caption), owner );
+    }
+
     bFirstEmpty = TRUE;
     if (!(dlgInfo->flags & DF_END)) /* was EndDialog called in WM_INITDIALOG ? */
     {

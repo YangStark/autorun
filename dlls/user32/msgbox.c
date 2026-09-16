@@ -540,9 +540,18 @@ INT WINAPI MessageBoxIndirectW( LPMSGBOXPARAMSW msgbox )
         EnumThreadWindows(GetCurrentThreadId(), MSGBOX_EnumProc, (LPARAM)&threadWindows);
     }
 
+    /* A program drawing with OpenGL holds the whole screen on Horizon, so a box
+     * it puts up is never drawn and the program looks frozen in its last frame
+     * while it waits here for an answer. Say what it asked, and what it answered. */
+    ERR( "message box %s: %s (style %#x)\n",
+         IS_INTRESOURCE(msgbox->lpszCaption) ? "<resource>" : debugstr_w(msgbox->lpszCaption),
+         IS_INTRESOURCE(msgbox->lpszText) ? "<resource>" : debugstr_w(msgbox->lpszText),
+         (unsigned int)msgbox->dwStyle );
+
     NtUserModifyUserStartupInfoFlags( STARTF_USESHOWWINDOW, 0 );
     ret=DialogBoxIndirectParamW(msgbox->hInstance, tmplate,
                                 msgbox->hwndOwner, MSGBOX_DlgProc, (LPARAM)msgbox);
+    ERR( "message box answered with %d\n", ret );
 
     if ((msgbox->dwStyle & MB_TASKMODAL) && (msgbox->hwndOwner==NULL))
     {
