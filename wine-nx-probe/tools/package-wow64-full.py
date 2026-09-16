@@ -51,7 +51,11 @@ NFS_DLLS = 'ddraw dinput8 netapi32 shfolder tapi32 dbghelp vcruntime140 msvcp140
 # GalaxyWrp.dll import the 2012 runtimes. d3dx9 loads images through
 # windowscodecs, which it delay-imports, so no import walk reaches it.
 FALLOUT_DLLS = 'xinput1_3 msvcp110 msvcr110 d3dx9_38 windowscodecs'.split()
-GAME_DLLS = NFS_DLLS + FALLOUT_DLLS
+# Left 4 Dead 2's launcher loads bin\\valve_avi.dll as one of the app systems the
+# engine cannot start without, and that imports AVIFIL32. msvfw32, which it
+# needs in turn, is already staged for WarCraft III's movies.
+SOURCE_DLLS = ['avifil32']
+GAME_DLLS = NFS_DLLS + FALLOUT_DLLS + SOURCE_DLLS
 pe = probe / 'build-wine-wow64-pe'
 toolchain = probe / 'toolchains/llvm-mingw-20260505-ucrt-macos-universal/bin'
 env = dict(os.environ, PATH=f'{toolchain}:/opt/homebrew/opt/bison/bin:' + os.environ['PATH'])
@@ -147,6 +151,12 @@ address space.
 Fallout New Vegas (GOG): xinput1_3, d3dx9_38 and the windowscodecs that loads its
 textures are staged, with msvcp110 and msvcr110 for Galaxy.dll and GalaxyWrp.dll.
 Its executable relocates, so it needs no forwarder.
+
+Left 4 Dead 2: the engine will not start without bin\\valve_avi.dll, which is one
+of the app systems its launcher creates, and that imports AVIFIL32, so avifil32
+is staged; msvfw32, which avifil32 needs, was already there for WarCraft III's
+movies. left4dead2.exe relocates, so it needs no forwarder either. Steam's
+GameOverlayRenderer.dll not loading is expected and harmless.
 
 The screen: windows are now shown through OpenGL on the GPU, each in its own
 layer drawn in stacking order, instead of copying their pixels straight to the
