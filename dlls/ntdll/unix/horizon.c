@@ -2754,6 +2754,8 @@ static void horizon_server_sleep_locked( long long timeout )
     horizon_server_sleepers--;
 }
 static struct horizon_server_handle_entry *horizon_server_handles;
+/* Whether any waitable timer is running, so waits skip the walk otherwise. */
+static int horizon_server_timers_armed;
 /* The same entries by handle value, which only grows. Requests look their
  * handles up, and walking every open handle made each lookup slower as the
  * number of handles grew. */
@@ -5040,6 +5042,42 @@ static unsigned int horizon_server_find_typed_object_locked( unsigned int handle
 static unsigned int horizon_server_current_tid(void)
 {
     return horizon_server_current ? horizon_server_current->tid : 0;
+}
+
+/* Signals the timers whose time has come and moves a periodic one on. Need
+ * for Speed Most Wanted paces its streaming thread with SetWaitableTimer and
+ * WaitForSingleObject; signalling a timer as it was set returned every wait at
+ * once, 70000 times a second on one core, and the game lost its pacing. */
+static void horizon_server_update_timers_locked(void)
+{
+    struct horizon_server_handle_entry *entry;
+    LARGE_INTEGER now;
+    int armed = 0;
+
+    if (!horizon_server_timers_armed) return;
+    NtQuerySystemTime( &now );
+    for (entry = horizon_server_handles; entry; entry = entry->next)
+    {
+        struct horizon_server_object *object = entry->object;
+
+        if (object->type != HORIZON_SERVER_OBJECT_TIMER || !object->timer_when) continue;
+        if (object->timer_when > now.QuadPart)
+        {
+            armed = 1;
+            continue;
+        }
+        object->signaled = 1;
+        if (!object->timer_period)
+        {
+            object->timer_when = 0;
+            continue;
+        }
+        /* A period is in milliseconds, and one that was missed does not repeat. */
+        do object->timer_when += (long long)object->timer_period * 10000;
+        while (object->timer_when <= now.QuadPart);
+        armed = 1;
+    }
+    horizon_server_timers_armed = armed;
 }
 
 static int horizon_server_object_is_signaled( const struct horizon_server_object *object )
@@ -11596,10 +11634,18 @@ static int horizon_server_handle_set_timer( struct horizon_server_connection *co
     status = horizon_server_find_typed_object_locked( request->handle, HORIZON_SERVER_OBJECT_TIMER, &object );
     if (status == HORIZON_STATUS_SUCCESS)
     {
+        LARGE_INTEGER now;
+
+        /* A waitable timer is signalled when it expires, not when it is set.
+         * expire is an absolute time, or a delay when it is not positive, as
+         * the wineserver's set_timer takes it. */
+        NtQuerySystemTime( &now );
         reply.signaled = object->signaled;
-        object->timer_when = request->expire;
+        object->timer_when = request->expire <= 0 ? now.QuadPart - request->expire
+                                                  : max( request->expire, now.QuadPart );
         object->timer_period = request->period > 0 ? request->period : 0;
-        object->signaled = 1;
+        object->signaled = 0;
+        horizon_server_timers_armed = 1;
         horizon_server_signal_changed_locked();
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
@@ -11623,6 +11669,7 @@ static int horizon_server_handle_cancel_timer( struct horizon_server_connection 
     {
         reply.signaled = object->signaled;
         object->signaled = 0;
+        object->timer_when = 0;
         object->timer_period = 0;
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
@@ -11641,6 +11688,7 @@ static int horizon_server_handle_get_timer_info( struct horizon_server_connectio
 
     memset( &reply, 0, sizeof(reply) );
     pthread_mutex_lock( &horizon_server_objects_mutex );
+    horizon_server_update_timers_locked();
     status = horizon_server_find_typed_object_locked( request->handle, HORIZON_SERVER_OBJECT_TIMER, &object );
     if (status == HORIZON_STATUS_SUCCESS)
     {
@@ -11748,8 +11796,11 @@ static int horizon_server_handle_polls_locked( unsigned int handle )
     struct horizon_server_handle_entry *entry;
 
     if (!handle || handle == HORIZON_CURRENT_THREAD_HANDLE) return 0;
-    return (entry = horizon_server_find_handle_locked( handle )) &&
-           entry->object->type == HORIZON_SERVER_OBJECT_MSG_QUEUE;
+    if (!(entry = horizon_server_find_handle_locked( handle ))) return 0;
+    /* Neither a message queue nor a timer that is running signals the waiter
+     * when it becomes ready: both are noticed by looking again. */
+    return entry->object->type == HORIZON_SERVER_OBJECT_MSG_QUEUE ||
+           (entry->object->type == HORIZON_SERVER_OBJECT_TIMER && entry->object->timer_when);
 }
 
 /* Whether a select waits on a message queue, which can become signaled without
@@ -11815,6 +11866,7 @@ static int horizon_server_handle_select( struct horizon_server_connection *conne
         LARGE_INTEGER now;
         long long timeout = HORIZON_SERVER_WAIT_SLICE;
 
+        horizon_server_update_timers_locked();
         reply.header.error = horizon_server_select_status( request, data, data_size, initial );
         if (reply.header.error != HORIZON_STATUS_TIMEOUT || !request->timeout) break;
         if (request->timeout != 0x7fffffffffffffffLL)

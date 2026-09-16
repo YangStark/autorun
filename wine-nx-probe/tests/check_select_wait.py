@@ -38,6 +38,9 @@ static unsigned horizon_server_wait_object_locked(unsigned h, int consume) {
     return 0;
 }
 static void assert_locked(void) { assert(pthread_mutex_trylock(&horizon_server_objects_mutex) == EBUSY); }
+/* Timers are check_waitable_timer.py's business; the loop only looks at them. */
+static unsigned timer_passes;
+static void horizon_server_update_timers_locked(void) { assert_locked(); timer_passes++; }
 static long long ticks, first_timeout, last_timeout;
 static unsigned calls, ready_after, signals, sleeps, reply_status;
 static int queue_wait;
@@ -71,8 +74,10 @@ static void run(long long timeout, unsigned ready, unsigned expected, unsigned a
     struct horizon_select_request r = { 8, timeout };
     struct horizon_server_connection c = { 1 };
     ticks = 100000; calls = signals = sleeps = 0; ready_after = ready;
+    timer_passes = 0;
     horizon_server_handle_select(&c, (const unsigned char *)&r, NULL, 0);
     assert(reply_status == expected && calls == attempts && signals == 1 && sleeps == attempts - 1);
+    assert(timer_passes == attempts); /* every attempt sees the timers that came due */
 }
 int main(void) {
     run(0, 2, 0x102, 1); /* Zero timeout does not block. */
