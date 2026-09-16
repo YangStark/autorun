@@ -39,6 +39,7 @@ fixture = r'''
 #include <sys/types.h>
 #include "wine/rbtree.h"
 #include "horizon_pool.h"
+#include "horizon_free_range.h"
 #include "horizon_memfile_host.h"
 #include "horizon_memfile.h"
 
@@ -73,6 +74,34 @@ static VirtmemReservation *reservations;
 static int reservation_count;
 static char *code_pool;
 static size_t code_pool_used;
+/* The window the runtime places its own mappings in, and the kernel's map of
+ * it: with no window set, anchor regions come from libnx as they do on an
+ * address space the runtime made no reservations in. */
+void *horizon_native_window_start, *horizon_native_window_end;
+static struct { unsigned long long addr, size; } native_blocks[4];
+static unsigned int native_block_count;
+static int horizon_query_region( void *context, unsigned long long addr, struct horizon_region *region )
+{
+    unsigned long long next = ~0ull;
+    unsigned int i;
+
+    (void)context;
+    for (i = 0; i < native_block_count; i++)
+    {
+        if (addr >= native_blocks[i].addr && addr - native_blocks[i].addr < native_blocks[i].size)
+        {
+            region->addr = native_blocks[i].addr;
+            region->size = native_blocks[i].size;
+            region->type = HORIZON_MEMTYPE_UNMAPPED + 1;
+            return 1;
+        }
+        if (native_blocks[i].addr > addr && native_blocks[i].addr < next) next = native_blocks[i].addr;
+    }
+    region->addr = addr;
+    region->size = (next == ~0ull ? addr + (1ull << 32) : next) - addr;
+    region->type = HORIZON_MEMTYPE_UNMAPPED;
+    return 1;
+}
 static void virtmemLock(void) {}
 static void virtmemUnlock(void) {}
 static VirtmemReservation *virtmemAddReservation( void *addr, size_t size )
@@ -166,7 +195,7 @@ for name in ['static void list_add_mapping(', 'static void list_remove_mapping('
              'static struct horizon_mapping *find_overlap_mapping(', 'static struct horizon_mapping *alloc_mapping(',
              'static VirtmemReservation *reserve_fixed_range_locked(', 'static VirtmemReservation *reserve_fixed_range(',
              'static void remove_reservation_locked(', 'static void remove_reservation(',
-             'static void *find_anchor_run_locked(', 'static void *find_anchor_address_locked(', 'static int replace_reservation_mapping(', 'static int change_reservation_mapping(', 'static int split_reservation_mapping(', 'static size_t page_align_size(',
+             'static void *find_anchor_run_locked(', 'static void *find_anchor_region_locked(', 'static void *find_anchor_address_locked(', 'static int replace_reservation_mapping(', 'static int change_reservation_mapping(', 'static int split_reservation_mapping(', 'static size_t page_align_size(',
              'static void section_failure(', 'static void *horizon_section_anchor(', 'static int horizon_section_unanchor(',
              'static int horizon_section_alias(', 'static int horizon_section_unalias(']:
     fixture += function(name)
@@ -292,6 +321,26 @@ int main(void)
         assert( next_region && anchor_region_count == 2 );
         assert( (char *)next_region >= anchor_region && (char *)next_region < anchor_region_end );
         list_remove_mapping( entry_at( filler ) );  /* both regions stay reserved */
+    }
+    /* A region is found by walking the runtime's own map and the kernel's,
+     * not by asking libnx for random addresses. */
+    {
+        char *window = host_reserve( 4 * HORIZON_ANCHOR_REGION );
+
+        horizon_native_window_start = window;
+        horizon_native_window_end = window + 4 * HORIZON_ANCHOR_REGION;
+        native_blocks[0].addr = (unsigned long long)(uintptr_t)(window + HORIZON_ANCHOR_REGION);
+        native_blocks[0].size = HORIZON_ANCHOR_REGION;
+        native_block_count = 1;
+        assert( find_anchor_region_locked( HORIZON_ANCHOR_REGION ) == window );
+        /* Past one of ours and one of libnx's. */
+        list_add_mapping( alloc_mapping( window, HORIZON_ANCHOR_REGION, NULL, 0, NULL, RW ) );
+        assert( find_anchor_region_locked( HORIZON_ANCHOR_REGION ) == window + 2 * HORIZON_ANCHOR_REGION );
+        /* Nothing that large left in the window. */
+        assert( !find_anchor_region_locked( 3 * HORIZON_ANCHOR_REGION ) );
+        list_remove_mapping( entry_at( window ) );
+        native_block_count = 0;
+        horizon_native_window_start = horizon_native_window_end = NULL;
     }
     b[0] = 0x11;
     assert( a[2 * P] == 0x11 );

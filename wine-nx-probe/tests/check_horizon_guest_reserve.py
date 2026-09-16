@@ -95,6 +95,8 @@ static struct range_entry *free_ranges_end = free_ranges + 2;
 '''
 # The window left for native thread stacks, from the real source.
 fixture += re.search(r'^#define HORIZON_NATIVE_STACKS .*$', source, re.M)[0] + '\n'
+# The window the runtime hands horizon.c for its own placements.
+fixture += 'void *horizon_native_window_start, *horizon_native_window_end;\n'
 for marker in ('static void mmap_add_reserved_area(', 'static int mmap_is_in_reserved_area(',
                'static void reserve_area(', 'static void horizon_reserve_guest_address_space('):
     fixture += block(marker)
@@ -199,6 +201,8 @@ int main(void)
     native[native_count++] = (struct native_map){0x400000, 0x28000000};
     native[native_count++] = (struct native_map){0x78200000, 0xf8200000};
     horizon_reserve_guest_address_space();
+    assert(horizon_native_window_start == (char *)stack_hi - (stack_hi - stack_lo) / 2);
+    assert(horizon_native_window_end == (void *)stack_hi);
     assert(mmap_is_in_reserved_area((void *)0x40000000, 0xafd0000) == 1);
     assert(!mmap_is_in_reserved_area((void *)(stack_hi - (stack_hi - stack_lo) / 2), 0x1000));
     {

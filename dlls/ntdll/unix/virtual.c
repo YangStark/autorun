@@ -4327,6 +4327,10 @@ static void *alloc_virtual_heap( SIZE_T size )
  * are packed into. */
 #define HORIZON_NATIVE_STACKS ((ULONG_PTR)512 * 1024 * 1024)
 
+/* The window itself, for the runtime's own placements. */
+void *horizon_native_window_start = NULL;
+void *horizon_native_window_end = NULL;
+
 /* The small Horizon map is shared with libnx's randomly placed stacks, JIT
  * aliases and section anchors. Protect the low guest range before those are
  * created, as Wine's preloader does on other hosts. These are PROT_NONE host
@@ -4361,6 +4365,10 @@ static void horizon_reserve_guest_address_space(void)
      * and the code arenas are bounded. A region too small keeps half. */
     stack_room = min( HORIZON_NATIVE_STACKS, ((ULONG_PTR)stack_end - (ULONG_PTR)stack_start) / 2 );
     window_start = (char *)ROUND_ADDR( (ULONG_PTR)stack_end - stack_room, granularity_mask );
+    /* horizon.c places section anchors in here itself rather than asking
+     * libnx, whose search picks addresses at random. */
+    horizon_native_window_start = window_start;
+    horizon_native_window_end = stack_end;
     snprintf( msg, sizeof(msg), "[VA] native stack region %p-%p; window for native mappings %p-%p",
               stack_start, stack_end, window_start, stack_end );
     wine_nx_runtime_trace( msg );

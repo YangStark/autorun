@@ -13612,8 +13612,11 @@ static void section_failure( const char *what, void *addr, void *source, size_t 
  * the runtime keeps for its own mappings until a 5 MB section had nowhere to
  * go; Need for Speed Most Wanted took the view that failed and died on it.
  * The region is reserved once, so the anchors inside it need no reservation. */
-#define HORIZON_ANCHOR_REGION ((size_t)128 * 1024 * 1024)
-#define HORIZON_ANCHOR_REGIONS 8
+extern void *horizon_native_window_start, *horizon_native_window_end;
+static int horizon_query_region( void *context, unsigned long long addr, struct horizon_region *region );
+
+#define HORIZON_ANCHOR_REGION ((size_t)32 * 1024 * 1024)
+#define HORIZON_ANCHOR_REGIONS 32
 
 static struct { char *start, *end, *cursor; } anchor_regions[HORIZON_ANCHOR_REGIONS];
 static unsigned int anchor_region_count;
@@ -13652,19 +13655,52 @@ static void *find_anchor_run_locked( size_t size )
     return NULL;
 }
 
+/* A free run for a new region, found by walking this runtime's own mappings
+ * and the kernel's map of the window it keeps for its own placements. libnx's
+ * search picks at random and asks 512 times, and each ask walks every
+ * reservation the process holds: with regions full, that search was 59% of
+ * Most Wanted's main thread and its frame rate halved. */
+static void *find_anchor_region_locked( size_t size )
+{
+    char *candidate = horizon_native_window_start;
+    char *end = horizon_native_window_end;
+    struct horizon_region region;
+
+    if (!candidate || !end) return NULL;
+    while (size <= (size_t)(end - candidate))
+    {
+        struct horizon_mapping *overlap = find_overlap_mapping( candidate, size );
+
+        if (overlap)
+        {
+            candidate = (char *)overlap->addr + overlap->size;
+            continue;
+        }
+        if (horizon_range_unmapped( (unsigned long long)(uintptr_t)candidate, size,
+                                    horizon_query_region, NULL ))
+            return candidate;
+        /* Past the block that is in the way, which is libnx's, not ours. */
+        if (!horizon_query_region( NULL, (unsigned long long)(uintptr_t)candidate, &region ) ||
+            region.addr + region.size <= (unsigned long long)(uintptr_t)candidate)
+            return NULL;
+        candidate = (char *)(uintptr_t)(region.addr + region.size);
+    }
+    return NULL;
+}
+
 static void *find_anchor_address_locked( size_t size )
 {
     void *addr, *region;
     size_t region_size = max( HORIZON_ANCHOR_REGION, size );
 
     if ((addr = find_anchor_run_locked( size ))) return addr;
-    /* Another region rather than one anchor at a time from libnx, whose
-     * search walks every reservation this process holds: with the first
-     * region full, 918 anchors spent half of Most Wanted's main thread in
-     * _memregionIsReserved. */
+    /* Another region rather than one anchor at a time. */
     if (anchor_region_count == HORIZON_ANCHOR_REGIONS) return NULL;
-    if (!(region = virtmemFindCodeMemory( region_size, 0x1000 ))) return NULL;
+    if (!(region = find_anchor_region_locked( region_size )) &&
+        !(region = virtmemFindCodeMemory( region_size, 0x1000 ))) return NULL;
     if (!virtmemAddReservation( region, region_size )) return NULL;
+    horizon_trace( "[HMAP] anchor region %u: 0x%lx bytes at %p",
+                   anchor_region_count + 1, (unsigned long)region_size, region );
     anchor_regions[anchor_region_count].start = region;
     anchor_regions[anchor_region_count].cursor = region;
     anchor_regions[anchor_region_count].end = (char *)region + region_size;
