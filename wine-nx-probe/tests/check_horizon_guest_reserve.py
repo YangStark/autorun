@@ -2,7 +2,8 @@
 """Run Wine's early reservation, allocation and release code against native maps.
 
 Protect a guest range before simulated libnx mappings fragment it, then reserve,
-commit and release the 60,032 KiB block requested during NFSU2 race loading.
+commit and release the 60,032 KiB block requested during NFSU2 race loading, and
+the 172 MiB Most Wanted reserves in one piece.
 """
 from pathlib import Path
 import os
@@ -91,6 +92,8 @@ static struct range_entry free_ranges[] = {{(void *)0x10000, (void *)0x75000000}
                                          {(void *)0xf5000000, (void *)0x100000000ull}};
 static struct range_entry *free_ranges_end = free_ranges + 2;
 '''
+# The window left for native thread stacks, from the real source.
+fixture += re.search(r'^#define HORIZON_NATIVE_STACKS .*$', source, re.M)[0] + '\n'
 for marker in ('static void mmap_add_reserved_area(', 'static int mmap_is_in_reserved_area(',
                'static void reserve_area(', 'static void horizon_reserve_guest_address_space('):
     fixture += block(marker)
@@ -148,12 +151,19 @@ int main(void)
     for (uintptr_t p = 0x1000000; p < 0x20000000; p += 0x1000000)
         assert(anon_mmap_tryfixed((void *)p, 0x100000, PROT_NONE, 0) == MAP_FAILED);
     /* Unlike generic native mappings, thread stack mirrors MUST lie in the
-     * kernel stack region. Build 103 reserved all of it. Exercise many new
-     * threads here with their guard pages, not a generic address above 1 GiB. */
-    for (uintptr_t p = 0x30000000; p < 0x34000000; p += 0x200000)
+     * kernel stack region. Build 103 reserved all of it. The window left at
+     * the top takes more of them, with their guard pages, than the 96 threads
+     * Horizon allows; a stack a megabyte, placed two megabytes apart. */
     {
-        assert(p - 0x4000 >= stack_lo && p + 0x104000 <= stack_hi);
-        assert(anon_mmap_tryfixed((void *)(p - 0x4000), 0x108000, PROT_NONE, 0) != MAP_FAILED);
+        uintptr_t stacks = 0;
+        for (uintptr_t p = stack_hi - HORIZON_NATIVE_STACKS + 0x10000; p + 0x104000 <= stack_hi;
+             p += 0x200000)
+        {
+            assert(p - 0x4000 >= stack_lo);
+            assert(anon_mmap_tryfixed((void *)(p - 0x4000), 0x108000, PROT_NONE, 0) != MAP_FAILED);
+            stacks++;
+        }
+        assert(stacks > 96);
     }
     for (int top_down = 0; top_down < 2; top_down++)
     {
@@ -177,6 +187,18 @@ int main(void)
         fixed_failures = 1;
         ptr = alloc_free_area_in_range(&a, (char *)0x10000, (char *)0x40000000);
         assert(ptr && ptr != MAP_FAILED && !fixed_failures);
+    }
+    /* Most Wanted reserves 172 MiB in one piece. Reserving the stack
+     * region's upper half instead of a window left the guest 511 MB, and
+     * once libnx had mapped anything low the request had nowhere to go. */
+    cleanup();
+    native[native_count++] = (struct native_map){0x400000, 0x1f000000};
+    horizon_reserve_guest_address_space();
+    {
+        struct alloc_area big = {.size = 0xafd0000, .align_mask = 0xffff};
+        void *p = alloc_free_area_in_range(&big, (char *)0x10000, (char *)0x40000000);
+        assert(p && p != MAP_FAILED && (uintptr_t)p >= 0x1f000000);
+        assert((uintptr_t)p + big.size <= stack_hi - HORIZON_NATIVE_STACKS);
     }
     cleanup();
     stack_query_ok = 0;

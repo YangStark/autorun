@@ -4321,6 +4321,10 @@ static void *alloc_virtual_heap( SIZE_T size )
 }
 
 #ifdef __SWITCH__
+/* Address space kept free at the top of Horizon's stack region for native
+ * thread stacks, which can be placed nowhere else. */
+#define HORIZON_NATIVE_STACKS ((ULONG_PTR)256 * 1024 * 1024)
+
 /* The small Horizon map is shared with libnx's randomly placed stacks, JIT
  * aliases and section anchors. Protect the low guest range before those are
  * created, as Wine's preloader does on other hosts. These are PROT_NONE host
@@ -4333,6 +4337,7 @@ static void horizon_reserve_guest_address_space(void)
     size_t total = 0, largest = 0;
     void *stack_start, *stack_end;
     char *reserve_end = (char *)0x40000000;
+    ULONG_PTR stack_room;
     char msg[192];
 
     if ((ULONG_PTR)host_addr_space_limit > limit_4g) return;
@@ -4341,12 +4346,17 @@ static void horizon_reserve_guest_address_space(void)
         wine_nx_runtime_trace( "[VA] early guest reservations disabled: native stack region unavailable" );
         return;
     }
-    /* virtmemFindStack cannot use arbitrary ASLR addresses. Leave at least
-     * the upper half of its permitted region outside our reservations.
-     * Build 103 reserved the entire small stack region, preventing native
-     * worker threads from starting even though high addresses were free. */
-    reserve_end = min( reserve_end, (char *)ROUND_ADDR( (ULONG_PTR)stack_start +
-                       ((ULONG_PTR)stack_end - (ULONG_PTR)stack_start) / 2, granularity_mask ) );
+    /* Native thread stacks are the one thing that must live in this region:
+     * virtmemFindStack only searches it, while everything else libnx places
+     * goes through the far larger ASLR region. Leave it a window at the top.
+     * Build 103 reserved the whole region and no native worker thread could
+     * start; leaving half of it instead capped the guest at 511 MB, and Need
+     * for Speed Most Wanted, which reserves 172 MB in one piece, ran out of
+     * address space. virtmemFindStack picks at random with 0x200 attempts, so
+     * a window many times the 96 threads Horizon allows, at a megabyte of
+     * kernel stack each, is enough; a region too small for one keeps half. */
+    stack_room = min( HORIZON_NATIVE_STACKS, ((ULONG_PTR)stack_end - (ULONG_PTR)stack_start) / 2 );
+    reserve_end = min( reserve_end, (char *)ROUND_ADDR( (ULONG_PTR)stack_end - stack_room, granularity_mask ) );
     snprintf( msg, sizeof(msg), "[VA] native stack region %p-%p; guest reservation ceiling %p",
               stack_start, stack_end, reserve_end );
     wine_nx_runtime_trace( msg );
