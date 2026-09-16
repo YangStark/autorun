@@ -28,6 +28,13 @@
 #define MAP_NORESERVE 0x4000
 #define MAP_FIXED_NOREPLACE 0x100000
 #define MAP_TRYFIXED        0x200000
+
+/* Horizon shares 20000 memory blocks between all applications (Mesosphere's
+ * ApplicationMemoryBlockSlabHeapSize), and every separately mapped range
+ * spends several of them, so committing part of a reservation maps the 64 KB
+ * chunk around it, the granularity Windows itself reserves in. The pages the
+ * program did not ask for stay inaccessible, so touching them still faults. */
+#define HORIZON_COMMIT_CHUNK ((size_t)0x10000)
 #define MAP_EXCL            0x400000
 #define MAP_FAILED    ((void *)-1)
 

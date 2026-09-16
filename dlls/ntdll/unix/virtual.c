@@ -6384,6 +6384,27 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
         horizon_trace( "[VA] base=%p size=0x%lx type=0x%x prot=0x%x -> status=0x%x out=%p/0x%lx",
                        requested_base, (unsigned long)requested_size, type, protect, status,
                        *ret, (unsigned long)*size_ptr );
+        if (status && wine_nx_runtime_trace)
+        {
+            /* Keep distinct failure classes visible even if commit retries
+             * dominate. No guest memory is read on this allocation path. */
+            static unsigned int failures[4];
+            unsigned int bucket = status == STATUS_ACCESS_DENIED ? 0 :
+                                  status == STATUS_NO_MEMORY ? 1 :
+                                  status == STATUS_CONFLICTING_ADDRESSES ? 2 : 3;
+            unsigned int count = __atomic_add_fetch( &failures[bucket], 1, __ATOMIC_RELAXED );
+            if (count <= 8 || !(count & (count - 1)))
+            {
+                char message[256];
+                /* The first allocations run before the thread has a TEB. */
+                TEB *teb = NtCurrentTeb();
+                snprintf( message, sizeof(message),
+                          "[VAFAIL] tid=%04x base=%p size=%#lx type=%#x prot=%#x zero_bits=%#lx status=%#x count=%u",
+                          teb ? HandleToULong( teb->ClientId.UniqueThread ) : 0, requested_base,
+                          (unsigned long)requested_size, type, protect, (unsigned long)zero_bits, status, count );
+                wine_nx_runtime_trace( message );
+            }
+        }
 #endif
         return status;
     }

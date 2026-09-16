@@ -33,6 +33,8 @@ typedef uintptr_t ULONG_PTR;
 #define PROT_READ 1
 #define PROT_WRITE 2
 #define MAP_FAILED ((void *)-1)
+#define MAP_PRIVATE 2
+#define MAP_ANON 0x20
 typedef struct { uintptr_t start, end; int used; } VirtmemReservation;
 struct horizon_mapping { void *addr; size_t size; VirtmemReservation *reservation; };
 static VirtmemReservation reservations[32];
@@ -84,6 +86,9 @@ static void list_remove_mapping(struct horizon_mapping *m)
     abort();
 }
 '''
+fixture += 'static int map_backing_at(void *, size_t, int, int, off_t, int, int);\n'
+fixture += function('static int replace_reservation_mapping(')
+fixture += function('static int change_reservation_mapping(')
 fixture += function('static int split_reservation_mapping(')
 fixture += r'''
 static int unmap_range_locked(void *p, size_t size)
@@ -150,6 +155,22 @@ int main(void)
         assert(split_reservation_mapping(old,(char *)0x12000,0x1000) == -1);
         assert(!violation && map_count == 1 && maps[0] == old && allocations == 1);
         assert(covered(0x12000));
+        cleanup();
+    }
+    /* A failed commit preserves both metadata and native exclusion; retry
+     * succeeds without reserving again, including full-range commits. */
+    for (int whole = 0; whole < 2; whole++)
+    {
+        setup(); require_target = 1; fail_replace = 1;
+        struct horizon_mapping *old = maps[0];
+        char *start = (char *)(uintptr_t)(whole ? 0x10000 : 0x12000);
+        size_t size = whole ? 0x5000 : 0x1000;
+        assert(change_reservation_mapping(old,start,size,3) == -1);
+        assert(errno == EEXIST && !violation && map_count == 1 && maps[0] == old);
+        assert(allocations == 1 && covered(0x12000));
+        fail_replace = 0;
+        assert(!change_reservation_mapping(old,start,size,3));
+        assert(!violation && map_count == (whole ? 1 : 3) && covered(0x12000));
         cleanup();
     }
     for (int prot = 0; prot <= 3; prot += 3)

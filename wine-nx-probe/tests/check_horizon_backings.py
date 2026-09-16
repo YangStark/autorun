@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the actual backing/splitting code with a simulated kernel unmap.
-Check last-view ownership, failed unmaps, zero fill and file writeback with pools.
+Check last-view ownership, failed unmaps, zero fill and file writeback with pools,
+that alias sources are tracked, and that pages still aliased never go back.
 """
 from pathlib import Path
 import re
@@ -35,6 +36,7 @@ typedef void VirtmemReservation;
 #define WARN(...) ((void)0)
 #define horizon_trace(...) ((void)0)
 #define memalign(a,s) aligned_alloc(a,s)
+char *fake_heap_start;
 static int writebacks, fail_unmap;
 static void *unmapped_source;
 static int check_code_memory_syscalls(void) { return 0; }
@@ -108,16 +110,53 @@ int main(void)
     char ch;
     assert(pread(fd, &ch, 1, 0) == 1 && ch == 'H');
     close(fd); unlink(path);
-    /* Oversized allocations use and release the ordinary heap. */
+    /* Oversized allocations take whole blocks of their own and release them. */
     b = create_backing_locked(3*1024*1024, PROT_READ|PROT_WRITE, -1, 0, MAP_ANON);
     assert(b && !horizon_pages_free(&backing_pages, b->heap_addr, b->size));
+    assert(!((uintptr_t)b->heap_addr % HORIZON_POOL_ARENA) && backing_pages.blocks == 1);
     destroy_backing(b);
+    /* No alias source shares a kernel memory block with anything else. */
+    for (i=0; i<HORIZON_POOL_ARENAS; i++) if (backing_pages.arenas[i].memory)
+        assert(!((uintptr_t)backing_pages.arenas[i].memory % HORIZON_POOL_ARENA));
+
+    /* The kernel leaves the source of an alias unmapped, so a backing freed
+     * while one is live keeps its pages instead of handing them on. */
+    b = create_backing_locked(2*page, PROT_READ|PROT_WRITE, -1, 0, MAP_ANON);
+    fake_heap_start = (char *)((uintptr_t)b->heap_addr & ~(uintptr_t)0xffffff);
+    original = b->heap_addr;
+    note_alias_source(original, (void *)0x30000000, 2*page, TRUE);
+    assert(alias_source_range_live(original, 2*page));
+    assert(!alias_source_range_live(original + 2*page, page));
+    char line[256];
+    strcpy(line, "[EXC]");
+    alias_source_report(original + page + 8, line, sizeof(line));
+    assert(!strcmp(line, "[EXC] alias=live"));
+    strcpy(line, "[EXC]");
+    alias_source_report(fake_heap_start - page, line, sizeof(line));
+    assert(!strcmp(line, "[EXC] alias=untracked"));
+    destroy_backing(b);
+    struct horizon_backing *reused = create_backing_locked(2*page, PROT_READ|PROT_WRITE, -1, 0, MAP_ANON);
+    assert(reused->heap_addr != original);
+    destroy_backing(reused);
+    /* Once the alias goes, a fault there names the range it had been. */
+    note_alias_source(original, (void *)0x30000000, 2*page, FALSE);
+    assert(!alias_source_range_live(original, 2*page));
+    strcpy(line, "[EXC]");
+    alias_source_report(original + page, line, sizeof(line));
+    assert(strstr(line, " alias=unmapped ") && strstr(line, "dst=0x30000000"));
+    assert(strstr(line, "size=0x2000") && strstr(line, "age=0"));
+    strcpy(line, "[EXC]");
+    alias_source_report(original + 8*page, line, sizeof(line));
+    assert(!strcmp(line, "[EXC] alias=none"));
+    assert(horizon_pages_free(&backing_pages, original, 2*page));  /* the run leaks these */
+
     for (i=0; i<HORIZON_POOL_ARENAS; i++) if (backing_pages.arenas[i].memory)
     {
         assert(backing_pages.arenas[i].free_pages == HORIZON_POOL_PAGES);
         free(backing_pages.arenas[i].memory);
     }
-    puts("Backing integration: failed unmaps, split views, last-reference release, zero fill, writeback and fallback passed");
+    puts("Backing integration: failed unmaps, split views, last-reference release, zero fill, "
+         "writeback, own blocks and live alias sources passed");
     return 0;
 }
 '''

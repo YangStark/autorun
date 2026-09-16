@@ -131,6 +131,10 @@ static Result svcUnmapProcessMemory( void *dst, Handle process, u64 src, u64 siz
     return host_unalias( dst, (void *)(uintptr_t)src, size ) ? 1 : 0;
 }
 '''
+# The commit granularity horizon.c reserves with, from the real header: the
+# host stand-in gets PROT_* and MAP_* from <sys/mman.h> instead.
+fixture += '\n'.join(re.findall(r'^#define HORIZON_COMMIT_\w+ .*$',
+                                (root / 'dlls/ntdll/unix/horizon_mman.h').read_text(), re.M)) + '\n'
 fixture += block(r'^enum horizon_section_state\n\{.*?^\};')
 for name in ['horizon_backing', 'horizon_mapping']:
     fixture += block(r'^struct ' + name + r'\n\{.*?^\};')
@@ -153,7 +157,7 @@ for name in ['static void list_add_mapping(', 'static void list_remove_mapping('
              'static struct horizon_mapping *find_overlap_mapping(', 'static struct horizon_mapping *alloc_mapping(',
              'static VirtmemReservation *reserve_fixed_range_locked(', 'static VirtmemReservation *reserve_fixed_range(',
              'static void remove_reservation_locked(', 'static void remove_reservation(',
-             'static int split_reservation_mapping(', 'static size_t page_align_size(',
+             'static int replace_reservation_mapping(', 'static int change_reservation_mapping(', 'static int split_reservation_mapping(', 'static size_t page_align_size(',
              'static void section_failure(', 'static void *horizon_section_anchor(', 'static int horizon_section_unanchor(',
              'static int horizon_section_alias(', 'static int horizon_section_unalias(']:
     fixture += function(name)

@@ -30,20 +30,34 @@ int main(void)
     assert(!horizon_pages_alloc(&pool, 0));
     assert(!horizon_pages_alloc(&pool, 4097));
     assert(!horizon_pages_alloc(&pool, (HORIZON_POOL_PAGES + 1) * HORIZON_POOL_PAGE));
-    bytes = HORIZON_POOL_PAGES * HORIZON_POOL_PAGE;
+    bytes = HORIZON_POOL_ARENA;
     for (i = 0; i < HORIZON_POOL_ARENAS; i++)
     {
         whole[i] = horizon_pages_alloc(&pool, bytes);
-        assert(whole[i] && !((uintptr_t)whole[i] % HORIZON_POOL_PAGE));
-        memset(whole[i], i + 1, bytes);
+        /* One arena is one kernel memory block, and shares it with nothing:
+         * aliasing a page of it unmaps whatever else the block holds. */
+        assert(whole[i] && !((uintptr_t)whole[i] % HORIZON_POOL_ARENA));
+        ((unsigned char *)whole[i])[bytes - 1] = (unsigned char)(i + 1);
     }
     assert(!horizon_pages_alloc(&pool, HORIZON_POOL_PAGE));
+    /* A full pool, and anything too large for an arena, take blocks of their
+     * own rather than pages the general heap shares with other allocations. */
+    {
+        void *one = horizon_pages_alloc_any(&pool, HORIZON_POOL_PAGE);
+        void *large = horizon_pages_alloc_any(&pool, HORIZON_POOL_ARENA + HORIZON_POOL_PAGE);
+        assert(one && !((uintptr_t)one % HORIZON_POOL_ARENA));
+        assert(large && !((uintptr_t)large % HORIZON_POOL_ARENA));
+        assert(!horizon_pages_free(&pool, one, HORIZON_POOL_PAGE));
+        assert(pool.blocks == 2 && !pool.shared);
+        free(one);
+        free(large);
+    }
     /* Release and reuse a middle arena while every other arena remains live. */
     assert(horizon_pages_free(&pool, whole[7], bytes));
     assert(horizon_pages_alloc(&pool, bytes) == whole[7]);
     for (i = 0; i < HORIZON_POOL_ARENAS; i++)
     {
-        assert(((unsigned char *)whole[i])[bytes - 1] == i + 1);
+        assert(((unsigned char *)whole[i])[bytes - 1] == (unsigned char)(i + 1));
         assert(horizon_pages_free(&pool, whole[i], bytes));
     }
     for (round = 0; round < 20000; round++)

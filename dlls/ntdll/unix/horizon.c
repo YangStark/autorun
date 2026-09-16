@@ -27,6 +27,7 @@
 #include <malloc.h>
 #include <poll.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -2676,6 +2677,7 @@ struct horizon_server_object
     int dir_queried;                /* a directory query has run on this handle */
     char *dir_mask;
     int sock_nonblocking;
+    int sock_bound;                 /* bind() succeeded; Windows fails a second bind */
     unsigned int sock_event_handle; /* event signaled by the poller (WSAEventSelect) */
     int sock_event_mask;            /* AFD_POLL_* bits the app asked for */
     int sock_pending_events;        /* accumulated AFD_POLL_* bits not yet fetched */
@@ -2887,6 +2889,35 @@ struct horizon_mapping
 };
 
 #include "horizon_pool.h"
+
+/* A section's pages are code-mapped as anchors, so they are alias sources too
+ * and come from arenas of their own. Memfiles allocate outside mapping_mutex,
+ * and a page pool is not itself thread safe. */
+static pthread_mutex_t section_pages_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct horizon_page_pool section_pages;
+
+static void *section_pages_alloc( size_t size )
+{
+    void *ptr;
+
+    pthread_mutex_lock( &section_pages_mutex );
+    ptr = horizon_pages_alloc_any( &section_pages, size );
+    pthread_mutex_unlock( &section_pages_mutex );
+    return ptr;
+}
+
+static void section_pages_free( void *ptr, size_t size )
+{
+    int pooled;
+
+    pthread_mutex_lock( &section_pages_mutex );
+    pooled = horizon_pages_free( &section_pages, ptr, size );
+    pthread_mutex_unlock( &section_pages_mutex );
+    if (!pooled) free( ptr );
+}
+
+#define HORIZON_MEMFILE_ALLOC_PAGES(size) section_pages_alloc( size )
+#define HORIZON_MEMFILE_FREE_PAGES(ptr, size) section_pages_free( ptr, size )
 #include "horizon_memfile.h"
 
 /* These freelists are protected by mapping_mutex, like the mapping tree. */
@@ -2895,17 +2926,140 @@ static struct horizon_mapping mapping_slots[8192];
 static struct horizon_object_pool backing_pool = { backing_slots, NULL, sizeof(backing_slots[0]), 4096, 0 };
 static struct horizon_object_pool mapping_pool = { mapping_slots, NULL, sizeof(mapping_slots[0]), 8192, 0 };
 static struct horizon_page_pool backing_pages;
-static unsigned long long backing_direct_allocs;
 /* Views of sections with no file (horizon_mmap_section), under mapping_mutex. */
 static unsigned long long section_view_maps, section_anchor_bytes;
 static unsigned int section_anchors, section_failures;
 
+/*
+ * The pages this process has given the kernel as the source of an alias.
+ *
+ * svcMapProcessCodeMemory and svcMapProcessMemory reprotect their source to
+ * Perm_None and mark it MemAttr_IsBorrowed, so a write to one of those pages
+ * faults as an unmapped page -- an ESR translation fault, not a protection
+ * fault -- for as long as the alias lives. Afterwards svcQueryMemory reports
+ * ordinary read-write heap again, and a map that fails after reprotecting the
+ * source restores it without the attribute ever being recorded, so the kernel
+ * alone cannot tell a fault handler that it hit an alias source. A bit a page
+ * can, and the last unmaps say whether one had just gone away.
+ */
+#define HORIZON_ALIAS_PAGES (1u << 20)  /* 4 GiB of heap, at 4 KB a page */
+#define HORIZON_ALIAS_RECENT 64
+static unsigned char alias_source_bits[HORIZON_ALIAS_PAGES / 8];
+static const char *alias_source_base;
+static unsigned int alias_source_seq;
+static struct
+{
+    const void *source;
+    const void *addr;
+    size_t size;
+    unsigned int seq;
+} alias_source_recent[HORIZON_ALIAS_RECENT];
+
+static void alias_source_init(void)
+{
+    extern char *fake_heap_start;
+
+    alias_source_base = fake_heap_start;
+}
+
+/* The page's bit index, or ~0 for an address outside the window: an anchor
+ * aliased onto a second address is not itself heap, and is not tracked. */
+static size_t alias_source_page( const void *addr )
+{
+    size_t page;
+
+    if (!alias_source_base || (const char *)addr < alias_source_base) return ~(size_t)0;
+    page = ((uintptr_t)addr - (uintptr_t)alias_source_base) / 0x1000;
+    return page < HORIZON_ALIAS_PAGES ? page : ~(size_t)0;
+}
+
+/* Records a range as the source of an alias, or as one no longer aliased.
+ * Called after the kernel agrees, from any thread. */
+static void note_alias_source( const void *source, const void *addr, size_t size, BOOL mapped )
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    size_t page, i, pages = size / 0x1000;
+
+    pthread_once( &once, alias_source_init );
+    if ((page = alias_source_page( source )) == ~(size_t)0) return;
+    if (page + pages > HORIZON_ALIAS_PAGES) return;
+
+    for (i = 0; i < pages; i++)
+    {
+        unsigned char mask = 1u << ((page + i) & 7);
+        unsigned char *byte = &alias_source_bits[(page + i) >> 3];
+
+        if (mapped) __atomic_or_fetch( byte, mask, __ATOMIC_RELAXED );
+        else __atomic_and_fetch( byte, (unsigned char)~mask, __ATOMIC_RELAXED );
+    }
+    if (!mapped)
+    {
+        unsigned int slot = __atomic_fetch_add( &alias_source_seq, 1, __ATOMIC_RELAXED ), i = slot % HORIZON_ALIAS_RECENT;
+
+        /* A fault handler reads these while another thread writes them, so the
+         * source, which is what it matches on, is published last. */
+        __atomic_store_n( &alias_source_recent[i].source, NULL, __ATOMIC_RELAXED );
+        alias_source_recent[i].addr = addr;
+        alias_source_recent[i].size = size;
+        alias_source_recent[i].seq = slot;
+        __atomic_store_n( &alias_source_recent[i].source, source, __ATOMIC_RELEASE );
+    }
+}
+
+/* Whether any page of the range is the source of an alias right now. */
+static BOOL alias_source_range_live( const void *addr, size_t size )
+{
+    size_t page = alias_source_page( addr ), i, pages = size / 0x1000;
+
+    if (page == ~(size_t)0 || page + pages > HORIZON_ALIAS_PAGES) return FALSE;
+    for (i = 0; i < pages; i++)
+        if (alias_source_bits[(page + i) >> 3] & (1u << ((page + i) & 7))) return TRUE;
+    return FALSE;
+}
+
+/* Appends what the faulting address was to a trace line. */
+static void alias_source_report( const void *addr, char *buffer, size_t size )
+{
+    size_t page = alias_source_page( addr ), len = strlen( buffer );
+    unsigned int seq, i;
+
+    if (page == ~(size_t)0)
+    {
+        snprintf( buffer + len, size - len, " alias=untracked" );
+        return;
+    }
+    if (alias_source_bits[page >> 3] & (1u << (page & 7)))
+    {
+        snprintf( buffer + len, size - len, " alias=live" );
+        return;
+    }
+    seq = __atomic_load_n( &alias_source_seq, __ATOMIC_RELAXED );
+    for (i = 0; i < HORIZON_ALIAS_RECENT; i++)
+    {
+        const void *source = __atomic_load_n( &alias_source_recent[i].source, __ATOMIC_ACQUIRE );
+
+        if (!source) continue;
+        if ((uintptr_t)addr - (uintptr_t)source >= alias_source_recent[i].size) continue;
+        /* Unmaps since this one: the alias the fault most likely raced went
+         * away last, at age zero. */
+        snprintf( buffer + len, size - len, " alias=unmapped src=%p dst=%p size=%#lx age=%u",
+                  source, alias_source_recent[i].addr,
+                  (unsigned long)alias_source_recent[i].size,
+                  seq - 1 - alias_source_recent[i].seq );
+        return;
+    }
+    snprintf( buffer + len, size - len, " alias=none" );
+}
+
 void horizon_memory_pool_stats( char *buffer, size_t size )
 {
     pthread_mutex_lock( &mapping_mutex );
-    snprintf( buffer, size, "[MEMPOOL] arena_mb=%llu pooled_allocs=%llu direct_allocs=%llu backing_slots=%zu mapping_slots=%zu"
-              " section_views=%llu anchors=%u anchor_mb=%llu section_failures=%u",
-              backing_pages.misses * 2, backing_pages.hits, backing_direct_allocs,
+    snprintf( buffer, size, "[MEMPOOL] arena_mb=%llu pooled_allocs=%llu block_allocs=%llu shared_allocs=%llu"
+              " backing_slots=%zu mapping_slots=%zu section_views=%llu anchors=%u anchor_mb=%llu section_failures=%u",
+              (backing_pages.misses + section_pages.misses) * 2,
+              backing_pages.hits + section_pages.hits,
+              backing_pages.blocks + section_pages.blocks,
+              backing_pages.shared + section_pages.shared,
               backing_pool.used, mapping_pool.used, section_view_maps, section_anchors,
               section_anchor_bytes >> 20, section_failures );
     pthread_mutex_unlock( &mapping_mutex );
@@ -2994,11 +3148,31 @@ unsigned int horizon_get_processor_count(void)
  * caches, dictionaries and thread counts from GlobalMemoryStatusEx. */
 void horizon_get_memory_info( unsigned long long *total, unsigned long long *used )
 {
+    extern char *fake_heap_start, *fake_heap_end;
+    unsigned long long heap_size, heap_free;
+    struct mallinfo heap;
     u64 value;
 
     *total = R_SUCCEEDED( svcGetInfo( &value, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0 ) ) ? value : 0;
     *used = R_SUCCEEDED( svcGetInfo( &value, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0 ) ) ? value : 0;
     if (*used > *total) *used = *total;
+
+    /* InfoType_UsedMemorySize counts the whole heap, which libnx claims from
+     * Horizon at startup, so it reports a few megabytes free however little the
+     * process has allocated. What a program can still get is what malloc holds
+     * unused plus what it has not taken from the heap, the same figure the
+     * runtime prints as heap_free_mb. Without this, GlobalMemoryStatusEx
+     * reported 4 MB of AvailPageFile and Fallout New Vegas, which wants 512 MB,
+     * quit with "Not enough memory to run application." */
+    heap = mallinfo();
+    heap_size = fake_heap_end > fake_heap_start ? (unsigned long long)(fake_heap_end - fake_heap_start) : 0;
+    heap_free = (unsigned long long)heap.fordblks +
+                (heap_size > (unsigned long long)heap.arena ? heap_size - (unsigned long long)heap.arena : 0);
+    /* mallinfo's fields are narrower than the heap on a 32-bit address space,
+     * so bound the result by the heap and by what Horizon reports. */
+    if (heap_free > heap_size) heap_free = heap_size;
+    if (heap_free > *total) heap_free = *total;
+    if (*total - heap_free < *used) *used = *total - heap_free;
 }
 
 /* The pipe behind a descriptor from horizon_pipe, or NULL. */
@@ -9418,6 +9592,7 @@ static int horizon_server_handle_open_thread( struct horizon_server_connection *
 
 /* AFD ioctl codes, mirrored from include/wine/afd.h (CTL_CODE expanded;
  * winsock headers must not be included here next to the BSD ones). */
+#define HORIZON_IOCTL_AFD_BIND              0x00012003 /* BEEP/0x800/NEITHER */
 #define HORIZON_IOCTL_AFD_POLL              0x00012024 /* BEEP/0x809/BUFFERED */
 #define HORIZON_IOCTL_AFD_GETSOCKNAME       0x0001202f /* BEEP/0x80b/NEITHER */
 #define HORIZON_IOCTL_AFD_EVENT_SELECT      0x00012087 /* BEEP/0x821/NEITHER */
@@ -9427,6 +9602,13 @@ static int horizon_server_handle_open_thread( struct horizon_server_connection *
 #define HORIZON_IOCTL_AFD_WINE_FIONBIO      0x00120344 /* NETWORK/209/BUFFERED */
 #define HORIZON_IOCTL_AFD_WINE_GETPEERNAME  0x00120360 /* NETWORK/216/BUFFERED */
 #define HORIZON_IOCTL_AFD_WINE_GET_SO_ERROR 0x00120378 /* NETWORK/222/BUFFERED */
+/* The options a socket is given before it is bound; RakNet, which GOG Galaxy
+ * runs, sets all five. */
+#define HORIZON_IOCTL_AFD_WINE_SET_SO_BROADCAST 0x00120374 /* NETWORK/221/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_SET_SO_LINGER    0x00120388 /* NETWORK/226/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_SET_SO_RCVBUF    0x00120394 /* NETWORK/229/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_SET_SO_SNDBUF    0x001203ac /* NETWORK/235/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_SET_IP_HDRINCL   0x001203dc /* NETWORK/247/BUFFERED */
 
 #define HORIZON_AFD_POLL_READ        0x0001
 #define HORIZON_AFD_POLL_OOB         0x0002
@@ -9826,6 +10008,7 @@ static unsigned int horizon_sock_ioctl_create( unsigned int handle, const unsign
         if (object->file_fd != -1) close( object->file_fd );
         object->file_fd = fd;
         object->sock_nonblocking = 0;
+        object->sock_bound = 0;
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
@@ -9955,6 +10138,103 @@ static unsigned int horizon_sock_ioctl_poll( unsigned int handle, const unsigned
     return HORIZON_STATUS_SUCCESS;
 }
 
+/* IOCTL_AFD_BIND carries struct afd_bind_params: a field Windows itself does
+ * not read, then the sockaddr. As wineserver does, the reply is the address the
+ * socket ended up on — the requested address with the port the kernel chose,
+ * which is what ws2_32 keeps for getsockname. */
+static unsigned int horizon_sock_ioctl_bind( unsigned int handle, const unsigned char *data,
+                                             unsigned int data_size, unsigned char *out,
+                                             unsigned int out_max, unsigned int *out_size )
+{
+    struct horizon_server_object *object;
+    struct sockaddr_in sa, bound;
+    socklen_t bound_len = sizeof(bound);
+    unsigned int status;
+    int fd = -1;
+
+    if (data_size < 4 + 16) return HORIZON_STATUS_INVALID_PARAMETER;
+    if ((status = horizon_ws_sockaddr_to_unix( data + 4, data_size - 4, &sa ))) return status;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    status = horizon_server_find_sock_locked( handle, &object );
+    if (!status && object->file_fd == -1) status = HORIZON_STATUS_INVALID_HANDLE;
+    if (!status && object->sock_bound) status = HORIZON_STATUS_ADDRESS_ALREADY_ASSOCIATED;
+    if (!status) fd = object->file_fd;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    if (status) return status;
+
+    if (bind( fd, (struct sockaddr *)&sa, sizeof(sa) ) == -1)
+    {
+        status = horizon_sock_errno_status( errno );
+        horizon_trace( "[server] AFD_BIND handle=%08x fd=%d port=%u errno=%d -> status=%08x\n",
+                       handle, fd, (unsigned)((data[6] << 8) | data[7]), errno, status );
+        return status;
+    }
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!horizon_server_find_sock_locked( handle, &object )) object->sock_bound = 1;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
+    if (getsockname( fd, (struct sockaddr *)&bound, &bound_len ) == -1) bound = sa;
+    else bound.sin_addr = sa.sin_addr;
+    /* A buffer too small for the address is not an error; Windows binds anyway. */
+    if (out_max >= 16) *out_size = horizon_ws_sockaddr_from_unix( &bound, out, out_max );
+    horizon_trace( "[server] AFD_BIND handle=%08x fd=%d port=%u -> bound port=%u\n", handle, fd,
+                   (unsigned)((data[6] << 8) | data[7]),
+                   (unsigned)((((const unsigned char *)&bound.sin_port)[0] << 8) |
+                              ((const unsigned char *)&bound.sin_port)[1]) );
+    return HORIZON_STATUS_SUCCESS;
+}
+
+/* The socket options set before a bind. Each carries its value alone, except
+ * SO_LINGER, whose Windows LINGER is two 16-bit fields where BSD has two ints. */
+static unsigned int horizon_sock_ioctl_setsockopt( unsigned int code, unsigned int handle,
+                                                   const unsigned char *data, unsigned int data_size )
+{
+    int fd, level = SOL_SOCKET, option, value = 0;
+    socklen_t optlen = sizeof(value);
+    struct linger linger_value;
+    const void *optval = &value;
+    unsigned int status;
+
+    switch (code)
+    {
+    case HORIZON_IOCTL_AFD_WINE_SET_SO_BROADCAST: option = SO_BROADCAST; break;
+    case HORIZON_IOCTL_AFD_WINE_SET_SO_RCVBUF:    option = SO_RCVBUF; break;
+    case HORIZON_IOCTL_AFD_WINE_SET_SO_SNDBUF:    option = SO_SNDBUF; break;
+    case HORIZON_IOCTL_AFD_WINE_SET_IP_HDRINCL:   level = IPPROTO_IP; option = IP_HDRINCL; break;
+    default:                                      option = SO_LINGER; break;
+    }
+
+    if (option == SO_LINGER)
+    {
+        unsigned short onoff, seconds;
+
+        if (data_size < 4) return HORIZON_STATUS_INVALID_PARAMETER;
+        memcpy( &onoff, data, sizeof(onoff) );
+        memcpy( &seconds, data + 2, sizeof(seconds) );
+        memset( &linger_value, 0, sizeof(linger_value) );
+        linger_value.l_onoff = onoff;
+        linger_value.l_linger = seconds;
+        optval = &linger_value;
+        optlen = sizeof(linger_value);
+    }
+    else
+    {
+        if (data_size < sizeof(value)) return HORIZON_STATUS_INVALID_PARAMETER;
+        memcpy( &value, data, sizeof(value) );
+    }
+
+    if ((status = horizon_server_get_sock_fd( handle, &fd, NULL ))) return status;
+    if (setsockopt( fd, level, option, optval, optlen ) == -1)
+        status = horizon_sock_errno_status( errno );
+    else
+        status = HORIZON_STATUS_SUCCESS;
+    horizon_trace( "[server] setsockopt handle=%08x fd=%d level=%d option=%d value=%d -> status=%08x\n",
+                   handle, fd, level, option, value, status );
+    return status;
+}
+
 static int horizon_server_handle_ioctl( struct horizon_server_connection *connection,
                                         const unsigned char *message,
                                         const unsigned char *data, unsigned int data_size )
@@ -9978,6 +10258,18 @@ static int horizon_server_handle_ioctl( struct horizon_server_connection *connec
 
     case HORIZON_IOCTL_AFD_WINE_CONNECT:
         status = horizon_sock_ioctl_connect( handle, data, data_size );
+        break;
+
+    case HORIZON_IOCTL_AFD_BIND:
+        status = horizon_sock_ioctl_bind( handle, data, data_size, out, out_max, &out_size );
+        break;
+
+    case HORIZON_IOCTL_AFD_WINE_SET_SO_BROADCAST:
+    case HORIZON_IOCTL_AFD_WINE_SET_SO_LINGER:
+    case HORIZON_IOCTL_AFD_WINE_SET_SO_RCVBUF:
+    case HORIZON_IOCTL_AFD_WINE_SET_SO_SNDBUF:
+    case HORIZON_IOCTL_AFD_WINE_SET_IP_HDRINCL:
+        status = horizon_sock_ioctl_setsockopt( request->code, handle, data, data_size );
         break;
 
     case HORIZON_IOCTL_AFD_POLL:
@@ -10170,7 +10462,34 @@ void horizon_trace( const char *fmt, ... )
     __builtin_va_list args;
     FILE *f;
 
-    /* Each line reopens the file on the SD card. */
+    /* Mapping failures must survive quiet runs. Sample repeated failures so
+     * an allocator retry loop cannot flood the SD card or hide the last error. */
+    if (!strncmp( fmt, "[HMAP]", 6 ) && strstr( fmt, "failed" ))
+    {
+        /* Per call site, so one loud failure cannot sample out the first of
+         * another kind: every literal format string has its own address. */
+        static struct { const char *fmt; unsigned int count; } sites[24];
+        static unsigned int used;
+        unsigned int i, count = 0;
+
+        for (i = 0; i < used && i < ARRAY_SIZE(sites); i++)
+            if (sites[i].fmt == fmt) break;
+        if (i == used && used < ARRAY_SIZE(sites))
+        {
+            sites[i].fmt = fmt;
+            __atomic_store_n( &used, used + 1, __ATOMIC_RELAXED );
+        }
+        count = i < ARRAY_SIZE(sites) ? __atomic_add_fetch( &sites[i].count, 1, __ATOMIC_RELAXED ) : 1;
+        if (count <= 16 || !(count & (count - 1)))
+        {
+            char message[384];
+            __builtin_va_start( args, fmt );
+            vsnprintf( message, sizeof(message), fmt, args );
+            __builtin_va_end( args );
+            wine_nx_runtime_trace( message );
+        }
+    }
+    /* Each verbose line reopens the separate trace file on the SD card. */
     if (!&wine_nx_runtime_verbose || !wine_nx_runtime_verbose) return;
     pthread_mutex_lock( &lock );
     if ((f = fopen( "sdmc:/switch/wine/horizon-trace.log", "a" )))
@@ -12215,6 +12534,54 @@ static BOOL horizon_redirect_user_shared_data( ThreadExceptionDump *ctx )
     for (i = 0; i < 32; i++) ctx->fpu_gprs[i].v = regs.v[i];
     return TRUE;
 }
+
+/*
+ * Horizon takes user access away from whole pages while it is using them.
+ *
+ * KPageTableBase::SetupForIpcClient reprotects the pages a read-write IPC
+ * buffer fully covers to KernelReadWrite|NotMapped for the length of the call,
+ * and svcSetMemoryAttribute -- which libnx uses for every non-cacheable GPU
+ * buffer, in nvMapCreate and nvMapClose -- goes through ChangePermissions with
+ * a refresh, which first applies an unmapped template, in Mesosphere's words
+ * "to cause all entries to page fault if accessed", forces a reschedule, then
+ * maps the pages back. A thread that touches such a page in that window takes
+ * a translation fault although the memory is ordinary heap, and by the time a
+ * handler asks, svcQueryMemory says it is plain accessible heap again.
+ *
+ * Resume the instruction once the kernel agrees the page is back. An address
+ * that keeps faulting is not a window closing, and still parks the thread.
+ */
+static BOOL horizon_transient_page_fault( ThreadExceptionDump *ctx )
+{
+    static u64 last_address;
+    static unsigned int repeats;
+    unsigned int exception_class = ctx->esr >> 26, fault_status = ctx->esr & 0x3f, i;
+    u32 needed = (ctx->esr & 0x40) ? (Perm_R | Perm_W) : Perm_R;
+    MemoryInfo info;
+    u32 page_info;
+
+    if (exception_class != 0x24 && exception_class != 0x25) return FALSE;
+    if ((fault_status & ~3u) != 0x04) return FALSE;  /* translation fault, any level */
+    if (ctx->esr & (1u << 10)) return FALSE;         /* FnV: FAR means nothing */
+
+    if (__atomic_exchange_n( &last_address, ctx->far.x, __ATOMIC_RELAXED ) == ctx->far.x)
+    {
+        if (__atomic_add_fetch( &repeats, 1, __ATOMIC_RELAXED ) > 256) return FALSE;
+    }
+    else __atomic_store_n( &repeats, 0, __ATOMIC_RELAXED );
+
+    for (i = 0; i < 16; i++)
+    {
+        if (R_FAILED( svcQueryMemory( &info, &page_info, ctx->far.x ) )) return FALSE;
+        /* Only the heap: guest memory faults are Wine's to handle. */
+        if (info.type != MemType_Heap) return FALSE;
+        if ((info.perm & needed) == needed &&
+            !(info.attr & (MemAttr_IsIpcMapped | MemAttr_IsDeviceMapped)))
+            return TRUE;
+        svcSleepThread( 100000ULL );  /* 0.1 ms; the calls that do this are short */
+    }
+    return FALSE;
+}
 #endif
 
 void __libnx_exception_handler( ThreadExceptionDump *ctx )
@@ -12222,7 +12589,7 @@ void __libnx_exception_handler( ThreadExceptionDump *ctx )
     EXCEPTION_RECORD rec = { 0 };
     DWORD64 esr = ctx->esr;
     NTSTATUS status;
-    char buf[256];
+    char buf[512];
 
 #if defined(__aarch64__)
     if (horizon_redirect_user_shared_data( ctx )) horizon_resume_exception( ctx );
@@ -12239,6 +12606,22 @@ void __libnx_exception_handler( ThreadExceptionDump *ctx )
             ctx->pc.x = pc;
             horizon_restore_exception_context_x9( ctx );
         }
+    }
+    if (horizon_transient_page_fault( ctx ))
+    {
+        static unsigned int resumed;
+        unsigned int count = __atomic_add_fetch( &resumed, 1, __ATOMIC_RELAXED );
+
+        /* Sampled: a busy IPC or GPU path can open the window often. */
+        if (count <= 8 || !(count & (count - 1)))
+        {
+            snprintf( buf, sizeof(buf),
+                      "[EXC] transient fault at 0x%llx pc=0x%llx kind=%s; the page is back, resumed (%u)",
+                      (unsigned long long)ctx->far.x, (unsigned long long)ctx->pc.x,
+                      (ctx->esr & 0x40) ? "write" : "read", count );
+            wine_nx_runtime_trace( buf );
+        }
+        horizon_resume_exception( ctx );
     }
 #endif
 
@@ -12257,6 +12640,29 @@ void __libnx_exception_handler( ThreadExceptionDump *ctx )
               (unsigned long long)ctx->sp.x, (unsigned long long)ctx->lr.x,
               rec.ExceptionInformation[0] == EXCEPTION_EXECUTE_FAULT ? "exec" :
               rec.ExceptionInformation[0] == EXCEPTION_WRITE_FAULT   ? "write" : "read" );
+    /* The fault status tells an unmapped page (translation, 0b0001xx) from one
+     * the process may not touch that way (permission, 0b0011xx). */
+    {
+        size_t len = strlen( buf );
+        snprintf( buf + len, sizeof(buf) - len, " dfsc=%#x", (unsigned)(esr & 0x3f) );
+    }
+    /* Put the kernel state in the first fault line: a second allocation or
+     * logging operation can itself fault when native heap pages are locked. */
+    {
+        MemoryInfo info;
+        u32 page_info;
+        if (R_SUCCEEDED( svcQueryMemory( &info, &page_info, ctx->far.x ) ))
+        {
+            size_t len = strlen( buf );
+            snprintf( buf + len, sizeof(buf) - len,
+                      " region=%#llx/%#llx type=%#x attr=%#x perm=%#x ipc=%u device=%u",
+                      (unsigned long long)info.addr, (unsigned long long)info.size,
+                      info.type, info.attr, info.perm, info.ipc_refcount, info.device_refcount );
+        }
+    }
+    /* Ordinary heap in that report means little on its own: the kernel unmaps
+     * the source of an alias without recording anything a later query shows. */
+    alias_source_report( (const void *)(ULONG_PTR)ctx->far.x, buf, sizeof(buf) );
     wine_nx_runtime_trace( buf );
     snprintf( buf, sizeof(buf),
               "[EXC] x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx x18=0x%llx",
@@ -12266,6 +12672,21 @@ void __libnx_exception_handler( ThreadExceptionDump *ctx )
     wine_nx_runtime_trace( buf );
 
     status = virtual_handle_fault( &rec, (void *)ctx->sp.x );
+#if defined(__aarch64__)
+    /* A fault inside a Wine __TRY block returns to its handler, as
+     * handle_syscall_fault does on Unix. virtual_check_buffer_for_write and
+     * its kind probe memory on purpose and must get FALSE, not a dead thread.
+     * Early init and the runtime's own threads have no TEB to ask. */
+    if (status && NtCurrentTeb() && ntdll_get_thread_data()->jmp_buf)
+    {
+        ctx->cpu_gprs[0].x = (ULONG_PTR)ntdll_get_thread_data()->jmp_buf;
+        ctx->cpu_gprs[1].x = 1;
+        ctx->pc.x = (ULONG_PTR)longjmp;
+        ntdll_get_thread_data()->jmp_buf = NULL;
+        wine_nx_runtime_trace( "[EXC] returning to the __TRY handler that probed it" );
+        horizon_resume_exception( ctx );
+    }
+#endif
     if (status)
     {
         unsigned int exception_class = esr >> 26;
@@ -12586,13 +13007,27 @@ static void remove_reservation( VirtmemReservation *reservation );
 
 static void free_backing( struct horizon_backing *backing, BOOL write_back )
 {
+    BOOL aliased;
+
     if (!backing) return;
 
-    if (write_back && backing->write_back && backing->fd != -1)
+    /* Pages the kernel still holds as the source of an alias have no mapping
+     * of their own: reading them back would fault, and handing them to another
+     * allocation would leave that allocation faulting on a write until the
+     * alias goes. Leak them instead; the trace says an unmap was missed. */
+    aliased = alias_source_range_live( backing->heap_addr, backing->size );
+    if (aliased)
+    {
+        horizon_trace( "[HMAP] backing %p size=0x%lx freed while still an alias source",
+                       backing->heap_addr, (unsigned long)backing->size );
+        WARN( "freeing Horizon backing %p while the kernel still aliases it.\n", backing->heap_addr );
+    }
+
+    if (!aliased && write_back && backing->write_back && backing->fd != -1)
         write_fd_at( backing->fd, backing->heap_addr, backing->size, backing->file_offset );
     if (backing->code_reservation) remove_reservation( backing->code_reservation );
     if (backing->fd != -1) close( backing->fd );
-    if (!horizon_pages_free( &backing_pages, backing->heap_addr, backing->size ))
+    if (!aliased && !horizon_pages_free( &backing_pages, backing->heap_addr, backing->size ))
         free( backing->heap_addr );
     horizon_object_free( &backing_pool, backing );
 }
@@ -12720,10 +13155,12 @@ static int map_code_memory_range( void *addr, void *source, size_t size, int pro
         errno = map_errno;
         return -1;
     }
+    note_alias_source( source, addr, size, TRUE );
 
     if (set_code_memory_perm( addr, source, size, prot, FALSE ))
     {
         svcUnmapProcessCodeMemory( envGetOwnProcessHandle(), (u64)addr, (u64)source, size );
+        note_alias_source( source, addr, size, FALSE );
         return -1;
     }
 
@@ -12743,6 +13180,7 @@ static int unmap_code_memory_range( void *addr, void *source, size_t size )
         errno = EINVAL;
         return -1;
     }
+    note_alias_source( source, addr, size, FALSE );
 
     return 0;
 }
@@ -12761,12 +13199,7 @@ static struct horizon_backing *create_backing_locked( size_t size, int prot, int
 
     backing->fd = -1;
     backing->size = size;
-    backing->heap_addr = horizon_pages_alloc( &backing_pages, size );
-    if (!backing->heap_addr)
-    {
-        backing->heap_addr = memalign( 0x1000, size );
-        backing_direct_allocs++;
-    }
+    backing->heap_addr = horizon_pages_alloc_any( &backing_pages, size );
     if (!backing->heap_addr)
     {
         horizon_object_free( &backing_pool, backing );
@@ -12866,12 +13299,18 @@ static int map_backing_at( void *addr, size_t size, int prot, int fd, off_t offs
     return ret;
 }
 
-static int split_reservation_mapping( struct horizon_mapping *mapping, char *start, size_t size )
+/* Replaces the reservation over [start, start + size) with a mapping. A range
+ * asked for with PROT_NONE is left unmapped, a hole, unless map_range says to
+ * map it inaccessible: memory that is mapped can be committed later with a
+ * permission change, which costs no further kernel mapping. */
+static int replace_reservation_mapping( struct horizon_mapping *mapping, char *start, size_t size,
+                                       int prot, BOOL map_range )
 {
     char *mapping_start = mapping->addr;
     char *mapping_end = mapping_start + mapping->size;
     char *end = start + size;
     struct horizon_mapping *left = NULL, *right = NULL;
+    int saved_errno;
 
     /* Prepare both replacements while the old reservation still excludes
      * native allocations. Dropping it first briefly exposed the entire
@@ -12901,6 +13340,13 @@ static int split_reservation_mapping( struct horizon_mapping *mapping, char *sta
     }
 
     list_remove_mapping( mapping );
+    if (map_range && map_backing_at( start, size, prot, -1, 0, MAP_PRIVATE | MAP_ANON, EINVAL ))
+    {
+        /* Keep the original reservation and tree entry on a failed commit.
+         * Releasing them here turns a retry into an unrecoverable hole. */
+        list_add_mapping( mapping );
+        goto failed;
+    }
     if (left) list_add_mapping( left );
     if (right) list_add_mapping( right );
     remove_reservation( mapping->reservation );
@@ -12908,12 +13354,29 @@ static int split_reservation_mapping( struct horizon_mapping *mapping, char *sta
     return 0;
 
 failed:
+    saved_errno = errno;
+    if (right)
+    {
+        remove_reservation( right->reservation );
+        horizon_object_free( &mapping_pool, right );
+    }
     if (left)
     {
         remove_reservation( left->reservation );
         horizon_object_free( &mapping_pool, left );
     }
+    errno = saved_errno;
     return -1;
+}
+
+static int change_reservation_mapping( struct horizon_mapping *mapping, char *start, size_t size, int prot )
+{
+    return replace_reservation_mapping( mapping, start, size, prot, prot != PROT_NONE );
+}
+
+static int split_reservation_mapping( struct horizon_mapping *mapping, char *start, size_t size )
+{
+    return change_reservation_mapping( mapping, start, size, PROT_NONE );
 }
 
 static int split_backing_mapping( struct horizon_mapping *mapping, char *start, size_t size )
@@ -13040,6 +13503,9 @@ static int protect_code_mapping( struct horizon_mapping *mapping, int prot )
     {
         int saved_errno;
 
+        /* Not a permission change: writing to a range turns it into
+         * AliasCodeData, which svcSetProcessMemoryPermission refuses
+         * (InvalidMemoryState), so the range has to be mapped again. */
         if (unmap_code_memory_range( mapping->addr, source, mapping->size )) return -1;
         if (!map_code_memory_range( mapping->addr, source, mapping->size, prot, EINVAL ))
         {
@@ -13390,21 +13856,37 @@ static int protect_range_locked( void *addr, size_t size, int prot )
         {
             if (prot != PROT_NONE)
             {
-                horizon_trace( "[HMAP] commit reservation=%p/0x%lx range=%p/0x%lx prot=0x%x",
+                /* Commit a whole chunk of the reservation at once. Each
+                 * mapped range costs kernel memory blocks, and Horizon has
+                 * 20000 for every application together
+                 * (ApplicationMemoryBlockSlabHeapSize); Fallout New Vegas
+                 * commits its heap a page at a time, so a mapping a page ran
+                 * svcMapProcessCodeMemory out of them (ResultOutOfResource),
+                 * after which every commit failed and the program retried for
+                 * ever on one core. The chunk is mapped inaccessible, so pages
+                 * the program has not committed still fault, and committing
+                 * any of them -- now or later -- is a permission change on
+                 * memory that is already mapped. */
+                char *chunk_start = (char *)((uintptr_t)start & ~(uintptr_t)(HORIZON_COMMIT_CHUNK - 1));
+                char *chunk_end = (char *)(((uintptr_t)protect_end + HORIZON_COMMIT_CHUNK - 1) &
+                                           ~(uintptr_t)(HORIZON_COMMIT_CHUNK - 1));
+
+                if (chunk_start < mapping_start) chunk_start = mapping_start;
+                if (chunk_end > mapping_end || chunk_end < protect_end) chunk_end = mapping_end;
+
+                horizon_trace( "[HMAP] commit reservation=%p/0x%lx range=%p/0x%lx chunk=%p/0x%lx prot=0x%x",
                                mapping->addr, (unsigned long)mapping->size, start,
-                               (unsigned long)protect_size, prot );
-                if (split_reservation_mapping( mapping, start, protect_size ))
+                               (unsigned long)protect_size, chunk_start,
+                               (unsigned long)(chunk_end - chunk_start), prot );
+                if (replace_reservation_mapping( mapping, chunk_start, chunk_end - chunk_start,
+                                                 PROT_NONE, TRUE ))
                 {
-                    horizon_trace( "[HMAP] split_reservation failed range=%p/0x%lx errno=%d",
-                                   start, (unsigned long)protect_size, errno );
-                    return -1;
-                }
-                if (map_backing_at( start, protect_size, prot, -1, 0, MAP_PRIVATE | MAP_ANON, EINVAL ))
-                {
-                    horizon_trace( "[HMAP] commit map_backing failed range=%p/0x%lx prot=0x%x errno=%d",
+                    horizon_trace( "[HMAP] commit reservation failed range=%p/0x%lx prot=%#x errno=%d",
                                    start, (unsigned long)protect_size, prot, errno );
                     return -1;
                 }
+                /* The chunk is mapped now, so this takes the branch below. */
+                if (protect_range_locked( start, protect_size, prot )) return -1;
             }
         }
         else
@@ -13437,6 +13919,18 @@ static int add_reservation_mapping_locked( void *start, size_t size )
 {
     VirtmemReservation *reservation;
     struct horizon_mapping *mapping;
+
+    /* A free kernel block can still lie below the permitted mapping region.
+     * Reject it at reserve time, before the game builds a heap there. */
+    void *region_start, *region_limit;
+    horizon_get_address_space_limits( &region_start, &region_limit );
+    if ((uintptr_t)start < (uintptr_t)region_start ||
+        (uintptr_t)start >= (uintptr_t)region_limit ||
+        size > (uintptr_t)region_limit - (uintptr_t)start)
+    {
+        errno = EINVAL;
+        return -1;
+    }
 
     /* see horizon_kernel_regions: this would claim pages the kernel gave away */
     if (horizon_overlaps_kernel_region( start, size ))

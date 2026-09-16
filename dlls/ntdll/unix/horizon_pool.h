@@ -38,7 +38,13 @@ static inline void horizon_object_free( struct horizon_object_pool *pool, void *
 
 #define HORIZON_POOL_PAGE 4096
 #define HORIZON_POOL_PAGES 512
-#define HORIZON_POOL_ARENAS 32  /* at most 64 MiB retained, allocated on demand */
+#define HORIZON_POOL_ARENAS 512  /* at most 1 GiB retained, allocated on demand */
+/* One arena is one kernel memory block, and is aligned like one: the pages an
+ * alias takes as its source lose their mapping until the alias goes away, and
+ * the kernel splits the block they sit in to do it, so a block must hold
+ * nothing but arena pages. Sharing one with the general heap leaves another
+ * thread's allocation unmapped under it. */
+#define HORIZON_POOL_ARENA ((size_t)HORIZON_POOL_PAGES * HORIZON_POOL_PAGE)
 struct horizon_page_arena
 {
     unsigned char *memory;
@@ -48,11 +54,12 @@ struct horizon_page_arena
 struct horizon_page_pool
 {
     struct horizon_page_arena arenas[HORIZON_POOL_ARENAS];
-    unsigned long long hits, misses;
+    unsigned long long hits, misses, blocks, shared;
 };
 
-/* Large requests and a full pool fall back to the ordinary allocator. Each
- * arena is independent of the general heap's small allocation metadata. */
+/* Arena pages, or NULL for a request larger than an arena or a full pool,
+ * which horizon_pages_alloc_any serves instead. Each arena is independent of
+ * the general heap's small allocation metadata. */
 static inline void *horizon_pages_alloc( struct horizon_page_pool *pool, size_t size )
 {
     size_t pages = size / HORIZON_POOL_PAGE;
@@ -63,7 +70,7 @@ static inline void *horizon_pages_alloc( struct horizon_page_pool *pool, size_t 
         struct horizon_page_arena *arena = &pool->arenas[i];
         if (!arena->memory)
         {
-            arena->memory = aligned_alloc( HORIZON_POOL_PAGE, HORIZON_POOL_PAGES * HORIZON_POOL_PAGE );
+            arena->memory = aligned_alloc( HORIZON_POOL_ARENA, HORIZON_POOL_ARENA );
             if (!arena->memory) return NULL;
             arena->free_pages = HORIZON_POOL_PAGES;
             pool->misses++;
@@ -85,6 +92,24 @@ static inline void *horizon_pages_alloc( struct horizon_page_pool *pool, size_t 
     return NULL;
 }
 
+/* Any size, for memory that may become the source of an alias: arena pages
+ * when they fit, otherwise whole blocks of its own. Only a failure to get
+ * those falls back to pages the general heap shares with everything else,
+ * counted apart because an alias then unmaps whatever shares their block. */
+static inline void *horizon_pages_alloc_any( struct horizon_page_pool *pool, size_t size )
+{
+    void *ptr;
+
+    if (!size || size % HORIZON_POOL_PAGE) return NULL;
+    if ((ptr = horizon_pages_alloc( pool, size ))) return ptr;
+
+    ptr = aligned_alloc( HORIZON_POOL_ARENA,
+                         ((size + HORIZON_POOL_ARENA - 1) / HORIZON_POOL_ARENA) * HORIZON_POOL_ARENA );
+    if (ptr) pool->blocks++;
+    else if ((ptr = aligned_alloc( HORIZON_POOL_PAGE, size ))) pool->shared++;
+    return ptr;
+}
+
 /* Returns zero for a direct allocation, which the caller must free normally. */
 static inline int horizon_pages_free( struct horizon_page_pool *pool, void *ptr, size_t size )
 {
@@ -93,7 +118,7 @@ static inline int horizon_pages_free( struct horizon_page_pool *pool, void *ptr,
     {
         struct horizon_page_arena *arena = &pool->arenas[i];
         uintptr_t offset = (uintptr_t)ptr - (uintptr_t)arena->memory;
-        if (arena->memory && offset < HORIZON_POOL_PAGES * HORIZON_POOL_PAGE)
+        if (arena->memory && offset < HORIZON_POOL_ARENA)
         {
             size_t pages = size / HORIZON_POOL_PAGE;
             memset( arena->used + offset / HORIZON_POOL_PAGE, 0, pages );
