@@ -188,17 +188,22 @@ int main(void)
         ptr = alloc_free_area_in_range(&a, (char *)0x10000, (char *)0x40000000);
         assert(ptr && ptr != MAP_FAILED && !fixed_failures);
     }
-    /* Most Wanted reserves 172 MiB in one piece. Reserving the stack
-     * region's upper half instead of a window left the guest 511 MB, and
-     * once libnx had mapped anything low the request had nowhere to go. */
+    /* Most Wanted reserves 172 MiB in one piece, with its own mappings
+     * filling the space below the window and the kernel heap taking 2 GB.
+     * Everything else a 32-bit address space holds is the guest's, so the
+     * range above the stack region is protected too: left free, libnx
+     * scattered stacks and code memory through it and the request failed. */
     cleanup();
-    native[native_count++] = (struct native_map){0x400000, 0x1f000000};
+    native[native_count++] = (struct native_map){0x400000, 0x28000000};
+    native[native_count++] = (struct native_map){0x78200000, 0xf8200000};
     horizon_reserve_guest_address_space();
+    assert(mmap_is_in_reserved_area((void *)0x40000000, 0xafd0000) == 1);
+    assert(!mmap_is_in_reserved_area((void *)(stack_hi - HORIZON_NATIVE_STACKS), 0x1000));
     {
         struct alloc_area big = {.size = 0xafd0000, .align_mask = 0xffff};
-        void *p = alloc_free_area_in_range(&big, (char *)0x10000, (char *)0x40000000);
-        assert(p && p != MAP_FAILED && (uintptr_t)p >= 0x1f000000);
-        assert((uintptr_t)p + big.size <= stack_hi - HORIZON_NATIVE_STACKS);
+        void *p = alloc_free_area_in_range(&big, (char *)0x10000, (char *)0x100000000ull);
+        assert(p && p != MAP_FAILED);
+        assert((uintptr_t)p >= stack_hi && (uintptr_t)p + big.size <= 0x78200000);
     }
     cleanup();
     stack_query_ok = 0;

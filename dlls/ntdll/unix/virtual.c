@@ -4321,9 +4321,10 @@ static void *alloc_virtual_heap( SIZE_T size )
 }
 
 #ifdef __SWITCH__
-/* Address space kept free at the top of Horizon's stack region for native
- * thread stacks, which can be placed nowhere else. */
-#define HORIZON_NATIVE_STACKS ((ULONG_PTR)256 * 1024 * 1024)
+/* Address space kept free at the top of Horizon's stack region for the native
+ * mappings that cannot go anywhere else: thread stacks, which virtmemFindStack
+ * only places there, and the dynarec's code memory. */
+#define HORIZON_NATIVE_STACKS ((ULONG_PTR)384 * 1024 * 1024)
 
 /* The small Horizon map is shared with libnx's randomly placed stacks, JIT
  * aliases and section anchors. Protect the low guest range before those are
@@ -4336,7 +4337,7 @@ static void horizon_reserve_guest_address_space(void)
     struct reserved_area *area;
     size_t total = 0, largest = 0;
     void *stack_start, *stack_end;
-    char *reserve_end = (char *)0x40000000;
+    char *window_start;
     ULONG_PTR stack_room;
     char msg[192];
 
@@ -4346,28 +4347,33 @@ static void horizon_reserve_guest_address_space(void)
         wine_nx_runtime_trace( "[VA] early guest reservations disabled: native stack region unavailable" );
         return;
     }
-    /* Native thread stacks are the one thing that must live in this region:
-     * virtmemFindStack only searches it, while everything else libnx places
-     * goes through the far larger ASLR region. Leave it a window at the top.
-     * Build 103 reserved the whole region and no native worker thread could
-     * start; leaving half of it instead capped the guest at 511 MB, and Need
-     * for Speed Most Wanted, which reserves 172 MB in one piece, ran out of
-     * address space. virtmemFindStack picks at random with 0x200 attempts, so
-     * a window many times the 96 threads Horizon allows, at a megabyte of
-     * kernel stack each, is enough; a region too small for one keeps half. */
+    /* Native thread stacks can only be placed in this region, since
+     * virtmemFindStack searches it alone, so leave a window at its top for
+     * them and for the code memory the dynarec maps. Build 103 reserved the
+     * whole region and no native worker thread could start. Both are placed
+     * at random with 0x200 attempts, so the window does not have to be empty:
+     * 96 threads, all Horizon allows, take a megabyte of kernel stack each,
+     * and the code arenas are bounded. A region too small keeps half. */
     stack_room = min( HORIZON_NATIVE_STACKS, ((ULONG_PTR)stack_end - (ULONG_PTR)stack_start) / 2 );
-    reserve_end = min( reserve_end, (char *)ROUND_ADDR( (ULONG_PTR)stack_end - stack_room, granularity_mask ) );
-    snprintf( msg, sizeof(msg), "[VA] native stack region %p-%p; guest reservation ceiling %p",
-              stack_start, stack_end, reserve_end );
+    window_start = (char *)ROUND_ADDR( (ULONG_PTR)stack_end - stack_room, granularity_mask );
+    snprintf( msg, sizeof(msg), "[VA] native stack region %p-%p; window for native mappings %p-%p",
+              stack_start, stack_end, window_start, stack_end );
     wine_nx_runtime_trace( msg );
     for (range = free_ranges; range != free_ranges_end; range++)
     {
         char *start = max( (char *)range->base, (char *)address_space_start );
-        char *end = min( (char *)range->end, reserve_end );
+        char *end = min( (char *)range->end, (char *)limit_4g );
 
         /* free_ranges excludes the kernel heap/alias regions and Wine's
-         * system views. reserve_area also preserves existing native maps. */
-        if (start < end) reserve_area( start, end );
+         * system views. reserve_area also preserves existing native maps.
+         * Everything a 32-bit program can address is the guest's except that
+         * window: on this address space there is no memory above 4 GB for
+         * libnx to place stacks and code memory in, and left free the rest of
+         * it is chosen at random, which cut what Need for Speed Most Wanted
+         * had for its 172 MB reservation down to 150 MB. */
+        if (start >= end) continue;
+        if (start < window_start) reserve_area( start, min( end, window_start ) );
+        if (end > (char *)stack_end) reserve_area( max( start, (char *)stack_end ), end );
     }
     LIST_FOR_EACH_ENTRY( area, &reserved_areas, struct reserved_area, entry )
     {
