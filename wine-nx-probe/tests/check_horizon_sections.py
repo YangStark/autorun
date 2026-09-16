@@ -98,13 +98,14 @@ static void virtmemRemoveReservation( VirtmemReservation *reservation )
     free( reservation );
     reservation_count--;
 }
+static size_t code_pool_size;
 static void *virtmemFindCodeMemory( size_t size, size_t align )
 {
     void *addr = code_pool + code_pool_used;
 
     (void)align;
     code_pool_used += (size + HOST_PAGE - 1) / HOST_PAGE * HOST_PAGE + HOST_PAGE;
-    assert( code_pool_used <= 256 * HOST_PAGE );
+    assert( code_pool_used <= code_pool_size );
     return addr;
 }
 
@@ -131,8 +132,10 @@ static Result svcUnmapProcessMemory( void *dst, Handle process, u64 src, u64 siz
     return host_unalias( dst, (void *)(uintptr_t)src, size ) ? 1 : 0;
 }
 '''
-# The commit granularity horizon.c reserves with, from the real header: the
-# host stand-in gets PROT_* and MAP_* from <sys/mman.h> instead.
+# The anchor region's size, and the commit granularity, from the real source:
+# the host stand-in gets PROT_* and MAP_* from <sys/mman.h> instead.
+fixture += re.search(r'^#define HORIZON_ANCHOR_REGION .*$', s, re.M)[0] + '\n'
+fixture += block(r'^static char \*anchor_region, \*anchor_region_end;')
 fixture += '\n'.join(re.findall(r'^#define HORIZON_COMMIT_\w+ .*$',
                                 (root / 'dlls/ntdll/unix/horizon_mman.h').read_text(), re.M)) + '\n'
 fixture += block(r'^enum horizon_section_state\n\{.*?^\};')
@@ -157,7 +160,7 @@ for name in ['static void list_add_mapping(', 'static void list_remove_mapping('
              'static struct horizon_mapping *find_overlap_mapping(', 'static struct horizon_mapping *alloc_mapping(',
              'static VirtmemReservation *reserve_fixed_range_locked(', 'static VirtmemReservation *reserve_fixed_range(',
              'static void remove_reservation_locked(', 'static void remove_reservation(',
-             'static int replace_reservation_mapping(', 'static int change_reservation_mapping(', 'static int split_reservation_mapping(', 'static size_t page_align_size(',
+             'static void *find_anchor_address_locked(', 'static int replace_reservation_mapping(', 'static int change_reservation_mapping(', 'static int split_reservation_mapping(', 'static size_t page_align_size(',
              'static void section_failure(', 'static void *horizon_section_anchor(', 'static int horizon_section_unanchor(',
              'static int horizon_section_alias(', 'static int horizon_section_unalias(']:
     fixture += function(name)
@@ -181,14 +184,24 @@ static void check_tree(void)
     {
         struct horizon_mapping *mapping = RB_ENTRY_VALUE( entry, struct horizon_mapping, entry );
 
-        assert( mapping->reservation && mapping->reservation->addr == mapping->addr &&
-                mapping->reservation->size == mapping->size );
+        if (mapping->reservation)
+            assert( mapping->reservation->addr == mapping->addr &&
+                    mapping->reservation->size == mapping->size );
+        else
+        {
+            /* An anchor packed into the anchor region is covered by the one
+             * reservation the region itself holds. */
+            assert( mapping->section_state == SECTION_ANCHOR );
+            assert( (char *)mapping->addr >= anchor_region &&
+                    (char *)mapping->addr + mapping->size <= anchor_region_end );
+            count--;
+        }
         assert( !mapping->section == (mapping->section_state == SECTION_NONE || mapping->section_state == SECTION_ANCHOR) );
         if (prev) assert( (char *)prev->addr + prev->size <= (char *)mapping->addr );
         prev = mapping;
         count++;
     }
-    assert( count == reservation_count );
+    assert( count + !!anchor_region == reservation_count );
 }
 
 static struct horizon_mapping *entry_at( void *addr )
@@ -223,7 +236,8 @@ int main(void)
     struct horizon_mapping *anchor;
     int before_reservations, before_anchors;
 
-    code_pool = host_reserve( 256 * P );
+    code_pool_size = HORIZON_ANCHOR_REGION + 256 * P;
+    code_pool = host_reserve( code_pool_size );
     views = host_reserve( 64 * P );
     assert( (file = horizon_memfile_alloc( 8 * P, 0, &horizon_section_ops )) );
 
@@ -234,6 +248,24 @@ int main(void)
     check_tree();
     assert( (b = horizon_mmap_section( NULL, 4 * P, RW, MAP_SHARED, file, 3 * P )) != MAP_FAILED );
     check_tree();
+    /* The anchors are packed into the region end to end, not spread through
+     * the address space the runtime keeps for its own mappings. */
+    {
+        struct rb_entry *e;
+        char *next = anchor_region;
+        int anchors = 0;
+
+        for (e = rb_head( mappings.root ); e; e = rb_next( e ))
+        {
+            struct horizon_mapping *m = RB_ENTRY_VALUE( e, struct horizon_mapping, entry );
+
+            if (m->section_state != SECTION_ANCHOR) continue;
+            assert( (char *)m->addr == next );
+            next = (char *)m->addr + m->size;
+            anchors++;
+        }
+        assert( anchors && next <= anchor_region_end );
+    }
     b[0] = 0x11;
     assert( a[2 * P] == 0x11 );
     a[3 * P + 1] = 0x22;
@@ -304,7 +336,8 @@ int main(void)
 
     /* a goes across its three entries: the last reference frees the memory. */
     assert( !unmap_range_locked( a, 4 * P ) );
-    assert( !mappings.root && !reservation_count && !host_live_anchors() && !host_alias_count );
+    assert( !mappings.root && reservation_count == !!anchor_region );
+    assert( !host_live_anchors() && !host_alias_count );
     assert( host_pages_live == 0 );
 
     /* A view mapped PROT_NONE has no pages until it is made accessible. */
@@ -317,7 +350,8 @@ int main(void)
     check_tree();
     assert( !unmap_range_locked( c, 2 * P ) );
     horizon_memfile_unref( reserved );
-    assert( !mappings.root && !reservation_count && !host_live_anchors() && host_pages_live == 0 );
+    assert( !mappings.root && reservation_count == !!anchor_region );
+    assert( !host_live_anchors() && host_pages_live == 0 );
 
     puts( "Section views in horizon.c: Wine's fixed maps and placed maps, overlapping writes, close before unmap, "
           "PROT_NONE and back, anchors kept from others, kernel refusals and unmapping in pieces passed" );

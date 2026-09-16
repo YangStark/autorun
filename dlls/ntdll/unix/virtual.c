@@ -4323,8 +4323,9 @@ static void *alloc_virtual_heap( SIZE_T size )
 #ifdef __SWITCH__
 /* Address space kept free at the top of Horizon's stack region for the native
  * mappings that cannot go anywhere else: thread stacks, which virtmemFindStack
- * only places there, and the dynarec's code memory. */
-#define HORIZON_NATIVE_STACKS ((ULONG_PTR)384 * 1024 * 1024)
+ * only places there, the dynarec's code memory, and the region section anchors
+ * are packed into. */
+#define HORIZON_NATIVE_STACKS ((ULONG_PTR)512 * 1024 * 1024)
 
 /* The small Horizon map is shared with libnx's randomly placed stacks, JIT
  * aliases and section anchors. Protect the low guest range before those are

@@ -13607,6 +13607,37 @@ static void section_failure( const char *what, void *addr, void *source, size_t 
 
 /* Anchors are in the mapping tree, so nothing is mapped over them, and their
  * addresses stay reserved while the pages are there. */
+/* Anchors go next to each other in one region rather than wherever libnx
+ * places them. Three hundred of them, scattered, fragmented the address space
+ * the runtime keeps for its own mappings until a 5 MB section had nowhere to
+ * go; Need for Speed Most Wanted took the view that failed and died on it.
+ * The region is reserved once, so the anchors inside it need no reservation. */
+#define HORIZON_ANCHOR_REGION ((size_t)128 * 1024 * 1024)
+
+static char *anchor_region, *anchor_region_end;
+
+static void *find_anchor_address_locked( size_t size )
+{
+    char *candidate;
+
+    if (!anchor_region)
+    {
+        void *region = virtmemFindCodeMemory( HORIZON_ANCHOR_REGION, 0x1000 );
+
+        if (!region || !virtmemAddReservation( region, HORIZON_ANCHOR_REGION )) return NULL;
+        anchor_region = region;
+        anchor_region_end = (char *)region + HORIZON_ANCHOR_REGION;
+    }
+    for (candidate = anchor_region; size <= (size_t)(anchor_region_end - candidate); )
+    {
+        struct horizon_mapping *overlap = find_overlap_mapping( candidate, size );
+
+        if (!overlap) return candidate;
+        candidate = (char *)overlap->addr + overlap->size;
+    }
+    return NULL;
+}
+
 static void *horizon_section_anchor( void *source, size_t size, void **token )
 {
     VirtmemReservation *reservation = NULL;
@@ -13614,9 +13645,11 @@ static void *horizon_section_anchor( void *source, size_t size, void **token )
     void *addr;
 
     virtmemLock();
-    if ((addr = virtmemFindCodeMemory( size, 0x1000 ))) reservation = reserve_fixed_range_locked( addr, size );
+    if (!(addr = find_anchor_address_locked( size )) &&
+        (addr = virtmemFindCodeMemory( size, 0x1000 )))
+        reservation = reserve_fixed_range_locked( addr, size );
     virtmemUnlock();
-    if (!reservation)
+    if (!addr)
     {
         section_failure( "anchor address", addr, source, size, ENOMEM );
         errno = ENOMEM;
@@ -13624,7 +13657,7 @@ static void *horizon_section_anchor( void *source, size_t size, void **token )
     }
     if (!(mapping = alloc_mapping( addr, size, NULL, 0, reservation, PROT_READ | PROT_WRITE )))
     {
-        remove_reservation( reservation );
+        if (reservation) remove_reservation( reservation );
         section_failure( "anchor slot", addr, source, size, ENOMEM );
         errno = ENOMEM;
         return NULL;
@@ -13633,7 +13666,7 @@ static void *horizon_section_anchor( void *source, size_t size, void **token )
     {
         const int saved_errno = errno;
 
-        remove_reservation( reservation );
+        if (reservation) remove_reservation( reservation );
         horizon_object_free( &mapping_pool, mapping );
         section_failure( "anchor", addr, source, size, saved_errno );
         errno = saved_errno;
@@ -13657,7 +13690,7 @@ static int horizon_section_unanchor( void *addr, void *source, size_t size, void
         return -1;
     }
     list_remove_mapping( mapping );
-    remove_reservation( mapping->reservation );
+    if (mapping->reservation) remove_reservation( mapping->reservation );
     horizon_object_free( &mapping_pool, mapping );
     section_anchors--;
     section_anchor_bytes -= size;

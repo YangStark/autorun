@@ -156,9 +156,10 @@ int main(void)
      * the top takes more of them, with their guard pages, than the 96 threads
      * Horizon allows; a stack a megabyte, placed two megabytes apart. */
     {
+        uintptr_t window = HORIZON_NATIVE_STACKS < (stack_hi - stack_lo) / 2
+                           ? HORIZON_NATIVE_STACKS : (stack_hi - stack_lo) / 2;
         uintptr_t stacks = 0;
-        for (uintptr_t p = stack_hi - HORIZON_NATIVE_STACKS + 0x10000; p + 0x104000 <= stack_hi;
-             p += 0x200000)
+        for (uintptr_t p = stack_hi - window + 0x10000; p + 0x104000 <= stack_hi; p += 0x200000)
         {
             assert(p - 0x4000 >= stack_lo);
             assert(anon_mmap_tryfixed((void *)(p - 0x4000), 0x108000, PROT_NONE, 0) != MAP_FAILED);
@@ -199,7 +200,7 @@ int main(void)
     native[native_count++] = (struct native_map){0x78200000, 0xf8200000};
     horizon_reserve_guest_address_space();
     assert(mmap_is_in_reserved_area((void *)0x40000000, 0xafd0000) == 1);
-    assert(!mmap_is_in_reserved_area((void *)(stack_hi - HORIZON_NATIVE_STACKS), 0x1000));
+    assert(!mmap_is_in_reserved_area((void *)(stack_hi - (stack_hi - stack_lo) / 2), 0x1000));
     {
         struct alloc_area big = {.size = 0xafd0000, .align_mask = 0xffff};
         void *p = alloc_free_area_in_range(&big, (char *)0x10000, (char *)0x100000000ull);
