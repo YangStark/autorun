@@ -89,7 +89,8 @@ for name in ('reserved_area', 'range_entry', 'alloc_area'):
 fixture += r'''
 /* virtual_init excludes the kernel heap before making reservations. */
 static struct range_entry free_ranges[] = {{(void *)0x10000, (void *)0x75000000},
-                                         {(void *)0xf5000000, (void *)0x100000000ull}};
+                                         {(void *)0xf5000000, (void *)0x100000000ull},
+                                         {(void *)0x100000000ull, (void *)0x8000000000ull}};
 static struct range_entry *free_ranges_end = free_ranges + 2;
 '''
 # The window left for native thread stacks, from the real source.
@@ -215,11 +216,20 @@ int main(void)
     horizon_reserve_guest_address_space();
     assert(anon_mmap_tryfixed((void *)0xc000000, 0x108000, PROT_NONE, 0) != MAP_FAILED);
     cleanup();
-    /* Large host address spaces retain the existing allocation policy. */
+    /* A 36- or 39-bit launch keeps the same low range for the guest, and
+     * nothing above 4 GB, which libnx has to itself. Its stack region can be
+     * up there as well, and then no window is taken out of the guest's. */
     host_addr_space_limit = (void *)0x8000000000ull;
+    free_ranges_end = free_ranges + 3;
+    stack_lo = 0x800000000ull;
+    stack_hi = 0x900000000ull;
     horizon_reserve_guest_address_space();
-    assert(!native_count && list_empty(&reserved_areas));
-    puts("Horizon guest reservation: native stacks within kernel limits, query failure, guest allocation/reuse and 39-bit bypass passed");
+    assert(mmap_is_in_reserved_area((void *)0x10000000, 0x40000000) == 1);
+    assert(!mmap_is_in_reserved_area((void *)0x100000000ull, 0x1000));
+    assert(!mmap_is_in_reserved_area((void *)stack_lo, 0x1000));
+    cleanup();
+    puts("Horizon guest reservation: native stacks within kernel limits, query failure, guest "
+         "allocation/reuse, Most Wanted's reservation and large address spaces passed");
 }
 '''
 with tempfile.TemporaryDirectory() as tmp:

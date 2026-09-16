@@ -4341,7 +4341,11 @@ static void horizon_reserve_guest_address_space(void)
     ULONG_PTR stack_room;
     char msg[192];
 
-    if ((ULONG_PTR)host_addr_space_limit > limit_4g) return;
+    /* On a 36- or 39-bit address space libnx has tens or hundreds of
+     * gigabytes to place things in and only lands below 4 GB by chance, but
+     * when it does it fragments the only range a 32-bit program can use, so
+     * the guest keeps that range in every launch. Everything here is clipped
+     * to 4 GB, which leaves the rest of a large address space alone. */
     if (!horizon_get_stack_region( &stack_start, &stack_end ))
     {
         wine_nx_runtime_trace( "[VA] early guest reservations disabled: native stack region unavailable" );
