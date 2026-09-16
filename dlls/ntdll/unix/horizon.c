@@ -13613,29 +13613,67 @@ static void section_failure( const char *what, void *addr, void *source, size_t 
  * go; Need for Speed Most Wanted took the view that failed and died on it.
  * The region is reserved once, so the anchors inside it need no reservation. */
 #define HORIZON_ANCHOR_REGION ((size_t)128 * 1024 * 1024)
+#define HORIZON_ANCHOR_REGIONS 8
 
-static char *anchor_region, *anchor_region_end;
+static struct { char *start, *end, *cursor; } anchor_regions[HORIZON_ANCHOR_REGIONS];
+static unsigned int anchor_region_count;
+static char *anchor_region, *anchor_region_end;   /* the first, for the tests */
+
+/* A free run of that size in one of the regions, starting where the last
+ * anchor ended so a region full of them is not walked from the beginning
+ * every time. */
+static void *find_anchor_run_locked( size_t size )
+{
+    unsigned int i;
+
+    for (i = 0; i < anchor_region_count; i++)
+    {
+        char *candidate = anchor_regions[i].cursor;
+        int wrapped = 0;
+
+        for (;;)
+        {
+            struct horizon_mapping *overlap;
+
+            if (size > (size_t)(anchor_regions[i].end - candidate))
+            {
+                if (wrapped++) break;
+                candidate = anchor_regions[i].start;
+                continue;
+            }
+            if (!(overlap = find_overlap_mapping( candidate, size )))
+            {
+                anchor_regions[i].cursor = candidate + size;
+                return candidate;
+            }
+            candidate = (char *)overlap->addr + overlap->size;
+        }
+    }
+    return NULL;
+}
 
 static void *find_anchor_address_locked( size_t size )
 {
-    char *candidate;
+    void *addr, *region;
+    size_t region_size = max( HORIZON_ANCHOR_REGION, size );
 
-    if (!anchor_region)
+    if ((addr = find_anchor_run_locked( size ))) return addr;
+    /* Another region rather than one anchor at a time from libnx, whose
+     * search walks every reservation this process holds: with the first
+     * region full, 918 anchors spent half of Most Wanted's main thread in
+     * _memregionIsReserved. */
+    if (anchor_region_count == HORIZON_ANCHOR_REGIONS) return NULL;
+    if (!(region = virtmemFindCodeMemory( region_size, 0x1000 ))) return NULL;
+    if (!virtmemAddReservation( region, region_size )) return NULL;
+    anchor_regions[anchor_region_count].start = region;
+    anchor_regions[anchor_region_count].cursor = region;
+    anchor_regions[anchor_region_count].end = (char *)region + region_size;
+    if (!anchor_region_count++)
     {
-        void *region = virtmemFindCodeMemory( HORIZON_ANCHOR_REGION, 0x1000 );
-
-        if (!region || !virtmemAddReservation( region, HORIZON_ANCHOR_REGION )) return NULL;
         anchor_region = region;
-        anchor_region_end = (char *)region + HORIZON_ANCHOR_REGION;
+        anchor_region_end = (char *)region + region_size;
     }
-    for (candidate = anchor_region; size <= (size_t)(anchor_region_end - candidate); )
-    {
-        struct horizon_mapping *overlap = find_overlap_mapping( candidate, size );
-
-        if (!overlap) return candidate;
-        candidate = (char *)overlap->addr + overlap->size;
-    }
-    return NULL;
+    return find_anchor_run_locked( size );
 }
 
 static void *horizon_section_anchor( void *source, size_t size, void **token )

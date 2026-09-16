@@ -134,10 +134,16 @@ static Result svcUnmapProcessMemory( void *dst, Handle process, u64 src, u64 siz
 '''
 # The anchor region's size, and the commit granularity, from the real source:
 # the host stand-in gets PROT_* and MAP_* from <sys/mman.h> instead.
-fixture += re.search(r'^#define HORIZON_ANCHOR_REGION .*$', s, re.M)[0] + '\n'
-fixture += block(r'^static char \*anchor_region, \*anchor_region_end;')
+# The commit granularity horizon.c reserves with, and the anchor region's size
+# and count, from the real source: the host stand-in gets PROT_* and MAP_* from
+# <sys/mman.h> instead.
 fixture += '\n'.join(re.findall(r'^#define HORIZON_COMMIT_\w+ .*$',
                                 (root / 'dlls/ntdll/unix/horizon_mman.h').read_text(), re.M)) + '\n'
+fixture += re.search(r'^#define HORIZON_ANCHOR_REGION .*$', s, re.M)[0] + '\n'
+fixture += re.search(r'^#define HORIZON_ANCHOR_REGIONS .*$', s, re.M)[0] + '\n'
+fixture += block(r'^static struct \{ char \*start, \*end, \*cursor; \} anchor_regions\[[^\]]*\];')
+fixture += block(r'^static unsigned int anchor_region_count;')
+fixture += block(r'^static char \*anchor_region, \*anchor_region_end;')
 fixture += block(r'^enum horizon_section_state\n\{.*?^\};')
 for name in ['horizon_backing', 'horizon_mapping']:
     fixture += block(r'^struct ' + name + r'\n\{.*?^\};')
@@ -160,7 +166,7 @@ for name in ['static void list_add_mapping(', 'static void list_remove_mapping('
              'static struct horizon_mapping *find_overlap_mapping(', 'static struct horizon_mapping *alloc_mapping(',
              'static VirtmemReservation *reserve_fixed_range_locked(', 'static VirtmemReservation *reserve_fixed_range(',
              'static void remove_reservation_locked(', 'static void remove_reservation(',
-             'static void *find_anchor_address_locked(', 'static int replace_reservation_mapping(', 'static int change_reservation_mapping(', 'static int split_reservation_mapping(', 'static size_t page_align_size(',
+             'static void *find_anchor_run_locked(', 'static void *find_anchor_address_locked(', 'static int replace_reservation_mapping(', 'static int change_reservation_mapping(', 'static int split_reservation_mapping(', 'static size_t page_align_size(',
              'static void section_failure(', 'static void *horizon_section_anchor(', 'static int horizon_section_unanchor(',
              'static int horizon_section_alias(', 'static int horizon_section_unalias(']:
     fixture += function(name)
@@ -189,11 +195,16 @@ static void check_tree(void)
                     mapping->reservation->size == mapping->size );
         else
         {
-            /* An anchor packed into the anchor region is covered by the one
-             * reservation the region itself holds. */
+            /* An anchor packed into a region is covered by the one
+             * reservation that region itself holds. */
+            unsigned int i;
+            int inside = 0;
+
             assert( mapping->section_state == SECTION_ANCHOR );
-            assert( (char *)mapping->addr >= anchor_region &&
-                    (char *)mapping->addr + mapping->size <= anchor_region_end );
+            for (i = 0; i < anchor_region_count; i++)
+                inside |= (char *)mapping->addr >= anchor_regions[i].start &&
+                          (char *)mapping->addr + mapping->size <= anchor_regions[i].end;
+            assert( inside );
             count--;
         }
         assert( !mapping->section == (mapping->section_state == SECTION_NONE || mapping->section_state == SECTION_ANCHOR) );
@@ -201,7 +212,7 @@ static void check_tree(void)
         prev = mapping;
         count++;
     }
-    assert( count + !!anchor_region == reservation_count );
+    assert( count + (int)anchor_region_count == reservation_count );
 }
 
 static struct horizon_mapping *entry_at( void *addr )
@@ -236,7 +247,7 @@ int main(void)
     struct horizon_mapping *anchor;
     int before_reservations, before_anchors;
 
-    code_pool_size = HORIZON_ANCHOR_REGION + 256 * P;
+    code_pool_size = 3 * HORIZON_ANCHOR_REGION + 256 * P;  /* room for the extra regions */
     code_pool = host_reserve( code_pool_size );
     views = host_reserve( 64 * P );
     assert( (file = horizon_memfile_alloc( 8 * P, 0, &horizon_section_ops )) );
@@ -265,6 +276,22 @@ int main(void)
             anchors++;
         }
         assert( anchors && next <= anchor_region_end );
+    }
+    /* A region with no room left takes another one: falling back to libnx for
+     * each anchor walks every reservation the process holds. */
+    {
+        int before = reservation_count;
+        void *filler = find_anchor_address_locked( HORIZON_ANCHOR_REGION );
+        void *next_region;
+
+        assert( filler && anchor_region_count == 2 );  /* it did not fit in the first */
+        assert( reservation_count == before + 1 );     /* one reservation, not one an anchor */
+        list_add_mapping( alloc_mapping( filler, HORIZON_ANCHOR_REGION, NULL, 0, NULL, RW ) );
+        /* With that region full the packing carries on in the one before it. */
+        next_region = find_anchor_address_locked( P );
+        assert( next_region && anchor_region_count == 2 );
+        assert( (char *)next_region >= anchor_region && (char *)next_region < anchor_region_end );
+        list_remove_mapping( entry_at( filler ) );  /* both regions stay reserved */
     }
     b[0] = 0x11;
     assert( a[2 * P] == 0x11 );
@@ -336,7 +363,7 @@ int main(void)
 
     /* a goes across its three entries: the last reference frees the memory. */
     assert( !unmap_range_locked( a, 4 * P ) );
-    assert( !mappings.root && reservation_count == !!anchor_region );
+    assert( !mappings.root && reservation_count == (int)anchor_region_count );
     assert( !host_live_anchors() && !host_alias_count );
     assert( host_pages_live == 0 );
 
@@ -350,7 +377,7 @@ int main(void)
     check_tree();
     assert( !unmap_range_locked( c, 2 * P ) );
     horizon_memfile_unref( reserved );
-    assert( !mappings.root && reservation_count == !!anchor_region );
+    assert( !mappings.root && reservation_count == (int)anchor_region_count );
     assert( !host_live_anchors() && host_pages_live == 0 );
 
     puts( "Section views in horizon.c: Wine's fixed maps and placed maps, overlapping writes, close before unmap, "
