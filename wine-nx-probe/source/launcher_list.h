@@ -122,43 +122,32 @@ static inline int launcher_find( const struct launcher_entry *entries, int count
     return 0;
 }
 
-/* Move the selection in a grid shown a page (columns x rows) at a time. Left and
- * right go on to the neighbouring page at the same row, up and down stay on the page. */
-static inline int launcher_grid_move( int selection, int count, int columns, int rows, int dx, int dy )
+/* Move the selection in a grid of `columns` that scrolls without end rather
+ * than turning pages: left and right walk the whole list, up and down move a
+ * row, and the ends of the list stay put so the caller can leave for the header. */
+static inline int launcher_grid_move( int selection, int count, int columns, int dx, int dy )
 {
-    int per_page = columns * rows, page = selection / per_page;
-    int row = selection % per_page / columns, column = selection % per_page % columns, next;
+    int next;
 
-    if (count <= 0) return 0;
-    if (dx > 0)
-    {
-        if (column + 1 < columns && selection + 1 < count) return selection + 1;
-        next = (page + 1) * per_page + row * columns;
-        if ((page + 1) * per_page < count) return next < count ? next : count - 1;
-    }
-    else if (dx < 0)
-    {
-        if (column > 0) return selection - 1;
-        if (page > 0) return (page - 1) * per_page + row * columns + columns - 1;
-    }
-    else if (dy > 0 && row + 1 < rows && selection + columns < count) return selection + columns;
-    else if (dy > 0 && row + 1 < rows && (page * per_page + (row + 1) * columns) < count) return count - 1;
-    else if (dy < 0 && row > 0) return selection - columns;
-    return selection;
+    if (count <= 0 || columns <= 0) return 0;
+    next = selection + dx + dy * columns;
+    /* Down from the last full row lands on the last program rather than nowhere. */
+    if (dy > 0 && next >= count && selection + columns - selection % columns < count) next = count - 1;
+    if (next < 0 || next >= count) return selection;
+    return next;
 }
 
-/* The same place on the next (direction 1) or previous (-1) page, or the last program. */
-static inline int launcher_grid_page( int selection, int count, int per_page, int direction )
+/* The same column, a screenful of rows further down (direction 1) or up. */
+static inline int launcher_grid_page( int selection, int count, int columns, int rows, int direction )
 {
-    int last_page, page, next;
+    int next;
 
-    if (count <= 0) return 0;
-    last_page = (count - 1) / per_page;
-    page = selection / per_page + direction;
-    if (page < 0) page = 0;
-    if (page > last_page) page = last_page;
-    next = page * per_page + selection % per_page;
-    return next < count ? next : count - 1;
+    if (count <= 0 || columns <= 0 || rows <= 0) return 0;
+    next = selection + direction * columns * rows;
+    while (next >= count) next -= columns;
+    if (next < 0) next = selection % columns;
+    if (next >= count) next = count - 1;
+    return next;
 }
 
 /* The first visible row, moved only as far as needed to show "selected". */

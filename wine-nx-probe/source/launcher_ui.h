@@ -91,6 +91,9 @@ struct ui
      * them; any screen's header can ask for them through this. */
     void (*header_status)( void *data, int right, int y );
     void *header_status_data;
+    /* Where the left of the clock and the battery came out, so that nothing a
+     * screen draws on the right stands underneath them. */
+    int status_left;
 
     SDL_GameController *controller;
     int held;

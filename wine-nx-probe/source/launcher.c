@@ -170,7 +170,7 @@ struct launcher
     int status, clock_hour, clock_minute, battery, charging;
 
     struct launcher_kv look;
-    int columns, rows, show_hidden;
+    int top_row, show_hidden;
     char browse_dir[512];
 
     SDL_Thread *thread;
@@ -868,7 +868,7 @@ static void request_icon( struct launcher *l, int index ) { request_art( l, inde
 
 struct grid
 {
-    int card, gap_x, gap_y, caption, x0, y0;
+    int card, gap_x, gap_y, caption, x0, y0, columns, rows, first;
 };
 
 static void draw_shell( struct launcher *l, int home );
@@ -876,37 +876,47 @@ static void draw_backdrop( struct launcher *l, int current );
 static void draw_cover( struct ui *ui, const struct program *p, SDL_Rect rect, int radius, int brightness,
                         int alpha );
 
+/* The library is one list that scrolls, so the only thing to work out is how
+ * many covers stand between the margins the header keeps: as many as fit at
+ * about the size the reference gives them, sharing what is left over. */
+#define GRID_CARD_TARGET 200
+
 static void grid_layout( const struct launcher *l, struct grid *g )
 {
     const struct ui *ui = &l->ui;
-    int available = ui->height - UI_HEADER_HEIGHT - FOOTER_SPACE, by_height, by_width, w, h;
+    int width = ui->width - 2 * SHELL_MARGIN, available = ui->height - UI_HEADER_HEIGHT - FOOTER_SPACE, h, rows;
 
     g->gap_x = 22;
     g->gap_y = 16;
     g->caption = 36;
-    by_height = (available - (l->rows - 1) * g->gap_y - l->rows * g->caption - 24) / l->rows;
-    by_width = (ui->width - 120 - (l->columns - 1) * g->gap_x) / l->columns;
-    g->card = by_height < by_width ? by_height : by_width;
+    g->columns = (width + g->gap_x) / (GRID_CARD_TARGET + g->gap_x);
+    if (g->columns < 1) g->columns = 1;
+    g->card = (width - (g->columns - 1) * g->gap_x) / g->columns;
     if (g->card < 64) g->card = 64;
-    w = l->columns * g->card + (l->columns - 1) * g->gap_x;
-    h = l->rows * (g->card + g->caption) + (l->rows - 1) * g->gap_y;
-    g->x0 = (ui->width - w) / 2;
+    g->rows = (available - 24 + g->gap_y) / (g->card + g->caption + g->gap_y);
+    if (g->rows < 1) g->rows = 1;
+    rows = (l->visible_count + g->columns - 1) / g->columns;
+    if (rows < 1) rows = 1;
+    g->first = launcher_first_visible( l->top_row, l->selection / g->columns, rows, g->rows ) * g->columns;
+    h = g->rows * (g->card + g->caption) + (g->rows - 1) * g->gap_y;
+    g->x0 = SHELL_MARGIN;
     g->y0 = UI_HEADER_HEIGHT + (available - h) / 2 + 4;
 }
 
 static int grid_hit( const struct launcher *l, int x, int y )
 {
-    int per_page = l->columns * l->rows, page_start = l->selection / per_page * per_page, row, column;
+    int row, column, hit;
     struct grid g;
 
     grid_layout( l, &g );
     if (x < g.x0 || y < g.y0) return -1;
     column = (x - g.x0) / (g.card + g.gap_x);
     row = (y - g.y0) / (g.card + g.caption + g.gap_y);
-    if (column >= l->columns || row >= l->rows) return -1;
+    if (column >= g.columns || row >= g.rows) return -1;
     if ((x - g.x0) % (g.card + g.gap_x) >= g.card || (y - g.y0) % (g.card + g.caption + g.gap_y) >= g.card + g.caption)
         return -1;
-    return page_start + row * l->columns + column < l->visible_count ? page_start + row * l->columns + column : -1;
+    hit = g.first + row * g.columns + column;
+    return hit < l->visible_count ? hit : -1;
 }
 
 /* A window with a title bar and the program's first letter, for programs without an icon. */
@@ -1016,32 +1026,34 @@ static void draw_library( struct launcher *l )
     /* With nothing to act on, only adding a game means anything. */
     static const struct ui_hint empty_hints[] = { { UI_X, "Add Game" } };
     struct ui *ui = &l->ui;
-    int per_page = l->columns * l->rows, page_start = l->selection / per_page * per_page, i;
     struct grid g;
+    int shown, i;
 
     draw_backdrop( l, l->visible_count ? l->visible[l->selection] : -1 );
     ui_fill( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 0, 0, 0, 120 } );
     grid_layout( l, &g );
+    l->top_row = g.first / g.columns;
+    shown = g.columns * g.rows;
 
     draw_shell( l, 0 );
-    for (i = page_start; i < l->visible_count && i < page_start + per_page; i++)
+    for (i = g.first; i < l->visible_count && i < g.first + shown; i++)
     {
-        int column = (i - page_start) % l->columns, row = (i - page_start) / l->columns;
+        int column = (i - g.first) % g.columns, row = (i - g.first) / g.columns;
 
         if (i == l->selection) continue;
         draw_card( l, i, g.x0 + column * (g.card + g.gap_x), g.y0 + row * (g.card + g.caption + g.gap_y), &g, 0 );
     }
-    if (l->visible_count)
+    if (l->visible_count && l->selection >= g.first && l->selection < g.first + shown)
     {
-        int column = (l->selection - page_start) % l->columns, row = (l->selection - page_start) / l->columns;
+        int column = (l->selection - g.first) % g.columns, row = (l->selection - g.first) / g.columns;
 
         /* Framed only while the games themselves have the focus: with the
          * header in focus the selection is remembered, not pointed at. */
         draw_card( l, l->selection, g.x0 + column * (g.card + g.gap_x),
                    g.y0 + row * (g.card + g.caption + g.gap_y), &g, l->zone != ZONE_HEADER );
     }
-    /* Decode the next page's icons too, so turning to it shows them at once. */
-    for (i = page_start + per_page; i < l->visible_count && i < page_start + 2 * per_page; i++)
+    /* Decode what is just off the bottom too, so scrolling on shows it at once. */
+    for (i = g.first + shown; i < l->visible_count && i < g.first + 2 * shown; i++)
         request_icon( l, l->visible[i] );
 
     if (!l->visible_count)
@@ -1130,7 +1142,9 @@ static int draw_status( struct launcher *l, int right, int cy )
 /* What a header outside the shell asks for, through the ui. */
 static void header_status( void *data, int right, int y )
 {
-    draw_status( data, right, y );
+    struct launcher *l = data;
+
+    l->ui.status_left = draw_status( l, right, y );
 }
 
 /* The header over Home and Library: the current view's icon and name, the other
@@ -1203,7 +1217,8 @@ static void draw_shell( struct launcher *l, int home )
         x += SHELL_GAP;
     }
 
-    right = draw_status( l, right, SHELL_Y ) - SHELL_GAP;
+    ui->status_left = right = draw_status( l, right, SHELL_Y );
+    right -= SHELL_GAP;
     width = l->symbols[SYMBOL_SETTINGS] ? SHELL_ICON - 4 : 0;
     right -= width;
     draw_symbol( l, SYMBOL_SETTINGS, right, SHELL_Y,
@@ -2011,7 +2026,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
 enum settings_row
 {
-    SET_ANIMATIONS, SET_COLUMNS, SET_ROWS, SET_HIDDEN, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_STEAMGRIDDB,
+    SET_HIDDEN, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_STEAMGRIDDB,
     SET_FORWARDER, SET_VERSION,
     SET_CREDITS, SETTINGS_ROWS
 };
@@ -2068,14 +2083,14 @@ static void choose_forwarder( struct launcher *l )
 
 static void save_look( struct launcher *l )
 {
-    char path[512], value[16];
+    char path[512];
 
     launcher_kv_set( &l->look, "theme", NULL );
-    launcher_kv_set( &l->look, "animations", l->ui.animations ? "1" : "0" );
-    snprintf( value, sizeof(value), "%d", l->columns );
-    launcher_kv_set( &l->look, "columns", value );
-    snprintf( value, sizeof(value), "%d", l->rows );
-    launcher_kv_set( &l->look, "rows", value );
+    /* What the library shows is worked out from the screen now, and the
+     * animations are simply on, so none of these are kept. */
+    launcher_kv_set( &l->look, "animations", NULL );
+    launcher_kv_set( &l->look, "columns", NULL );
+    launcher_kv_set( &l->look, "rows", NULL );
     launcher_kv_set( &l->look, "show-hidden", l->show_hidden ? "1" : "0" );
     launcher_kv_set( &l->look, "browse", l->browse_dir );
     runtime_file( l, "launcher.txt", path, sizeof(path) );
@@ -2154,11 +2169,11 @@ static void credits_screen( struct launcher *l )
 }
 
 /* The sections of Settings, in the order they stand in the list. */
-enum settings_section { SET_SECTION_LOOK, SET_SECTION_DEFAULTS, SET_SECTION_ARTWORK, SET_SECTION_SYSTEM };
+enum settings_section { SET_SECTION_LIBRARY, SET_SECTION_DEFAULTS, SET_SECTION_ARTWORK, SET_SECTION_SYSTEM };
 
 static void settings_menu( struct launcher *l )
 {
-    static const char *const sections[] = { "Appearance", "Game defaults", "Artwork", "System" };
+    static const char *const sections[] = { "Library", "Game defaults", "Artwork", "System" };
     static const char *on_off[2] = { "Off", "On" };
     static int section;
     struct ui_row rows[SETTINGS_ROWS];
@@ -2169,11 +2184,10 @@ static void settings_menu( struct launcher *l )
     for (;;)
     {
         enum ui_action action;
-        int i, direction;
+        int i;
         static const unsigned char row_section[SETTINGS_ROWS] =
         {
-            [SET_ANIMATIONS] = SET_SECTION_LOOK, [SET_COLUMNS] = SET_SECTION_LOOK,
-            [SET_ROWS] = SET_SECTION_LOOK, [SET_HIDDEN] = SET_SECTION_LOOK,
+            [SET_HIDDEN] = SET_SECTION_LIBRARY,
             [SET_VERBOSE] = SET_SECTION_DEFAULTS, [SET_PROFILE] = SET_SECTION_DEFAULTS,
             [SET_WINDOWS] = SET_SECTION_DEFAULTS,
             [SET_STEAMGRIDDB] = SET_SECTION_ARTWORK,
@@ -2188,17 +2202,6 @@ static void settings_menu( struct launcher *l )
             rows[i].kind = UI_ROW_VALUE;
             rows[i].group = row_section[i];
         }
-        snprintf( rows[SET_ANIMATIONS].label, sizeof(rows[0].label), "Animations" );
-        snprintf( rows[SET_ANIMATIONS].value, sizeof(rows[0].value), "%s", on_off[ui->animations] );
-        rows[SET_ANIMATIONS].kind = UI_ROW_SWITCH;
-        rows[SET_ANIMATIONS].on = ui->animations;
-        rows[SET_ANIMATIONS].help = "Moving backgrounds, fades and the sliding highlight. Off draws only when something changes.";
-        snprintf( rows[SET_COLUMNS].label, sizeof(rows[0].label), "Library columns" );
-        snprintf( rows[SET_COLUMNS].value, sizeof(rows[0].value), "%d", l->columns );
-        rows[SET_COLUMNS].help = "How many covers stand side by side in the library.";
-        snprintf( rows[SET_ROWS].label, sizeof(rows[0].label), "Library rows" );
-        snprintf( rows[SET_ROWS].value, sizeof(rows[0].value), "%d", l->rows );
-        rows[SET_ROWS].help = "How many rows of covers the library shows at once.";
         snprintf( rows[SET_HIDDEN].label, sizeof(rows[0].label), "Show hidden programs" );
         snprintf( rows[SET_HIDDEN].value, sizeof(rows[0].value), "%s", on_off[l->show_hidden] );
         rows[SET_HIDDEN].help = "Programs hidden from a game's own settings are listed again.";
@@ -2254,12 +2257,8 @@ static void settings_menu( struct launcher *l )
                 if (row_section[i] == section && shown++ == list.selection) break;
             if (i >= SETTINGS_ROWS) continue;
         }
-        direction = action == UI_ACTION_LEFT ? -1 : 1;
         switch (i)
         {
-        case SET_ANIMATIONS: ui->animations = !ui->animations; break;
-        case SET_COLUMNS: l->columns = 3 + (l->columns - 3 + 6 + direction) % 6; break;
-        case SET_ROWS: l->rows = 1 + (l->rows - 1 + 3 + direction) % 3; break;
         case SET_HIDDEN: l->show_hidden = !l->show_hidden; break;
         case SET_VERBOSE:
             l->options->verbose = !l->options->verbose;
@@ -2569,8 +2568,9 @@ static int run_library( struct launcher *l, char *target, size_t size )
     ui_start_screen( ui );
     while (ui_begin_frame( ui ))
     {
-        int per_page = l->columns * l->rows;
+        struct grid g;
 
+        grid_layout( l, &g );
         pump_icons( l );
         while (ui_poll( ui, &input ))
         {
@@ -2619,7 +2619,7 @@ static int run_library( struct launcher *l, char *target, size_t size )
                 {
                     if (l->history_selection + 1 < l->history_count) l->history_selection++;
                 }
-                else l->selection = launcher_grid_page( l->selection, l->visible_count, per_page, 1 );
+                else l->selection = launcher_grid_page( l->selection, l->visible_count, g.columns, g.rows, 1 );
                 break;
             case UI_TOUCH_SWIPE_RIGHT:
             case UI_TOUCH_SCROLL_DOWN:
@@ -2627,7 +2627,7 @@ static int run_library( struct launcher *l, char *target, size_t size )
                 {
                     if (l->history_selection > 0) l->history_selection--;
                 }
-                else l->selection = launcher_grid_page( l->selection, l->visible_count, per_page, -1 );
+                else l->selection = launcher_grid_page( l->selection, l->visible_count, g.columns, g.rows, -1 );
                 break;
             default:
                 break;
@@ -2679,7 +2679,7 @@ static int run_library( struct launcher *l, char *target, size_t size )
                     if (step < 0 && l->history_selection > 0) l->history_selection--;
                     if (step > 0 && l->history_selection + 1 < l->history_count) l->history_selection++;
                 }
-                else l->selection = launcher_grid_move( l->selection, l->visible_count, l->columns, l->rows, step, 0 );
+                else l->selection = launcher_grid_move( l->selection, l->visible_count, g.columns, step, 0 );
                 break;
             }
             case UI_UP:
@@ -2701,7 +2701,7 @@ static int run_library( struct launcher *l, char *target, size_t size )
                 }
                 else
                 {
-                    int next = launcher_grid_move( l->selection, l->visible_count, l->columns, l->rows, 0, down ? 1 : -1 );
+                    int next = launcher_grid_move( l->selection, l->visible_count, g.columns, 0, down ? 1 : -1 );
 
                     /* The top row has nowhere above it but the header. */
                     if (next == l->selection && !down)
@@ -2807,10 +2807,6 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
     l->options = options;
     runtime_file( l, "launcher.txt", path, sizeof(path) );
     launcher_kv_load( &l->look, path );
-    l->columns = launcher_kv_get_int( &l->look, "columns", 5 );
-    l->rows = launcher_kv_get_int( &l->look, "rows", 2 );
-    if (l->columns < 3 || l->columns > 8) l->columns = 5;
-    if (l->rows < 1 || l->rows > 3) l->rows = 2;
     l->show_hidden = launcher_kv_get_int( &l->look, "show-hidden", 0 ) == 1;
     if (!launcher_kv_get( &l->look, "browse", l->browse_dir, sizeof(l->browse_dir) ) || !l->browse_dir[0])
         snprintf( l->browse_dir, sizeof(l->browse_dir), "%s", LAUNCHER_DRIVE_C );
@@ -2821,7 +2817,7 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
      * frame, and the log has to name the call that did not return. */
     launcher_log( "[LAUNCHER] bringing the screen up: the shared font" );
     if (!launcher_platform_font( &font, &font_size ) ||
-        !ui_init( &l->ui, font, font_size, launcher_kv_get_int( &l->look, "animations", 1 ) != 0 ))
+        !ui_init( &l->ui, font, font_size, 1 ))
     {
         launcher_platform_font_release();
         /* libnx's console cannot draw once EGL has had the screen. */

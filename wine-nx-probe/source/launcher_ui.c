@@ -20,6 +20,10 @@
 #define STICK_RELEASE    8000
 #define LIST_TOP         124
 #define ROW_HEIGHT       64
+/* What a row keeps between its outline and its text. Small, so the text of a
+ * list lines up with the text of the header above it rather than sitting in
+ * from it. */
+#define ROW_PADDING      12
 
 enum glyph
 {
@@ -694,6 +698,7 @@ void ui_header_back( struct ui *ui, const char *title, const char *context )
         if (room > 60)
             ui_text_fit( ui, ui->small, x, cy - TTF_FontHeight( ui->small ) / 2, room, context, ui->dim, 0 );
     }
+    ui->status_left = ui->width;
     if (ui->header_status) ui->header_status( ui->header_status_data, ui->width - UI_HEADER_MARGIN, cy );
 }
 
@@ -1182,10 +1187,10 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
 {
     /* The same width and the same flat surfaces as the settings screens: one
      * language for every list the launcher shows. */
-    const int column_x = UI_HEADER_MARGIN, column_w = 1280 - 2 * UI_HEADER_MARGIN;
+    const int column_x = UI_HEADER_MARGIN;
     const int visible = (ui->height - LIST_TOP - 86) / ROW_HEIGHT;
     struct ui_input input;
-    int i;
+    int column_w = 1280 - 2 * UI_HEADER_MARGIN, value_right, i;
 
     if (!list->started)
     {
@@ -1284,22 +1289,28 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
         ui_gradient( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 3, 6, 10, 156 },
                      (SDL_Color){ 3, 6, 10, 20 }, 1 );
         ui_header_back( ui, title, context );
+        column_w = ui->width - UI_HEADER_MARGIN - column_x;
+        if (column_x + column_w > ui->status_left - 16) column_w = ui->status_left - 16 - column_x;
+        value_right = column_x + column_w - ROW_PADDING;
         bar = ui_highlight( ui, LIST_TOP + (list->selection - list->top) * ROW_HEIGHT + 2 );
         for (i = list->top; i < count && i < list->top + visible; i++)
         {
             int y = LIST_TOP + (i - list->top) * ROW_HEIGHT, current = i == list->selection;
             int text_y = y + (ROW_HEIGHT - TTF_FontHeight( ui->normal )) / 2;
             int value_w = rows[i].value[0] ? ui_text_width( ui, ui->small, rows[i].value ) : 0;
-            int label_w = column_w - 78 - (value_w ? (value_w < column_w / 3 ? value_w : column_w / 3) + 28 : 0);
+            int value_max = value_w < column_w / 3 ? value_w : column_w / 3;
+            int label_w = value_right - ROW_PADDING - column_x - (value_w ? value_max + 28 : 0);
             SDL_Color color = rows[i].disabled ? ui->dim : rows[i].destructive ? ui->danger : current ? ui->value : ui->text;
 
             any_adjustable |= rows[i].adjustable && !rows[i].disabled;
+            /* Nothing is filled: what has the focus is outlined, so the colour
+             * on the screen is the artwork's and the text's. */
             if (current)
-                ui_rounded( ui, column_x, (int)bar - 1, column_w, ROW_HEIGHT - 6, 12,
-                            (SDL_Color){ 255, 255, 255, 26 } );
-            ui_text_fit( ui, ui->normal, column_x + 26, text_y, label_w, rows[i].label, color, current );
+                ui_rounded_border( ui, column_x, (int)bar - 1, column_w, ROW_HEIGHT - 6, 12, 1,
+                                   (SDL_Color){ 236, 240, 246, 150 } );
+            ui_text_fit( ui, ui->normal, column_x + ROW_PADDING, text_y, label_w, rows[i].label, color, current );
             if (value_w)
-                ui_text_fit( ui, ui->small, column_x + column_w - 30 - (value_w < column_w / 3 ? value_w : column_w / 3),
+                ui_text_fit( ui, ui->small, value_right - value_max,
                              text_y + (TTF_FontHeight( ui->normal ) - TTF_FontHeight( ui->small )) / 2,
                              column_w / 3, rows[i].value, current ? ui->value : ui->dim, current );
         }
@@ -1348,8 +1359,8 @@ static void ui_switch( struct ui *ui, int x, int y, int on, int current, int dis
                      disabled ? (SDL_Color){ 92, 98, 106, 255 } : (SDL_Color){ 226, 230, 236, 255 };
 
     ui_rounded( ui, x, y, w, h, h / 2, track );
-    if (current && !disabled) ui_border( ui, x, y, w, h, 1, (SDL_Color){ 236, 240, 246, 120 } );
     ui_rounded( ui, on ? x + w - h + 3 : x + 3, y + 3, h - 6, h - 6, (h - 6) / 2, knob );
+    (void)current;
 }
 
 /* The arrow that says a row opens something of its own. */
@@ -1378,11 +1389,12 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
 {
     /* The rows end where the clock and the battery begin, as everything else on
      * the screen does. */
-    const int row_w = 1280 - UI_HEADER_MARGIN - SET_ROW_X;
     const int visible = (ui->height - LIST_TOP - 86) / SET_ROW_H;
+    int row_w, controls_right;
     int index[64], shown, i;
     struct ui_input input;
 
+    row_w = controls_right = 0;
     if (!list->started)
     {
         ui_start_screen( ui );
@@ -1395,6 +1407,7 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
         int hint_count = 0, any_adjustable = 0;
 
         if (count <= 0) return UI_ACTION_BACK;
+        if (!row_w) row_w = ui->width - UI_HEADER_MARGIN - SET_ROW_X;
         if (*group >= group_count) *group = group_count - 1;
         if (*group < 0) *group = 0;
         /* The rows of this section, in the order they were given. */
@@ -1518,6 +1531,13 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
         ui_gradient( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 3, 6, 10, 156 },
                      (SDL_Color){ 3, 6, 10, 20 }, 1 );
         ui_header_back( ui, title, context );
+        /* The rows end at the margin, or before the clock and the battery when
+         * those reach further in, so that nothing a row carries -- and no edge
+         * of the outline around it -- stands under the reading. */
+        controls_right = ui->width - UI_HEADER_MARGIN;
+        if (controls_right > ui->status_left - 16) controls_right = ui->status_left - 16;
+        row_w = controls_right - SET_ROW_X;
+        controls_right -= ROW_PADDING;
 
         /* The sections. The one in focus is framed; the rest are their name and
          * nothing else. */
@@ -1529,70 +1549,67 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
             /* Only what has the focus is framed, so there is one highlight on
              * the screen and it is plain which arrows do what. */
             if (i == *group && !list->in_rows)
-            {
-                ui_rounded( ui, SET_SIDEBAR_X, y + 2, SET_SIDEBAR_W, SET_GROUP_H - 8, 12,
-                            (SDL_Color){ 255, 255, 255, 26 } );
                 ui_rounded_border( ui, SET_SIDEBAR_X, y + 2, SET_SIDEBAR_W, SET_GROUP_H - 8, 12, 1,
-                                   (SDL_Color){ 236, 240, 246, 130 } );
-            }
-            ui_text_fit( ui, ui->normal, SET_SIDEBAR_X + 22, text_y, SET_SIDEBAR_W - 40, groups[i],
+                                   (SDL_Color){ 236, 240, 246, 150 } );
+            ui_text_fit( ui, ui->normal, SET_SIDEBAR_X + ROW_PADDING, text_y,
+                         SET_SIDEBAR_W - 2 * ROW_PADDING, groups[i],
                          i == *group ? ui->value : ui->dim, i == *group );
         }
 
         for (i = list->top; i < shown && i < list->top + visible; i++)
         {
             const struct ui_row *r = rows + index[i];
-            int y = LIST_TOP + (i - list->top) * SET_ROW_H, current = i == list->selection;
+            int box_y = LIST_TOP + (i - list->top) * SET_ROW_H + 4, box_h = SET_ROW_H - 10;
+            int current = i == list->selection, middle = box_y + box_h / 2;
             int control_w = r->kind == UI_ROW_SWITCH ? 92 : 44;
             int value_w = r->value[0] ? ui_text_width( ui, ui->small, r->value ) : 0;
-            int label_w, right;
+            int label_w, right, label_h, help_lines, block_h, text_y;
             SDL_Color color = r->disabled ? ui->dim : r->destructive ? ui->danger : current ? ui->value : ui->text;
 
             if (value_w > row_w / 3) value_w = row_w / 3;
             control_w += value_w ? value_w + 18 : 0;
-            label_w = row_w - 56 - control_w;
-            right = SET_ROW_X + row_w - 28;
+            label_w = controls_right - ROW_PADDING - SET_ROW_X - control_w;
+            right = controls_right;
             any_adjustable |= r->adjustable && !r->disabled;
 
-            /* The rows stand on the background. Only the one in focus is drawn
-             * at all, and lightly: the reference keeps the screen flat. */
+            /* Nothing is filled: the row in focus is outlined, and held for
+             * changing it is outlined brighter, so it is plain that left and
+             * right now change it rather than move away from it. */
             if (current && list->in_rows)
-            {
-                ui_rounded( ui, SET_ROW_X, y + 4, row_w, SET_ROW_H - 10, 12,
-                            (SDL_Color){ 255, 255, 255, 26 } );
-                /* Held, the row is outlined brighter, so it is plain that left
-                 * and right now change it rather than move away from it. */
-                ui_rounded_border( ui, SET_ROW_X, y + 4, row_w, SET_ROW_H - 10, 12, list->editing ? 2 : 1,
-                                   (SDL_Color){ 236, 240, 246, list->editing ? 220 : 130 } );
-            }
-            ui_text_fit( ui, ui->normal, SET_ROW_X + 30, y + 12, label_w, r->label, color, current );
-            if (r->help)
-                ui_text_wrapped( ui, ui->small, SET_ROW_X + 30, y + 44, label_w, 2, r->help, ui->dim, 0 );
+                ui_rounded_border( ui, SET_ROW_X, box_y, row_w, box_h, 12, list->editing ? 2 : 1,
+                                   (SDL_Color){ 236, 240, 246, list->editing ? 230 : 150 } );
+
+            /* The name and the line under it are one block, standing in the
+             * middle of the row however many lines the second one takes. */
+            label_h = TTF_FontHeight( ui->normal );
+            help_lines = r->help ? wrap_text( ui, ui->small, 0, 0, label_w, 2, r->help, ui->dim, 0, 0 ) : 0;
+            block_h = label_h + (help_lines ? 4 + help_lines * (TTF_FontHeight( ui->small ) + 4) - 4 : 0);
+            text_y = box_y + (box_h - block_h) / 2;
+            ui_text_fit( ui, ui->normal, SET_ROW_X + ROW_PADDING, text_y, label_w, r->label, color, current );
+            if (help_lines)
+                ui_text_wrapped( ui, ui->small, SET_ROW_X + ROW_PADDING, text_y + label_h + 4, label_w, 2,
+                                 r->help, ui->dim, 0 );
             switch (r->kind)
             {
             case UI_ROW_SWITCH:
-                ui_switch( ui, right - 56, y + (SET_ROW_H - 10 - 30) / 2 + 4, r->on, current, r->disabled );
+                ui_switch( ui, right - 56, middle - 15, r->on, current, r->disabled );
                 break;
             case UI_ROW_VALUE:
             case UI_ROW_ACTION:
             default:
                 if (value_w)
-                    ui_text_fit( ui, ui->small, right - 26 - value_w,
-                                 y + (SET_ROW_H - 10 - TTF_FontHeight( ui->small )) / 2 + 4, value_w + 4,
-                                 r->value, current ? ui->value : ui->dim, current );
+                    ui_text_fit( ui, ui->small, right - 26 - value_w, middle - TTF_FontHeight( ui->small ) / 2,
+                                 value_w + 4, r->value, current ? ui->value : ui->dim, current );
                 /* The arrow says the row opens something. A row held for
                  * changing puts one on either side of the value instead, which
                  * is what left and right now do. */
                 if (current && list->editing && r->adjustable)
                 {
-                    int mid = y + (SET_ROW_H - 10) / 2 - 4;
-
-                    ui_chevron_dir( ui, right - 42 - value_w, mid, -1, ui->value );
-                    ui_chevron_dir( ui, right - 14, mid, 1, ui->value );
+                    ui_chevron_dir( ui, right - 42 - value_w, middle - 8, -1, ui->value );
+                    ui_chevron_dir( ui, right - 14, middle - 8, 1, ui->value );
                 }
                 else if (!r->adjustable)
-                    ui_chevron( ui, right - 14, y + (SET_ROW_H - 10) / 2 - 4,
-                                r->disabled ? ui->dim : current ? ui->value : ui->dim );
+                    ui_chevron( ui, right - 14, middle - 8, r->disabled ? ui->dim : current ? ui->value : ui->dim );
                 break;
             }
         }
