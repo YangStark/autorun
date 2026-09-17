@@ -18,7 +18,7 @@
 #define REPEAT_MS        85
 #define STICK_PRESS      18000
 #define STICK_RELEASE    8000
-#define LIST_TOP         146
+#define LIST_TOP         124
 #define ROW_HEIGHT       64
 
 enum glyph
@@ -623,6 +623,34 @@ void ui_header( struct ui *ui, const char *title, const char *context )
     }
 }
 
+/* The header of a screen one goes back from, as the reference has it: the arrow
+ * and the screen's name at the left, the clock and the battery at the right, and
+ * nothing in the middle. */
+void ui_header_back( struct ui *ui, const char *title, const char *context )
+{
+    const int band = UI_HEADER_HEIGHT - 4;
+    int y = (band - TTF_FontHeight( ui->normal )) / 2, x = 34, i;
+
+    ui_fill( ui, 0, 0, ui->width, band, ui->panel );
+    /* The arrow, drawn rather than written, so it needs no glyph of its own. */
+    for (i = 0; i < 9; i++)
+    {
+        ui_rounded( ui, x + i, band / 2 - i, 2, 2, 1, ui->value );
+        ui_rounded( ui, x + i, band / 2 + i, 2, 2, 1, ui->value );
+    }
+    ui_fill( ui, x + 2, band / 2 - 1, 18, 2, ui->value );
+    ui_text( ui, ui->normal, x + 38, y, title, ui->value );
+    x += 38 + ui_text_width( ui, ui->normal, title ) + 20;
+    if (context && context[0])
+    {
+        int room = ui->width - 300 - x;
+
+        if (room > 60)
+            ui_text_fit( ui, ui->small, x, (band - TTF_FontHeight( ui->small )) / 2, room, context, ui->dim, 0 );
+    }
+    if (ui->header_status) ui->header_status( ui->header_status_data, ui->width - 34, band / 2 );
+}
+
 static SDL_Texture *button_glyph( struct ui *ui, int button )
 {
     switch (button)
@@ -1101,7 +1129,9 @@ int ui_confirm( struct ui *ui, const char *title, const char *text, const char *
 enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *title, const char *context,
                             const struct ui_row *rows, int count, int can_reset )
 {
-    const int column_w = 820, column_x = 84;
+    /* The same width and the same flat surfaces as the settings screens: one
+     * language for every list the launcher shows. */
+    const int column_x = 40, column_w = 1280 - 2 * column_x;
     const int visible = (ui->height - LIST_TOP - 86) / ROW_HEIGHT;
     struct ui_input input;
     int i;
@@ -1202,10 +1232,7 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
         }
         ui_gradient( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 3, 6, 10, 156 },
                      (SDL_Color){ 3, 6, 10, 20 }, 1 );
-        ui_header( ui, title, context );
-        ui_rounded( ui, column_x - 20, LIST_TOP - 28, column_w + 40, visible * ROW_HEIGHT + 42, 26,
-                    (SDL_Color){ 12, 16, 22, 222 } );
-        ui_text( ui, ui->small, column_x + 18, LIST_TOP - 18, "OPTIONS", ui->dim );
+        ui_header_back( ui, title, context );
         bar = ui_highlight( ui, LIST_TOP + (list->selection - list->top) * ROW_HEIGHT + 2 );
         for (i = list->top; i < count && i < list->top + visible; i++)
         {
@@ -1216,14 +1243,10 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
             SDL_Color color = rows[i].disabled ? ui->dim : rows[i].destructive ? ui->danger : current ? ui->value : ui->text;
 
             any_adjustable |= rows[i].adjustable && !rows[i].disabled;
-            ui_rounded( ui, column_x, y + 3, column_w, ROW_HEIGHT - 6, 16,
-                        current ? (SDL_Color){ 53, 64, 77, 244 } : (SDL_Color){ 30, 37, 46, 158 } );
             if (current)
-            {
-                ui_border( ui, column_x, (int)bar, column_w, ROW_HEIGHT - 4, 1, (SDL_Color){ 231, 237, 244, 164 } );
-                ui_rounded( ui, column_x + 9, y + 13, 5, ROW_HEIGHT - 26, 3, ui->selection );
-            }
-            ui_text_fit( ui, ui->normal, column_x + 34, text_y, label_w, rows[i].label, color, current );
+                ui_rounded( ui, column_x, (int)bar - 1, column_w, ROW_HEIGHT - 6, 12,
+                            (SDL_Color){ 255, 255, 255, 26 } );
+            ui_text_fit( ui, ui->normal, column_x + 26, text_y, label_w, rows[i].label, color, current );
             if (value_w)
                 ui_text_fit( ui, ui->small, column_x + column_w - 30 - (value_w < column_w / 3 ? value_w : column_w / 3),
                              text_y + (TTF_FontHeight( ui->normal ) - TTF_FontHeight( ui->small )) / 2,
@@ -1244,7 +1267,7 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
         if (row->help) hints[hint_count++] = (struct ui_hint){ UI_X, "Info" };
         if (can_reset && row->adjustable && !row->disabled) hints[hint_count++] = (struct ui_hint){ UI_Y, "Default" };
         hints[hint_count++] = (struct ui_hint){ UI_B, "Back" };
-        ui_footer( ui, hints, hint_count );
+        ui_hints_right( ui, hints, hint_count, ui->width - 34, ui->height - 34 );
         ui_fade( ui );
         ui_present( ui );
         ui_wait( ui );
@@ -1268,12 +1291,13 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
 static void ui_switch( struct ui *ui, int x, int y, int on, int current, int disabled )
 {
     const int w = 56, h = 30;
-    SDL_Color track = disabled ? (SDL_Color){ 44, 50, 58, 220 } :
-                      on ? (SDL_Color){ 108, 152, 214, 255 } : (SDL_Color){ 58, 66, 78, 244 };
-    SDL_Color knob = disabled ? (SDL_Color){ 96, 104, 114, 255 } : (SDL_Color){ 244, 247, 250, 255 };
+    SDL_Color track = disabled ? (SDL_Color){ 38, 42, 48, 200 } :
+                      on ? ui->selection : (SDL_Color){ 52, 57, 64, 240 };
+    SDL_Color knob = on && !disabled ? (SDL_Color){ 18, 22, 28, 255 } :
+                     disabled ? (SDL_Color){ 92, 98, 106, 255 } : (SDL_Color){ 226, 230, 236, 255 };
 
     ui_rounded( ui, x, y, w, h, h / 2, track );
-    if (current && !disabled) ui_border( ui, x, y, w, h, 1, (SDL_Color){ 231, 237, 244, 150 } );
+    if (current && !disabled) ui_border( ui, x, y, w, h, 1, (SDL_Color){ 236, 240, 246, 120 } );
     ui_rounded( ui, on ? x + w - h + 3 : x + 3, y + 3, h - 6, h - 6, (h - 6) / 2, knob );
 }
 
@@ -1409,9 +1433,10 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
         ui_background( ui );
         ui_gradient( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 3, 6, 10, 156 },
                      (SDL_Color){ 3, 6, 10, 20 }, 1 );
-        ui_header( ui, title, context );
+        ui_header_back( ui, title, context );
 
-        /* The sections. The one in focus carries the accent, the rest recede. */
+        /* The sections. The one in focus is framed; the rest are their name and
+         * nothing else. */
         for (i = 0; i < group_count; i++)
         {
             int y = LIST_TOP + i * SET_GROUP_H;
@@ -1419,10 +1444,8 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
 
             if (i == *group)
             {
-                ui_rounded( ui, SET_SIDEBAR_X, y + 2, SET_SIDEBAR_W, SET_GROUP_H - 8, 14,
-                            (SDL_Color){ 30, 40, 54, 236 } );
-                ui_border( ui, SET_SIDEBAR_X, y + 2, SET_SIDEBAR_W, SET_GROUP_H - 8, 1,
-                           (SDL_Color){ 120, 158, 210, 150 } );
+                ui_rounded( ui, SET_SIDEBAR_X, y + 2, SET_SIDEBAR_W, SET_GROUP_H - 8, 12,
+                            (SDL_Color){ 255, 255, 255, 30 } );
             }
             ui_text_fit( ui, ui->normal, SET_SIDEBAR_X + 22, text_y, SET_SIDEBAR_W - 40, groups[i],
                          i == *group ? ui->value : ui->dim, i == *group );
@@ -1443,13 +1466,11 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
             right = SET_ROW_X + row_w - 28;
             any_adjustable |= r->adjustable && !r->disabled;
 
-            ui_rounded( ui, SET_ROW_X, y + 4, row_w, SET_ROW_H - 10, 18,
-                        current ? (SDL_Color){ 46, 56, 70, 244 } : (SDL_Color){ 24, 30, 38, 170 } );
+            /* The rows stand on the background. Only the one in focus is drawn
+             * at all, and lightly: the reference keeps the screen flat. */
             if (current)
-            {
-                ui_border( ui, SET_ROW_X, y + 4, row_w, SET_ROW_H - 10, 1, (SDL_Color){ 231, 237, 244, 164 } );
-                ui_rounded( ui, SET_ROW_X + 10, y + 20, 4, SET_ROW_H - 42, 2, ui->selection );
-            }
+                ui_rounded( ui, SET_ROW_X, y + 4, row_w, SET_ROW_H - 10, 12,
+                            (SDL_Color){ 255, 255, 255, 26 } );
             ui_text_fit( ui, ui->normal, SET_ROW_X + 30, y + 12, label_w, r->label, color, current );
             if (r->help)
                 ui_text_wrapped( ui, ui->small, SET_ROW_X + 30, y + 44, label_w, 2, r->help, ui->dim, 0 );
@@ -1488,7 +1509,7 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
         if (any_adjustable) hints[hint_count++] = (struct ui_hint){ UI_RIGHT, "Change" };
         if (!row->disabled) hints[hint_count++] = (struct ui_hint){ UI_A, row->adjustable ? "Next" : "Choose" };
         hints[hint_count++] = (struct ui_hint){ UI_B, "Back" };
-        ui_footer( ui, hints, hint_count );
+        ui_hints_right( ui, hints, hint_count, ui->width - 34, ui->height - 34 );
         ui_fade( ui );
         ui_present( ui );
         ui_wait( ui );

@@ -83,6 +83,11 @@ struct ui
     struct ui_text_entry cache[UI_TEXT_CACHE];
     unsigned int cache_use;
 
+    /* The clock and the battery belong to the launcher, which knows how to read
+     * them; any screen's header can ask for them through this. */
+    void (*header_status)( void *data, int right, int y );
+    void *header_status_data;
+
     SDL_GameController *controller;
     int held;
     Uint32 held_since, held_last;
@@ -158,6 +163,9 @@ int  ui_text_wrapped( struct ui *ui, TTF_Font *font, int x, int y, int max_width
                       const char *text, SDL_Color color, int centered );
 
 void ui_header( struct ui *ui, const char *title, const char *context );
+/* A header for a screen one goes back from: an arrow, the screen's name beside
+ * it, and what the launcher puts at the right. */
+void ui_header_back( struct ui *ui, const char *title, const char *context );
 void ui_footer( struct ui *ui, const struct ui_hint *hints, int count );
 /* The same hints, ending at right on the line through y, and tappable like the footer's. */
 void ui_hints_right( struct ui *ui, const struct ui_hint *hints, int count, int right, int y );

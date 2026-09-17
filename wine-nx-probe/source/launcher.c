@@ -1089,6 +1089,43 @@ static int shell_width( struct launcher *l, int tab, int active )
     return width;
 }
 
+/* The clock and the battery, at the right of whichever header asks for them.
+ * Returns where the left of what it drew is. */
+static int draw_status( struct launcher *l, int right, int cy )
+{
+    struct ui *ui = &l->ui;
+    Uint32 now = SDL_GetTicks();
+    char text[32];
+
+    if (!l->status_read || now - l->status_read >= 1000)
+    {
+        l->status = launcher_platform_status( &l->clock_hour, &l->clock_minute, &l->battery, &l->charging );
+        l->status_read = now ? now : 1;
+    }
+    if (l->status & LAUNCHER_STATUS_BATTERY)
+    {
+        snprintf( text, sizeof(text), "%d%%", l->battery );
+        right -= ui_text_width( ui, ui->small, text );
+        ui_text( ui, ui->small, right, cy - TTF_FontHeight( ui->small ) / 2, text, ui->value );
+        right -= 8 + 29;
+        draw_battery( ui, right, cy, l->battery, l->charging );
+        right -= 24;
+    }
+    if (l->status & LAUNCHER_STATUS_CLOCK)
+    {
+        snprintf( text, sizeof(text), "%02d:%02d", l->clock_hour, l->clock_minute );
+        right -= ui_text_width( ui, ui->small, text );
+        ui_text( ui, ui->small, right, cy - TTF_FontHeight( ui->small ) / 2, text, ui->value );
+    }
+    return right;
+}
+
+/* What a header outside the shell asks for, through the ui. */
+static void header_status( void *data, int right, int y )
+{
+    draw_status( data, right, y );
+}
+
 /* The header over Home and Library: the current view's icon and name, the other
  * views and Add Game as icons, and Settings, the clock and the battery at the right. */
 static void draw_shell( struct launcher *l, int home )
@@ -1101,8 +1138,6 @@ static void draw_shell( struct launcher *l, int home )
     };
     struct ui *ui = &l->ui;
     int x = SHELL_MARGIN, right = ui->width - SHELL_MARGIN, i, width;
-    Uint32 now = SDL_GetTicks();
-    char text[16];
 
     ui_gradient( ui, 0, 0, ui->width, 150, (SDL_Color){ 0, 0, 0, 150 }, (SDL_Color){ 0, 0, 0, 0 }, 0 );
     for (i = SHELL_HOME; i <= SHELL_ADD; i++)
@@ -1123,27 +1158,7 @@ static void draw_shell( struct launcher *l, int home )
         x += SHELL_GAP;
     }
 
-    if (!l->status_read || now - l->status_read >= 1000)
-    {
-        l->status = launcher_platform_status( &l->clock_hour, &l->clock_minute, &l->battery, &l->charging );
-        l->status_read = now ? now : 1;
-    }
-    if (l->status & LAUNCHER_STATUS_BATTERY)
-    {
-        snprintf( text, sizeof(text), "%d%%", l->battery );
-        right -= ui_text_width( ui, ui->small, text );
-        ui_text( ui, ui->small, right, SHELL_Y - TTF_FontHeight( ui->small ) / 2, text, ui->value );
-        right -= 8 + 29;
-        draw_battery( ui, right, SHELL_Y, l->battery, l->charging );
-        right -= 24;
-    }
-    if (l->status & LAUNCHER_STATUS_CLOCK)
-    {
-        snprintf( text, sizeof(text), "%02d:%02d", l->clock_hour, l->clock_minute );
-        right -= ui_text_width( ui, ui->small, text );
-        ui_text( ui, ui->small, right, SHELL_Y - TTF_FontHeight( ui->small ) / 2, text, ui->value );
-        right -= SHELL_GAP;
-    }
+    right = draw_status( l, right, SHELL_Y ) - SHELL_GAP;
     width = l->symbols[SYMBOL_SETTINGS] ? SHELL_ICON - 4 : 0;
     right -= width;
     if (l->zone == ZONE_HEADER && l->header_focus == SHELL_SETTINGS)
@@ -2782,6 +2797,10 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
         return 0;
 #endif
     }
+    /* ui_init starts from a cleared screen, so the clock and the battery are
+     * handed to it once it stands. */
+    l->ui.header_status = header_status;
+    l->ui.header_status_data = l;
 
     {
         SDL_RendererInfo info;
