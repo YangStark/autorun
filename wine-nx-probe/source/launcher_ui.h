@@ -50,6 +50,10 @@ struct ui_input
 #define UI_TEXT_KEY      160
 #define UI_FOOTER_HINTS  10
 #define UI_HEADER_HEIGHT 80
+/* Every header keeps these, so the clock and the battery do not move from one
+ * screen to the next. */
+#define UI_HEADER_MARGIN 84     /* from the left and right edges */
+#define UI_HEADER_CENTRE 56     /* the centre line of what a header draws */
 #define UI_FOOTER_Y      (720 - 26)
 
 struct ui_hint

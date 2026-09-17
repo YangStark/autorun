@@ -628,27 +628,29 @@ void ui_header( struct ui *ui, const char *title, const char *context )
  * nothing in the middle. */
 void ui_header_back( struct ui *ui, const char *title, const char *context )
 {
-    const int band = UI_HEADER_HEIGHT - 4;
-    int y = (band - TTF_FontHeight( ui->normal )) / 2, x = 34, i;
+    const int cy = UI_HEADER_CENTRE;
+    int x = UI_HEADER_MARGIN, i;
 
-    ui_fill( ui, 0, 0, ui->width, band, ui->panel );
+    /* The same shading over the top as the shell's, rather than a band of its
+     * own: one screen should not look like it has a bar the others do not. */
+    ui_gradient( ui, 0, 0, ui->width, 150, (SDL_Color){ 0, 0, 0, 150 }, (SDL_Color){ 0, 0, 0, 0 }, 0 );
     /* The arrow, drawn rather than written, so it needs no glyph of its own. */
     for (i = 0; i < 9; i++)
     {
-        ui_rounded( ui, x + i, band / 2 - i, 2, 2, 1, ui->value );
-        ui_rounded( ui, x + i, band / 2 + i, 2, 2, 1, ui->value );
+        ui_rounded( ui, x + i, cy - i, 2, 2, 1, ui->value );
+        ui_rounded( ui, x + i, cy + i, 2, 2, 1, ui->value );
     }
-    ui_fill( ui, x + 2, band / 2 - 1, 18, 2, ui->value );
-    ui_text( ui, ui->normal, x + 38, y, title, ui->value );
+    ui_fill( ui, x + 2, cy - 1, 18, 2, ui->value );
+    ui_text( ui, ui->normal, x + 38, cy - TTF_FontHeight( ui->normal ) / 2, title, ui->value );
     x += 38 + ui_text_width( ui, ui->normal, title ) + 20;
     if (context && context[0])
     {
         int room = ui->width - 300 - x;
 
         if (room > 60)
-            ui_text_fit( ui, ui->small, x, (band - TTF_FontHeight( ui->small )) / 2, room, context, ui->dim, 0 );
+            ui_text_fit( ui, ui->small, x, cy - TTF_FontHeight( ui->small ) / 2, room, context, ui->dim, 0 );
     }
-    if (ui->header_status) ui->header_status( ui->header_status_data, ui->width - 34, band / 2 );
+    if (ui->header_status) ui->header_status( ui->header_status_data, ui->width - UI_HEADER_MARGIN, cy );
 }
 
 static SDL_Texture *button_glyph( struct ui *ui, int button )
@@ -1074,20 +1076,25 @@ void ui_wait( struct ui *ui )
 static void draw_card( struct ui *ui, const char *title, const char *heading, const char *text,
                        const struct ui_hint *hints, int hint_count )
 {
-    const int w = 860, x = (ui->width - w) / 2;
-    int lines, h, y;
+    /* The same screen as the settings and the lists: the name at the top with
+     * the arrow back, what it has to say below it, and the buttons at the
+     * bottom right. What it says is the screen, not a card laid over one. */
+    const int x = UI_HEADER_MARGIN, w = ui->width - 2 * UI_HEADER_MARGIN;
+    int y = LIST_TOP;
 
     ui_background( ui );
-    ui_header( ui, title, NULL );
-    lines = wrap_text( ui, ui->normal, 0, 0, w - 80, 9, text, ui->text, 0, 0 );
-    h = 110 + lines * (TTF_FontHeight( ui->normal ) + 4);
-    y = UI_HEADER_HEIGHT + (ui->height - UI_HEADER_HEIGHT - 60 - h) / 2;
-    ui_fill( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 0, 0, 0, 90 } );
-    ui_rounded( ui, x, y, w, h, 14, ui->card );
-    ui_fill( ui, x + 40, y + 70, w - 80, 2, ui->selection );
-    ui_text_fit( ui, ui->large, x + 40, y + 18, w - 80, heading, ui->value, 0 );
-    ui_text_wrapped( ui, ui->normal, x + 40, y + 88, w - 80, 9, text, ui->text, 0 );
-    ui_footer( ui, hints, hint_count );
+    ui_gradient( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 3, 6, 10, 156 },
+                 (SDL_Color){ 3, 6, 10, 20 }, 1 );
+    ui_header_back( ui, title, NULL );
+    /* The header already says the name; a heading repeats it only when it says
+     * something else. */
+    if (heading && strcmp( heading, title ))
+    {
+        ui_text_fit( ui, ui->large, x, LIST_TOP, w, heading, ui->value, 0 );
+        y = LIST_TOP + TTF_FontHeight( ui->large ) + 26;
+    }
+    ui_text_wrapped( ui, ui->normal, x, y, w, 12, text, ui->text, 0 );
+    ui_hints_right( ui, hints, hint_count, ui->width - 34, ui->height - 34 );
     ui_fade( ui );
 }
 

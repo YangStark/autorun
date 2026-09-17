@@ -48,9 +48,9 @@
 
 /* Home and Library's header, laid out after GameHub's at 1280x720. */
 enum shell_tab { SHELL_HOME, SHELL_LIBRARY, SHELL_ADD, SHELL_SETTINGS, SHELL_TABS };
-#define SHELL_Y        56     /* its centre line */
+#define SHELL_Y        UI_HEADER_CENTRE
 #define SHELL_ICON     30
-#define SHELL_MARGIN   84     /* from the left and right edges, which Home's content keeps too */
+#define SHELL_MARGIN   UI_HEADER_MARGIN   /* which Home's content keeps too */
 #define SHELL_GAP      36
 
 /* Home: the games that have been played, most recent first, as 2:3 covers. The
@@ -157,6 +157,9 @@ struct launcher
     int history_count, history_selection;
     /* What the D-pad moves, and which header item it is on. */
     int zone, header_focus;
+    /* Where the header's pill stands and how wide it is, eased toward the item
+     * in focus so it slides between them instead of jumping. */
+    float pill_x, pill_w;
     /* Where the last frame drew what a tap can hit. */
     SDL_Rect shell_hits[SHELL_TABS], add_hit;
     /* The programs whose artwork is behind Home, fading from the previous one; -1 for none. */
@@ -938,17 +941,19 @@ static void draw_card( struct launcher *l, int index, int x, int y, const struct
     if (!p->square_art[0]) request_icon( l, l->visible[index] );
     if (current)
     {
-        SDL_Color glow = ui->selection;
-
-        glow.a = 110;
         if (ui->glow)
         {
             SDL_Rect rect = { x - g->card / 4, y - g->card / 4, g->card * 3 / 2, g->card * 3 / 2 };
-            SDL_SetTextureColorMod( ui->glow, glow.r, glow.g, glow.b );
-            SDL_SetTextureAlphaMod( ui->glow, glow.a );
+
+            SDL_SetTextureColorMod( ui->glow, 255, 255, 255 );
+            SDL_SetTextureAlphaMod( ui->glow, 40 );
             SDL_RenderCopy( ui->renderer, ui->glow, NULL, &rect );
         }
-        ui_rounded( ui, x - 5, y - 5, g->card + 10, g->card + 10, 18, ui->selection );
+        /* The plate the cover sits on, lit from above, as the focused cover on
+         * Home has: the two views frame the selection the same way. */
+        ui_rounded( ui, x - 5, y - 5, g->card + 10, g->card + 10, 18, (SDL_Color){ 150, 160, 176, 120 } );
+        ui_rounded_texture( ui, ui_sheen( ui ), NULL, (SDL_Rect){ x - 5, y - 5, g->card + 10, g->card + 10 }, 18,
+                            (SDL_Color){ 252, 253, 255, 235 } );
     }
     else
     {
@@ -1030,8 +1035,10 @@ static void draw_library( struct launcher *l )
     {
         int column = (l->selection - page_start) % l->columns, row = (l->selection - page_start) / l->columns;
 
+        /* Framed only while the games themselves have the focus: with the
+         * header in focus the selection is remembered, not pointed at. */
         draw_card( l, l->selection, g.x0 + column * (g.card + g.gap_x),
-                   g.y0 + row * (g.card + g.caption + g.gap_y), &g, 1 );
+                   g.y0 + row * (g.card + g.caption + g.gap_y), &g, l->zone != ZONE_HEADER );
     }
     /* Decode the next page's icons too, so turning to it shows them at once. */
     for (i = page_start + per_page; i < l->visible_count && i < page_start + 2 * per_page; i++)
@@ -1140,13 +1147,51 @@ static void draw_shell( struct launcher *l, int home )
     int x = SHELL_MARGIN, right = ui->width - SHELL_MARGIN, i, width;
 
     ui_gradient( ui, 0, 0, ui->width, 150, (SDL_Color){ 0, 0, 0, 150 }, (SDL_Color){ 0, 0, 0, 0 }, 0 );
+    /* Where the pill is going, before anything is drawn over it. */
+    {
+        int target_x = 0, target_w = 0, at = SHELL_MARGIN;
+
+        for (i = SHELL_HOME; i <= SHELL_ADD; i++)
+        {
+            int active = i == (home ? SHELL_HOME : SHELL_LIBRARY);
+            int item_w = shell_width( l, i, active );
+
+            if (l->zone == ZONE_HEADER && l->header_focus == i)
+            {
+                target_x = at - 14;
+                target_w = item_w + 28;
+            }
+            at += item_w + SHELL_GAP;
+        }
+        if (l->zone == ZONE_HEADER && l->header_focus == SHELL_SETTINGS)
+        {
+            int icon = l->symbols[SYMBOL_SETTINGS] ? SHELL_ICON - 4 : 0;
+
+            target_x = ui->width - SHELL_MARGIN - icon - 14;
+            target_w = icon + 28;
+        }
+        if (!target_w) l->pill_w = 0;      /* focus left the header; it starts again where it returns */
+        else
+        {
+            if (!ui->animations || l->pill_w <= 0)
+            {
+                l->pill_x = target_x;
+                l->pill_w = target_w;
+            }
+            else
+            {
+                l->pill_x += (target_x - l->pill_x) * 0.30f;
+                l->pill_w += (target_w - l->pill_w) * 0.30f;
+            }
+            ui_rounded( ui, (int)(l->pill_x + 0.5f), SHELL_Y - 24, (int)(l->pill_w + 0.5f), 48, 24,
+                        (SDL_Color){ 255, 255, 255, 52 } );
+        }
+    }
     for (i = SHELL_HOME; i <= SHELL_ADD; i++)
     {
         int active = i == (home ? SHELL_HOME : SHELL_LIBRARY), focused = l->zone == ZONE_HEADER && l->header_focus == i;
         int start = x;
 
-        if (focused) ui_rounded( ui, x - 14, SHELL_Y - 24, shell_width( l, i, active ) + 28, 48, 24,
-                                 (SDL_Color){ 255, 255, 255, 52 } );
         x += draw_symbol( l, tabs[i].symbol, x, SHELL_Y, active || focused ? 255 : 150 );
         if (active)
         {
@@ -1161,9 +1206,8 @@ static void draw_shell( struct launcher *l, int home )
     right = draw_status( l, right, SHELL_Y ) - SHELL_GAP;
     width = l->symbols[SYMBOL_SETTINGS] ? SHELL_ICON - 4 : 0;
     right -= width;
-    if (l->zone == ZONE_HEADER && l->header_focus == SHELL_SETTINGS)
-        ui_rounded( ui, right - 14, SHELL_Y - 24, width + 28, 48, 24, (SDL_Color){ 255, 255, 255, 52 } );
-    draw_symbol( l, SYMBOL_SETTINGS, right, SHELL_Y, 190 );
+    draw_symbol( l, SYMBOL_SETTINGS, right, SHELL_Y,
+                 l->zone == ZONE_HEADER && l->header_focus == SHELL_SETTINGS ? 255 : 190 );
     l->shell_hits[SHELL_SETTINGS] = (SDL_Rect){ right - SHELL_GAP / 2, 0, width + SHELL_GAP, UI_HEADER_HEIGHT };
 }
 
@@ -1276,9 +1320,10 @@ static void draw_carousel_card( struct launcher *l, int index, SDL_Rect rect, fl
     int target = w / 2, cx = x + w / 2, cy = y + h / 2, shade = 170 + (int)(85 * focus);
 
     request_icon( l, l->history[index] );
-    if (focus > 0)
+    if (focus > 0 && l->zone != ZONE_HEADER)
     {
-        /* A soft light behind the focused cover, and a thin bright edge around it. */
+        /* A soft light behind the focused cover, and a thin bright edge around
+         * it -- while the games have the focus. The header takes it away. */
         int strength = (int)(focus * 255);
 
         if (ui->glow)
