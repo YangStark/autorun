@@ -71,6 +71,13 @@ static void wine_nx_init_sockets(void)
     }
 }
 
+/* The SDL launcher performs HTTPS requests before Wine's loader and virtual
+ * memory are initialized, so its socket service must be available separately. */
+void wine_nx_runtime_network_init(void)
+{
+    wine_nx_init_sockets();
+}
+
 void wine_nx_runtime_platform_init(void)
 {
     static int paths_initialized;

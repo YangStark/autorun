@@ -124,14 +124,16 @@ enum launcher_catalog_result launcher_catalog_load( struct launcher_catalog *cat
         else if (!strcmp( key, "path" )) invalid |= !copy_value( entry->path, sizeof(entry->path), value );
         else if (!strcmp( key, "title" )) invalid |= !copy_value( entry->title, sizeof(entry->title), value );
         else if (!strcmp( key, "square-art" )) invalid |= !copy_value( entry->square_art, sizeof(entry->square_art), value );
-        else if (!strcmp( key, "landscape-art" )) invalid |= !copy_value( entry->landscape_art, sizeof(entry->landscape_art), value );
+        else if (!strcmp( key, "portrait-art" ) || !strcmp( key, "landscape-art" ))
+            invalid |= !copy_value( entry->portrait_art, sizeof(entry->portrait_art), value );
+        else if (!strcmp( key, "hero-art" )) invalid |= !copy_value( entry->hero_art, sizeof(entry->hero_art), value );
         else if (!strcmp( key, "favorite" )) entry->favorite = atoi( value ) == 1;
         else if (!strcmp( key, "added-order" )) entry->added_order = strtoul( value, NULL, 10 );
         else if (!strcmp( key, "launched-order" )) entry->launched_order = strtoul( value, NULL, 10 );
     }
     if (ferror( file )) invalid = 1;
     fclose( file );
-    if (version != LAUNCHER_CATALOG_VERSION) invalid = 1;
+    if (version != 2 && version != LAUNCHER_CATALOG_VERSION) invalid = 1;
     for (int i = 0; !invalid && i < parsed.count; i++)
     {
         if (!parsed.entries[i].path[0]) invalid = 1;
@@ -165,7 +167,8 @@ int launcher_catalog_save( const struct launcher_catalog *catalog, const char *p
         ok &= fprintf( file, "added-order=%u\nlaunched-order=%u\nfavorite=%d\n",
                        entry->added_order, entry->launched_order, entry->favorite ) > 0;
         if (entry->square_art[0]) ok &= write_value( file, "square-art", entry->square_art );
-        if (entry->landscape_art[0]) ok &= write_value( file, "landscape-art", entry->landscape_art );
+        if (entry->portrait_art[0]) ok &= write_value( file, "portrait-art", entry->portrait_art );
+        if (entry->hero_art[0]) ok &= write_value( file, "hero-art", entry->hero_art );
     }
     if (fflush( file ) || fclose( file )) ok = 0;
     if (!ok) { remove( temp ); return 0; }

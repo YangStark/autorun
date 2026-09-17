@@ -18,8 +18,8 @@
 #define REPEAT_MS        85
 #define STICK_PRESS      18000
 #define STICK_RELEASE    8000
-#define LIST_TOP         118
-#define ROW_HEIGHT       46
+#define LIST_TOP         146
+#define ROW_HEIGHT       64
 
 enum glyph
 {
@@ -1082,8 +1082,8 @@ int ui_confirm( struct ui *ui, const char *title, const char *text, const char *
 enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *title, const char *context,
                             const struct ui_row *rows, int count, int can_reset )
 {
-    const int column_w = 980, column_x = (ui->width - column_w) / 2;
-    const int visible = (ui->height - LIST_TOP - 72) / ROW_HEIGHT;
+    const int column_w = 820, column_x = 84;
+    const int visible = (ui->height - LIST_TOP - 86) / ROW_HEIGHT;
     struct ui_input input;
     int i;
 
@@ -1171,35 +1171,53 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
         if (list->top < 0) list->top = 0;
         row = rows + list->selection;
 
+        /* Options use the same calm, layered surface as Home: a dark sheet
+         * anchored to the left, spacious cards, and one obvious focus target. */
         ui_background( ui );
+        if (ui->glow)
+        {
+            SDL_Rect glow = { column_x + column_w - 80, 54, 360, 360 };
+            SDL_SetTextureColorMod( ui->glow, 136, 158, 190 );
+            SDL_SetTextureAlphaMod( ui->glow, 46 );
+            SDL_RenderCopy( ui->renderer, ui->glow, NULL, &glow );
+        }
+        ui_gradient( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 3, 6, 10, 156 },
+                     (SDL_Color){ 3, 6, 10, 20 }, 1 );
         ui_header( ui, title, context );
-        ui_panel( ui, column_x - 12, LIST_TOP - 10, column_w + 24, visible * ROW_HEIGHT + 18 );
-        bar = ui_highlight( ui, LIST_TOP + (list->selection - list->top) * ROW_HEIGHT + 1 );
-        ui_fill( ui, column_x, bar, column_w, ROW_HEIGHT - 2, ui->focus );
-        ui_fill( ui, column_x, bar, 5, ROW_HEIGHT - 2, ui->selection );
+        ui_rounded( ui, column_x - 20, LIST_TOP - 28, column_w + 40, visible * ROW_HEIGHT + 42, 26,
+                    (SDL_Color){ 12, 16, 22, 222 } );
+        ui_text( ui, ui->small, column_x + 18, LIST_TOP - 18, "OPTIONS", ui->dim );
+        bar = ui_highlight( ui, LIST_TOP + (list->selection - list->top) * ROW_HEIGHT + 2 );
         for (i = list->top; i < count && i < list->top + visible; i++)
         {
             int y = LIST_TOP + (i - list->top) * ROW_HEIGHT, current = i == list->selection;
             int text_y = y + (ROW_HEIGHT - TTF_FontHeight( ui->normal )) / 2;
             int value_w = rows[i].value[0] ? ui_text_width( ui, ui->small, rows[i].value ) : 0;
-            int label_w = column_w - 80 - (value_w ? (value_w < column_w / 3 ? value_w : column_w / 3) + 24 : 0);
+            int label_w = column_w - 78 - (value_w ? (value_w < column_w / 3 ? value_w : column_w / 3) + 28 : 0);
             SDL_Color color = rows[i].disabled ? ui->dim : rows[i].destructive ? ui->danger : current ? ui->value : ui->text;
 
             any_adjustable |= rows[i].adjustable && !rows[i].disabled;
-            ui_text_fit( ui, ui->normal, column_x + 40, text_y, label_w, rows[i].label, color, current );
+            ui_rounded( ui, column_x, y + 3, column_w, ROW_HEIGHT - 6, 16,
+                        current ? (SDL_Color){ 53, 64, 77, 244 } : (SDL_Color){ 30, 37, 46, 158 } );
+            if (current)
+            {
+                ui_border( ui, column_x, (int)bar, column_w, ROW_HEIGHT - 4, 1, (SDL_Color){ 231, 237, 244, 164 } );
+                ui_rounded( ui, column_x + 9, y + 13, 5, ROW_HEIGHT - 26, 3, ui->selection );
+            }
+            ui_text_fit( ui, ui->normal, column_x + 34, text_y, label_w, rows[i].label, color, current );
             if (value_w)
-                ui_text_fit( ui, ui->small, column_x + column_w - 40 - (value_w < column_w / 3 ? value_w : column_w / 3),
+                ui_text_fit( ui, ui->small, column_x + column_w - 30 - (value_w < column_w / 3 ? value_w : column_w / 3),
                              text_y + (TTF_FontHeight( ui->normal ) - TTF_FontHeight( ui->small )) / 2,
                              column_w / 3, rows[i].value, current ? ui->value : ui->dim, current );
         }
         if (count > visible)
         {
-            int track_h = visible * ROW_HEIGHT, thumb = track_h * visible / count;
+            int track_h = visible * ROW_HEIGHT - 12, thumb = track_h * visible / count;
 
             if (thumb < 16) thumb = 16;
-            ui_fill( ui, column_x + column_w + 16, LIST_TOP - 2, 4, track_h, (SDL_Color){ 40, 44, 54, 255 } );
-            ui_fill( ui, column_x + column_w + 16, LIST_TOP - 2 + (track_h - thumb) * list->top / (count - visible),
-                     4, thumb, ui->selection );
+            ui_rounded( ui, column_x + column_w + 12, LIST_TOP + 4, 5, track_h, 3, (SDL_Color){ 66, 73, 85, 160 } );
+            ui_rounded( ui, column_x + column_w + 12, LIST_TOP + 4 + (track_h - thumb) * list->top / (count - visible),
+                        5, thumb, 3, ui->selection );
         }
         if (any_adjustable) hints[hint_count++] = (struct ui_hint){ UI_LEFT, NULL };
         if (any_adjustable) hints[hint_count++] = (struct ui_hint){ UI_RIGHT, "Change" };

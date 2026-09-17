@@ -21,6 +21,9 @@ int main(void)
     assert( index == 0 );
     written.entries[index].favorite = 1;
     written.entries[index].launched_order = 8;
+    snprintf( written.entries[index].square_art, sizeof(written.entries[index].square_art), "/art/square.png" );
+    snprintf( written.entries[index].portrait_art, sizeof(written.entries[index].portrait_art), "/art/portrait.png" );
+    snprintf( written.entries[index].hero_art, sizeof(written.entries[index].hero_art), "/art/hero.png" );
     assert( launcher_catalog_add( &written, "SDMC:/games/a=b/[one]/GAME.EXE", "duplicate" ) == 0 );
     assert( launcher_catalog_save( &written, path ) );
     assert( launcher_catalog_load( &read, path ) == LAUNCHER_CATALOG_OK );
@@ -28,6 +31,9 @@ int main(void)
     assert( !strcmp( read.entries[0].path, "sdmc:/Games/A=B/[One]/game.exe" ) );
     assert( !strcmp( read.entries[0].title, "A %= Game" ) );
     assert( read.entries[0].favorite == 1 && read.entries[0].launched_order == 8 );
+    assert( !strcmp( read.entries[0].square_art, "/art/square.png" ) );
+    assert( !strcmp( read.entries[0].portrait_art, "/art/portrait.png" ) );
+    assert( !strcmp( read.entries[0].hero_art, "/art/hero.png" ) );
 
     launcher_catalog_remove( &read, 0 );
     assert( read.count == 0 );

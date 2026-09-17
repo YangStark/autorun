@@ -595,6 +595,7 @@ add_executable(wine-nx-runtime
     source/launcher_console.c
     source/launcher_svg.c
     source/launcher_ui.c
+    source/steamgriddb.c
     source/runtime_platform.c
     source/sd_cache.c
     source/wow64_box64_bridge.c
@@ -672,6 +673,10 @@ find_library(SWITCH_HARFBUZZ harfbuzz HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib
 find_library(SWITCH_PNG png HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_BZ2 bz2 HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_Z z HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+find_library(SWITCH_CURL curl HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+find_library(SWITCH_MBEDTLS mbedtls HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+find_library(SWITCH_MBEDX509 mbedx509 HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+find_library(SWITCH_MBEDCRYPTO mbedcrypto HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 # devkitPro's Mesa for OpenGL through EGL on the GPU (nouveau over nvservices);
 # its nouveau compiler is C++.
 find_library(SWITCH_EGL EGL HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
@@ -749,11 +754,12 @@ endif()
 # functions come through eglGetProcAddress, so it works over either Mesa.
 find_library(SWITCH_SDL2 SDL2 HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_SDL2_TTF SDL2_ttf HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
-set_source_files_properties(source/launcher.c source/launcher_catalog.c source/launcher_ui.c PROPERTIES
+set_source_files_properties(source/launcher.c source/launcher_catalog.c source/launcher_ui.c source/steamgriddb.c PROPERTIES
     INCLUDE_DIRECTORIES "$ENV{DEVKITPRO}/portlibs/switch/include/SDL2"
     COMPILE_DEFINITIONS _REENTRANT)
 target_link_libraries(wine-nx-runtime PRIVATE
     ${SWITCH_SDL2_TTF} ${SWITCH_SDL2}
+    ${SWITCH_CURL} ${SWITCH_MBEDTLS} ${SWITCH_MBEDX509} ${SWITCH_MBEDCRYPTO}
     ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_HARFBUZZ}
     ${SWITCH_EGL} ${SWITCH_GLAPI} ${SWITCH_DRM_NOUVEAU} stdc++ nx m)
 

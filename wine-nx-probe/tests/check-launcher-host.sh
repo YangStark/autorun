@@ -22,8 +22,9 @@ clang -std=gnu11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-
 clang -std=gnu11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
     -I "$probe/source" $(sdl2-config --cflags) -I/opt/homebrew/include \
     "$probe/tests/launcher_host.c" "$probe/source/launcher.c" "$probe/source/launcher_catalog.c" "$probe/source/launcher_ui.c" \
+    "$probe/source/steamgriddb.c" \
     "$probe/source/launcher_svg.c" \
-    $(sdl2-config --libs) -L/opt/homebrew/lib -lSDL2_ttf -lpng -o "$build/launcher_host"
+    $(sdl2-config --libs) -L/opt/homebrew/lib -lSDL2_ttf -lpng -lcurl -o "$build/launcher_host"
 # sdl2-compat looks for SDL3 next to the program, not in Homebrew's lib folder.
 ln -s /opt/homebrew/lib/libSDL3.0.dylib "$build/libSDL3.dylib"
 
@@ -57,7 +58,7 @@ SCRIPT
 cd "$build/card"
 SDL_VIDEODRIVER=dummy "$build/launcher_host" "$font" "$build/script.txt" > "$build/out.txt" 2>&1 || { cat "$build/out.txt"; exit 1; }
 grep -q "launcher returned 1 target 'sdmc:/switch/wine/drive_c/openttd/openttd.exe'" "$build/out.txt" || { cat "$build/out.txt"; exit 1; }
-grep -q '^version=2$' "sdmc:/switch/wine/launcher-library-v2.ini"
+grep -q '^version=3$' "sdmc:/switch/wine/launcher-library-v2.ini"
 grep -q '^path=sdmc:/switch/wine/drive_c/openttd/openttd.exe$' "sdmc:/switch/wine/launcher-library-v2.ini"
 test "$(grep -c '^\[game ' "sdmc:/switch/wine/launcher-library-v2.ini")" -eq 1
 grep -qx "sdmc:/switch/wine/drive_c/openttd/openttd.exe" "sdmc:/switch/wine/target.txt"
@@ -81,7 +82,7 @@ grep -q "launcher returned 1 target 'sdmc:/switch/wine/drive_c/openttd/openttd.e
 echo "launcher host run: empty home, explicit add, persistence, details and start passed"
 
 # Eight played covers exercise Home's row: animated hit testing, swipe selection,
-# both ends, the header and the actions under the row, and the square library.
+# both ends, the header, Y Options, and the square library.
 cat > "$build/carousel-script.txt" <<SCRIPT
 wait 35
 key left
@@ -106,15 +107,26 @@ shot $shots/carousel-last.png
 key up
 wait 10
 shot $shots/carousel-header.png
+key right
+key right
+key right
+key a
+wait 10
+shot $shots/settings.png
+key b
+wait 10
+key left
+key left
+key left
 key down
 key r
 wait 15
 shot $shots/carousel-library.png
 key l
 wait 20
-key down
+key y
 wait 10
-shot $shots/carousel-actions.png
+shot $shots/carousel-options.png
 key a
 wait 5
 key a
@@ -125,4 +137,4 @@ SDL_VIDEODRIVER=dummy "$build/launcher_host" "$font" "$build/carousel-script.txt
 grep -q "launcher returned 1 target 'sdmc:/switch/wine/drive_c/Vanguard/Game.exe'" "$build/carousel-out.txt" || {
     cat "$build/carousel-out.txt"; exit 1;
 }
-echo "launcher host run: Home history row, taps, swipes, boundaries, header focus and View Details passed"
+echo "launcher host run: Home history row, taps, swipes, boundaries, header focus and Y Options passed"

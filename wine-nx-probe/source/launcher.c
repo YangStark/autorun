@@ -15,6 +15,7 @@
  * When SDL cannot start, the text menu of launcher_console.c is shown instead.
  */
 #include <dirent.h>
+#include <errno.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -37,6 +38,7 @@
 #include "launcher_pe.h"
 #include "launcher_settings.h"
 #include "launcher_ui.h"
+#include "steamgriddb.h"
 
 #define ICON_SIDE      128    /* icons are decoded no larger than this */
 #define ICON_TEXTURES  12     /* at most 12 MiB with 512px artwork */
@@ -63,19 +65,17 @@ enum shell_tab { SHELL_HOME, SHELL_LIBRARY, SHELL_ADD, SHELL_SETTINGS, SHELL_TAB
 #define HOME_CARD_GAP     18
 #define HOME_RADIUS       26
 #define HOME_TITLE_Y      440
-#define HOME_BUTTON_Y     (HOME_TOP + HOME_FOCUS_H + 26)
-#define HOME_BUTTON_H     62
-#define HOME_DETAILS_W    246
 #define HOME_HINT_Y       (720 - 50)
 #define BACKDROP_FADE_MS  280
 
-/* Where the D-pad and stick are: the header, the games, or the actions under them. */
-enum zone { ZONE_HEADER, ZONE_CONTENT, ZONE_ACTIONS };
+/* Where the D-pad and stick are: the header or the games. */
+enum zone { ZONE_HEADER, ZONE_CONTENT };
 
 /* The icons drawn from assets/ (launcher_icons.h), made once at the size they are shown. */
 enum symbol { SYMBOL_HOME, SYMBOL_LIBRARY, SYMBOL_ADD, SYMBOL_SETTINGS, SYMBOL_COUNT };
 
 enum icon_state { ICON_UNKNOWN, ICON_QUEUED, ICON_READY, ICON_MISSING };
+enum art_kind { ART_PORTRAIT, ART_SQUARE, ART_HERO };
 
 struct program
 {
@@ -93,7 +93,8 @@ struct program
     int favorite;
     int missing;
     char square_art[512];
-    char landscape_art[512];
+    char portrait_art[512];
+    char hero_art[512];
     int removed;
     enum icon_state icon_state;
     SDL_Texture *icon;
@@ -101,11 +102,16 @@ struct program
     int icon_is_art;
     Uint32 icon_time;
     unsigned int icon_use;
+    enum icon_state square_state, hero_state;
+    SDL_Texture *square_icon, *hero_icon;
+    int square_width, square_height, hero_width, hero_height;
+    Uint32 square_time, hero_time;
 };
 
 struct icon_job
 {
     int index;
+    int kind;
     char path[512];
     char artwork[512];
 };
@@ -113,6 +119,7 @@ struct icon_job
 struct icon_result
 {
     int index;
+    int kind;
     int width, height;
     unsigned char *rgba;
     int artwork;
@@ -151,7 +158,7 @@ struct launcher
     /* What the D-pad moves, and which header item it is on. */
     int zone, header_focus;
     /* Where the last frame drew what a tap can hit. */
-    SDL_Rect shell_hits[SHELL_TABS], details_hit, add_hit;
+    SDL_Rect shell_hits[SHELL_TABS], add_hit;
     /* The programs whose artwork is behind Home, fading from the previous one; -1 for none. */
     int backdrop, backdrop_previous;
     Uint32 backdrop_since;
@@ -388,7 +395,8 @@ static void describe_catalog_program( struct launcher *l, struct program *p,
     p->launched_order = entry->launched_order;
     p->favorite = entry->favorite;
     snprintf( p->square_art, sizeof(p->square_art), "%s", entry->square_art );
-    snprintf( p->landscape_art, sizeof(p->landscape_art), "%s", entry->landscape_art );
+    snprintf( p->portrait_art, sizeof(p->portrait_art), "%s", entry->portrait_art );
+    snprintf( p->hero_art, sizeof(p->hero_art), "%s", entry->hero_art );
     p->added = 1;
     if (file_exists( p->path ) && !l->options->machine_of( p->path, &p->machine ))
     {
@@ -458,7 +466,8 @@ static int save_library( struct launcher *l )
         entry->launched_order = p->launched_order;
         entry->favorite = p->favorite;
         snprintf( entry->square_art, sizeof(entry->square_art), "%s", p->square_art );
-        snprintf( entry->landscape_art, sizeof(entry->landscape_art), "%s", p->landscape_art );
+        snprintf( entry->portrait_art, sizeof(entry->portrait_art), "%s", p->portrait_art );
+        snprintf( entry->hero_art, sizeof(entry->hero_art), "%s", p->hero_art );
         if (entry->id >= l->catalog.next_id) l->catalog.next_id = entry->id + 1;
         if (entry->added_order >= l->catalog.next_order) l->catalog.next_order = entry->added_order + 1;
         if (entry->launched_order >= l->catalog.next_order) l->catalog.next_order = entry->launched_order + 1;
@@ -677,14 +686,16 @@ static int icon_thread( void *arg )
         memmove( l->jobs, l->jobs + 1, --l->job_count * sizeof(l->jobs[0]) );
         SDL_UnlockMutex( l->mutex );
 
+        memset( &icon, 0, sizeof(icon) );
         result.artwork = read_cover( job.artwork, &icon );
-        if (!result.artwork)
+        if (!result.artwork && job.kind == ART_PORTRAIT)
         {
             launcher_pe_describe( job.path, ICON_SIDE, &icon, NULL, 0 );
             if (icon.kind == LAUNCHER_ICON_PNG && !decode_png( &icon )) launcher_icon_free( &icon );
             if (icon.kind == LAUNCHER_ICON_RGBA && !launcher_icon_fit( &icon, ICON_SIDE )) launcher_icon_free( &icon );
         }
         result.index = job.index;
+        result.kind = job.kind;
         result.width = icon.width;
         result.height = icon.height;
         result.rgba = icon.kind == LAUNCHER_ICON_RGBA ? icon.data : NULL;
@@ -726,7 +737,10 @@ static void stop_icons( struct launcher *l )
     for (i = 0; i < l->program_count; i++)
     {
         if (l->programs[i].icon) SDL_DestroyTexture( l->programs[i].icon );
+        if (l->programs[i].square_icon) SDL_DestroyTexture( l->programs[i].square_icon );
+        if (l->programs[i].hero_icon) SDL_DestroyTexture( l->programs[i].hero_icon );
         l->programs[i].icon = NULL;
+        l->programs[i].square_icon = l->programs[i].hero_icon = NULL;
     }
     if (l->cond) SDL_DestroyCond( l->cond );
     if (l->mutex) SDL_DestroyMutex( l->mutex );
@@ -761,44 +775,72 @@ static void pump_icons( struct launcher *l )
             SDL_SetTextureBlendMode( texture, SDL_BLENDMODE_BLEND );
         }
         free( results[i].rgba );
-        p->icon = texture;
-        p->icon_width = results[i].width;
-        p->icon_height = results[i].height;
-        p->icon_is_art = results[i].artwork;
-        p->icon_time = SDL_GetTicks();
-        p->icon_state = texture ? ICON_READY : ICON_MISSING;
+        if (results[i].kind == ART_SQUARE)
+        {
+            p->square_icon = texture; p->square_width = results[i].width; p->square_height = results[i].height;
+            p->square_time = SDL_GetTicks(); p->square_state = texture ? ICON_READY : ICON_MISSING;
+        }
+        else if (results[i].kind == ART_HERO)
+        {
+            p->hero_icon = texture; p->hero_width = results[i].width; p->hero_height = results[i].height;
+            p->hero_time = SDL_GetTicks(); p->hero_state = texture ? ICON_READY : ICON_MISSING;
+        }
+        else
+        {
+            p->icon = texture; p->icon_width = results[i].width; p->icon_height = results[i].height;
+            p->icon_is_art = results[i].artwork; p->icon_time = SDL_GetTicks();
+            p->icon_state = texture ? ICON_READY : ICON_MISSING;
+        }
     }
 
     /* Keep the most recently shown icons. */
-    for (i = 0; i < l->program_count; i++) loaded += l->programs[i].icon != NULL;
+    for (i = 0; i < l->program_count; i++)
+        loaded += (l->programs[i].icon != NULL) + (l->programs[i].square_icon != NULL) +
+                  (l->programs[i].hero_icon != NULL);
     while (loaded > ICON_TEXTURES)
     {
         oldest = -1;
         for (i = 0; i < l->program_count; i++)
-            if (l->programs[i].icon && (oldest < 0 || l->programs[i].icon_use < l->programs[oldest].icon_use))
+            if ((l->programs[i].icon || l->programs[i].square_icon || l->programs[i].hero_icon) &&
+                (oldest < 0 || l->programs[i].icon_use < l->programs[oldest].icon_use))
                 oldest = i;
-        SDL_DestroyTexture( l->programs[oldest].icon );
-        l->programs[oldest].icon = NULL;
-        l->programs[oldest].icon_state = ICON_UNKNOWN;
+        if (l->programs[oldest].hero_icon)
+        {
+            SDL_DestroyTexture( l->programs[oldest].hero_icon );
+            l->programs[oldest].hero_icon = NULL; l->programs[oldest].hero_state = ICON_UNKNOWN;
+        }
+        else if (l->programs[oldest].square_icon)
+        {
+            SDL_DestroyTexture( l->programs[oldest].square_icon );
+            l->programs[oldest].square_icon = NULL; l->programs[oldest].square_state = ICON_UNKNOWN;
+        }
+        else
+        {
+            SDL_DestroyTexture( l->programs[oldest].icon );
+            l->programs[oldest].icon = NULL; l->programs[oldest].icon_state = ICON_UNKNOWN;
+        }
         loaded--;
     }
 }
 
-static void request_icon( struct launcher *l, int index )
+static void request_art( struct launcher *l, int index, enum art_kind kind )
 {
     struct program *p = &l->programs[index];
+    enum icon_state *state = kind == ART_SQUARE ? &p->square_state : kind == ART_HERO ? &p->hero_state : &p->icon_state;
+    const char *art = kind == ART_SQUARE ? p->square_art : kind == ART_HERO ? p->hero_art : p->portrait_art;
 
     p->icon_use = ++l->icon_use;
-    if (p->icon_state != ICON_UNKNOWN || !l->thread) return;
+    if (*state != ICON_UNKNOWN || !l->thread) return;
     SDL_LockMutex( l->mutex );
     if (l->job_count < ICON_JOBS)
     {
         l->jobs[l->job_count].index = index;
+        l->jobs[l->job_count].kind = kind;
         memcpy( l->jobs[l->job_count].path, p->path, sizeof(p->path) );
-        if (p->landscape_art[0] || p->square_art[0])
+        if (art[0])
             snprintf( l->jobs[l->job_count].artwork, sizeof(l->jobs[0].artwork), "%s",
-                      p->landscape_art[0] ? p->landscape_art : p->square_art );
-        else
+                      art );
+        else if (kind == ART_PORTRAIT)
         {
             char folder[512];
             snprintf( folder, sizeof(folder), "%s", p->path );
@@ -806,12 +848,15 @@ static void request_icon( struct launcher *l, int index )
             if (snprintf( l->jobs[l->job_count].artwork, sizeof(l->jobs[0].artwork), "%s/cover.png", folder ) >=
                 (int)sizeof(l->jobs[0].artwork)) l->jobs[l->job_count].artwork[0] = 0;
         }
+        else l->jobs[l->job_count].artwork[0] = 0;
         l->job_count++;
-        p->icon_state = ICON_QUEUED;
+        *state = ICON_QUEUED;
         SDL_CondSignal( l->cond );
     }
     SDL_UnlockMutex( l->mutex );
 }
+
+static void request_icon( struct launcher *l, int index ) { request_art( l, index, ART_PORTRAIT ); }
 
 /***********************************************************************
  * Library grid
@@ -888,7 +933,8 @@ static void draw_card( struct launcher *l, int index, int x, int y, const struct
     SDL_Color caption = current ? ui->value : ui->dim;
     int text_w;
 
-    request_icon( l, l->visible[index] );
+    request_art( l, l->visible[index], ART_SQUARE );
+    if (!p->square_art[0]) request_icon( l, l->visible[index] );
     if (current)
     {
         SDL_Color glow = ui->selection;
@@ -911,7 +957,13 @@ static void draw_card( struct launcher *l, int index, int x, int y, const struct
     ui_rounded( ui, x, y, g->card, g->card, 14, current ? ui->focus : ui->card );
     ui_fill( ui, x + 14, y, g->card - 28, 1, (SDL_Color){ 255, 255, 255, 30 } );
 
-    if (p->icon && p->icon_is_art)
+    if (p->square_icon)
+    {
+        SDL_Rect src = {0, 0, p->square_width, p->square_height};
+        ui_rounded_texture( ui, p->square_icon, &src, (SDL_Rect){x, y, g->card, g->card}, 14,
+                            (SDL_Color){ current ? 255 : 190, current ? 255 : 190, current ? 255 : 190, 255 } );
+    }
+    else if (p->icon && p->icon_is_art)
         draw_cover( ui, p, (SDL_Rect){x, y, g->card, g->card}, 14, current ? 255 : 190, 255 );
     else if (p->icon)
     {
@@ -1131,14 +1183,34 @@ static void draw_backdrop_art( struct launcher *l, int index, int alpha )
 
     if (index < 0 || alpha <= 0) return;
     p = &l->programs[index];
-    if (!p->icon || !p->icon_is_art) return;
-    age = SDL_GetTicks() - p->icon_time;
+    request_art( l, index, ART_HERO );
+    if (!p->hero_icon)
+    {
+        request_icon( l, index );
+        if (!p->icon || !p->icon_is_art) return;
+    }
+    age = SDL_GetTicks() - (p->hero_icon ? p->hero_time : p->icon_time);
     if (ui->animations && age < BACKDROP_FADE_MS) alpha = alpha * (int)age / BACKDROP_FADE_MS;
-    src = cover_crop( p, ui->width, ui->height );
-    SDL_SetTextureColorMod( p->icon, 205, 205, 205 );
-    SDL_SetTextureAlphaMod( p->icon, alpha );
-    SDL_SetTextureScaleMode( p->icon, SDL_ScaleModeLinear );
-    SDL_RenderCopy( ui->renderer, p->icon, &src, NULL );
+    if (p->hero_icon)
+    {
+        int sw = p->hero_width, sh = p->hero_height;
+        src = (SDL_Rect){0, 0, sw, sh};
+        if ((long long)sw * ui->height > (long long)sh * ui->width)
+        { src.w = sh * ui->width / ui->height; src.x = (sw - src.w) / 2; }
+        else { src.h = sw * ui->height / ui->width; src.y = (sh - src.h) / 2; }
+        SDL_SetTextureColorMod( p->hero_icon, 205, 205, 205 );
+        SDL_SetTextureAlphaMod( p->hero_icon, alpha );
+        SDL_SetTextureScaleMode( p->hero_icon, SDL_ScaleModeLinear );
+        SDL_RenderCopy( ui->renderer, p->hero_icon, &src, NULL );
+    }
+    else
+    {
+        src = cover_crop( p, ui->width, ui->height );
+        SDL_SetTextureColorMod( p->icon, 205, 205, 205 );
+        SDL_SetTextureAlphaMod( p->icon, alpha );
+        SDL_SetTextureScaleMode( p->icon, SDL_ScaleModeLinear );
+        SDL_RenderCopy( ui->renderer, p->icon, &src, NULL );
+    }
 }
 
 /* The focused game's artwork behind the whole screen, shaded toward the left and
@@ -1259,9 +1331,8 @@ static int draw_tag( struct ui *ui, int x, int cy, const char *text, int warning
 
 static void draw_home( struct launcher *l )
 {
-    static const struct ui_hint play_hints[] = { { UI_A, "Play" } }, details_hints[] = { { UI_A, "View Details" } };
+    static const struct ui_hint hints[] = { { UI_A, "Play" }, { UI_Y, "Options" }, { UI_X, "Add Game" } };
     static const struct ui_hint empty_hints[] = { { UI_A, "Open Library" } };
-    const SDL_Color button = { 236, 238, 240, 52 }, button_focused = { 246, 248, 250, 92 };
     struct ui *ui = &l->ui;
     int i;
     Uint32 now = SDL_GetTicks();
@@ -1278,7 +1349,6 @@ static void draw_home( struct launcher *l )
     l->carousel_started = 1;
     l->carousel_tick = now;
     memset( l->carousel_hits, 0, sizeof(l->carousel_hits) );
-    memset( &l->details_hit, 0, sizeof(l->details_hit) );
     memset( &l->add_hit, 0, sizeof(l->add_hit) );
 
     draw_backdrop( l, l->history_count ? l->history[l->history_selection] : -1 );
@@ -1334,16 +1404,7 @@ static void draw_home( struct launcher *l )
         if (p->missing)
             draw_tag( ui, title_x, HOME_TITLE_Y + TTF_FontHeight( ui->normal ) + 12, "Missing", 1 );
 
-        l->details_hit = (SDL_Rect){ SHELL_MARGIN, HOME_BUTTON_Y, HOME_DETAILS_W, HOME_BUTTON_H };
-        if (l->zone == ZONE_ACTIONS)
-            ui_rounded( ui, l->details_hit.x - 2, l->details_hit.y - 2, l->details_hit.w + 4, l->details_hit.h + 4, 22,
-                        (SDL_Color){ 245, 246, 248, 200 } );
-        ui_rounded( ui, l->details_hit.x, l->details_hit.y, l->details_hit.w, l->details_hit.h, 20,
-                    l->zone == ZONE_ACTIONS ? button_focused : button );
-        ui_text_centered( ui, ui->small, l->details_hit.x + l->details_hit.w / 2,
-                          HOME_BUTTON_Y + (HOME_BUTTON_H - TTF_FontHeight( ui->small )) / 2, "View Details", ui->value );
-        ui_hints_right( ui, l->zone == ZONE_ACTIONS ? details_hints : play_hints, 1, ui->width - SHELL_MARGIN,
-                        HOME_HINT_Y );
+        ui_hints_right( ui, hints, 3, ui->width - SHELL_MARGIN, HOME_HINT_Y );
     }
     ui_fade( ui );
 }
@@ -1354,11 +1415,87 @@ static void draw_home( struct launcher *l )
 
 enum program_row
 {
-    ROW_START, ROW_FAVORITE, ROW_LOCATE, ROW_TITLE, ROW_ARGS, ROW_VERBOSE, ROW_PROFILE, ROW_WINDOWS, ROW_D3D9, ROW_CONTROLS, ROW_BOX64,
+    ROW_START, ROW_FAVORITE, ROW_ARTWORK, ROW_LOCATE, ROW_TITLE, ROW_ARGS, ROW_VERBOSE, ROW_PROFILE, ROW_WINDOWS, ROW_D3D9, ROW_CONTROLS, ROW_BOX64,
     ROW_HIDE, ROW_LIBRARY, PROGRAM_ROWS
 };
 
 static int file_browser_pick( struct launcher *l, char *target, size_t size );
+static void save_look( struct launcher *l );
+
+static void download_artwork( struct launcher *l, struct program *p )
+{
+    char key[512], folder[512], square[512], portrait[512], hero[512], matched[192], message[512];
+    struct steamgriddb_game games[STEAMGRIDDB_MAX_GAMES];
+    struct ui_row rows[STEAMGRIDDB_MAX_GAMES];
+    struct ui_list list = {0};
+    int count = 0, i;
+    enum steamgriddb_result result;
+
+    if (!launcher_kv_get( &l->look, "steamgriddb-key", key, sizeof(key) ) || !key[0])
+    {
+        if (!launcher_platform_prompt( "SteamGridDB API key", "", key, sizeof(key) ) || !key[0]) return;
+        launcher_kv_set( &l->look, "steamgriddb-key", key );
+        save_look( l );
+    }
+    snprintf( folder, sizeof(folder), "%s/artwork", l->options->runtime_dir );
+    if (mkdir( folder, 0777 ) && errno != EEXIST)
+    { ui_message( &l->ui, "Artwork download failed", "The artwork cache directory could not be created." ); return; }
+    if (snprintf( square, sizeof(square), "%s/%u-square.png", folder, p->catalog_id ) >= (int)sizeof(square) ||
+        snprintf( portrait, sizeof(portrait), "%s/%u-portrait.png", folder, p->catalog_id ) >= (int)sizeof(portrait) ||
+        snprintf( hero, sizeof(hero), "%s/%u-hero.png", folder, p->catalog_id ) >= (int)sizeof(hero)) return;
+
+    ui_background( &l->ui );
+    ui_header( &l->ui, "Downloading artwork", p->title );
+    ui_text_centered( &l->ui, l->ui.normal, l->ui.width / 2, l->ui.height / 2 - 12,
+                      "Searching SteamGridDB...", l->ui.text );
+    ui_present( &l->ui );
+    result = steamgriddb_search_games( key, p->title, games, STEAMGRIDDB_MAX_GAMES, &count );
+    if (result == STEAMGRIDDB_NO_KEY)
+    {
+        launcher_kv_set( &l->look, "steamgriddb-key", NULL );
+        save_look( l );
+    }
+    if (result != STEAMGRIDDB_OK)
+    { ui_message( &l->ui, "Artwork download failed", steamgriddb_result_message( result ) ); return; }
+
+    memset( rows, 0, sizeof(rows) );
+    for (i = 0; i < count; i++)
+    {
+        snprintf( rows[i].label, sizeof(rows[i].label), "%s", games[i].name );
+        snprintf( rows[i].value, sizeof(rows[i].value), "SteamGridDB" );
+        rows[i].help = "Download the highest-rated square, portrait and hero artwork for this match.";
+    }
+    if (count > 1 && ui_list_run( &l->ui, &list, "Choose SteamGridDB game", p->title, rows, count, 0 ) != UI_ACTION_CHOOSE)
+        return;
+    snprintf( matched, sizeof(matched), "%s", games[list.selection].name );
+
+    ui_background( &l->ui );
+    ui_header( &l->ui, "Downloading artwork", matched );
+    ui_text_centered( &l->ui, l->ui.normal, l->ui.width / 2, l->ui.height / 2 - 12,
+                      "Square, portrait and hero from SteamGridDB...", l->ui.text );
+    ui_present( &l->ui );
+    result = steamgriddb_download_game_bundle( key, games[list.selection].id, square, portrait, hero );
+    if (result == STEAMGRIDDB_NO_KEY)
+    {
+        launcher_kv_set( &l->look, "steamgriddb-key", NULL );
+        save_look( l );
+    }
+    if (result != STEAMGRIDDB_OK)
+    { ui_message( &l->ui, "Artwork download failed", steamgriddb_result_message( result ) ); return; }
+
+    snprintf( p->square_art, sizeof(p->square_art), "%s", square );
+    snprintf( p->portrait_art, sizeof(p->portrait_art), "%s", portrait );
+    snprintf( p->hero_art, sizeof(p->hero_art), "%s", hero );
+    if (p->icon) SDL_DestroyTexture( p->icon );
+    if (p->square_icon) SDL_DestroyTexture( p->square_icon );
+    if (p->hero_icon) SDL_DestroyTexture( p->hero_icon );
+    p->icon = NULL; p->icon_state = ICON_UNKNOWN; p->icon_is_art = 0;
+    p->square_icon = p->hero_icon = NULL;
+    p->square_state = p->hero_state = ICON_UNKNOWN;
+    save_library( l );
+    snprintf( message, sizeof(message), "Downloaded the highest-rated square, portrait and hero artwork for %s.", matched );
+    ui_message( &l->ui, "Artwork downloaded", message );
+}
 
 /* A setting that follows the global one (-1) or is on (1) or off (0) for this program. */
 static const char *state_text( int state, int global, const char *on, const char *off, char *buffer, size_t size )
@@ -1466,6 +1603,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
         ADD_ROW( ROW_START, "Start", NULL );
         ADD_ROW( ROW_FAVORITE, p->favorite ? "Remove from favorites" : "Add to favorites", NULL );
+        ADD_ROW( ROW_ARTWORK, "Download artwork", "Automatically downloads the highest-rated square, portrait and hero artwork from SteamGridDB." );
         if (p->missing) ADD_ROW( ROW_LOCATE, "Locate executable", "Choose the game's executable at its new location." );
         ADD_ROW( ROW_TITLE, "Title",
                  "The name shown in the library. Y goes back to the name in the program's own resources." );
@@ -1558,7 +1696,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
         }
 #undef ADD_ROW
 
-        action = ui_list_run( ui, &list, p->title, p->dos, rows, count, 1 );
+        action = ui_list_run( ui, &list, "Game Options", p->title, rows, count, 1 );
         if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return 0;
         id = ids[list.selection];
         switch (id)
@@ -1576,6 +1714,10 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
             p->favorite = !p->favorite;
             if (!save_library( l )) p->favorite = !p->favorite;
             else ui_toast( ui, p->favorite ? "Added to favorites" : "Removed from favorites", 1500 );
+            break;
+
+        case ROW_ARTWORK:
+            if (action == UI_ACTION_CHOOSE) download_artwork( l, p );
             break;
 
         case ROW_LOCATE:
@@ -1704,7 +1846,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
 enum settings_row
 {
-    SET_ANIMATIONS, SET_COLUMNS, SET_ROWS, SET_HIDDEN, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_VERSION,
+    SET_ANIMATIONS, SET_COLUMNS, SET_ROWS, SET_HIDDEN, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_STEAMGRIDDB, SET_VERSION,
     SET_CREDITS, SETTINGS_ROWS
 };
 
@@ -1830,6 +1972,11 @@ static void settings_menu( struct launcher *l )
                   l->options->framebuffer ? "Framebuffer" : "Compositor" );
         rows[SET_WINDOWS].help = "framebuffer.txt: the framebuffer copies window pixels straight to the screen, "
                                  "for when the OpenGL compositor misbehaves.";
+        snprintf( rows[SET_STEAMGRIDDB].label, sizeof(rows[0].label), "SteamGridDB API key" );
+        snprintf( rows[SET_STEAMGRIDDB].value, sizeof(rows[0].value), "%s",
+                  launcher_kv_get( &l->look, "steamgriddb-key", path, sizeof(path) ) && path[0] ? "Configured" : "Not set" );
+        rows[SET_STEAMGRIDDB].help = "Used to automatically download the community's highest-rated square, portrait and hero artwork.";
+        rows[SET_STEAMGRIDDB].adjustable = 0;
         snprintf( rows[SET_VERSION].label, sizeof(rows[0].label), "Runtime" );
         snprintf( rows[SET_VERSION].value, sizeof(rows[0].value), "%s", l->options->build );
         rows[SET_VERSION].disabled = 1;
@@ -1863,6 +2010,14 @@ static void settings_menu( struct launcher *l )
             runtime_file( l, "framebuffer.txt", path, sizeof(path) );
             write_line( path, l->options->framebuffer ? "1" : "0" );
             break;
+        case SET_STEAMGRIDDB:
+        {
+            char key[512] = "";
+            launcher_kv_get( &l->look, "steamgriddb-key", key, sizeof(key) );
+            if (action == UI_ACTION_CHOOSE && launcher_platform_prompt( "SteamGridDB API key (blank removes)", key, key, sizeof(key) ))
+                launcher_kv_set( &l->look, "steamgriddb-key", key[0] ? key : NULL );
+            break;
+        }
         case SET_CREDITS:
             credits_screen( l );
             ui_start_screen( ui );
@@ -2172,11 +2327,6 @@ static int run_library( struct launcher *l, char *target, size_t size )
                 if (home)
                 {
                     if (SDL_PointInRect( &point, &l->add_hit )) show_library( l, &home, ui );
-                    else if (SDL_PointInRect( &point, &l->details_hit ))
-                    {
-                        l->zone = ZONE_ACTIONS;
-                        input.button = UI_A;
-                    }
                     else if ((hit = carousel_hit( l, input.x, input.y )) >= 0)
                     {
                         l->zone = ZONE_CONTENT;
@@ -2254,7 +2404,6 @@ static int run_library( struct launcher *l, char *target, size_t size )
 
                     if (next >= SHELL_HOME && next < SHELL_TABS) l->header_focus = next;
                 }
-                else if (l->zone == ZONE_ACTIONS) break;   /* View Details is the only action */
                 else if (home)
                 {
                     if (step < 0 && l->history_selection > 0) l->history_selection--;
@@ -2272,14 +2421,9 @@ static int run_library( struct launcher *l, char *target, size_t size )
                 {
                     if (down) l->zone = ZONE_CONTENT;
                 }
-                else if (l->zone == ZONE_ACTIONS)
-                {
-                    if (!down) l->zone = ZONE_CONTENT;
-                }
                 else if (home)
                 {
-                    if (down && l->history_count) l->zone = ZONE_ACTIONS;
-                    else if (!down)
+                    if (!down)
                     {
                         l->zone = ZONE_HEADER;
                         l->header_focus = SHELL_HOME;
@@ -2322,7 +2466,7 @@ static int run_library( struct launcher *l, char *target, size_t size )
                 }
                 if (l->zone == ZONE_CONTENT)
                 {
-                    /* A on a game plays it; Y, or View Details on Home, opens its menu. */
+                    /* A on a game plays it; Y opens its Options menu. */
                     if (start_program( l, p, target, size )) return 1;
                     ui_start_screen( ui );
                 }

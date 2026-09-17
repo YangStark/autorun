@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include "launcher_list.h"
 
-#define LAUNCHER_CATALOG_VERSION 2
+#define LAUNCHER_CATALOG_VERSION 3
 #define LAUNCHER_CATALOG_FILE "launcher-library-v2.ini"
 
 struct launcher_catalog_entry
@@ -16,7 +16,8 @@ struct launcher_catalog_entry
     char path[512];
     char title[128];
     char square_art[512];
-    char landscape_art[512];
+    char portrait_art[512];
+    char hero_art[512];
 };
 
 struct launcher_catalog
