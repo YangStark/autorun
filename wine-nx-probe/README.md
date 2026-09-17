@@ -317,7 +317,13 @@ hero for the focused game's backdrop. They are cached in `switch/wine/artwork`
 and replaced atomically.
 Existing v2 catalogs are migrated when they are next saved.
 
-**Address space** under Game Options says what a game needs of the address space
+Settings and a game's own settings stand as sections beside their rows: the
+sections at the left, and each row with its name, the line that says what it
+does, and what it is set to -- a switch, a value the row changes where it
+stands, or an arrow into a screen of its own. L and R move between sections, so
+Left and Right stay the row's own.
+
+**Address space** under Game Settings says what a game needs of the address space
 Horizon gives Wine-NX. A game with no relocations is linked for one address and
 no other, and only a forwarder made with a 32-bit address space has the low 4 GB
 that address lives in; Need for Speed Underground 2 is one. The forwarder that

@@ -175,6 +175,10 @@ int  ui_confirm( struct ui *ui, const char *title, const char *text, const char 
 /* A list of settings rows. ui_list_run draws it and handles input until the
  * user acts on a row, then returns the action for the row at list->selection;
  * the caller changes what it must and calls it again. */
+/* How a settings row draws what it carries on the right: an arrow into a screen
+ * of its own, a value the row itself changes, or a switch. */
+enum ui_row_kind { UI_ROW_ACTION, UI_ROW_VALUE, UI_ROW_SWITCH };
+
 struct ui_row
 {
     char label[96];
@@ -182,7 +186,10 @@ struct ui_row
     int disabled;
     int adjustable;     /* Left and Right change the value */
     int destructive;
-    const char *help;   /* shown by X */
+    const char *help;   /* the line under the label, and what X shows */
+    unsigned char kind; /* enum ui_row_kind, for ui_settings_run */
+    unsigned char on;   /* UI_ROW_SWITCH: which way it is set */
+    unsigned char group;/* which section it belongs to */
 };
 
 struct ui_list
@@ -203,5 +210,13 @@ enum ui_action
 
 enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *title, const char *context,
                             const struct ui_row *rows, int count, int can_reset );
+
+/* Settings, as a section list beside the rows of the section in focus: each row
+ * carries its own description, and shows a switch, a value or an arrow. L and R
+ * change section, so Left and Right are still the row's own. group selects the
+ * section on entry and is left on the one the user ends in. */
+enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char *title, const char *context,
+                                const char *const *groups, int group_count,
+                                const struct ui_row *rows, int count, int can_reset, int *group );
 
 #endif

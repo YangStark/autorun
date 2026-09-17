@@ -1251,3 +1251,247 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
     }
     return UI_ACTION_QUIT;
 }
+
+/***********************************************************************
+ * Settings
+ *
+ * The sections stand at the left and the rows of the section in focus fill the
+ * rest, each with its name, the line that says what it does, and what it is set
+ * to on the right: a switch, a value, or an arrow into a screen of its own.
+ */
+#define SET_SIDEBAR_X    40
+#define SET_SIDEBAR_W    248
+#define SET_GROUP_H      54
+#define SET_ROW_X        (SET_SIDEBAR_X + SET_SIDEBAR_W + 32)
+#define SET_ROW_H        104
+
+static void ui_switch( struct ui *ui, int x, int y, int on, int current, int disabled )
+{
+    const int w = 56, h = 30;
+    SDL_Color track = disabled ? (SDL_Color){ 44, 50, 58, 220 } :
+                      on ? (SDL_Color){ 108, 152, 214, 255 } : (SDL_Color){ 58, 66, 78, 244 };
+    SDL_Color knob = disabled ? (SDL_Color){ 96, 104, 114, 255 } : (SDL_Color){ 244, 247, 250, 255 };
+
+    ui_rounded( ui, x, y, w, h, h / 2, track );
+    if (current && !disabled) ui_border( ui, x, y, w, h, 1, (SDL_Color){ 231, 237, 244, 150 } );
+    ui_rounded( ui, on ? x + w - h + 3 : x + 3, y + 3, h - 6, h - 6, (h - 6) / 2, knob );
+}
+
+/* The arrow that says a row opens something of its own. */
+static void ui_chevron( struct ui *ui, int x, int y, SDL_Color color )
+{
+    int i;
+
+    for (i = 0; i < 8; i++)
+    {
+        ui_rounded( ui, x + 8 - i, y + 8 - i, 2, 2, 1, color );
+        ui_rounded( ui, x + 8 - i, y + 8 + i, 2, 2, 1, color );
+    }
+}
+
+enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char *title, const char *context,
+                                const char *const *groups, int group_count,
+                                const struct ui_row *rows, int count, int can_reset, int *group )
+{
+    const int row_w = 1280 - SET_ROW_X - 56;
+    const int visible = (ui->height - LIST_TOP - 86) / SET_ROW_H;
+    int index[64], shown, i;
+    struct ui_input input;
+
+    if (!list->started)
+    {
+        ui_start_screen( ui );
+        list->started = 1;
+    }
+    while (ui_begin_frame( ui ))
+    {
+        const struct ui_row *row;
+        struct ui_hint hints[6];
+        int hint_count = 0, any_adjustable = 0;
+
+        if (count <= 0) return UI_ACTION_BACK;
+        if (*group >= group_count) *group = group_count - 1;
+        if (*group < 0) *group = 0;
+        /* The rows of this section, in the order they were given. */
+        for (i = 0, shown = 0; i < count && shown < (int)(sizeof(index) / sizeof(index[0])); i++)
+            if (rows[i].group == *group) index[shown++] = i;
+        if (!shown) { *group = (*group + 1) % group_count; continue; }
+        if (list->selection >= shown) list->selection = shown - 1;
+        if (list->selection < 0) list->selection = 0;
+
+        while (ui_poll( ui, &input ))
+        {
+            int direction = 0, section = 0;
+
+            row = rows + index[list->selection];
+            switch (input.touch)
+            {
+            case UI_TOUCH_SCROLL_UP:
+            case UI_TOUCH_SCROLL_DOWN:
+                list->selection += (input.touch == UI_TOUCH_SCROLL_UP ? 1 : -1) * input.steps;
+                if (list->selection >= shown) list->selection = shown - 1;
+                if (list->selection < 0) list->selection = 0;
+                continue;
+            case UI_TOUCH_SWIPE_LEFT:
+            case UI_TOUCH_SWIPE_RIGHT:
+                if (!row->disabled && row->adjustable)
+                    return input.touch == UI_TOUCH_SWIPE_LEFT ? UI_ACTION_LEFT : UI_ACTION_RIGHT;
+                continue;
+            case UI_TOUCH_TAP:
+            {
+                int in_list = list->top + (input.y - LIST_TOP) / SET_ROW_H;
+
+                if (input.y < UI_HEADER_HEIGHT) return UI_ACTION_BACK;
+                /* A section under the finger, or a row of the one in focus. */
+                if (input.x >= SET_SIDEBAR_X && input.x < SET_SIDEBAR_X + SET_SIDEBAR_W && input.y >= LIST_TOP)
+                {
+                    int picked = (input.y - LIST_TOP) / SET_GROUP_H;
+
+                    if (picked >= 0 && picked < group_count && picked != *group)
+                    {
+                        *group = picked;
+                        list->selection = list->top = 0;
+                    }
+                    continue;
+                }
+                if (input.x < SET_ROW_X || input.x >= SET_ROW_X + row_w || input.y < LIST_TOP ||
+                    in_list >= shown || in_list >= list->top + visible) continue;
+                list->selection = in_list;
+                row = rows + index[in_list];
+                if (row->disabled) continue;
+                if (row->adjustable) return input.x >= SET_ROW_X + row_w / 2 ? UI_ACTION_RIGHT : UI_ACTION_LEFT;
+                return UI_ACTION_CHOOSE;
+            }
+            default:
+                break;
+            }
+            switch (input.button)
+            {
+            case UI_UP: direction = -1; break;
+            case UI_DOWN: direction = 1; break;
+            case UI_L: section = -1; break;
+            case UI_R: section = 1; break;
+            case UI_LEFT: if (!row->disabled && row->adjustable) return UI_ACTION_LEFT; break;
+            case UI_RIGHT: if (!row->disabled && row->adjustable) return UI_ACTION_RIGHT; break;
+            case UI_A: if (!row->disabled) return UI_ACTION_CHOOSE; break;
+            case UI_B: return UI_ACTION_BACK;
+            case UI_Y: if (can_reset && !row->disabled && row->adjustable) return UI_ACTION_RESET; break;
+            case UI_X:
+                if (row->help)
+                {
+                    ui_message( ui, row->label, row->help );
+                    ui_start_screen( ui );
+                }
+                break;
+            }
+            if (section)
+            {
+                *group = (*group + section + group_count) % group_count;
+                list->selection = list->top = 0;
+                break;      /* the section's rows are gathered again next frame */
+            }
+            if (direction)
+            {
+                int next = list->selection;
+
+                do next = (next + direction + shown) % shown;
+                while (rows[index[next]].disabled && next != list->selection);
+                list->selection = next;
+            }
+        }
+        if (!ui->running) break;
+        if (list->selection < list->top) list->top = list->selection;
+        if (list->selection >= list->top + visible) list->top = list->selection - visible + 1;
+        if (list->top > shown - visible) list->top = shown - visible;
+        if (list->top < 0) list->top = 0;
+        row = rows + index[list->selection];
+
+        ui_background( ui );
+        ui_gradient( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 3, 6, 10, 156 },
+                     (SDL_Color){ 3, 6, 10, 20 }, 1 );
+        ui_header( ui, title, context );
+
+        /* The sections. The one in focus carries the accent, the rest recede. */
+        for (i = 0; i < group_count; i++)
+        {
+            int y = LIST_TOP + i * SET_GROUP_H;
+            int text_y = y + (SET_GROUP_H - TTF_FontHeight( ui->normal )) / 2;
+
+            if (i == *group)
+            {
+                ui_rounded( ui, SET_SIDEBAR_X, y + 2, SET_SIDEBAR_W, SET_GROUP_H - 8, 14,
+                            (SDL_Color){ 30, 40, 54, 236 } );
+                ui_border( ui, SET_SIDEBAR_X, y + 2, SET_SIDEBAR_W, SET_GROUP_H - 8, 1,
+                           (SDL_Color){ 120, 158, 210, 150 } );
+            }
+            ui_text_fit( ui, ui->normal, SET_SIDEBAR_X + 22, text_y, SET_SIDEBAR_W - 40, groups[i],
+                         i == *group ? ui->value : ui->dim, i == *group );
+        }
+
+        for (i = list->top; i < shown && i < list->top + visible; i++)
+        {
+            const struct ui_row *r = rows + index[i];
+            int y = LIST_TOP + (i - list->top) * SET_ROW_H, current = i == list->selection;
+            int control_w = r->kind == UI_ROW_SWITCH ? 92 : 44;
+            int value_w = r->value[0] ? ui_text_width( ui, ui->small, r->value ) : 0;
+            int label_w, right;
+            SDL_Color color = r->disabled ? ui->dim : r->destructive ? ui->danger : current ? ui->value : ui->text;
+
+            if (value_w > row_w / 3) value_w = row_w / 3;
+            control_w += value_w ? value_w + 18 : 0;
+            label_w = row_w - 56 - control_w;
+            right = SET_ROW_X + row_w - 28;
+            any_adjustable |= r->adjustable && !r->disabled;
+
+            ui_rounded( ui, SET_ROW_X, y + 4, row_w, SET_ROW_H - 10, 18,
+                        current ? (SDL_Color){ 46, 56, 70, 244 } : (SDL_Color){ 24, 30, 38, 170 } );
+            if (current)
+            {
+                ui_border( ui, SET_ROW_X, y + 4, row_w, SET_ROW_H - 10, 1, (SDL_Color){ 231, 237, 244, 164 } );
+                ui_rounded( ui, SET_ROW_X + 10, y + 20, 4, SET_ROW_H - 42, 2, ui->selection );
+            }
+            ui_text_fit( ui, ui->normal, SET_ROW_X + 30, y + 12, label_w, r->label, color, current );
+            if (r->help)
+                ui_text_wrapped( ui, ui->small, SET_ROW_X + 30, y + 44, label_w, 2, r->help, ui->dim, 0 );
+            switch (r->kind)
+            {
+            case UI_ROW_SWITCH:
+                ui_switch( ui, right - 56, y + (SET_ROW_H - 10 - 30) / 2 + 4, r->on, current, r->disabled );
+                break;
+            case UI_ROW_VALUE:
+            case UI_ROW_ACTION:
+            default:
+                if (value_w)
+                    ui_text_fit( ui, ui->small, right - 26 - value_w,
+                                 y + (SET_ROW_H - 10 - TTF_FontHeight( ui->small )) / 2 + 4, value_w + 4,
+                                 r->value, current ? ui->value : ui->dim, current );
+                /* The arrow says the row opens something. A row that changes
+                 * where it stands says so with the Left and Right hints. */
+                if (!r->adjustable)
+                    ui_chevron( ui, right - 14, y + (SET_ROW_H - 10) / 2 - 4,
+                                r->disabled ? ui->dim : current ? ui->value : ui->dim );
+                break;
+            }
+        }
+        if (shown > visible)
+        {
+            int track_h = visible * SET_ROW_H - 12, thumb = track_h * visible / shown;
+
+            if (thumb < 16) thumb = 16;
+            ui_rounded( ui, SET_ROW_X + row_w + 14, LIST_TOP + 4, 5, track_h, 3, (SDL_Color){ 66, 73, 85, 160 } );
+            ui_rounded( ui, SET_ROW_X + row_w + 14, LIST_TOP + 4 + (track_h - thumb) * list->top / (shown - visible),
+                        5, thumb, 3, ui->selection );
+        }
+        if (group_count > 1) hints[hint_count++] = (struct ui_hint){ UI_L, NULL };
+        if (group_count > 1) hints[hint_count++] = (struct ui_hint){ UI_R, "Section" };
+        if (any_adjustable) hints[hint_count++] = (struct ui_hint){ UI_LEFT, NULL };
+        if (any_adjustable) hints[hint_count++] = (struct ui_hint){ UI_RIGHT, "Change" };
+        if (!row->disabled) hints[hint_count++] = (struct ui_hint){ UI_A, row->adjustable ? "Next" : "Choose" };
+        hints[hint_count++] = (struct ui_hint){ UI_B, "Back" };
+        ui_footer( ui, hints, hint_count );
+        ui_fade( ui );
+        ui_present( ui );
+        ui_wait( ui );
+    }
+    return UI_ACTION_QUIT;
+}

@@ -1637,10 +1637,16 @@ static void edit_text( const char *header, char *value, size_t size )
 }
 
 /* Returns 1 when the program is to be started. */
+/* The sections of Game Settings, in the order they stand in the list. */
+enum program_section { SECTION_GENERAL, SECTION_GRAPHICS, SECTION_DIAGNOSTICS, SECTION_LIBRARY };
+
 static int program_menu( struct launcher *l, struct program *p, char *target, size_t size )
 {
+    static const char *const sections[] = { "General", "Graphics", "Diagnostics", "Library" };
+    /* Kept between openings, so a game returns to the section it was left in. */
+    static int section;
     struct ui_row rows[PROGRAM_ROWS];
-    int ids[PROGRAM_ROWS], count, id;
+    int ids[PROGRAM_ROWS], count, id, i;
     struct ui_list list = {0};
     struct ui *ui = &l->ui;
     char path[520], dir[512], line[896], global_line[896], name[128], buffer[64];
@@ -1662,19 +1668,23 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
         dxvk_installed = file_exists( LAUNCHER_DRIVE_C "/dxvk/d3d9.dll" );
 
         count = 0;
-#define ADD_ROW(i, text, help_text) \
+#define ADD_ROW(i, section, text, help_text) \
         do { row = rows + count; memset( row, 0, sizeof(*row) ); ids[count++] = (i); \
+             row->group = (section); row->kind = UI_ROW_ACTION; \
              snprintf( row->label, sizeof(row->label), "%s", (text) ); row->help = (help_text); } while (0)
 
-        ADD_ROW( ROW_START, "Start", NULL );
-        ADD_ROW( ROW_FAVORITE, p->favorite ? "Remove from favorites" : "Add to favorites", NULL );
-        ADD_ROW( ROW_ARTWORK, "Download artwork", "Automatically downloads the highest-rated square, portrait and hero artwork from SteamGridDB." );
-        if (p->missing) ADD_ROW( ROW_LOCATE, "Locate executable", "Choose the game's executable at its new location." );
-        ADD_ROW( ROW_TITLE, "Title",
+        ADD_ROW( ROW_START, SECTION_GENERAL, "Start", "Runs the game." );
+        ADD_ROW( ROW_FAVORITE, SECTION_GENERAL, "Favorite", "Keeps the game in the Favorites filter of the library." );
+        row->kind = UI_ROW_SWITCH;
+        row->on = p->favorite;
+        ADD_ROW( ROW_ARTWORK, SECTION_LIBRARY, "Download artwork", "Takes the highest-rated square, portrait and hero pictures for this game from SteamGridDB." );
+        if (p->missing) ADD_ROW( ROW_LOCATE, SECTION_LIBRARY, "Locate executable", "Choose the game's executable at its new location." );
+        ADD_ROW( ROW_TITLE, SECTION_GENERAL, "Title",
                  "The name shown in the library. Y goes back to the name in the program's own resources." );
+        row->kind = UI_ROW_VALUE;
         snprintf( row->value, sizeof(row->value), "%s", p->title );
 
-        ADD_ROW( ROW_ARGS, "Arguments",
+        ADD_ROW( ROW_ARGS, SECTION_GENERAL, "Arguments",
                  "The command line after the program's name, kept beside it as NAME.args.txt. "
                  "Leave it empty to remove them." );
         line[0] = 0;
@@ -1685,20 +1695,20 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
             snprintf( row->value, sizeof(row->value), "args.txt: %s", global_line );
         else snprintf( row->value, sizeof(row->value), "None" );
 
-        ADD_ROW( ROW_VERBOSE, "Verbose traces",
+        ADD_ROW( ROW_VERBOSE, SECTION_DIAGNOSTICS, "Verbose traces",
                  "Writes Wine's traces to wine-nx-runtime.log, which slows the program down. "
                  "Global follows the setting in Settings (X on the library)." );
         row->adjustable = 1;
         snprintf( row->value, sizeof(row->value), "%s",
                   state_text( p->settings.verbose, l->options->verbose, "On", "Off", buffer, sizeof(buffer) ) );
 
-        ADD_ROW( ROW_PROFILE, "Profiler",
+        ADD_ROW( ROW_PROFILE, SECTION_DIAGNOSTICS, "Profiler",
                  "Samples where every thread spends its time and writes [PROF] lines to wine-nx-runtime.log." );
         row->adjustable = 1;
         snprintf( row->value, sizeof(row->value), "%s",
                   state_text( p->settings.profile, l->options->profile, "On", "Off", buffer, sizeof(buffer) ) );
 
-        ADD_ROW( ROW_WINDOWS, "Windows shown by",
+        ADD_ROW( ROW_WINDOWS, SECTION_GRAPHICS, "Windows shown by",
                  "The compositor draws every window through OpenGL. The framebuffer copies window pixels "
                  "straight to the screen, for when the compositor misbehaves." );
         row->adjustable = 1;
@@ -1708,7 +1718,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
         if (l->options->vulkan && x86)
         {
-            ADD_ROW( ROW_D3D9, "Direct3D 9",
+            ADD_ROW( ROW_D3D9, SECTION_GRAPHICS, "Direct3D 9",
                      "Wine draws Direct3D 9 with OpenGL. DXVK draws it with Vulkan: C:\\dxvk\\d3d9.dll is "
                      "loaded instead of Wine's. A d3d9.dll next to the program is always loaded first." );
             if (dxvk_beside)
@@ -1731,7 +1741,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
         {
             enum launcher_address_space needs = launcher_program_address_space( p->path );
 
-            ADD_ROW( ROW_ADDRESS, "Address space",
+            ADD_ROW( ROW_ADDRESS, SECTION_GRAPHICS, "Address space",
                      "What the game needs of the address space Horizon gives Wine-NX. A game linked for a "
                      "fixed address in the low 4 GB runs only under a forwarder made with 32 bits; the "
                      "forwarder decides this, and a game that needs one it was not given is not started." );
@@ -1744,7 +1754,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
                            needs == LAUNCHER_ADDRESS_ANY ? "any" : "unread" );
         }
 
-        ADD_ROW( ROW_CONTROLS, "Controls",
+        ADD_ROW( ROW_CONTROLS, SECTION_DIAGNOSTICS, "Controls",
                  "Keys the controller presses: NAME.keys.txt next to the program, applied over the "
                  "shared keys.txt, one NAME=code line each." );
         if (launcher_keys_path( p->path, path, sizeof(path) ) && file_exists( path ))
@@ -1757,7 +1767,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
         if (x86)
         {
-            ADD_ROW( ROW_BOX64, "Box64 options",
+            ADD_ROW( ROW_BOX64, SECTION_DIAGNOSTICS, "Box64 options",
                      "Options for the x86 translator, read from NAME.box64.txt next to the program." );
             launcher_sibling_path( p->path, ".box64.txt", path, sizeof(path) );
             snprintf( row->value, sizeof(row->value), "%s", file_exists( path ) ? file_name( path ) : "None" );
@@ -1765,21 +1775,28 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
         if (in_library)
         {
-            ADD_ROW( ROW_HIDE, p->settings.hidden ? "Show in the library" : "Hide from the library",
+            ADD_ROW( ROW_HIDE, SECTION_LIBRARY, "Hidden",
                      "Hidden programs stay out of the library unless Settings shows them." );
+            row->kind = UI_ROW_SWITCH;
+            row->on = p->settings.hidden;
         }
         if (!in_library || p->added)
         {
-            ADD_ROW( ROW_LIBRARY, in_library ? "Remove from the library" : "Add to the library",
+            ADD_ROW( ROW_LIBRARY, SECTION_LIBRARY, in_library ? "Remove from the library" : "Add to the library",
                      "The library finds programs within two folders of drive_c by itself; "
                      "others found with the file browser can be added." );
             row->destructive = in_library;
         }
 #undef ADD_ROW
 
-        action = ui_list_run( ui, &list, "Game Options", p->title, rows, count, 1 );
+        action = ui_settings_run( ui, &list, "Game Settings", p->title, sections,
+                                  sizeof(sections) / sizeof(sections[0]), rows, count, 1, &section );
         if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return 0;
-        id = ids[list.selection];
+        /* The screen shows one section at a time, so the row it chose is the
+         * selection counted within that section. */
+        for (id = 0, i = 0; i < count; i++)
+            if (rows[i].group == section && id++ == list.selection) break;
+        id = i < count ? ids[i] : ids[0];
         switch (id)
         {
         case ROW_START:
@@ -2076,9 +2093,14 @@ static void credits_screen( struct launcher *l )
     }
 }
 
+/* The sections of Settings, in the order they stand in the list. */
+enum settings_section { SET_SECTION_LOOK, SET_SECTION_DEFAULTS, SET_SECTION_ARTWORK, SET_SECTION_SYSTEM };
+
 static void settings_menu( struct launcher *l )
 {
+    static const char *const sections[] = { "Appearance", "Game defaults", "Artwork", "System" };
     static const char *on_off[2] = { "Off", "On" };
+    static int section;
     struct ui_row rows[SETTINGS_ROWS];
     struct ui_list list = {0};
     struct ui *ui = &l->ui;
@@ -2088,23 +2110,49 @@ static void settings_menu( struct launcher *l )
     {
         enum ui_action action;
         int i, direction;
+        static const unsigned char row_section[SETTINGS_ROWS] =
+        {
+            [SET_ANIMATIONS] = SET_SECTION_LOOK, [SET_COLUMNS] = SET_SECTION_LOOK,
+            [SET_ROWS] = SET_SECTION_LOOK, [SET_HIDDEN] = SET_SECTION_LOOK,
+            [SET_VERBOSE] = SET_SECTION_DEFAULTS, [SET_PROFILE] = SET_SECTION_DEFAULTS,
+            [SET_WINDOWS] = SET_SECTION_DEFAULTS,
+            [SET_STEAMGRIDDB] = SET_SECTION_ARTWORK,
+            [SET_FORWARDER] = SET_SECTION_SYSTEM, [SET_VERSION] = SET_SECTION_SYSTEM,
+            [SET_CREDITS] = SET_SECTION_SYSTEM,
+        };
 
         memset( rows, 0, sizeof(rows) );
-        for (i = 0; i < SETTINGS_ROWS; i++) rows[i].adjustable = 1;
+        for (i = 0; i < SETTINGS_ROWS; i++)
+        {
+            rows[i].adjustable = 1;
+            rows[i].kind = UI_ROW_VALUE;
+            rows[i].group = row_section[i];
+        }
         snprintf( rows[SET_ANIMATIONS].label, sizeof(rows[0].label), "Animations" );
         snprintf( rows[SET_ANIMATIONS].value, sizeof(rows[0].value), "%s", on_off[ui->animations] );
+        rows[SET_ANIMATIONS].kind = UI_ROW_SWITCH;
+        rows[SET_ANIMATIONS].on = ui->animations;
         rows[SET_ANIMATIONS].help = "Moving backgrounds, fades and the sliding highlight. Off draws only when something changes.";
         snprintf( rows[SET_COLUMNS].label, sizeof(rows[0].label), "Library columns" );
         snprintf( rows[SET_COLUMNS].value, sizeof(rows[0].value), "%d", l->columns );
+        rows[SET_COLUMNS].help = "How many covers stand side by side in the library.";
         snprintf( rows[SET_ROWS].label, sizeof(rows[0].label), "Library rows" );
         snprintf( rows[SET_ROWS].value, sizeof(rows[0].value), "%d", l->rows );
+        rows[SET_ROWS].help = "How many rows of covers the library shows at once.";
         snprintf( rows[SET_HIDDEN].label, sizeof(rows[0].label), "Show hidden programs" );
         snprintf( rows[SET_HIDDEN].value, sizeof(rows[0].value), "%s", on_off[l->show_hidden] );
+        rows[SET_HIDDEN].help = "Programs hidden from a game's own settings are listed again.";
+        rows[SET_HIDDEN].kind = UI_ROW_SWITCH;
+        rows[SET_HIDDEN].on = l->show_hidden;
         snprintf( rows[SET_VERBOSE].label, sizeof(rows[0].label), "Verbose traces" );
         snprintf( rows[SET_VERBOSE].value, sizeof(rows[0].value), "%s", on_off[!!l->options->verbose] );
+        rows[SET_VERBOSE].kind = UI_ROW_SWITCH;
+        rows[SET_VERBOSE].on = !!l->options->verbose;
         rows[SET_VERBOSE].help = "verbose.txt: Wine's traces go to wine-nx-runtime.log for every program without its own setting.";
         snprintf( rows[SET_PROFILE].label, sizeof(rows[0].label), "Profiler" );
         snprintf( rows[SET_PROFILE].value, sizeof(rows[0].value), "%s", on_off[!!l->options->profile] );
+        rows[SET_PROFILE].kind = UI_ROW_SWITCH;
+        rows[SET_PROFILE].on = !!l->options->profile;
         rows[SET_PROFILE].help = "profile.txt: [PROF] lines with where each thread spends its time.";
         snprintf( rows[SET_WINDOWS].label, sizeof(rows[0].label), "Windows shown by" );
         snprintf( rows[SET_WINDOWS].value, sizeof(rows[0].value), "%s",
@@ -2134,10 +2182,20 @@ static void settings_menu( struct launcher *l )
         rows[SET_CREDITS].help = "The projects and platform references used by Wine-NX.";
         rows[SET_CREDITS].adjustable = 0;
 
-        action = ui_list_run( ui, &list, "Settings", NULL, rows, SETTINGS_ROWS, 0 );
+        action = ui_settings_run( ui, &list, "Settings", NULL, sections,
+                                  sizeof(sections) / sizeof(sections[0]), rows, SETTINGS_ROWS, 0, &section );
         if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return;
+        /* One section is shown at a time, so what it chose is counted within
+         * that section: find the row it stands for. */
+        {
+            int shown = 0;
+
+            for (i = 0; i < SETTINGS_ROWS; i++)
+                if (row_section[i] == section && shown++ == list.selection) break;
+            if (i >= SETTINGS_ROWS) continue;
+        }
         direction = action == UI_ACTION_LEFT ? -1 : 1;
-        switch (list.selection)
+        switch (i)
         {
         case SET_ANIMATIONS: ui->animations = !ui->animations; break;
         case SET_COLUMNS: l->columns = 3 + (l->columns - 3 + 6 + direction) % 6; break;
