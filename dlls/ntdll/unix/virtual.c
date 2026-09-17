@@ -5408,10 +5408,16 @@ static void usd_update_time(void)
 
 static void *usd_clock_thread( void *arg )
 {
+    extern volatile int wine_nx_quit_requested __attribute__((weak));
+    extern void wine_nx_quit_point( void ) __attribute__((weak));
+
     (void)arg;
     for (;;)
     {
         usleep( 1000 );
+        /* This writes the guest's shared data page every tick, so it has to
+         * stop before that memory is taken apart. */
+        if (&wine_nx_quit_requested && wine_nx_quit_requested && &wine_nx_quit_point) wine_nx_quit_point();
         usd_update_time();
     }
     return NULL;

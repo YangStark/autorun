@@ -1591,12 +1591,14 @@ void abort_process( int status )
 }
 
 
+/* The thread that ended last, waiting to be joined by the next one to end. */
+static void *prev_teb;
+
 /***********************************************************************
  *           exit_thread
  */
 static DECLSPEC_NORETURN void exit_thread( int status )
 {
-    static void *prev_teb;
     TEB *teb;
 
     wine_pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
@@ -1625,6 +1627,31 @@ static DECLSPEC_NORETURN void exit_thread( int status )
 #endif
     pthread_exit_wrapper( status );
 }
+
+
+#ifdef __SWITCH__
+/***********************************************************************
+ *           horizon_join_last_exited_thread
+ *
+ * A thread is joined by the next one to end, which is what gives its stack and
+ * its TEB back; the last one to end has no next one and is still holding them.
+ * Called by the runtime once the program's threads are gone, on its way back to
+ * the launcher: the loader cannot reset a heap that still lends pages out.
+ */
+unsigned int horizon_join_last_exited_thread(void)
+{
+    TEB *teb = InterlockedExchangePointer( &prev_teb, NULL );
+    struct ntdll_thread_data *thread_data;
+
+    if (!teb) return 0;
+    thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
+    if (!thread_data->pthread_id) return 0;
+    pthread_join( thread_data->pthread_id, NULL );
+    virtual_free_teb( teb );
+    __atomic_sub_fetch( &horizon_lifecycle.worker_pthreads, 1, __ATOMIC_RELAXED );
+    return 1;
+}
+#endif
 
 
 /***********************************************************************

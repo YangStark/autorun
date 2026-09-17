@@ -15,8 +15,21 @@ void wine_nx_thread_register( char kind, unsigned int tid, void *teb );
 void wine_nx_thread_unregister( void );
 /* Starts the sampler behind the [PROF] lines. */
 void wine_nx_profile_start( void );
+/* Waits for the sampler and gives its stack back, on the way to the launcher. */
+void wine_nx_profile_stop( void );
 /* With each [PROGRESS] report: the [THREADS] line, and [PROF] when sampling. */
 void wine_nx_thread_report( void );
+/* Interrupts every registered thread's wait but this one's, so each reaches its
+ * next check; returns how many it interrupted. */
+unsigned int wine_nx_threads_wake( void );
+/* Registered threads other than this one. */
+unsigned int wine_nx_threads_other( void );
+/* The same, without the runtime's presenter: the threads of the program itself. */
+unsigned int wine_nx_threads_program( void );
+/* A thread stopping at a quit point, or going back to work. */
+void wine_nx_thread_parked( int parked );
+/* Writes which threads have not stopped, by id and kind. */
+void wine_nx_threads_report_unparked( void );
 /* Called by a thread whose cores the program chose; the balancer leaves it. */
 void wine_nx_thread_affinity_fixed( void );
 /* Every two seconds: moves threads so the busiest ones get cores of their own

@@ -29,6 +29,8 @@ struct compositor_backend
     int (*attach)( int width, int height, char *error, int size );
     /* Release the context and destroy the surface, giving the screen away. */
     void (*detach)( void );
+    /* Gives up the graphics API, for a program that is closing; may be NULL. */
+    void (*quit)( void );
     void (*swap)( void );
     void (*log)( const char *message );
 };
@@ -57,6 +59,8 @@ void wine_nx_compositor_cursor( int x, int y, int visible );
 
 /* An OpenGL program takes the screen: returns once the presenter has given it
  * up. _resume() lets the presenter take it back. */
+/* Ends the presenter thread and waits for it, before the program closes. */
+void wine_nx_compositor_stop( void );
 void wine_nx_compositor_suspend( void );
 void wine_nx_compositor_resume( void );
 

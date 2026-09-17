@@ -51,6 +51,7 @@ struct nx_prof_thread
     Handle handle;  /* 0: free */
     unsigned int tid;
     char kind;
+    int parked;     /* stopped at a quit point, waiting to hear whether to end */
     s32 core;       /* as the thread saw itself when it registered */
     int fixed;      /* the program chose its cores */
     uint64_t teb;
@@ -136,6 +137,55 @@ void wine_nx_thread_register( char kind, unsigned int tid, void *teb )
         registry[slot].last_ticks = registry[slot].balance_ticks = thread_ticks( handle );
     }
     pthread_mutex_unlock( &registry_mutex );
+}
+
+unsigned int wine_nx_threads_wake( void )
+{
+    Handle self = threadGetCurHandle();
+    unsigned int i, woken = 0;
+
+    /* No lock: a thread ending while this runs leaves a handle that is simply
+     * refused, and waiting on a thread that is being told to end would not do. */
+    for (i = 0; i < NX_PROF_MAX_THREADS; i++)
+    {
+        Handle handle = registry[i].handle;
+
+        if (!handle || handle == self) continue;
+        if (R_SUCCEEDED( svcCancelSynchronization( handle ) )) woken++;
+    }
+    return woken;
+}
+
+/* A thread says it has stopped where it can be ended, or has gone back to work. */
+void wine_nx_thread_parked( int parked )
+{
+    Handle handle = threadGetCurHandle();
+    unsigned int i;
+
+    for (i = 0; i < NX_PROF_MAX_THREADS; i++)
+        if (registry[i].handle == handle) registry[i].parked = parked;
+}
+
+unsigned int wine_nx_threads_program( void )
+{
+    Handle self = threadGetCurHandle();
+    unsigned int i, count = 0;
+
+    /* The presenter is the runtime's own and is stopped separately; everything
+     * else belongs to the program that is being closed. */
+    for (i = 0; i < NX_PROF_MAX_THREADS; i++)
+        if (registry[i].handle && registry[i].handle != self && registry[i].kind != 'c') count++;
+    return count;
+}
+
+unsigned int wine_nx_threads_other( void )
+{
+    Handle self = threadGetCurHandle();
+    unsigned int i, count = 0;
+
+    for (i = 0; i < NX_PROF_MAX_THREADS; i++)
+        if (registry[i].handle && registry[i].handle != self) count++;
+    return count;
 }
 
 void wine_nx_thread_unregister( void )
@@ -254,6 +304,8 @@ static void record( struct nx_prof_target *target, const ThreadContext *ctx, int
     nx_prof_add( &target->tables[NX_PROF_CHAIN], nx_prof_pair_key( sites[0], sites[1] ) );
 }
 
+extern volatile int wine_nx_quit_requested __attribute__((weak));
+
 static void sampler( void *arg )
 {
     uint64_t callers[NX_PROF_DEPTH];
@@ -266,6 +318,9 @@ static void sampler( void *arg )
     for (;;)
     {
         svcSleepThread( NX_PROF_PERIOD_NS );
+        /* It reads other threads' stacks and contexts, so it must stop before
+         * they and the memory they ran in are taken away. */
+        if (&wine_nx_quit_requested && wine_nx_quit_requested) break;
         pthread_mutex_lock( &profile_mutex );
         for (i = 0; i < NX_PROF_TARGETS; i++)
         {
@@ -298,9 +353,14 @@ static void sampler( void *arg )
     }
 }
 
+/* The sampler's own thread, waited for and closed by wine_nx_profile_stop.
+ * libnx keeps its threads in a list through this structure, so it stays where
+ * it was created and is never copied. */
+static Thread sampler_thread;
+
 void wine_nx_profile_start( void )
 {
-    static Thread thread;
+    Thread *thread = &sampler_thread;
     MemoryInfo info;
     char line[200];
     u32 page;
@@ -321,14 +381,32 @@ void wine_nx_profile_start( void )
     runtime_base = info.addr;
     runtime_end = (uintptr_t)__end__;
     /* Above every program thread (priority 59) and the audio feeder (56). */
-    rc = threadCreate( &thread, sampler, NULL, NULL, 0x4000, 0x24, 2 );
-    if (R_FAILED( rc )) rc = threadCreate( &thread, sampler, NULL, NULL, 0x4000, 0x24, -2 );
-    if (R_SUCCEEDED( rc ) && R_FAILED( rc = threadStart( &thread ) )) threadClose( &thread );
+    rc = threadCreate( thread, sampler, NULL, NULL, 0x4000, 0x24, 2 );
+    if (R_FAILED( rc )) rc = threadCreate( thread, sampler, NULL, NULL, 0x4000, 0x24, -2 );
+    if (R_SUCCEEDED( rc ) && R_FAILED( rc = threadStart( thread ) )) threadClose( thread );
     profiling = R_SUCCEEDED( rc );
     snprintf( line, sizeof(line), "[PROF] sampler %s (rc=%#x): every %u ms, the %u busiest threads; runtime %#lx-%#lx",
               profiling ? "started" : "not started", (unsigned int)rc, NX_PROF_PERIOD_NS / 1000000, NX_PROF_TARGETS,
               (unsigned long)runtime_base, (unsigned long)runtime_end );
     wine_nx_runtime_trace( line );
+}
+
+/* The sampler leaves its loop as soon as a quit is asked for, but its stack is
+ * heap the kernel lent it, and only threadClose gives that back. Called on the
+ * way out, after the threads it was sampling have ended. */
+void wine_nx_profile_stop( void )
+{
+    if (!profiling) return;
+    profiling = 0;
+    /* Bounded, and closed only once it really has exited: threadClose takes the
+     * stack away from underneath a thread that is still running on it. */
+    if (R_FAILED( waitSingle( waiterForThread( &sampler_thread ), 3000000000ULL ) ))
+    {
+        wine_nx_runtime_trace( "[PROF] the sampler did not end; its stack stays lent out" );
+        return;
+    }
+    threadClose( &sampler_thread );
+    wine_nx_runtime_trace( "[PROF] sampler ended" );
 }
 
 static int appendf( char *line, int len, const char *fmt, ... )
@@ -570,6 +648,24 @@ void wine_nx_thread_report( void )
     wine_nx_runtime_trace( line );
     server_report();
     if (profiling) profile_report( rows, count );
+}
+
+/* Names the threads that did not stop, so the wait they are in can be found. */
+void wine_nx_threads_report_unparked( void )
+{
+    Handle self = threadGetCurHandle();
+    char line[256];
+    unsigned int i;
+    int len;
+
+    len = appendf( line, 0, "[QUIT] still running:" );
+    for (i = 0; i < NX_PROF_MAX_THREADS && len < 200; i++)
+    {
+        if (!registry[i].handle || registry[i].handle == self || registry[i].kind == 'c') continue;
+        if (registry[i].parked) continue;
+        len = appendf( line, len, " %u%c", registry[i].tid, registry[i].kind );
+    }
+    wine_nx_runtime_trace( line );
 }
 
 void wine_nx_thread_affinity_fixed( void )

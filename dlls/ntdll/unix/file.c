@@ -6688,6 +6688,9 @@ static void async_file_complete_io( struct async_file_read_job *job, NTSTATUS st
 
 static void *async_file_read_thread(void *dummy)
 {
+    extern volatile int wine_nx_quit_requested __attribute__((weak));
+    extern void wine_nx_quit_point( void ) __attribute__((weak));
+
     struct async_file_read_job *job, *ptr;
     ULONG buffer_length = 0;
     void *buffer = NULL;
@@ -6703,8 +6706,24 @@ static void *async_file_read_thread(void *dummy)
     {
         while (!(entry = list_head( &async_file_read_queue )))
         {
-            pthread_cond_wait( &async_file_read_cond, &async_file_read_mutex );
-            continue;
+            struct timespec deadline;
+
+            /* In slices, so a quit is noticed; nothing of this thread may be
+             * held while it stops, or the others cannot reach their own stop. */
+            clock_gettime( CLOCK_REALTIME, &deadline );
+            deadline.tv_nsec += 250000000L;
+            if (deadline.tv_nsec >= 1000000000L)
+            {
+                deadline.tv_sec++;
+                deadline.tv_nsec -= 1000000000L;
+            }
+            pthread_cond_timedwait( &async_file_read_cond, &async_file_read_mutex, &deadline );
+            if (&wine_nx_quit_requested && wine_nx_quit_requested && &wine_nx_quit_point)
+            {
+                pthread_mutex_unlock( &async_file_read_mutex );
+                wine_nx_quit_point();
+                pthread_mutex_lock( &async_file_read_mutex );
+            }
         }
 
         job = LIST_ENTRY( entry, struct async_file_read_job, queue_entry );

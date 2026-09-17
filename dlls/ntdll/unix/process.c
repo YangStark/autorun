@@ -997,7 +997,14 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                                       exit_code );
             snprintf( buf, sizeof(buf), "[EXIT] NtTerminateProcess(self) exit_code=0x%08x", (unsigned)exit_code );
             wine_nx_runtime_trace( buf );
-            wine_nx_runtime_trace( "[EXIT] parked after self-terminate; close from HOME" );
+        }
+        {
+            /* The runtime ends the process; without it there is nothing to
+             * return to, so park as this did before and wait for HOME. */
+            extern void wine_nx_leave_process( const char *why ) __attribute__((weak));
+
+            if (&wine_nx_leave_process) wine_nx_leave_process( "the program terminated itself" );
+            if (&wine_nx_runtime_trace) wine_nx_runtime_trace( "[EXIT] parked after self-terminate; close from HOME" );
         }
         for (;;) usleep( 1000 * 1000 );
     }

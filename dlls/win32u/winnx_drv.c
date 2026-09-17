@@ -76,6 +76,9 @@ struct wine_nx_surface_entry
 static pthread_mutex_t wine_nx_surface_entries_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct wine_nx_surface_entry *wine_nx_surface_entries;
 static volatile int wine_nx_input_thread_started;
+static volatile int wine_nx_input_thread_quit;
+static volatile int wine_nx_input_thread_ended;
+static pthread_t wine_nx_input_thread_id;
 static void nxdrv_trace( const char *fmt, int a, int b, int c, int d );
 static void nxdrv_trace_hot( const char *fmt, int a, int b, int c, int d );
 
@@ -86,7 +89,7 @@ static void nxdrv_trace_hot( const char *fmt, int a, int b, int c, int d );
 static void *wine_nx_input_thread( void *arg )
 {
     (void)arg;
-    for (;;)
+    while (!__atomic_load_n( &wine_nx_input_thread_quit, __ATOMIC_ACQUIRE ))
     {
         unsigned int buttons;
         int x, y;
@@ -95,21 +98,44 @@ static void *wine_nx_input_thread( void *arg )
         wine_nx_fb_present();
         usleep( 16000 );
     }
+    __atomic_store_n( &wine_nx_input_thread_ended, 1, __ATOMIC_RELEASE );
     return NULL;
+}
+
+/* The runtime calls this on its way back to the launcher. This thread polls and
+ * presents on its own, so it has to stop before the screen it presents to is
+ * closed, and it has to be joined: libnx has no pthread_detach, and a thread
+ * that was never joined keeps the heap pages of its stack, which the loader
+ * cannot give back. */
+void wine_nx_input_thread_stop(void)
+{
+    int i;
+
+    if (!__atomic_load_n( &wine_nx_input_thread_started, __ATOMIC_ACQUIRE )) return;
+    __atomic_store_n( &wine_nx_input_thread_quit, 1, __ATOMIC_RELEASE );
+    /* Bounded: a thread stuck in the display driver must not stop the program
+     * from closing, and its stack is then reported as still lent out. */
+    for (i = 0; i < 300 && !__atomic_load_n( &wine_nx_input_thread_ended, __ATOMIC_ACQUIRE ); i++)
+        usleep( 10000 );
+    if (!__atomic_load_n( &wine_nx_input_thread_ended, __ATOMIC_ACQUIRE ))
+    {
+        nxdrv_trace( "[NXINPUT] polling did not stop; its stack stays lent out", 0, 0, 0, 0 );
+        return;
+    }
+    pthread_join( wine_nx_input_thread_id, NULL );
+    __atomic_store_n( &wine_nx_input_thread_started, 0, __ATOMIC_RELEASE );
+    nxdrv_trace( "[NXINPUT] background polling ended", 0, 0, 0, 0 );
 }
 
 static void wine_nx_start_input_thread(void)
 {
-    pthread_t thread;
-
     if (__atomic_exchange_n( &wine_nx_input_thread_started, 1, __ATOMIC_ACQ_REL )) return;
-    if (pthread_create( &thread, NULL, wine_nx_input_thread, NULL ))
+    if (pthread_create( &wine_nx_input_thread_id, NULL, wine_nx_input_thread, NULL ))
     {
         __atomic_store_n( &wine_nx_input_thread_started, 0, __ATOMIC_RELEASE );
         nxdrv_trace( "[NXINPUT] thread create failed", 0, 0, 0, 0 );
         return;
     }
-    pthread_detach( thread );
     nxdrv_trace( "[NXINPUT] background polling started", 0, 0, 0, 0 );
 }
 

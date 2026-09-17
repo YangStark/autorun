@@ -6,8 +6,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "compositor.h"
+#include "thread_profile.h"
 #include "compositor_gl.h"
 
 struct wine_nx_layer
@@ -38,6 +40,10 @@ static struct
     int width, height;
     enum compositor_state state;
     int frame;                  /* the screen needs drawing */
+    int quit;                   /* the presenter must end: the program is closing */
+    pthread_t thread;
+    int thread_started;         /* thread is a thread to join, ended or not */
+    int thread_ended;           /* the presenter has run its last instruction */
     int suspend;                /* an OpenGL program wants the screen */
     int suspended;              /* and the presenter has given it up */
     struct wine_nx_layer *layers;
@@ -213,6 +219,36 @@ void wine_nx_compositor_cursor( int x, int y, int visible )
     pthread_mutex_unlock( &comp.lock );
 }
 
+/* Ends the presenter and waits for it, so nothing of it is left running. The
+ * wait is a join, which is also what gives its stack back to the heap: libnx
+ * has no pthread_detach, and the loader cannot reset a heap that still lends
+ * pages to a thread. */
+void wine_nx_compositor_stop( void )
+{
+    pthread_t thread;
+    int started, i;
+
+    pthread_mutex_lock( &comp.lock );
+    if (comp.state == STATE_RUNNING || comp.state == STATE_STARTING)
+    {
+        comp.quit = 1;
+        comp.suspend = 0;
+        pthread_cond_broadcast( &comp.wake );
+    }
+    started = comp.thread_started;
+    thread = comp.thread;
+    comp.thread_started = 0;
+    pthread_mutex_unlock( &comp.lock );
+    if (!started) return;
+    /* Outside the lock: the presenter takes it on its way out. The wait is
+     * bounded, because a presenter stuck in the display driver must not stop
+     * the program from closing; its stack is then reported as still lent. */
+    for (i = 0; i < 300 && !__atomic_load_n( &comp.thread_ended, __ATOMIC_ACQUIRE ); i++)
+        usleep( 10000 );
+    if (__atomic_load_n( &comp.thread_ended, __ATOMIC_ACQUIRE )) pthread_join( thread, NULL );
+    else comp_log( "[NXCOMP] the presenter did not end; its stack stays lent out" );
+}
+
 void wine_nx_compositor_suspend( void )
 {
     pthread_mutex_lock( &comp.lock );
@@ -275,6 +311,7 @@ static void *presenter_thread( void *arg )
     char error[256] = "";
 
     (void)arg;
+    wine_nx_thread_register( 'c', 0, NULL );
     if (!(funcs = backend->init( error, sizeof(error) ))) goto failed;
     if (backend->attach( comp.width, comp.height, error, sizeof(error) )) goto failed;
     if (compositor_gl_init( &gl, funcs, comp.width, comp.height ))
@@ -293,6 +330,7 @@ static void *presenter_thread( void *arg )
     pthread_cond_broadcast( &comp.idle );
     for (;;)
     {
+        if (comp.quit) goto stopped;
         if (comp.suspend)
         {
             if (attached)
@@ -334,6 +372,7 @@ static void *presenter_thread( void *arg )
             pthread_cond_wait( &comp.wake, &comp.lock );
             continue;
         }
+        if (comp.quit) goto stopped;
         comp.frame = 0;
 
         /* Take the destroyed layers out, and the shown ones in stacking order. */
@@ -401,18 +440,33 @@ static void *presenter_thread( void *arg )
         comp.frames++;
     }
 
+stopped:
+    /* Asked to end: give the screen back and let go of the GPU, so nothing of
+     * this thread is left when the program returns to the loader. */
+    comp.state = STATE_STOPPED;
+    pthread_cond_broadcast( &comp.idle );
+    pthread_mutex_unlock( &comp.lock );
+    compositor_gl_destroy( &gl );
+    if (attached) backend->detach();
+    if (backend->quit) backend->quit();
+    comp_log( "[NXCOMP] presenter ended" );
+    wine_nx_thread_unregister();
+    __atomic_store_n( &comp.thread_ended, 1, __ATOMIC_RELEASE );
+    return NULL;
+
 failed:
+    wine_nx_thread_unregister();
     comp_log( "[NXCOMP] cannot present through OpenGL, keeping the framebuffer: %s", error );
     pthread_mutex_lock( &comp.lock );
     comp.state = STATE_FAILED;
     pthread_cond_broadcast( &comp.idle );
     pthread_mutex_unlock( &comp.lock );
+    __atomic_store_n( &comp.thread_ended, 1, __ATOMIC_RELEASE );
     return NULL;
 }
 
 int wine_nx_compositor_start( const struct compositor_backend *backend, int width, int height )
 {
-    pthread_t thread;
     int ret;
 
     pthread_mutex_lock( &comp.lock );
@@ -427,8 +481,11 @@ int wine_nx_compositor_start( const struct compositor_backend *backend, int widt
         pthread_attr_init( &attr );
         /* Mesa compiles the shaders on this thread, which recurses deeply. */
         pthread_attr_setstacksize( &attr, 1024 * 1024 );
-        /* Never joined: the presenter runs for the whole session. */
-        if (pthread_create( &thread, &attr, presenter_thread, NULL )) comp.state = STATE_FAILED;
+        /* Joined by wine_nx_compositor_stop when the program closes: a running
+         * thread keeps its stack, and the loader cannot reset a heap that lends
+         * pages to one. */
+        if (pthread_create( &comp.thread, &attr, presenter_thread, NULL )) comp.state = STATE_FAILED;
+        else comp.thread_started = 1;
         pthread_attr_destroy( &attr );
     }
     while (comp.state == STATE_STARTING) pthread_cond_wait( &comp.idle, &comp.lock );

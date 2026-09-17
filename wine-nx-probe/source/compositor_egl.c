@@ -98,6 +98,17 @@ static void egl_detach( void )
     egl_surface = EGL_NO_SURFACE;
 }
 
+/* Gives up OpenGL altogether, which lets go of the driver's buffers: for a
+ * program that is closing, after the surface is gone. */
+static void egl_quit( void )
+{
+    if (egl_context != EGL_NO_CONTEXT) eglDestroyContext( egl_display, egl_context );
+    egl_context = EGL_NO_CONTEXT;
+    if (egl_display != EGL_NO_DISPLAY) eglTerminate( egl_display );
+    egl_display = EGL_NO_DISPLAY;
+    eglReleaseThread();
+}
+
 static void egl_swap( void )
 {
     eglSwapBuffers( egl_display, egl_surface );
@@ -108,6 +119,7 @@ const struct compositor_backend wine_nx_compositor_egl_backend =
     .init = egl_init,
     .attach = egl_attach,
     .detach = egl_detach,
+    .quit = egl_quit,
     .swap = egl_swap,
     .log = wine_nx_runtime_trace,
 };

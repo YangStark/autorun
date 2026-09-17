@@ -408,6 +408,16 @@ NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
 {
     unsigned int table_idx = (syscall_id >> 12) & 3;
     unsigned int func_idx  = syscall_id & 0xfff;
+#ifdef __SWITCH__
+    /* + and - ask for the launcher back. A thread cannot be ended from outside
+     * on Horizon, so each ends itself here, where every one of them passes. */
+    {
+        extern volatile int wine_nx_quit_requested __attribute__((weak));
+        extern void wine_nx_quit_point( void ) __attribute__((weak));
+
+        if (&wine_nx_quit_requested && wine_nx_quit_requested && &wine_nx_quit_point) wine_nx_quit_point();
+    }
+#endif
     SYSTEM_SERVICE_TABLE *table = &KeServiceDescriptorTable[table_idx];
     ULONG_PTR *handler;
     unsigned int arg_bytes;

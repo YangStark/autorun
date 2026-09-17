@@ -185,6 +185,44 @@ static int map_arena( struct nx_arena *arena, size_t size, unsigned int *rc )
     return 1;
 }
 
+/* Gives the arenas' code memory back on the way to the launcher. An arena is a
+ * kernel code memory object over heap pages, and while it lives those pages are
+ * lent to it: the loader cannot reset a heap that holds them. Nothing may run
+ * translated code afterwards, so this is only for a process on its way out, and
+ * it is called once the program's threads are gone. Returns how many it closed
+ * and, through bytes, how much heap they held. */
+unsigned int wine_nx_box64_release_arenas( unsigned long long *bytes )
+{
+    unsigned int i, closed = 0;
+    unsigned long long held = 0;
+
+    pthread_mutex_lock( &arena_mutex );
+    for (i = 0; i < arena_count; i++)
+    {
+        struct nx_arena *arena = &arenas[i];
+
+        if (!arena->size) continue;
+#ifdef __SWITCH__
+        jitClose( &arena->jit );
+#else
+        munmap( arena->rw, arena->size );
+        munmap( arena->rx, arena->size );
+#endif
+        held += arena->size;
+        free( arena->starts );
+        arena->starts = NULL;
+        arena->rw = arena->rx = NULL;
+        arena->size = arena->used = 0;
+        closed++;
+    }
+    arena_count = 0;
+    dynarec_ready = 0;
+    wine_nx_box64_arena_bytes = 0;
+    pthread_mutex_unlock( &arena_mutex );
+    if (bytes) *bytes = held;
+    return closed;
+}
+
 /* Called with arena_mutex held. The next arena doubles the last one, from
  * NX_ARENA_FIRST up to NX_ARENA_LARGEST, and holds at least minimum bytes;
  * smaller sizes are tried when the heap has no block that large. When even

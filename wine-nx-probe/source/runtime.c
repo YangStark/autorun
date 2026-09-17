@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <malloc.h>
@@ -50,7 +51,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-131"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-165"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -165,12 +166,15 @@ static void runtime_alternate_clean(void)
 /* Flushing each line to the SD card serialized every thread behind the file
  * lock. Buffer instead and flush often enough that a hang loses under 200 ms.
  * The same thread emits idle partial output lines and reports interpreter speed. */
+static int log_flusher_quit;
+static pthread_t log_flusher_thread;
+
 static void *log_flusher( void *arg )
 {
     unsigned int ticks = 0;
 
     (void)arg;
-    for (;;)
+    while (!__atomic_load_n( &log_flusher_quit, __ATOMIC_RELAXED ))
     {
         svcSleepThread( 200000000LL );
         runtime_tick_std_streams();
@@ -187,6 +191,17 @@ static void *log_flusher( void *arg )
         pthread_mutex_unlock( &log_mutex );
     }
     return NULL;
+}
+
+/* A running thread keeps its stack, which libnx maps out of the heap, lent to
+ * the mapping: the loader then cannot reset the heap and gives up with
+ * InvalidMemoryState. Every thread this runtime owns has to end before it does. */
+static void stop_log_flusher( void )
+{
+    if (!log_flusher_running) return;
+    __atomic_store_n( &log_flusher_quit, 1, __ATOMIC_RELAXED );
+    pthread_join( log_flusher_thread, NULL );
+    log_flusher_running = 0;
 }
 
 static void log_line( const char *fmt, ... )
@@ -549,6 +564,12 @@ unsigned int wine_nx_pad_key_state;
 /* When a program last read the controller through XInput (xinput_unix.c). */
 extern u64 wine_nx_xinput_last_poll;
 
+/* How long + and - must be held together before the program is closed. */
+#define WINE_NX_QUIT_CHORD_NS 1000000000ull
+
+void wine_nx_leave_process( const char *why );
+void wine_nx_request_quit( const char *why );
+
 /* One mouse for win32u, in native 1280x720 display coordinates: the right
  * analog stick moves the cursor, A holds the left button and B the right,
  * and a touchscreen contact puts the cursor under the finger with the left
@@ -559,7 +580,7 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
     HidAnalogStickState stick;
     unsigned int pressed = 0;
     u64 now, held, xinput_poll;
-    int moved, gamepad;
+    int moved, gamepad, leave = 0;
 
     pthread_mutex_lock( &wine_nx_pointer_mutex );
     if (!wine_nx_pointer_ready)
@@ -623,7 +644,18 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
     *buttons = pressed;
     pointer_buttons_update( &wine_nx_pointer_buttons, pressed );
     wine_nx_pointer_moved |= moved;
+    /* + and - held together close the program, whether or not it still draws:
+     * this poll runs on the display driver's thread, outside it. */
+    {
+        static u64 chord_since;
+        const u64 chord = HidNpadButton_Plus | HidNpadButton_Minus;
+
+        if ((held & chord) != chord) chord_since = 0;
+        else if (!chord_since) chord_since = now;
+        else if (armTicksToNs( now - chord_since ) >= WINE_NX_QUIT_CHORD_NS) leave = 1;
+    }
     pthread_mutex_unlock( &wine_nx_pointer_mutex );
+    if (leave) wine_nx_request_quit( "+ and - held" );
 
     wine_nx_cursor_move( *x, *y );
     return moved;
@@ -1882,11 +1914,691 @@ static int runtime_describe_image( void *module, SIZE_T size, void **entry )
               module, (unsigned long)size,
               (unsigned long long)IMAGE_FIELD(ImageBase),
               IMAGE_FIELD(AddressOfEntryPoint), nt->FileHeader.Machine );
+    /* A program with no relocations only works at the address it was linked for.
+     * The low addresses belong to this runtime unless Horizon gave the process a
+     * 32-bit address space, which is what the forwarders are for; started any
+     * other way the program reads and writes the wrong addresses and dies. */
+    {
+        const IMAGE_DATA_DIRECTORY *relocs = guest32 ?
+            &nt32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] :
+            &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+
+        if ((ULONG_PTR)module != (ULONG_PTR)IMAGE_FIELD(ImageBase) && !relocs->Size &&
+            !(IMAGE_FIELD(DllCharacteristics) & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE))
+            log_line( "[IMAGE] this program cannot be moved: no relocations, linked for 0x%llx, mapped at %p. "
+                      "It needs Wine-NX started through a 32-bit forwarder.",
+                      (unsigned long long)IMAGE_FIELD(ImageBase), module );
+    }
     log_line( "[IMAGE] subsystem=%u dll_char=0x%x imports=0x%x/0x%x sections=%u",
               IMAGE_FIELD(Subsystem), IMAGE_FIELD(DllCharacteristics),
               imports->VirtualAddress, imports->Size, nt->FileHeader.NumberOfSections );
     return 1;
 #undef IMAGE_FIELD
+}
+
+/***********************************************************************
+ * Leaving the process
+ *
+ * The homebrew loader takes the process back when main returns, unmaps this
+ * program and resets the heap. Pages the graphics driver lent to nvservices are
+ * pages the kernel will not let it reset: it gives up with InvalidMemoryState
+ * (0xd401) and writes a crash report naming hbl. Ending the process instead is
+ * no better, because the loader runs inside the album applet and killing that
+ * leaves the system to notice on its own.
+ *
+ * So the lent pages go back first, by closing the driver session, and the
+ * program then leaves the ordinary way.
+ */
+static void log_step( const char *step )
+{
+    log_line( "[EXIT] %s", step );
+    pthread_mutex_lock( &log_mutex );
+    if (log_file) fflush( log_file );
+    pthread_mutex_unlock( &log_mutex );
+}
+
+/* What the loader had already lent out when this program started: it maps its
+ * own NRO out of the heap, so those pages read as borrowed and are its business.
+ * Anything lent that is not one of these was lent by this program, and is what
+ * the loader will refuse to reset. */
+#define LOADER_LENT_MAX 32
+static struct { u64 addr, size; } loader_lent[LOADER_LENT_MAX];
+static int loader_lent_count;
+
+static int lent_by_loader( u64 addr, u64 size )
+{
+    int i;
+
+    for (i = 0; i < loader_lent_count; i++)
+        if (loader_lent[i].addr == addr && loader_lent[i].size == size) return 1;
+    return 0;
+}
+
+/* Regions the loader cannot cope with: pages lent to another process, and heap
+ * pages carrying an attribute of any kind. The loader reads the next program
+ * into the whole heap in one file read, and the kernel maps that buffer into the
+ * filesystem process for the length of the call, which it refuses over a page
+ * that is not plain memory. Logs them when report is set, saying which were
+ * already there when this program started, and returns how many there are; ours
+ * come back through mine when it is given. */
+static int memory_left_behind_ex( int report, int *mine )
+{
+    static const char *types[] = { "unmapped", "io", "normal", "code", "code-rw", "heap", "shared", "weird",
+                                   "module", "module-rw", "ipc0", "stack", "thread-local", "transfer-iso",
+                                   "transfer", "process", "reserved", "ipc1", "ipc3", "kernel-stack", "code-ro",
+                                   "code-w" };
+    u64 address = 0;
+    int lines = 0, regions = 0, ours = 0;
+
+    for (;;)
+    {
+        MemoryInfo info = {0};
+        u32 page_info = 0;
+
+        if (R_FAILED( svcQueryMemory( &info, &page_info, address ) )) break;
+        /* The loader's own module pages carry MemAttr_IsPermissionLocked and are
+         * its business; the heap is the part it has to be able to use. */
+        if ((info.attr & (MemAttr_IsBorrowed | MemAttr_IsIpcMapped | MemAttr_IsDeviceMapped)) ||
+            (info.type == MemType_Heap && info.attr))
+        {
+            const char *type = info.type < sizeof(types) / sizeof(types[0]) ? types[info.type] : "?";
+            int loaders = lent_by_loader( info.addr, info.size );
+
+            /* Every one of ours is named: whatever is left is what the next run
+             * has to give back, and there is no telling beforehand how many. */
+            if (report && (!loaders || lines < 8) && lines < 96)
+            {
+                log_line( "[EXIT] still held: %010llx-%010llx %lluKB %s perm=%x attr=%x%s%s%s%s",
+                          (unsigned long long)info.addr, (unsigned long long)(info.addr + info.size),
+                          (unsigned long long)(info.size / 1024), type,
+                          (unsigned)info.perm, (unsigned)info.attr,
+                          info.attr & MemAttr_IsDeviceMapped ? " device" : "",
+                          info.attr & MemAttr_IsBorrowed ? " borrowed" : "",
+                          info.attr & MemAttr_IsUncached ? " uncached" : "",
+                          loaders ? " (the loader's)" : "" );
+                lines++;
+            }
+            if (!loaders) ours++;
+            regions++;
+        }
+        if (!info.size || info.addr + info.size <= address) break;
+        address = info.addr + info.size;
+    }
+    if (mine) *mine = ours;
+    return regions;
+}
+
+static int memory_left_behind( int report )
+{
+    return memory_left_behind_ex( report, NULL );
+}
+
+/* Remembers what the loader had lent when this program started, so the end can
+ * tell the loader's own pages from the ones this program failed to give back. */
+static void note_loader_lent_memory( void )
+{
+    u64 address = 0;
+
+    loader_lent_count = 0;
+    for (;;)
+    {
+        MemoryInfo info = {0};
+        u32 page_info = 0;
+
+        if (R_FAILED( svcQueryMemory( &info, &page_info, address ) )) break;
+        if ((info.attr & (MemAttr_IsBorrowed | MemAttr_IsIpcMapped | MemAttr_IsDeviceMapped)) &&
+            loader_lent_count < LOADER_LENT_MAX)
+        {
+            loader_lent[loader_lent_count].addr = info.addr;
+            loader_lent[loader_lent_count].size = info.size;
+            loader_lent_count++;
+        }
+        if (!info.size || info.addr + info.size <= address) break;
+        address = info.addr + info.size;
+    }
+}
+
+/* The whole address space, to compare what this program leaves behind with what
+ * it was given: the loader undoes its own mappings when the program returns,
+ * and refuses when a region is not in the state it expects. */
+static void log_memory_map( const char *when )
+{
+    static const char *types[] = { "unmapped", "io", "normal", "code", "code-rw", "heap", "shared", "weird",
+                                   "module", "module-rw", "ipc0", "stack", "thread-local", "transfer-iso",
+                                   "transfer", "process", "reserved", "ipc1", "ipc3", "kernel-stack", "code-ro",
+                                   "code-w" };
+    u64 address = 0, heap_base = 0, heap_size = 0;
+    int lines = 0;
+
+    svcGetInfo( &heap_base, InfoType_HeapRegionAddress, CUR_PROCESS_HANDLE, 0 );
+    svcGetInfo( &heap_size, InfoType_HeapRegionSize, CUR_PROCESS_HANDLE, 0 );
+    log_line( "[MAP] %s: heap region %010llx+%lluKB", when, (unsigned long long)heap_base,
+              (unsigned long long)(heap_size / 1024) );
+    for (;;)
+    {
+        MemoryInfo info = {0};
+        u32 page_info = 0;
+
+        if (R_FAILED( svcQueryMemory( &info, &page_info, address ) )) break;
+        if (info.type != MemType_Unmapped && lines < 40)
+        {
+            const char *type = info.type < sizeof(types) / sizeof(types[0]) ? types[info.type] : "?";
+
+            log_line( "[MAP] %s: %010llx-%010llx %s perm=%x attr=%x", when, (unsigned long long)info.addr,
+                      (unsigned long long)(info.addr + info.size), type, (unsigned)info.perm, (unsigned)info.attr );
+            lines++;
+        }
+        if (!info.size || info.addr + info.size <= address) break;
+        address = info.addr + info.size;
+    }
+}
+
+/* Says how much is lent away at a point in the start-up, so the step that lends
+ * it can be told apart from the ones that do not. */
+static void log_lent_memory( const char *after )
+{
+    u64 address = 0, total = 0;
+    int regions = 0;
+
+    for (;;)
+    {
+        MemoryInfo info = {0};
+        u32 page_info = 0;
+
+        if (R_FAILED( svcQueryMemory( &info, &page_info, address ) )) break;
+        if (info.attr & (MemAttr_IsBorrowed | MemAttr_IsIpcMapped | MemAttr_IsDeviceMapped))
+        {
+            regions++;
+            total += info.size;
+        }
+        if (!info.size || info.addr + info.size <= address) break;
+        address = info.addr + info.size;
+    }
+    log_line( "[MEM] after %s: %d regions lent away, %llu KB", after, regions, (unsigned long long)(total / 1024) );
+}
+
+/* A line the card has before the next step runs: the flusher thread is gone by
+ * the time these are written, so a step that never returns would otherwise take
+ * its own account of itself with it. */
+static void log_flushed( const char *fmt, ... )
+{
+    char line[320];
+    va_list args;
+
+    va_start( args, fmt );
+    vsnprintf( line, sizeof(line), fmt, args );
+    va_end( args );
+    log_line( "%s", line );
+    pthread_mutex_lock( &log_mutex );
+    if (log_file) fflush( log_file );
+    pthread_mutex_unlock( &log_mutex );
+}
+
+static int device_regions( void );
+
+/* Mesa says which driver session it is closing; on the card before the next one
+ * starts, so a log that stops names the one that did not come back. The count
+ * is what the stage before it left, which is how much each one gave back. */
+static void log_graphics_step( const char *what )
+{
+    char line[96];
+
+    snprintf( line, sizeof(line), "closing the %s session, %d pages still with the GPU",
+              what, device_regions() );
+    log_step( line );
+}
+
+/* Heap pages the GPU still has: Mesa registers its buffers with nvservices, and
+ * the game that owned them is gone without giving them back. */
+static int device_regions( void )
+{
+    u64 address = 0;
+    int regions = 0;
+
+    for (;;)
+    {
+        MemoryInfo info = {0};
+        u32 page_info = 0;
+
+        if (R_FAILED( svcQueryMemory( &info, &page_info, address ) )) break;
+        if (info.attr & MemAttr_IsDeviceMapped) regions++;
+        if (!info.size || info.addr + info.size <= address) break;
+        address = info.addr + info.size;
+    }
+    return regions;
+}
+
+/* The screen's own buffers: libnx registers the text console's and Wine's
+ * framebuffer with the graphics driver, so each is heap the GPU holds and each
+ * counts as one open of the driver session. Nothing may draw afterwards. */
+static void release_screen_buffers( void )
+{
+    pthread_mutex_lock( &wine_nx_fb_mutex );
+    if (wine_nx_fb_ready)
+    {
+        framebufferClose( &wine_nx_fb );
+        wine_nx_fb_ready = 0;
+        wine_nx_fb_pending_bits = NULL;
+        wine_nx_fb_pending_stride = 0;
+        wine_nx_fb_pending_dirty = 0;
+        log_line( "[EXIT] framebuffer closed" );
+    }
+    if (wine_nx_console_active)
+    {
+        consoleExit( NULL );
+        wine_nx_console_active = 0;
+    }
+    /* A program's OpenGL or Vulkan surface that was never destroyed left its
+     * images with the display, which holds them -- and through them the driver's
+     * buffers -- until the window they were configured on lets them go. */
+    nwindowReleaseBuffers( nwindowGetDefault() );
+    pthread_mutex_unlock( &wine_nx_fb_mutex );
+}
+
+/* A step of the closing that waits on something outside this program, run on a
+ * thread of its own so that it cannot take the way out with it: libnx waits
+ * inside the driver close for nvservices to unmap the transfer memory, and that
+ * wait has no end -- build 161 stopped there and the console never came back.
+ * A step that does not finish now costs its few seconds and a line in the log,
+ * and the thread it was left on shows in what is still lent out. */
+struct closing_step
+{
+    void (*run)( void );
+    volatile int done;
+};
+
+static void *closing_step_thread( void *arg )
+{
+    struct closing_step *step = arg;
+
+    step->run();
+    __atomic_store_n( &step->done, 1, __ATOMIC_RELEASE );
+    return NULL;
+}
+
+/* Returns whether the step ran to the end within seconds. */
+static int run_closing_step( void (*run)( void ), int seconds, const char *what )
+{
+    struct closing_step *step = calloc( 1, sizeof(*step) );  /* left behind if it hangs */
+    pthread_t thread;
+    int i;
+
+    if (!step) return 0;
+    step->run = run;
+    log_flushed( "[EXIT] %s", what );
+    if (pthread_create( &thread, NULL, closing_step_thread, step ))
+    {
+        log_flushed( "[EXIT] no thread to %s on", what );
+        free( step );
+        return 0;
+    }
+    for (i = 0; i < seconds * 20 && !__atomic_load_n( &step->done, __ATOMIC_ACQUIRE ); i++)
+        svcSleepThread( 50000000LL );
+    if (!__atomic_load_n( &step->done, __ATOMIC_ACQUIRE ))
+    {
+        log_flushed( "[EXIT] %s did not finish in %d s", what, seconds );
+        return 0;
+    }
+    pthread_join( thread, NULL );
+    free( step );
+    return 1;
+}
+
+/* Closing the last nvdrv session is what makes nvservices give a process's
+ * buffers back, and it is also what returns the driver's own 8 MB transfer
+ * memory, which comes out of this heap. libnx counts the opens -- the text
+ * console, Wine's framebuffer and Mesa each took one -- and ignores a close once
+ * the count is at zero, so this closes it more often than it was opened. */
+static void close_graphics_driver( void )
+{
+    int i;
+
+    for (i = 0; i < 16; i++) nvExit();
+}
+
+/* mesa-switch (u_queue.c): Mesa's worker threads, which take 8 MB stacks of
+ * heap on this platform (u_thread.c), and are ended and joined the way its own
+ * atexit handler ends them. */
+static void stop_mesa_workers( void )
+{
+    extern void util_queue_kill_all_threads( void ) __attribute__((weak));
+
+    if (&util_queue_kill_all_threads) util_queue_kill_all_threads();
+}
+
+/* Gives the graphics driver's pages back: the buffers of the screen, then the
+ * driver taken apart object by object, then the session itself. */
+static void release_lent_memory( void )
+{
+    /* mesa-switch (nouveau_horizon_runtime.c): closes the driver sessions
+     * whatever still holds them, which is the only way left once the program
+     * that owned the buffers has gone without freeing them. */
+    extern void nouveau_horizon_runtime_shutdown( void (*step)( const char *what ) ) __attribute__((weak));
+    int before = device_regions(), i;
+
+    /* The screen first: the text console and Wine's framebuffer are buffers of
+     * libnx's own, registered with the driver, and each holds one open. */
+    release_screen_buffers();
+    log_flushed( "[QUIT] the screen gave its buffers back: %d pages with the GPU, was %d",
+                 device_regions(), before );
+    if (&nouveau_horizon_runtime_shutdown) nouveau_horizon_runtime_shutdown( log_graphics_step );
+    log_flushed( "[QUIT] the driver was taken apart: %d pages with the GPU, was %d",
+                 device_regions(), before );
+    run_closing_step( close_graphics_driver, 5, "closing the driver session" );
+    /* nvservices unmaps on its own, a moment after the session closes. */
+    for (i = 0; i < 40 && device_regions(); i++) svcSleepThread( 50000000LL );
+    log_flushed( "[QUIT] graphics driver closed: %d pages held by the GPU, was %d",
+                 device_regions(), before );
+}
+
+/* The graphics driver's buffers are marked uncached while it has them, by
+ * libnx's nvMapCreate, and the mark is taken off again by nvMapClose. The
+ * program that owned them never got that far, and closing the driver's session
+ * gives the pages back without touching the mark. It has to go: the loader reads
+ * the next program into the whole heap in one file read, and the kernel refuses
+ * to lend the filesystem process a buffer with a marked page anywhere in it --
+ * InvalidCurrentMemory, which the loader then stops the console with. Returns
+ * how many it could not clear. */
+static int clear_heap_attributes( void )
+{
+    u64 address = 0, bytes = 0;
+    int cleared = 0, refused = 0;
+
+    for (;;)
+    {
+        MemoryInfo info = {0};
+        u32 page_info = 0;
+
+        if (R_FAILED( svcQueryMemory( &info, &page_info, address ) )) break;
+        if (info.type == MemType_Heap && (info.attr & MemAttr_IsUncached))
+        {
+            if (R_SUCCEEDED( svcSetMemoryAttribute( (void *)(uintptr_t)info.addr, info.size,
+                                                    MemAttr_IsUncached, 0 ) ))
+            {
+                bytes += info.size;
+                cleared++;
+            }
+            else refused++;
+        }
+        if (!info.size || info.addr + info.size <= address) break;
+        address = info.addr + info.size;
+    }
+    if (cleared || refused)
+        log_flushed( "[QUIT] %d uncached heap regions made plain again, %lluKB, %d refused",
+                     cleared, (unsigned long long)(bytes / 1024), refused );
+    return refused;
+}
+
+/* Gives the pages back and says what is left; nonzero when the loader will
+ * still refuse to clean up. */
+static int leave_cleanly( void )
+{
+    int left = memory_left_behind( 0 ), after;
+
+    /* Services opened for the whole run hold heap pages of their own: the
+     * sockets take a transfer memory at start-up and nothing ever gave it back.
+     * Close them and say what each one returns, so the one that matters shows. */
+    socketExit();
+    after = memory_left_behind( 0 );
+    log_line( "[EXIT] sockets closed: %d regions lent, was %d", after, left );
+    left = after;
+    stop_log_flusher();
+    after = memory_left_behind( 0 );
+    log_line( "[EXIT] flusher thread ended: %d regions lent, was %d", after, left );
+    left = after;
+    log_memory_map( "exit" );
+    log_step( "leaving through the loader" );
+    return left;
+}
+
+/***********************************************************************
+ * Returning to the launcher
+ *
+ * Horizon cannot end one thread from another, so each ends itself at its next
+ * system call, and the main thread jumps back to where it started the program.
+ * With every thread gone and every service closed, the loader can take the
+ * process back and start this program again, which opens the launcher.
+ */
+volatile int wine_nx_quit_requested;
+/* libnx's weak default is 0: when this program ends, leave through the loader.
+ * 1 closes the application itself, the way the HOME menu closes it. Set at the
+ * end of return_to_launcher, so only the way out chooses it. */
+u32 __nx_applet_exit_mode = 0;
+static jmp_buf quit_jump;
+static int quit_jump_ready;
+static char own_nro[512];
+
+/* Called wherever a thread can leave off what it is doing. Never returns while
+ * a quit is under way: the thread it is called on ends, or, for the one that
+ * started the program, unwinds to main. */
+static volatile int quit_go;        /* the parked threads may end */
+static volatile int quit_parked;    /* how many of them are waiting to hear */
+/* libnx has no pthread_detach, so a thread's stack is given back only when it is
+ * joined. Each one that ends leaves itself here to be joined. */
+#define QUIT_JOIN_MAX 256
+static pthread_t quit_joinable[QUIT_JOIN_MAX];
+static volatile int quit_joinable_count;
+
+/* A thread that has stopped where it can be ended waits here. It ends only once
+ * every one of the program's threads has arrived: a thread ended while another
+ * is still running takes a lock or a buffer with it, and the program is left
+ * unable to go on. If they do not all arrive, they all carry on instead. */
+void wine_nx_quit_point( void )
+{
+    unsigned int left = 0;
+    int i;
+
+    if (!wine_nx_quit_requested) return;
+    if (!quit_jump_ready || !log_main_thread_set || !pthread_equal( pthread_self(), log_main_thread ))
+    {
+        int waited;
+
+        wine_nx_thread_parked( 1 );
+        __atomic_add_fetch( &quit_parked, 1, __ATOMIC_SEQ_CST );
+        /* Bounded: if the thread that started the program never gets to decide,
+         * this one goes back to what it was doing rather than wait for ever. */
+        for (waited = 0; wine_nx_quit_requested && !quit_go && waited < 1600; waited++)
+            svcSleepThread( 5000000LL );
+        if (quit_go)
+        {
+            int slot = __atomic_fetch_add( &quit_joinable_count, 1, __ATOMIC_SEQ_CST );
+
+            if (slot < QUIT_JOIN_MAX) quit_joinable[slot] = pthread_self();
+            if (wine_nx_thread_unregister) wine_nx_thread_unregister();
+            pthread_exit( NULL );
+        }
+        __atomic_sub_fetch( &quit_parked, 1, __ATOMIC_SEQ_CST );
+        wine_nx_thread_parked( 0 );
+        return;
+    }
+    /* The thread that started the program waits here, inside the system call it
+     * was making, for the others to park. */
+    for (i = 0; i < 500; i++)
+    {
+        left = wine_nx_threads_program();
+        if ((int)left <= __atomic_load_n( &quit_parked, __ATOMIC_SEQ_CST )) break;
+        wine_nx_threads_wake();
+        svcSleepThread( 10000000LL );
+    }
+    log_line( "[QUIT] %d of the program's %u threads parked after %d ms",
+              __atomic_load_n( &quit_parked, __ATOMIC_SEQ_CST ), left, i * 10 );
+    if ((int)left > __atomic_load_n( &quit_parked, __ATOMIC_SEQ_CST ))
+    {
+        /* Not all of them: nothing has ended, so the program carries on. */
+        wine_nx_threads_report_unparked();
+        __atomic_store_n( (int *)&wine_nx_quit_requested, 0, __ATOMIC_SEQ_CST );
+        log_line( "[QUIT] not all of them stopped; the program keeps running" );
+        return;
+    }
+    __atomic_store_n( (int *)&quit_go, 1, __ATOMIC_SEQ_CST );
+    for (i = 0; i < 200 && wine_nx_threads_program(); i++) svcSleepThread( 10000000LL );
+    log_line( "[QUIT] %u of the program's threads left after letting them end", wine_nx_threads_program() );
+    quit_jump_ready = 0;
+    longjmp( quit_jump, 1 );
+}
+
+/* + and - held together. The threads take it from here. */
+void wine_nx_request_quit( const char *why )
+{
+    if (__atomic_exchange_n( (int *)&wine_nx_quit_requested, 1, __ATOMIC_SEQ_CST )) return;
+    log_line( "[QUIT] %s; ending %u threads to return to the launcher", why, wine_nx_threads_other() );
+    wine_nx_threads_wake();
+}
+
+/* Wine calls this where it used to park after the program it ran terminated.
+ * It cannot return to main from there, so the kernel ends the process. */
+void wine_nx_leave_process( const char *why )
+{
+    log_line( "[EXIT] %s; returning to the launcher", why );
+    /* The same road as the chord: the threads stop, this one parks with them if
+     * it is not the one that started the program, and that one takes over. */
+    wine_nx_request_quit( why );
+    wine_nx_quit_point();
+    /* Only here when the threads would not all stop, or there is no way back to
+     * main: close as before, which the loader survives but does not like. */
+    log_line( "[EXIT] the launcher cannot be reached from here; closing" );
+    leave_cleanly();
+    svcExitProcess();
+    __builtin_unreachable();
+}
+
+/* Every thread the program left has to end before the loader takes over. Waits
+ * for them, closes what the runtime opened, and asks the loader for this
+ * program again, with no arguments, which is what opens the launcher. */
+static int return_to_launcher( void )
+{
+    int i, still_lent = 0;
+
+    /* Only reached with the program's threads already gone. Both of these wait
+     * for the thread they end: a thread of the runtime's own has no quit point
+     * to stop at, and while it runs it holds the heap pages of its stack. */
+    {
+        /* dlls/win32u/winnx_drv.c: polls the sticks and presents the screen. */
+        extern void wine_nx_input_thread_stop( void ) __attribute__((weak));
+
+        if (&wine_nx_input_thread_stop) wine_nx_input_thread_stop();
+    }
+    wine_nx_compositor_stop();
+    wine_nx_profile_stop();
+    /* Mesa's worker threads outlive the program that made work for them. */
+    run_closing_step( stop_mesa_workers, 5, "ending the graphics library's worker threads" );
+    for (i = 0; i < 200 && wine_nx_threads_other(); i++) svcSleepThread( 10000000LL );
+    /* A thread that has unregistered is not finished: it still runs its own
+     * teardown, which touches memory that is about to be taken away. Its stack
+     * is given back as it really ends, so wait for the lent regions to settle
+     * before touching anything. */
+    {
+        int previous = -1, now, still = 0;
+
+        for (i = 0; i < 60 && still < 3; i++)
+        {
+            svcSleepThread( 50000000LL );
+            now = memory_left_behind( 0 );
+            still = now == previous ? still + 1 : 0;
+            previous = now;
+        }
+        log_line( "[QUIT] threads finished after %d ms, %d regions lent", i * 50, previous );
+    }
+    {
+        /* Joining an ended thread is what gives its stack back to the heap. */
+        int i, count = __atomic_load_n( &quit_joinable_count, __ATOMIC_SEQ_CST );
+        int joined = 0;
+
+        if (count > QUIT_JOIN_MAX) count = QUIT_JOIN_MAX;
+        for (i = 0; i < count; i++)
+            if (!pthread_join( quit_joinable[i], NULL )) joined++;
+        log_line( "[QUIT] %d of %d ended threads joined, %d regions lent", joined, count,
+                  memory_left_behind( 0 ) );
+    }
+    {
+        /* Translated code lives in kernel code memory over heap pages, which are
+         * lent to it while the arena lives. Nothing runs guest code any more. */
+        extern unsigned int wine_nx_box64_release_arenas( unsigned long long *bytes )
+            __attribute__((weak));
+        unsigned long long bytes = 0;
+
+        if (&wine_nx_box64_release_arenas)
+        {
+            unsigned int closed = wine_nx_box64_release_arenas( &bytes );
+
+            log_line( "[QUIT] %u code arenas given back, %lluMB, %d regions lent",
+                      closed, bytes >> 20, memory_left_behind( 0 ) );
+        }
+    }
+    {
+        /* The thread that ends is joined by the next one to end, in Wine and in
+         * the server both, so the last of each is still holding its stack. */
+        extern unsigned int horizon_release_thread_stacks( void ) __attribute__((weak));
+
+        if (&horizon_release_thread_stacks)
+        {
+            unsigned int joined = horizon_release_thread_stacks();
+
+            log_line( "[QUIT] %u stacks of ended threads given back, %d regions lent",
+                      joined, memory_left_behind( 0 ) );
+        }
+    }
+    socketExit();
+    stop_log_flusher();
+    {
+        /* Wine's code mappings outlive its threads; the loader must not find them. */
+        extern void horizon_release_code_mappings( unsigned int *released, unsigned int *failed )
+            __attribute__((weak));
+        unsigned int released = 0, failed = 0;
+
+        if (&horizon_release_code_mappings)
+        {
+            horizon_release_code_mappings( &released, &failed );
+            log_line( "[QUIT] %u code mappings given back, %u refused", released, failed );
+        }
+    }
+    /* Name whatever is left: at this point there should be nothing but the
+     * pages the loader itself lent out before this program started. */
+    release_lent_memory();
+    clear_heap_attributes();
+    {
+        int mine = 0, left = memory_left_behind_ex( 1, &mine );
+
+        log_line( "[QUIT] %u threads and %d lent regions left, %d of them ours",
+                  wine_nx_threads_other(), left, mine );
+        /* The loader takes the process back by unmapping this program and
+         * resetting the heap, and the kernel refuses both over a page that is
+         * still lent: it gives up with InvalidCurrentMemory (0xd401) and the
+         * console dies with a crash report. So a page of ours left over is
+         * reason enough not to go that way, and the log says which. With
+         * switch/wine/loader-anyway.txt the loader is handed the process as it
+         * is, to find out what it will still take. */
+        if (mine && !read_bool_file( RUNTIME_DIR "/loader-anyway.txt" ))
+        {
+            log_step( "pages are still lent out; the loader must not take the process back" );
+            log_memory_map( "exit" );
+            still_lent = 1;
+        }
+    }
+    /* Two ways out, and which one works is the loader's business, not ours.
+     *
+     * Through the loader: it unloads this program and starts it again, which
+     * opens the launcher without leaving the console. It is what
+     * switch/wine/reload-launcher.txt asks for. sphaira's forwarder cannot do
+     * it: its loader checks the result of svcBreak, a system call that returns
+     * nothing at all (svc 0x26 is declared void in the kernel's own table), so
+     * it reads whatever the register happens to hold and stops the console with
+     * it -- the crash report says 2001-0106 whatever this program leaves behind,
+     * with a clean heap as readily as with a dirty one. Upstream nx-hbloader
+     * makes the same four svcBreak calls without looking at any of them.
+     *
+     * Otherwise: close the application the way the HOME menu does, through
+     * libnx's applet exit. The console goes back to the menu with no error, and
+     * the launcher is one press away. */
+    if (!still_lent && read_bool_file( RUNTIME_DIR "/reload-launcher.txt" ) &&
+        envHasNextLoad() && own_nro[0] && R_SUCCEEDED( envSetNextLoad( own_nro, own_nro ) ))
+    {
+        log_step( "starting this program again for the launcher" );
+        return 0;
+    }
+    __nx_applet_exit_mode = 1;
+    log_step( "closing this program; the console goes back to the menu" );
+    return 0;
 }
 
 int main( int argc, char **argv )
@@ -1909,6 +2621,11 @@ int main( int argc, char **argv )
 
     log_main_thread = pthread_self();
     log_main_thread_set = 1;
+    if (argc > 0 && argv[0] && strstr( argv[0], ".nro" )) snprintf( own_nro, sizeof(own_nro), "%s", argv[0] );
+    else snprintf( own_nro, sizeof(own_nro), "%s", RUNTIME_DIR "/wine-nx-runtime.nro" );
+    /* Before the console, whose framebuffer is lent to the graphics driver:
+     * what is lent now is the loader's, and everything after it is ours. */
+    note_loader_lent_memory();
     consoleInit( NULL );
     mkdir( "sdmc:/switch", 0777 );
     mkdir( RUNTIME_DIR, 0777 );
@@ -1919,13 +2636,14 @@ int main( int argc, char **argv )
     log_file = fopen( RUNTIME_DIR "/wine-nx-runtime.log", "w" );
     if (log_file)
     {
-        pthread_t flusher;
-
         setvbuf( log_file, log_file_buffer, _IOFBF, sizeof(log_file_buffer) );
-        log_flusher_running = !pthread_create( &flusher, NULL, log_flusher, NULL );
+        log_flusher_running = !pthread_create( &log_flusher_thread, NULL, log_flusher, NULL );
     }
     /* The launcher can access SteamGridDB before a game is selected. */
+    log_memory_map( "start-up" );
+    log_line( "[MAP] start-up: %d regions the loader already had lent", loader_lent_count );
     wine_nx_runtime_network_init();
+    log_lent_memory( "the network" );
 
     autorun = read_bool_file( RUNTIME_DIR "/run-entry.txt" );
     wine_nx_runtime_verbose = read_bool_file( RUNTIME_DIR "/verbose.txt" );
@@ -1964,6 +2682,7 @@ int main( int argc, char **argv )
             extern void wine_nx_vulkan_probe( void );
 
             wine_nx_vulkan_probe();
+            log_lent_memory( "the Vulkan probe" );
         }
     }
 #endif
@@ -1993,7 +2712,9 @@ int main( int argc, char **argv )
         pthread_mutex_unlock( &log_mutex );
         consoleExit( NULL );
         wine_nx_console_active = 0;
+        log_lent_memory( "the settings" );
         chosen = wine_nx_launcher_run( &options, target, sizeof(target) );
+        log_lent_memory( "the launcher" );
         /* The console stays off from here: after SDL's EGL surface let the
          * screen go, libnx's console was set up but could not dequeue a buffer,
          * and its first line aborted in framebufferBegin (build 106). The log
@@ -2008,14 +2729,16 @@ int main( int argc, char **argv )
         if (!chosen)
         {
             log_line( "[LAUNCHER] closed without starting a program" );
-            pthread_mutex_lock( &log_mutex );
-            if (log_file) fflush( log_file );
-            pthread_mutex_unlock( &log_mutex );
             consoleExit( NULL );
+            leave_cleanly();
             return 0;
         }
         autorun = 1;
     }
+
+    /* From here a thread may be asked to end; this one comes back here. */
+    if (setjmp( quit_jump )) return return_to_launcher();
+    quit_jump_ready = 1;
 
     /* The program's own settings, written by the launcher next to it, over the global files. */
     {

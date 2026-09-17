@@ -2753,6 +2753,20 @@ static void horizon_server_sleep_locked( long long timeout )
                         (u64)timeout * 100 );
     horizon_server_sleepers--;
 }
+/* A server thread waiting for a client's objects holds the object lock while it
+ * sleeps in slices. Asked to stop, it has to let the lock go first: parked or
+ * ended holding it, no other thread could reach its own stopping place. */
+static void horizon_server_quit_check_locked( void )
+{
+    extern volatile int wine_nx_quit_requested __attribute__((weak));
+    extern void wine_nx_quit_point( void ) __attribute__((weak));
+
+    if (!&wine_nx_quit_requested || !wine_nx_quit_requested || !&wine_nx_quit_point) return;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    wine_nx_quit_point();
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+}
+
 static struct horizon_server_handle_entry *horizon_server_handles;
 /* Whether any waitable timer is running, so waits skip the walk otherwise. */
 static int horizon_server_timers_armed;
@@ -2885,6 +2899,7 @@ struct horizon_mapping
     struct horizon_backing *backing;
     VirtmemReservation *reservation;
     struct horizon_memfile *section;  /* SECTION_ALIASED and SECTION_HOLE */
+    void *anchor_source;              /* SECTION_ANCHOR: the pages it was mapped from */
     size_t section_offset;
     unsigned char section_state;
     struct rb_entry entry;
@@ -3446,6 +3461,37 @@ static int horizon_pipe_close_r( struct _reent *r, void *fdptr )
     return 0;
 }
 
+/* Horizon's condition variables cannot be interrupted, so a thread asked to stop
+ * would wait in one for ever. Wait in slices, and look between them, holding
+ * nothing while it does: a thread that parked or ended with the lock would stop
+ * the others from reaching their own quit point. */
+static void horizon_cond_wait_quit( pthread_cond_t *cond, pthread_mutex_t *mutex )
+{
+    extern volatile int wine_nx_quit_requested __attribute__((weak));
+    extern void wine_nx_quit_point( void ) __attribute__((weak));
+    struct timespec deadline;
+
+    if (!&wine_nx_quit_requested || !&wine_nx_quit_point)
+    {
+        pthread_cond_wait( cond, mutex );
+        return;
+    }
+    clock_gettime( CLOCK_REALTIME, &deadline );
+    deadline.tv_nsec += 250000000L;
+    if (deadline.tv_nsec >= 1000000000L)
+    {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_cond_timedwait( cond, mutex, &deadline );
+    if (wine_nx_quit_requested)
+    {
+        pthread_mutex_unlock( mutex );
+        wine_nx_quit_point();
+        pthread_mutex_lock( mutex );
+    }
+}
+
 static ssize_t horizon_pipe_write_r( struct _reent *r, void *fdptr, const char *ptr, size_t len )
 {
     struct horizon_pipe_file *file = *(struct horizon_pipe_file **)fdptr;
@@ -3471,7 +3517,7 @@ static ssize_t horizon_pipe_write_r( struct _reent *r, void *fdptr, const char *
             /* The reader has to make room first. */
             if (pipe->read_waiters) pthread_cond_signal( &pipe->can_read );
             pipe->write_waiters++;
-            pthread_cond_wait( &pipe->can_write, &pipe->mutex );
+            horizon_cond_wait_quit( &pipe->can_write, &pipe->mutex );
             pipe->write_waiters--;
         }
 
@@ -3525,7 +3571,7 @@ static ssize_t horizon_pipe_read_r( struct _reent *r, void *fdptr, char *ptr, si
             /* A writer waiting for room can go on with what this took. */
             if (total && pipe->write_waiters) pthread_cond_signal( &pipe->can_write );
             pipe->read_waiters++;
-            pthread_cond_wait( &pipe->can_read, &pipe->mutex );
+            horizon_cond_wait_quit( &pipe->can_read, &pipe->mutex );
             pipe->read_waiters--;
         }
 
@@ -3682,7 +3728,7 @@ static int horizon_fd_queue_pop( struct horizon_fd_queue *queue, unsigned int *h
 
     pthread_mutex_lock( &queue->mutex );
     while (!queue->head)
-        pthread_cond_wait( &queue->cond, &queue->mutex );
+        horizon_cond_wait_quit( &queue->cond, &queue->mutex );
 
     message = queue->head;
     queue->head = message->next;
@@ -3707,11 +3753,16 @@ int horizon_server_take_client_fd( unsigned int *handle )
 
 static int horizon_read_exact( int fd, void *buffer, size_t size )
 {
+    extern volatile int wine_nx_quit_requested __attribute__((weak));
+    extern void wine_nx_quit_point( void ) __attribute__((weak));
     char *ptr = buffer;
 
     while (size)
     {
-        ssize_t ret = read( fd, ptr, size );
+        ssize_t ret;
+
+        if (&wine_nx_quit_requested && wine_nx_quit_requested && &wine_nx_quit_point) wine_nx_quit_point();
+        ret = read( fd, ptr, size );
 
         if (ret > 0)
         {
@@ -5375,7 +5426,10 @@ static int horizon_server_handle_init_thread( struct horizon_server_connection *
      * thread suspended and resumes it after NtCreateThreadEx returns. */
     pthread_mutex_lock( &horizon_server_objects_mutex );
     while (connection->thread && !horizon_thread_may_start( &connection->thread->thread ))
+    {
         horizon_server_sleep_locked( HORIZON_SERVER_WAIT_SLICE );
+        horizon_server_quit_check_locked();
+    }
     if (connection->thread) connection->thread->thread.started = 1;
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
@@ -9811,6 +9865,12 @@ static void *horizon_sock_poller_thread( void *param )
     (void)param;
     for (;;)
     {
+        {
+            extern volatile int wine_nx_quit_requested __attribute__((weak));
+            extern void wine_nx_quit_point( void ) __attribute__((weak));
+
+            if (&wine_nx_quit_requested && wine_nx_quit_requested && &wine_nx_quit_point) wine_nx_quit_point();
+        }
         struct horizon_server_handle_entry *entry;
 
         usleep( 50000 );
@@ -10545,9 +10605,20 @@ void horizon_trace( const char *fmt, ... )
  * sleeps atomically with respect to SignalToAddress. */
 int horizon_futex_wait( const int *addr, int value, long long timeout_ns )
 {
-    Result rc = svcWaitForAddress( (void *)addr, ArbitrationType_WaitIfEqual, value,
-                                   timeout_ns < 0 ? -1 : timeout_ns );
+    extern volatile int wine_nx_quit_requested __attribute__((weak));
+    extern void wine_nx_quit_point( void ) __attribute__((weak));
+    /* Nothing interrupts svcWaitForAddress, and a thread asked to end has to
+     * notice: wait without an end in slices, and look between them. */
+    const long long slice = 250000000LL;
+    Result rc;
 
+    for (;;)
+    {
+        if (&wine_nx_quit_requested && wine_nx_quit_requested && &wine_nx_quit_point) wine_nx_quit_point();
+        rc = svcWaitForAddress( (void *)addr, ArbitrationType_WaitIfEqual, value,
+                                timeout_ns < 0 ? slice : timeout_ns );
+        if (timeout_ns >= 0 || !(R_MODULE(rc) == Module_Kernel && R_DESCRIPTION(rc) == KernelError_TimedOut)) break;
+    }
     if (R_SUCCEEDED(rc)) return 0;
     if (R_MODULE(rc) == Module_Kernel && R_DESCRIPTION(rc) == KernelError_TimedOut) errno = ETIMEDOUT;
     else if (R_MODULE(rc) == Module_Kernel && R_DESCRIPTION(rc) == KernelError_InvalidState) errno = EAGAIN;
@@ -11886,6 +11957,7 @@ static int horizon_server_handle_select( struct horizon_server_connection *conne
         }
         if (polls && timeout > HORIZON_SERVER_POLL_INTERVAL) timeout = HORIZON_SERVER_POLL_INTERVAL;
         horizon_server_sleep_locked( timeout );
+        horizon_server_quit_check_locked();
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
     reply.signaled = 1;
@@ -11911,6 +11983,12 @@ static void *horizon_server_thread( void *param )
     svcSetThreadPriority( CUR_THREAD_HANDLE, 0x39 );
     for (;;)
     {
+        {
+            extern volatile int wine_nx_quit_requested __attribute__((weak));
+            extern void wine_nx_quit_point( void ) __attribute__((weak));
+
+            if (&wine_nx_quit_requested && wine_nx_quit_requested && &wine_nx_quit_point) wine_nx_quit_point();
+        }
         struct horizon_server_request_header *header = (void *)message;
         unsigned char *request_data = NULL;
         int status = 0;
@@ -12729,6 +12807,20 @@ void __libnx_exception_handler( ThreadExceptionDump *ctx )
      * handle_syscall_fault does on Unix. virtual_check_buffer_for_write and
      * its kind probe memory on purpose and must get FALSE, not a dead thread.
      * Early init and the runtime's own threads have no TEB to ask. */
+    {
+        /* The program is being taken apart: memory a thread still reads is on
+         * its way out. Whatever faults now is a thread that should have stopped;
+         * it says so once and stops, instead of faulting here for ever. */
+        extern volatile int wine_nx_quit_requested __attribute__((weak));
+        static int reported;
+
+        if (&wine_nx_quit_requested && wine_nx_quit_requested)
+        {
+            if (!reported++)
+                wine_nx_runtime_trace( "[EXC] a thread faulted while the program was closing; stopping it" );
+            svcExitThread();
+        }
+    }
     if (status && NtCurrentTeb() && ntdll_get_thread_data()->jmp_buf)
     {
         ctx->cpu_gprs[0].x = (ULONG_PTR)ntdll_get_thread_data()->jmp_buf;
@@ -13253,6 +13345,10 @@ static int map_code_memory_range( void *addr, void *source, size_t size, int pro
     return 0;
 }
 
+/* Set while the process is being taken apart: the guest's memory is going away,
+ * and both traces read the thread's TEB, which lives in it. */
+static int releasing_everything;
+
 static int unmap_code_memory_range( void *addr, void *source, size_t size )
 {
     Result rc;
@@ -13264,6 +13360,7 @@ static int unmap_code_memory_range( void *addr, void *source, size_t size )
     {
         char at[96], from[96];
 
+        if (releasing_everything) return -1;
         describe_memory( addr, at, sizeof(at) );
         describe_memory( source, from, sizeof(from) );
         horizon_trace( "[HMAP] unmap_code failed addr=%p source=%p size=0x%lx rc=0x%x at %s from %s",
@@ -13579,6 +13676,56 @@ failed:
     return NULL;
 }
 
+/* Gives back the stacks of the threads that ended last, for the same reason and
+ * at the same point in the closing as the code mappings below. libnx maps a
+ * thread's stack out of the heap and gives those pages back only when the thread
+ * is joined, and a thread here is joined by the next one to end: the last
+ * connection thread and the last thread of Wine's own are still holding theirs.
+ * Returns how many were joined. */
+unsigned int horizon_release_thread_stacks(void)
+{
+    extern unsigned int horizon_join_last_exited_thread(void);  /* thread.c */
+
+    return horizon_zombie_reap( &horizon_server_zombies ) + horizon_join_last_exited_thread();
+}
+
+/* Gives every code mapping back before the loader takes the process over. One
+ * left behind keeps its source pages lent and its own pages marked as code, and
+ * the loader reuses that memory for the next program: it then runs into pages
+ * that are not what it mapped there. Called once the program's threads are gone,
+ * so nothing is walking these mappings any more. */
+void horizon_release_code_mappings( unsigned int *released, unsigned int *failed )
+{
+    struct rb_entry *entry;
+
+    releasing_everything = 1;
+    pthread_mutex_lock( &mapping_mutex );
+    /* A view first: its pages come from a section's anchors, and an anchor a
+     * view still uses cannot go. */
+    for (entry = rb_head( mappings.root ); entry; entry = rb_next( entry ))
+    {
+        struct horizon_mapping *mapping = RB_ENTRY_VALUE( entry, struct horizon_mapping, entry );
+
+        if (mapping->section_state != SECTION_ALIASED || !mapping->section) continue;
+        if (horizon_memfile_alias( mapping->section, mapping->addr, mapping->section_offset, mapping->size, 0 ))
+            (*failed)++;
+        else (*released)++;
+    }
+    for (entry = rb_head( mappings.root ); entry; entry = rb_next( entry ))
+    {
+        struct horizon_mapping *mapping = RB_ENTRY_VALUE( entry, struct horizon_mapping, entry );
+        void *source;
+
+        if (mapping->backing && mapping->backing->heap_addr)
+            source = (char *)mapping->backing->heap_addr + mapping->source_offset;
+        else if (mapping->anchor_source) source = mapping->anchor_source;  /* a section's anchor */
+        else continue;
+        if (unmap_code_memory_range( mapping->addr, source, mapping->size )) (*failed)++;
+        else (*released)++;
+    }
+    pthread_mutex_unlock( &mapping_mutex );
+}
+
 static int protect_code_mapping( struct horizon_mapping *mapping, int prot )
 {
     int old_prot = mapping->prot;
@@ -13787,6 +13934,7 @@ static void *horizon_section_anchor( void *source, size_t size, void **token )
         return NULL;
     }
     mapping->section_state = SECTION_ANCHOR;
+    mapping->anchor_source = source;
     list_add_mapping( mapping );
     section_anchors++;
     section_anchor_bytes += size;
