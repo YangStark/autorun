@@ -1415,7 +1415,7 @@ static void draw_home( struct launcher *l )
 
 enum program_row
 {
-    ROW_START, ROW_FAVORITE, ROW_ARTWORK, ROW_LOCATE, ROW_TITLE, ROW_ARGS, ROW_VERBOSE, ROW_PROFILE, ROW_WINDOWS, ROW_D3D9, ROW_CONTROLS, ROW_BOX64,
+    ROW_START, ROW_FAVORITE, ROW_ARTWORK, ROW_LOCATE, ROW_TITLE, ROW_ARGS, ROW_VERBOSE, ROW_PROFILE, ROW_WINDOWS, ROW_D3D9, ROW_ADDRESS, ROW_CONTROLS, ROW_BOX64,
     ROW_HIDE, ROW_LIBRARY, PROGRAM_ROWS
 };
 
@@ -1532,6 +1532,23 @@ static void show_file( struct launcher *l, const char *title, const char *path, 
     ui_message( &l->ui, title, j ? text : "The file is empty." );
 }
 
+/* What the program needs of the address space: what it was told, or what the
+ * program itself says when it was told nothing. */
+static enum launcher_address_space program_address_space( struct program *p )
+{
+    if (p->settings.address_space >= 0)
+        return p->settings.address_space ? LAUNCHER_ADDRESS_LOW : LAUNCHER_ADDRESS_ANY;
+    return launcher_program_address_space( p->path );
+}
+
+/* Whether this process can run it at all. Nothing here can widen or narrow the
+ * address space: Horizon fixed it when the forwarder started this process. */
+static int address_space_fits( struct launcher *l, struct program *p )
+{
+    return !l->options->address_space_bits || l->options->address_space_bits == 32 ||
+           program_address_space( p ) != LAUNCHER_ADDRESS_LOW;
+}
+
 static int start_program( struct launcher *l, struct program *p, char *target, size_t size )
 {
     struct ui *ui = &l->ui;
@@ -1541,6 +1558,19 @@ static int start_program( struct launcher *l, struct program *p, char *target, s
     {
         p->missing = 1;
         ui_message( ui, "Game unavailable", "The executable is missing or is not supported by this build." );
+        return 0;
+    }
+    if (!address_space_fits( l, p ))
+    {
+        char message[512];
+
+        snprintf( message, sizeof(message),
+                  "%s is linked for a fixed address in the low 4 GB and carries no relocations, so it can "
+                  "only run where that address exists. This forwarder started Wine-NX with a %d-bit address "
+                  "space, which begins above it. Open the game from a forwarder made with a 32-bit address "
+                  "space. Address space under Game Options says what a game needs.",
+                  p->title, l->options->address_space_bits );
+        ui_message( ui, "Needs a 32-bit forwarder", message );
         return 0;
     }
     p->missing = 0;
@@ -1663,6 +1693,22 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
             }
         }
 
+        {
+            enum launcher_address_space needs = launcher_program_address_space( p->path );
+
+            ADD_ROW( ROW_ADDRESS, "Address space",
+                     "What the game needs of the address space Horizon gives Wine-NX. A game linked for a "
+                     "fixed address in the low 4 GB runs only under a forwarder made with 32 bits; the "
+                     "forwarder decides this, and a game that needs one it was not given is not started." );
+            row->adjustable = 1;
+            if (p->settings.address_space >= 0)
+                snprintf( row->value, sizeof(row->value), "%s",
+                          p->settings.address_space ? "32-bit" : "Any" );
+            else snprintf( row->value, sizeof(row->value), "Auto (%s)",
+                           needs == LAUNCHER_ADDRESS_LOW ? "32-bit" :
+                           needs == LAUNCHER_ADDRESS_ANY ? "any" : "unread" );
+        }
+
         ADD_ROW( ROW_CONTROLS, "Controls",
                  "Keys the controller presses: NAME.keys.txt next to the program, applied over the "
                  "shared keys.txt, one NAME=code line each." );
@@ -1781,6 +1827,13 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
         case ROW_D3D9:
             p->settings.dxvk = action == UI_ACTION_RESET ? 0 : !p->settings.dxvk;
+            save_program_settings( l, p );
+            break;
+
+        case ROW_ADDRESS:
+            /* Auto, then what the two answers are, so either can be forced. */
+            p->settings.address_space = action == UI_ACTION_RESET ? -1 :
+                                        next_state( p->settings.address_space, action == UI_ACTION_LEFT ? -1 : 1 );
             save_program_settings( l, p );
             break;
 

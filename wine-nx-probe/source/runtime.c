@@ -51,7 +51,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-165"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-166"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -2601,6 +2601,22 @@ static int return_to_launcher( void )
     return 0;
 }
 
+/* What the kernel left this process to map things in. A 32-bit address space is
+ * the low 4 GB and nothing else, which is the only place a program linked for a
+ * fixed low address can go. */
+static int runtime_address_space_bits( void )
+{
+    u64 base = 0, size = 0, limit;
+
+    if (R_FAILED( svcGetInfo( &base, InfoType_AslrRegionAddress, CUR_PROCESS_HANDLE, 0 ) ) ||
+        R_FAILED( svcGetInfo( &size, InfoType_AslrRegionSize, CUR_PROCESS_HANDLE, 0 ) ))
+        return 0;
+    limit = base + size;
+    if (limit <= 0x100000000ull) return 32;
+    if (limit <= 0x1000000000ull) return 36;
+    return 39;
+}
+
 int main( int argc, char **argv )
 {
     char target[512] = DEFAULT_TARGET;
@@ -2694,6 +2710,7 @@ int main( int argc, char **argv )
             .runtime_dir = RUNTIME_DIR,
             .build = WINE_NX_RUNTIME_BUILD,
             .machine_of = launcher_machine,
+            .address_space_bits = runtime_address_space_bits(),
 #ifdef WINE_NX_MESA_SWITCH
             .vulkan = 1,
 #endif

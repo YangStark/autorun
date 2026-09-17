@@ -5,6 +5,77 @@
 
 #include "../source/launcher_catalog.h"
 
+/* A PE header as small as the launcher's reader needs, to say what a program
+ * asks of the address space. relocations is the size of the base relocation
+ * directory, stripped and dynamic the two header flags that answer the same
+ * question in their own way. */
+static void write_pe( const char *path, int plus, unsigned long long image_base,
+                      unsigned int relocations, int stripped, int dynamic )
+{
+    unsigned char image[0x400] = {0};
+    unsigned char *pe = image + 0x80, *optional = pe + 24;
+    unsigned char *directories = optional + (plus ? 112 : 96);
+    int base_offset = plus ? 24 : 28, base_bytes = plus ? 8 : 4;
+    FILE *file;
+
+    image[0] = 'M'; image[1] = 'Z';
+    image[0x3c] = 0x80;
+    pe[0] = 'P'; pe[1] = 'E';
+    pe[4] = plus ? 0x64 : 0x4c; pe[5] = plus ? 0x86 : 0x01;   /* Machine: x86-64 or i386 */
+    pe[4 + 16] = plus ? 240 : 224;                       /* SizeOfOptionalHeader */
+    pe[4 + 18] = stripped ? 0x01 : 0x00;                 /* IMAGE_FILE_RELOCS_STRIPPED */
+    optional[0] = 0x0b; optional[1] = plus ? 0x02 : 0x01;   /* PE32+ or PE32 */
+    for (int i = 0; i < base_bytes; i++) optional[base_offset + i] = (image_base >> (8 * i)) & 0xff;
+    optional[70] = dynamic ? 0x40 : 0x00;                /* IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE */
+    optional[plus ? 108 : 92] = 16;                      /* NumberOfRvaAndSizes */
+    for (int i = 0; i < 4; i++) directories[5 * 8 + 4 + i] = (relocations >> (8 * i)) & 0xff;
+
+    file = fopen( path, "wb" );
+    assert( file );
+    assert( fwrite( image, 1, sizeof(image), file ) == sizeof(image) );
+    assert( !fclose( file ) );
+}
+
+static void check_address_space(void)
+{
+    char path[] = "/tmp/wine-nx-program-XXXXXX";
+    int fd = mkstemp( path );
+    FILE *file;
+
+    assert( fd >= 0 );
+    close( fd );
+
+    /* Relocations and a low image base: it goes wherever there is room. */
+    write_pe( path, 0, 0x400000, 0x1000, 0, 0 );
+    assert( launcher_program_address_space( path ) == LAUNCHER_ADDRESS_ANY );
+
+    /* None, and linked for an address only the low 4 GB has. */
+    write_pe( path, 0, 0x400000, 0, 0, 0 );
+    assert( launcher_program_address_space( path ) == LAUNCHER_ADDRESS_LOW );
+    write_pe( path, 0, 0x400000, 0x1000, 1, 0 );
+    assert( launcher_program_address_space( path ) == LAUNCHER_ADDRESS_LOW );
+
+    /* Asking to be moved answers the question by itself. */
+    write_pe( path, 0, 0x400000, 0, 0, 1 );
+    assert( launcher_program_address_space( path ) == LAUNCHER_ADDRESS_ANY );
+
+    /* A 64-bit program linked above 4 GB, where a 32-bit address space reaches
+     * nothing: only PE32+ can say such a base at all. */
+    write_pe( path, 1, 0x140000000ull, 0, 0, 0 );
+    assert( launcher_program_address_space( path ) == LAUNCHER_ADDRESS_ANY );
+    write_pe( path, 1, 0x400000, 0, 0, 0 );
+    assert( launcher_program_address_space( path ) == LAUNCHER_ADDRESS_LOW );
+
+    /* Not a program at all. */
+    file = fopen( path, "wb" );
+    assert( file );
+    assert( fprintf( file, "this is not a program" ) > 0 );
+    assert( !fclose( file ) );
+    assert( launcher_program_address_space( path ) == LAUNCHER_ADDRESS_UNKNOWN );
+    unlink( path );
+    assert( launcher_program_address_space( path ) == LAUNCHER_ADDRESS_UNKNOWN );
+}
+
 int main(void)
 {
     struct launcher_catalog written, read;
@@ -53,5 +124,7 @@ int main(void)
     assert( !strcmp( written.entries[1].path, "sdmc:/games/missing.exe" ) );
     unlink( path );
     unlink( legacy );
+    check_address_space();
+    puts( "launcher catalog: entries, art, ordering, legacy import and address space passed" );
     return 0;
 }

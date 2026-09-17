@@ -7,7 +7,14 @@
 set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 probe="$root/wine-nx-probe"
-drive_c="$probe/build-switch-wow64-dynarec/notepad-sd-card/switch/wine/drive_c"
+# Two programs to stand in for games, out of whichever stage the card was last
+# packaged from: the full package keeps its own and takes the checkpoints' away.
+drive_c=""
+for stage in full-sd-card notepad-sd-card openttd-sd-card audio-sd-card opengl-sd-card d3d9-sd-card war3-sd-card; do
+    candidate="$probe/build-switch-wow64-dynarec/$stage/switch/wine/drive_c"
+    [ -f "$candidate/notepad.exe" ] && { drive_c="$candidate"; break; }
+done
+[ -n "$drive_c" ] || { echo "no staged drive_c with notepad.exe: run tools/package-wow64-full.py" >&2; exit 1; }
 build="$(mktemp -d "${TMPDIR:-/tmp}/wine-nx-launcher.XXXXXX")"
 trap 'rm -rf "$build"' EXIT HUP INT TERM
 font="${LAUNCHER_FONT:-/System/Library/Fonts/Supplemental/Arial.ttf}"
@@ -18,6 +25,10 @@ python3 "$probe/tools/make-launcher-icons.py" --check
 clang -std=gnu11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
     "$probe/tests/launcher_svg.c" "$probe/source/launcher_svg.c" -o "$build/launcher_svg"
 "$build/launcher_svg"
+
+clang -std=gnu11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+    "$probe/tests/launcher_catalog.c" "$probe/source/launcher_catalog.c" -o "$build/launcher_catalog"
+"$build/launcher_catalog"
 
 clang -std=gnu11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
     -I "$probe/source" $(sdl2-config --cflags) -I/opt/homebrew/include \

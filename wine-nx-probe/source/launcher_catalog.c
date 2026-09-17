@@ -57,6 +57,65 @@ void launcher_catalog_init( struct launcher_catalog *catalog )
     catalog->next_id = catalog->next_order = 1;
 }
 
+/* Little-endian fields of a PE header, read by hand: the launcher has no Windows
+ * headers, and only four of them are wanted. */
+static unsigned int pe_u16( const unsigned char *p ) { return p[0] | (p[1] << 8); }
+static unsigned long long pe_u32( const unsigned char *p )
+{
+    return (unsigned long long)p[0] | ((unsigned long long)p[1] << 8) |
+           ((unsigned long long)p[2] << 16) | ((unsigned long long)p[3] << 24);
+}
+
+enum launcher_address_space launcher_program_address_space( const char *path )
+{
+    /* Enough for the DOS stub's one useful field and the whole PE header. */
+    unsigned char head[0x400];
+    const unsigned char *pe, *optional, *directories;
+    unsigned long long lfanew, image_base;
+    unsigned int magic, characteristics, dll_characteristics, directory_count, relocations;
+    size_t read;
+    FILE *file = fopen( path, "rb" );
+
+    if (!file) return LAUNCHER_ADDRESS_UNKNOWN;
+    read = fread( head, 1, sizeof(head), file );
+    fclose( file );
+    if (read < 0x40 || head[0] != 'M' || head[1] != 'Z') return LAUNCHER_ADDRESS_UNKNOWN;
+    lfanew = pe_u32( head + 0x3c );
+    /* The COFF header is 20 bytes and the smallest optional header 96. */
+    if (lfanew + 4 + 20 + 96 > read) return LAUNCHER_ADDRESS_UNKNOWN;
+    pe = head + lfanew;
+    if (pe[0] != 'P' || pe[1] != 'E' || pe[2] || pe[3]) return LAUNCHER_ADDRESS_UNKNOWN;
+    characteristics = pe_u16( pe + 4 + 18 );
+    optional = pe + 4 + 20;
+    magic = pe_u16( optional );
+    if (magic == 0x10b)        /* PE32 */
+    {
+        image_base = pe_u32( optional + 28 );
+        directory_count = (unsigned int)pe_u32( optional + 92 );
+        directories = optional + 96;
+    }
+    else if (magic == 0x20b)   /* PE32+ */
+    {
+        image_base = pe_u32( optional + 24 ) | (pe_u32( optional + 28 ) << 32);
+        directory_count = (unsigned int)pe_u32( optional + 108 );
+        directories = optional + 112;
+    }
+    else return LAUNCHER_ADDRESS_UNKNOWN;
+    dll_characteristics = pe_u16( optional + 70 );
+    /* Directory 5 is the base relocations. */
+    if (directories + 6 * 8 > head + read) return LAUNCHER_ADDRESS_UNKNOWN;
+    relocations = directory_count > 5 ? (unsigned int)pe_u32( directories + 5 * 8 + 4 ) : 0;
+
+    /* It can be moved if it says where to, or if it allows being moved at all.
+     * IMAGE_FILE_RELOCS_STRIPPED is 0x0001, IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE
+     * 0x0040. An image above 4 GB is out of a 32-bit address space's reach and
+     * cannot want one. */
+    if (relocations && !(characteristics & 0x0001)) return LAUNCHER_ADDRESS_ANY;
+    if (dll_characteristics & 0x0040) return LAUNCHER_ADDRESS_ANY;
+    if (image_base >= 0x100000000ull) return LAUNCHER_ADDRESS_ANY;
+    return LAUNCHER_ADDRESS_LOW;
+}
+
 int launcher_catalog_find( const struct launcher_catalog *catalog, const char *path )
 {
     int i;

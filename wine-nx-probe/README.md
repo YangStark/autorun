@@ -317,6 +317,16 @@ hero for the focused game's backdrop. They are cached in `switch/wine/artwork`
 and replaced atomically.
 Existing v2 catalogs are migrated when they are next saved.
 
+**Address space** under Game Options says what a game needs of the address space
+Horizon gives Wine-NX. A game with no relocations is linked for one address and
+no other, and only a forwarder made with a 32-bit address space has the low 4 GB
+that address lives in; Need for Speed Underground 2 is one. The forwarder that
+opened Wine-NX fixes this for everything it starts, and nothing can change it
+afterwards, so a game that needs the low 4 GB under a 36- or 39-bit forwarder is
+not started at all, with a message saying which forwarder to use. Auto reads the
+game's own header; 32-bit and Any force the answer, and are kept in the game's
+`.wine-nx.txt` beside it.
+
 The launcher no longer discovers every `.exe` below `drive_c`. Membership is
 stored in `launcher-library-v2.ini`. On first use, paths that were explicitly
 saved in the older `launcher-library.txt` are migrated; other executables must

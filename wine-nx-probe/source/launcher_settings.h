@@ -178,6 +178,9 @@ struct launcher_settings
     int profile;      /* the sampling profiler */
     int framebuffer;  /* 1: windows go to the framebuffer, 0: through the compositor */
     int dxvk;         /* 1: Direct3D 9 from C:\dxvk\d3d9.dll, 0: Wine's */
+    /* What the program needs of the address space (launcher_catalog.h):
+     * -1 read it from the program itself, 0 any, 1 the low 4 GB. */
+    int address_space;
 };
 
 static inline int launcher_settings_path( const char *exe_path, char *out, size_t size )
@@ -215,6 +218,12 @@ static inline void launcher_settings_read( const struct launcher_kv *kv, struct 
         else if (!strcasecmp( value, "compositor" )) settings->framebuffer = 0;
     }
     settings->dxvk = launcher_kv_get( kv, "d3d9", value, sizeof(value) ) && !strcasecmp( value, "dxvk" );
+    settings->address_space = -1;
+    if (launcher_kv_get( kv, "address-space", value, sizeof(value) ))
+    {
+        if (!strcasecmp( value, "32-bit" ) || !strcmp( value, "32" )) settings->address_space = 1;
+        else if (!strcasecmp( value, "any" )) settings->address_space = 0;
+    }
 }
 
 /* Store settings, leaving out what matches the global settings. */
@@ -228,7 +237,9 @@ static inline int launcher_settings_write( struct launcher_kv *kv, const struct 
            launcher_kv_set( kv, "profile", states[settings->profile + 1] ) &&
            launcher_kv_set( kv, "windows", settings->framebuffer < 0 ? NULL :
                                            settings->framebuffer ? "framebuffer" : "compositor" ) &&
-           launcher_kv_set( kv, "d3d9", settings->dxvk ? "dxvk" : NULL );
+           launcher_kv_set( kv, "d3d9", settings->dxvk ? "dxvk" : NULL ) &&
+           launcher_kv_set( kv, "address-space", settings->address_space < 0 ? NULL :
+                                                 settings->address_space ? "32-bit" : "any" );
 }
 
 #endif

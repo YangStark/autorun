@@ -284,7 +284,8 @@ static void carousel_fixture(void)
 
 int main( int argc, char **argv )
 {
-    struct wine_nx_launcher_options options = { "sdmc:/switch/wine", "nx-host-test", machine_of, 1, 0, 0, 0 };
+    struct wine_nx_launcher_options options = { .runtime_dir = "sdmc:/switch/wine", .build = "nx-host-test",
+                                                .machine_of = machine_of, .vulkan = 1 };
     char target[512] = "", line[300];
     FILE *file;
     int chosen;

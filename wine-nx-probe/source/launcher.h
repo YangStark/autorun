@@ -13,6 +13,11 @@ struct wine_nx_launcher_options
     /* 0 with the program's IMAGE_FILE_MACHINE_* when this runtime can start it. */
     int (*machine_of)( const char *path, unsigned short *machine );
     int vulkan;                /* the runtime has Vulkan, so DXVK's d3d9 can run */
+    /* How wide an address space Horizon gave this process: 32 when the low 4 GB
+     * is all of it, 36 or 39 when it reaches beyond, 0 when it could not be
+     * read. The title that started the process fixes it, so a program that needs
+     * the low 4 GB has to be opened from a forwarder that asks for 32 bits. */
+    int address_space_bits;
     /* The global settings on entry, as the user left them on return. */
     int verbose;
     int profile;

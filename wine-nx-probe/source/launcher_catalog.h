@@ -28,6 +28,21 @@ struct launcher_catalog
     unsigned int next_order;
 };
 
+/* What a program needs of the address space it runs in. Horizon fixes that when
+ * it makes the process, from the title that started it, so a forwarder decides
+ * it for everything it opens and nothing can change it afterwards. A program
+ * with no relocations is linked for one address and no other, which only the
+ * low 4 GB of a 32-bit address space has. */
+enum launcher_address_space
+{
+    LAUNCHER_ADDRESS_ANY,   /* runs wherever it is put */
+    LAUNCHER_ADDRESS_LOW,   /* needs the low 4 GB: a 32-bit forwarder */
+    LAUNCHER_ADDRESS_UNKNOWN  /* the program could not be read */
+};
+
+/* Reads the program's own header and says which it is. */
+enum launcher_address_space launcher_program_address_space( const char *path );
+
 enum launcher_catalog_result
 {
     LAUNCHER_CATALOG_OK,
