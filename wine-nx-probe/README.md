@@ -323,9 +323,15 @@ no other, and only a forwarder made with a 32-bit address space has the low 4 GB
 that address lives in; Need for Speed Underground 2 is one. The forwarder that
 opened Wine-NX fixes this for everything it starts, and nothing can change it
 afterwards, so a game that needs the low 4 GB under a 36- or 39-bit forwarder is
-not started at all, with a message saying which forwarder to use. Auto reads the
-game's own header; 32-bit and Any force the answer, and are kept in the game's
-`.wine-nx.txt` beside it.
+not started at all. Auto reads the game's own header; 32-bit and Any force the
+answer, and are kept in the game's `.wine-nx.txt` beside it.
+
+Name the 32-bit forwarder under **Settings → 32-bit forwarder**, choosing it from
+the applications the console has installed, and a game that needs it is offered
+to it instead: the game's path goes to `switch/wine/run-next.txt`, the console is
+asked to close this forwarder and open that one, and the launcher there starts
+the game without asking, then takes the file away. Without the setting the game
+is refused with a message naming what it needs.
 
 The launcher no longer discovers every `.exe` below `drive_c`. Membership is
 stored in `launcher-library-v2.ini`. On first use, paths that were explicitly

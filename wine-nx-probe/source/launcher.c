@@ -293,13 +293,14 @@ static void runtime_file( const struct launcher *l, const char *name, char *out,
     snprintf( out, size, "%s/%s", l->options->runtime_dir, name );
 }
 
-static void write_line( const char *path, const char *text )
+/* Nonzero when the line reached the card, which the handoff in start_program
+ * has to know before it gives the console away. */
+static int write_line( const char *path, const char *text )
 {
     FILE *file = fopen( path, "w" );
 
-    if (!file) return;
-    fprintf( file, "%s\n", text );
-    fclose( file );
+    if (!file) return 0;
+    return fprintf( file, "%s\n", text ) > 0 && !fclose( file );
 }
 
 static int read_line( const char *path, char *out, size_t size )
@@ -1562,15 +1563,49 @@ static int start_program( struct launcher *l, struct program *p, char *target, s
     }
     if (!address_space_fits( l, p ))
     {
-        char message[512];
+        char message[640], forwarder[64] = "", name[128] = "";
+        unsigned long long id = 0;
+
+        if (launcher_kv_get( &l->look, "forwarder-32bit", forwarder, sizeof(forwarder) ) && forwarder[0])
+            id = strtoull( forwarder, NULL, 16 );
+        if (!launcher_kv_get( &l->look, "forwarder-32bit-name", name, sizeof(name) ) || !name[0])
+            snprintf( name, sizeof(name), "%s", forwarder );
 
         snprintf( message, sizeof(message),
                   "%s is linked for a fixed address in the low 4 GB and carries no relocations, so it can "
                   "only run where that address exists. This forwarder started Wine-NX with a %d-bit address "
-                  "space, which begins above it. Open the game from a forwarder made with a 32-bit address "
-                  "space. Address space under Game Options says what a game needs.",
-                  p->title, l->options->address_space_bits );
-        ui_message( ui, "Needs a 32-bit forwarder", message );
+                  "space, which begins above it.%s",
+                  p->title, l->options->address_space_bits,
+                  id && l->options->launch_title ?
+                  " The console can close this forwarder and open the 32-bit one, which starts the game by "
+                  "itself." :
+                  " Open the game from a forwarder made with a 32-bit address space, or name that forwarder "
+                  "under Settings and it will be offered here. Address space under Game Options says what a "
+                  "game needs." );
+        if (!id || !l->options->launch_title || !ui_confirm( ui, "Needs a 32-bit forwarder", message, "Open it there" ))
+        {
+            if (!id || !l->options->launch_title) ui_message( ui, "Needs a 32-bit forwarder", message );
+            return 0;
+        }
+        /* The game goes on the card before the forwarder is asked for, because
+         * once the console takes the request nothing here runs again. */
+        runtime_file( l, "run-next.txt", path, sizeof(path) );
+        if (!write_line( path, p->path ))
+        {
+            ui_toast( ui, "Could not write run-next.txt", 2500 );
+            return 0;
+        }
+        p->launched_order = l->catalog.next_order++;
+        save_library( l );
+        if (l->options->launch_title( id ))
+        {
+            ui_toast( ui, "Opening the 32-bit forwarder...", 4000 );
+            return 0;
+        }
+        remove( path );
+        snprintf( message, sizeof(message), "The console refused to open %s. It has to be installed, and this "
+                  "forwarder has to be the application that is running.", name );
+        ui_message( ui, "Could not open the forwarder", message );
         return 0;
     }
     p->missing = 0;
@@ -1899,9 +1934,60 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
 enum settings_row
 {
-    SET_ANIMATIONS, SET_COLUMNS, SET_ROWS, SET_HIDDEN, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_STEAMGRIDDB, SET_VERSION,
+    SET_ANIMATIONS, SET_COLUMNS, SET_ROWS, SET_HIDDEN, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_STEAMGRIDDB,
+    SET_FORWARDER, SET_VERSION,
     SET_CREDITS, SETTINGS_ROWS
 };
+
+/* Which forwarder to send a game to when this one cannot run it. The console
+ * lists what is installed; the user picks the one they made with a 32-bit
+ * address space, since only they know which that is. */
+static void choose_forwarder( struct launcher *l )
+{
+    struct wine_nx_launcher_title *titles;
+    struct ui_row *rows;
+    struct ui_list list = {0};
+    char value[64];
+    int count, i, chosen;
+
+    if (!l->options->list_titles) return;
+    titles = calloc( LAUNCHER_MAX_TITLES, sizeof(*titles) );
+    rows = calloc( LAUNCHER_MAX_TITLES + 1, sizeof(*rows) );
+    if (!titles || !rows) { free( titles ); free( rows ); return; }
+
+    count = l->options->list_titles( titles, LAUNCHER_MAX_TITLES );
+    /* The first row clears the choice; this forwarder is not offered, as sending
+     * a game to the address space it was refused in would only refuse it again. */
+    snprintf( rows[0].label, sizeof(rows[0].label), "None" );
+    snprintf( rows[0].value, sizeof(rows[0].value), "%s", "Do not offer another forwarder" );
+    for (i = 0; i < count; i++)
+    {
+        struct ui_row *row = &rows[i + 1];
+
+        snprintf( row->label, sizeof(row->label), "%s", titles[i].name );
+        snprintf( row->value, sizeof(row->value), "%016llX", titles[i].id );
+        row->disabled = titles[i].id == l->options->title_id;
+        if (row->disabled) snprintf( row->value, sizeof(row->value), "%s", "This forwarder" );
+    }
+    if (ui_list_run( &l->ui, &list, "32-bit forwarder", "Installed applications", rows, count + 1, 1 ) ==
+        UI_ACTION_CHOOSE)
+    {
+        chosen = list.selection;
+        if (!chosen || titles[chosen - 1].id == l->options->title_id)
+        {
+            launcher_kv_set( &l->look, "forwarder-32bit", NULL );
+            launcher_kv_set( &l->look, "forwarder-32bit-name", NULL );
+        }
+        else
+        {
+            snprintf( value, sizeof(value), "%016llX", titles[chosen - 1].id );
+            launcher_kv_set( &l->look, "forwarder-32bit", value );
+            launcher_kv_set( &l->look, "forwarder-32bit-name", titles[chosen - 1].name );
+        }
+    }
+    free( titles );
+    free( rows );
+}
 
 static void save_look( struct launcher *l )
 {
@@ -2030,6 +2116,15 @@ static void settings_menu( struct launcher *l )
                   launcher_kv_get( &l->look, "steamgriddb-key", path, sizeof(path) ) && path[0] ? "Configured" : "Not set" );
         rows[SET_STEAMGRIDDB].help = "Used to automatically download the community's highest-rated square, portrait and hero artwork.";
         rows[SET_STEAMGRIDDB].adjustable = 0;
+        snprintf( rows[SET_FORWARDER].label, sizeof(rows[0].label), "32-bit forwarder" );
+        snprintf( rows[SET_FORWARDER].value, sizeof(rows[0].value), "%s",
+                  launcher_kv_get( &l->look, "forwarder-32bit-name", path, sizeof(path) ) && path[0] ? path :
+                  launcher_kv_get( &l->look, "forwarder-32bit", path, sizeof(path) ) && path[0] ? path : "Not set" );
+        rows[SET_FORWARDER].help = "The forwarder made with a 32-bit address space, for games that need the low "
+                                   "4 GB. A game that needs it is offered to that forwarder, which the console "
+                                   "opens in this one's place and which starts the game by itself.";
+        rows[SET_FORWARDER].adjustable = 0;
+        rows[SET_FORWARDER].disabled = !l->options->list_titles || !l->options->launch_title;
         snprintf( rows[SET_VERSION].label, sizeof(rows[0].label), "Runtime" );
         snprintf( rows[SET_VERSION].value, sizeof(rows[0].value), "%s", l->options->build );
         rows[SET_VERSION].disabled = 1;
@@ -2071,6 +2166,10 @@ static void settings_menu( struct launcher *l )
                 launcher_kv_set( &l->look, "steamgriddb-key", key[0] ? key : NULL );
             break;
         }
+        case SET_FORWARDER:
+            if (action == UI_ACTION_CHOOSE) choose_forwarder( l );
+            break;
+
         case SET_CREDITS:
             credits_screen( l );
             ui_start_screen( ui );

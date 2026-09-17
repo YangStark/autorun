@@ -6,6 +6,16 @@
 
 #include <stddef.h>
 
+/* An application installed on the console. The launcher shows these so a
+ * forwarder made with another address space can be chosen. */
+#define LAUNCHER_MAX_TITLES 96
+
+struct wine_nx_launcher_title
+{
+    unsigned long long id;
+    char name[128];
+};
+
 struct wine_nx_launcher_options
 {
     const char *runtime_dir;   /* sdmc:/switch/wine: target.txt, args.txt, verbose.txt... */
@@ -18,6 +28,13 @@ struct wine_nx_launcher_options
      * read. The title that started the process fixes it, so a program that needs
      * the low 4 GB has to be opened from a forwarder that asks for 32 bits. */
     int address_space_bits;
+    /* This forwarder, and the ones beside it. A game that needs an address space
+     * this forwarder was not made with is started by asking the console for the
+     * forwarder that was: list_titles writes how many it found, launch_title
+     * returns nonzero when the console took the request. Both may be NULL. */
+    unsigned long long title_id;
+    int (*list_titles)( struct wine_nx_launcher_title *titles, int max );
+    int (*launch_title)( unsigned long long id );
     /* The global settings on entry, as the user left them on return. */
     int verbose;
     int profile;

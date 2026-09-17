@@ -51,7 +51,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-166"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-167"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -2617,6 +2617,62 @@ static int runtime_address_space_bits( void )
     return 39;
 }
 
+/* The applications installed beside this one. The forwarders a user made for
+ * Wine-NX are among them, which is how a game can be sent to the one with the
+ * address space it needs. */
+static int launcher_titles( struct wine_nx_launcher_title *titles, int max )
+{
+    NsApplicationRecord *records = calloc( max, sizeof(*records) );
+    NsApplicationControlData *control = calloc( 1, sizeof(*control) );
+    s32 found = 0;
+    int written = 0;
+
+    if (records && control && R_SUCCEEDED( nsInitialize() ))
+    {
+        if (R_SUCCEEDED( nsListApplicationRecord( records, max, 0, &found ) ))
+        {
+            for (s32 i = 0; i < found && written < max; i++)
+            {
+                NacpLanguageEntry *entry = NULL;
+                u64 size = 0;
+
+                titles[written].id = records[i].application_id;
+                /* Its name when the console has one, its id when it does not. */
+                snprintf( titles[written].name, sizeof(titles[written].name), "%016llX",
+                          (unsigned long long)records[i].application_id );
+                if (R_SUCCEEDED( nsGetApplicationControlData( NsApplicationControlSource_Storage,
+                                                              records[i].application_id, control,
+                                                              sizeof(*control), &size ) ) &&
+                    R_SUCCEEDED( nacpGetLanguageEntry( &control->nacp, &entry ) ) && entry && entry->name[0])
+                    snprintf( titles[written].name, sizeof(titles[written].name), "%s", entry->name );
+                written++;
+            }
+        }
+        nsExit();
+    }
+    free( records );
+    free( control );
+    return written;
+}
+
+/* Asks the console to close this application and open that one. */
+static int launcher_launch_title( unsigned long long id )
+{
+    Result rc = appletRequestLaunchApplication( id, NULL );
+
+    if (R_FAILED( rc )) log_line( "[LAUNCHER] could not start %016llx: rc=0x%x", id, (unsigned)rc );
+    return R_SUCCEEDED( rc );
+}
+
+/* This forwarder's own application id, to tell it from the others in the list. */
+static unsigned long long runtime_title_id( void )
+{
+    u64 id = 0;
+
+    if (R_FAILED( svcGetInfo( &id, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0 ) )) return 0;
+    return id;
+}
+
 int main( int argc, char **argv )
 {
     char target[512] = DEFAULT_TARGET;
@@ -2631,7 +2687,7 @@ int main( int argc, char **argv )
     unsigned int status;
     unsigned int ldr_status = STATUS_INVALID_IMAGE_FORMAT;
     unsigned int attach_status = STATUS_INVALID_IMAGE_FORMAT;
-    int autorun;
+    int autorun, handed_over = 0;
     USHORT target_machine;
     int sd_cache = wine_nx_sd_cache_install();  /* before any file on the card is opened */
 
@@ -2702,7 +2758,23 @@ int main( int argc, char **argv )
         }
     }
 #endif
-    if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
+    /* A launcher in another forwarder sent this game here, because it needs the
+     * address space this forwarder was made with and that one was not. It is
+     * ours to start once: the file goes before the game does, so a game that
+     * cannot start does not meet the same handoff on the way back. */
+    {
+        char handoff[512];
+
+        if (read_first_line( RUNTIME_DIR "/run-next.txt", handoff, sizeof(handoff) ) && handoff[0])
+        {
+            remove( RUNTIME_DIR "/run-next.txt" );
+            snprintf( target, sizeof(target), "%s", handoff );
+            autorun = handed_over = 1;
+            log_line( "[LAUNCHER] started here by another forwarder: %s", target );
+        }
+    }
+    if (handed_over) { /* the game to start came with the handoff */ }
+    else if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else
     {
         struct wine_nx_launcher_options options =
@@ -2711,6 +2783,9 @@ int main( int argc, char **argv )
             .build = WINE_NX_RUNTIME_BUILD,
             .machine_of = launcher_machine,
             .address_space_bits = runtime_address_space_bits(),
+            .title_id = runtime_title_id(),
+            .list_titles = launcher_titles,
+            .launch_title = launcher_launch_title,
 #ifdef WINE_NX_MESA_SWITCH
             .vulkan = 1,
 #endif
