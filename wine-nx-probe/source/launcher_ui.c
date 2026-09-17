@@ -192,6 +192,19 @@ static TTF_Font *open_font( const void *data, size_t size, int points )
     return stream ? TTF_OpenFontRW( stream, 1, points ) : NULL;
 }
 
+/* Each step of bringing the screen up, on the card before it is taken: a console
+ * that came back to the launcher four times froze on the fourth inside here, and
+ * a log that stops between two of these says which call did not return. */
+static void ui_step( const char *what )
+{
+    extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+    char line[96];
+
+    if (!&wine_nx_runtime_trace) return;
+    snprintf( line, sizeof(line), "[LAUNCHER] bringing the screen up: %s", what );
+    wine_nx_runtime_trace( line );
+}
+
 int ui_init( struct ui *ui, const void *font_data, size_t font_size, int animations )
 {
     static const struct { const char *label; int pill; } glyphs[GLYPH_COUNT] =
@@ -222,28 +235,34 @@ int ui_init( struct ui *ui, const void *font_data, size_t font_size, int animati
     SDL_SetMainReady();
     SDL_SetHint( SDL_HINT_RENDER_SCALE_QUALITY, "linear" );
     SDL_SetHint( SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1" );
+    ui_step( "SDL_Init" );
     if (SDL_Init( SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS ))
     {
         snprintf( last_error, sizeof(last_error), "%s", SDL_GetError() );
         return 0;
     }
+    ui_step( "TTF_Init" );
     if (TTF_Init()) goto fail;
 #ifdef __SWITCH__
     flags = SDL_WINDOW_FULLSCREEN;
 #endif
+    ui_step( "SDL_CreateWindow" );
     if (!(ui->window = SDL_CreateWindow( "Wine-NX", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                          ui->width, ui->height, flags ))) goto fail;
     window_created = 1;
     /* SDL's software renderer draws the same, only slower, if the GPU one cannot start. */
+    ui_step( "SDL_CreateRenderer" );
     if (!(ui->renderer = SDL_CreateRenderer( ui->window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC )) &&
         !(ui->renderer = SDL_CreateRenderer( ui->window, -1, SDL_RENDERER_SOFTWARE )))
         goto fail;
     SDL_RenderSetLogicalSize( ui->renderer, ui->width, ui->height );
     SDL_SetRenderDrawBlendMode( ui->renderer, SDL_BLENDMODE_BLEND );
+    ui_step( "fonts" );
     if (!(ui->small = open_font( font_data, font_size, 20 )) || !(ui->normal = open_font( font_data, font_size, 26 )) ||
         !(ui->large = open_font( font_data, font_size, 40 ))) goto fail;
     ui->glow = make_glow( ui );
     for (i = 0; i < GLYPH_COUNT; i++) ui->glyphs[i] = make_glyph( ui, glyphs[i].label, glyphs[i].pill );
+    ui_step( "controllers" );
     for (i = 0; i < SDL_NumJoysticks() && !ui->controller; i++)
         if (SDL_IsGameController( i )) ui->controller = SDL_GameControllerOpen( i );
     return 1;
