@@ -268,6 +268,14 @@ void wine_nx_compositor_resume( void )
     pthread_mutex_unlock( &comp.lock );
 }
 
+/* Without the lock, for a watch that must not wait on anything the program it
+ * is watching could be holding (runtime.c, stall_watch). A count read while it
+ * is being written is close enough to tell a stopped screen from a busy one. */
+unsigned int wine_nx_compositor_frames_fast( void )
+{
+    return __atomic_load_n( &comp.frames, __ATOMIC_RELAXED );
+}
+
 unsigned int wine_nx_compositor_frames( void )
 {
     unsigned int frames;

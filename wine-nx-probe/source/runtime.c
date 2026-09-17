@@ -51,7 +51,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-171"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-172"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -307,7 +307,7 @@ static void stall_watch( void *arg )
             svcSleepThread( 100000000LL );
         frames = __atomic_load_n( &wine_nx_fb_frames, __ATOMIC_RELAXED ) +
                  (&wine_nx_gl_swaps ? __atomic_load_n( &wine_nx_gl_swaps, __ATOMIC_RELAXED ) : 0) +
-                 wine_nx_compositor_frames() +
+                 wine_nx_compositor_frames_fast() +
                  (&wine_nx_vk_presents ? __atomic_load_n( &wine_nx_vk_presents, __ATOMIC_RELAXED ) : 0);
         if (frames != last_frames) { quiet = 0; reported = 0; }
         else quiet++;
@@ -2598,6 +2598,14 @@ static int return_to_launcher( void )
                   memory_left_behind( 0 ) );
     }
     {
+        /* dlls/win32u/font.c: the console's fonts are shared memory this process
+         * keeps while it draws. The loader starts this program again in the same
+         * process, so one left mapped is left for good. */
+        extern void wine_nx_release_shared_fonts( void ) __attribute__((weak));
+
+        if (&wine_nx_release_shared_fonts) wine_nx_release_shared_fonts();
+    }
+    {
         /* Translated code lives in kernel code memory over heap pages, which are
          * lent to it while the arena lives. Nothing runs guest code any more. */
         extern unsigned int wine_nx_box64_release_arenas( unsigned long long *bytes )
@@ -2903,9 +2911,11 @@ int main( int argc, char **argv )
         pthread_mutex_lock( &log_mutex );
         if (log_file) fflush( log_file );
         pthread_mutex_unlock( &log_mutex );
+        log_line( "[LAUNCHER] bringing the screen up: closing the console" );
         consoleExit( NULL );
         wine_nx_console_active = 0;
         log_lent_memory( "the settings" );
+        log_line( "[LAUNCHER] bringing the screen up: the launcher" );
         chosen = wine_nx_launcher_run( &options, target, sizeof(target) );
         log_lent_memory( "the launcher" );
         /* The console stays off from here: after SDL's EGL surface let the

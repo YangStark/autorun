@@ -2698,6 +2698,10 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
         snprintf( l->browse_dir, sizeof(l->browse_dir), "%s", LAUNCHER_DRIVE_C );
 
     started = SDL_GetTicks();
+    /* The steps of coming up, on the card before each is taken: the launcher
+     * that froze a console said nothing between the settings and its first
+     * frame, and the log has to name the call that did not return. */
+    launcher_log( "[LAUNCHER] bringing the screen up: the shared font" );
     if (!launcher_platform_font( &font, &font_size ) ||
         !ui_init( &l->ui, font, font_size, launcher_kv_get_int( &l->look, "animations", 1 ) != 0 ))
     {

@@ -59,6 +59,9 @@ void wine_nx_compositor_cursor( int x, int y, int visible );
 
 /* An OpenGL program takes the screen: returns once the presenter has given it
  * up. _resume() lets the presenter take it back. */
+/* The frames drawn, read without the presenter's lock: for a watch that cannot
+ * afford to wait on it. */
+unsigned int wine_nx_compositor_frames_fast( void );
 /* Ends the presenter thread and waits for it, before the program closes. */
 void wine_nx_compositor_stop( void );
 void wine_nx_compositor_suspend( void );

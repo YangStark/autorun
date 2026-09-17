@@ -6774,6 +6774,19 @@ static void load_switch_directory_fonts( const char *unix_dir, const char *nt_pr
     nxfont_trace( "[NXFONT] nx_scan_done flags=%x count=%u path=%s", flags, count, unix_dir );
 }
 
+/* The console's own fonts are shared memory this process maps and keeps for as
+ * long as it draws with them. The homebrew loader starts this program again in
+ * the same process when a game goes back to the launcher, so a mapping left
+ * behind is left for good and the next run maps another beside it. */
+static BOOL shared_fonts_mapped;
+
+void wine_nx_release_shared_fonts(void)
+{
+    if (!shared_fonts_mapped) return;
+    shared_fonts_mapped = FALSE;
+    plExit();
+}
+
 static unsigned int load_switch_shared_fonts(void)
 {
     static BOOL attempted;
@@ -6795,6 +6808,7 @@ static unsigned int load_switch_shared_fonts(void)
     rc = plInitialize( PlServiceType_User );
     nxfont_trace( "[NXFONT] plInitialize rc=%08x", rc );
     if (rc) return 0;
+    shared_fonts_mapped = TRUE;
 
     for (i = 0; i < ARRAY_SIZE(types); i++)
     {
