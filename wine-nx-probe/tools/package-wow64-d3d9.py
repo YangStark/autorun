@@ -82,11 +82,17 @@ here: d3d9.dll hands the work to wined3d.dll, which draws with opengl32.
 ''')
 subprocess.run([sys.executable, str(probe / 'tools/verify-wow64-package.py'), str(stage)], check=True)
 marker_version = re.search(r'nx-wow64-dynarec-(\d+)', (probe / 'source/runtime.c').read_text()).group(1)
-archive = build / f'wine-nx-d3d9-dynarec-{marker_version}.zip'
-with ZipFile(archive, 'w', ZIP_DEFLATED) as z:
-    for f in sorted(stage.rglob('*')):
-        if f.is_file() and f.name != '.DS_Store' and f.suffix != '.log':
-            z.write(f, f.relative_to(stage_root))
-with ZipFile(archive) as z:
-    assert z.testzip() is None
-print(archive)
+# The full package stages every checkpoint over the one before it and has only one
+# archive to give; asked for a stage alone, this leaves its own unwritten.
+stage_only = os.environ.get('WINE_NX_STAGE_ONLY') == '1'
+if stage_only:
+    print(stage_root)
+else:
+    archive = build / f'wine-nx-d3d9-dynarec-{marker_version}.zip'
+    with ZipFile(archive, 'w', ZIP_DEFLATED) as z:
+        for f in sorted(stage.rglob('*')):
+            if f.is_file() and f.name != '.DS_Store' and f.suffix != '.log':
+                z.write(f, f.relative_to(stage_root))
+    with ZipFile(archive) as z:
+        assert z.testzip() is None
+    print(archive)

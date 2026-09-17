@@ -23,8 +23,12 @@ marker = re.search(r'nx-wow64-dynarec-(\d+)', (probe / 'source/runtime.c').read_
 stage_root = build / 'full-sd-card'
 stage = stage_root / 'switch/wine'
 
+# Each checkpoint packager stages the one before it and, run on its own, writes an
+# archive of its stage. Here they are steps towards one package, so they are asked
+# for the stage alone and only the last archive below is written.
 def package(script, **base):
-    subprocess.run([sys.executable, str(tools / script)], check=True, env=dict(os.environ, **base))
+    subprocess.run([sys.executable, str(tools / script)], check=True,
+                   env=dict(os.environ, WINE_NX_STAGE_ONLY='1', **base))
 
 package('package-wow64-notepad.py')
 package('package-wow64-openttd.py')
@@ -202,4 +206,9 @@ with ZipFile(archive, 'w', ZIP_DEFLATED) as z:
             z.write(f, f.relative_to(stage_root))
 with ZipFile(archive) as z:
     assert z.testzip() is None
+
+# The checkpoints' stages are steps on the way here, and each is most of a card's
+# worth of files; the one this package was made from stays.
+for step in ('notepad', 'openttd', 'audio', 'opengl', 'd3d9', 'war3'):
+    shutil.rmtree(build / f'{step}-sd-card', ignore_errors=True)
 print(archive)

@@ -133,11 +133,17 @@ assert 'cryptbase.dll' in staged, 'advapi32 forwards SystemFunction036 to cryptb
 assert list((game / 'baseset').rglob('opengfx.obg')), 'OpenGFX is missing'
 assert (game / 'lang/english.lng').is_file()
 
-archive = build / 'wine-nx-openttd-dynarec-41.zip'
-with ZipFile(archive, 'w', ZIP_DEFLATED) as z:
-    for f in sorted(stage.rglob('*')):
-        if f.is_file() and f.name != '.DS_Store' and f.suffix != '.log':
-            z.write(f, f.relative_to(stage_root))
-with ZipFile(archive) as z:
-    assert z.testzip() is None
-print(archive)
+# The full package stages every checkpoint over the one before it and has only one
+# archive to give; asked for a stage alone, this leaves its own unwritten.
+stage_only = os.environ.get('WINE_NX_STAGE_ONLY') == '1'
+if stage_only:
+    print(stage_root)
+else:
+    archive = build / 'wine-nx-openttd-dynarec-41.zip'
+    with ZipFile(archive, 'w', ZIP_DEFLATED) as z:
+        for f in sorted(stage.rglob('*')):
+            if f.is_file() and f.name != '.DS_Store' and f.suffix != '.log':
+                z.write(f, f.relative_to(stage_root))
+    with ZipFile(archive) as z:
+        assert z.testzip() is None
+    print(archive)
