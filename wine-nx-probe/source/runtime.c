@@ -51,7 +51,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-169"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-170"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -169,6 +169,17 @@ static void runtime_alternate_clean(void)
     }
 }
 
+/* Watches for the program stopping without stopping. It runs on a thread of its
+ * own, and touches nothing but the kernel: the flusher below shares its lot with
+ * whatever the program is stuck in -- the card, a lock of Wine's -- and a watch
+ * kept there would be stuck in the same place and say nothing, which is what a
+ * hang looked like until now. */
+static void log_line( const char *fmt, ... ) __attribute__((format(printf,1,2)));
+
+static volatile int stall_watch_quit;
+static int stall_watch_running;
+static Thread stall_watch_thread;
+
 /* Flushing each line to the SD card serialized every thread behind the file
  * lock. Buffer instead and flush often enough that a hang loses under 200 ms.
  * The same thread emits idle partial output lines and reports interpreter speed. */
@@ -202,12 +213,45 @@ static void *log_flusher( void *arg )
 /* A running thread keeps its stack, which libnx maps out of the heap, lent to
  * the mapping: the loader then cannot reset the heap and gives up with
  * InvalidMemoryState. Every thread this runtime owns has to end before it does. */
+/* Its stack is heap lent to it, like every thread's, so it has to end and be
+ * waited for before the loader can take the process back. */
+static void stop_stall_watch( void )
+{
+    if (!stall_watch_running) return;
+    stall_watch_running = 0;
+    __atomic_store_n( (int *)&stall_watch_quit, 1, __ATOMIC_RELAXED );
+    if (R_SUCCEEDED( waitSingle( waiterForThread( &stall_watch_thread ), 3000000000ULL ) ))
+        threadClose( &stall_watch_thread );
+    else log_line( "[EXIT] the stall watch did not end; its stack stays lent out" );
+}
+
 static void stop_log_flusher( void )
 {
+    stop_stall_watch();
     if (!log_flusher_running) return;
     __atomic_store_n( &log_flusher_quit, 1, __ATOMIC_RELAXED );
     pthread_join( log_flusher_thread, NULL );
     log_flusher_running = 0;
+}
+
+/* Logging must not be able to stop the program. The flusher holds this lock
+ * while it writes to the card, and a write that does not come back would
+ * otherwise take every thread that logs a line down with it -- which looks
+ * exactly like the game hanging. A line that cannot be written is dropped and
+ * counted instead. */
+static unsigned int log_lines_dropped;
+
+static int log_lock_bounded( void )
+{
+    int i;
+
+    for (i = 0; i < 50; i++)
+    {
+        if (!pthread_mutex_trylock( &log_mutex )) return 1;
+        svcSleepThread( 1000000LL );
+    }
+    __atomic_add_fetch( &log_lines_dropped, 1, __ATOMIC_RELAXED );
+    return 0;
 }
 
 static void log_line( const char *fmt, ... )
@@ -233,16 +277,52 @@ static void log_line( const char *fmt, ... )
     /* Syscall traces stay in the file: each console update presents a frame. */
     if (on_main && strncmp( line, "[SYSCALL]", 9 )) fputs( line, stdout );
 
-    if (log_file)
+    if (log_file && log_lock_bounded())
     {
         /* One write per line, so concurrent threads never interleave. */
-        pthread_mutex_lock( &log_mutex );
+        unsigned int dropped = __atomic_exchange_n( &log_lines_dropped, 0, __ATOMIC_RELAXED );
+
+        if (dropped) fprintf( log_file, "[LOG] %u lines dropped while the card was busy\n", dropped );
         fwrite( line, 1, len, log_file );
         if (!log_flusher_running || log_line_is_urgent( line )) fflush( log_file );
         pthread_mutex_unlock( &log_mutex );
     }
     if (on_main && strncmp( line, "[SYSCALL]", 9 )) consoleUpdate( NULL );
 }
+
+static void stall_watch( void *arg )
+{
+    extern unsigned int wine_nx_gl_swaps __attribute__((weak));
+    extern unsigned int wine_nx_vk_presents __attribute__((weak));
+    unsigned int quiet = 0, last_frames = ~0u, reported = 0;
+
+    (void)arg;
+    while (!__atomic_load_n( (int *)&stall_watch_quit, __ATOMIC_RELAXED ))
+    {
+        unsigned int frames;
+        int i;
+
+        /* Five seconds, in slices, so quitting does not wait for them. */
+        for (i = 0; i < 50 && !__atomic_load_n( (int *)&stall_watch_quit, __ATOMIC_RELAXED ); i++)
+            svcSleepThread( 100000000LL );
+        frames = __atomic_load_n( &wine_nx_fb_frames, __ATOMIC_RELAXED ) +
+                 (&wine_nx_gl_swaps ? __atomic_load_n( &wine_nx_gl_swaps, __ATOMIC_RELAXED ) : 0) +
+                 wine_nx_compositor_frames() +
+                 (&wine_nx_vk_presents ? __atomic_load_n( &wine_nx_vk_presents, __ATOMIC_RELAXED ) : 0);
+        if (frames != last_frames) { quiet = 0; reported = 0; }
+        else quiet++;
+        last_frames = frames;
+        /* Ten seconds without a frame. A game loading a level does that too, so
+         * this says its piece three times and then leaves the log alone. */
+        if (quiet >= 2 && reported < 3)
+        {
+            log_line( "[STALL] no frame drawn for %u s; where the threads are standing", quiet * 5 );
+            wine_nx_threads_report_stalled();
+            reported++;
+        }
+    }
+}
+
 
 void wine_nx_runtime_trace( const char *msg )
 {
@@ -865,7 +945,7 @@ static void runtime_report_interpreter(void)
         extern unsigned int wine_nx_gl_explicit_flushes __attribute__((weak));
         extern int wine_nx_gl_pinned_memory __attribute__((weak));
         extern unsigned int wine_nx_syscall_counts[] __attribute__((weak));
-        static unsigned int calls, last_reads = ~0u, last_frames = ~0u, stalls;
+        static unsigned int calls, last_reads = ~0u, last_frames = ~0u;
         static u64 start;
         unsigned int reads = &wine_nx_file_reads ? __atomic_load_n( &wine_nx_file_reads, __ATOMIC_RELAXED ) : 0;
         unsigned int gl_frames = &wine_nx_gl_swaps ? __atomic_load_n( &wine_nx_gl_swaps, __ATOMIC_RELAXED ) : 0;
@@ -879,23 +959,7 @@ static void runtime_report_interpreter(void)
 
         if (!start) start = now;
         if (++calls % 2) return;
-        if (reads == last_reads && frames == last_frames)
-        {
-            /* Nothing read and nothing drawn since the last look. This line is
-             * quiet then, because a program sitting at a menu does that too --
-             * but a program waiting for something that will not come looks the
-             * same from outside, and the only difference is where its threads
-             * are standing. Say that, the first few times. */
-            if (stalls < 3)
-            {
-                log_line( "[STALL] nothing read or drawn since the last report; "
-                          "where the threads are standing" );
-                wine_nx_threads_report_stalled();
-                stalls++;
-            }
-            return;
-        }
-        stalls = 0;
+        if (reads == last_reads && frames == last_frames) return;
         last_reads = reads;
         last_frames = frames;
         /* The three system calls made most since the last line, as id:calls: a
@@ -2733,6 +2797,12 @@ int main( int argc, char **argv )
     {
         setvbuf( log_file, log_file_buffer, _IOFBF, sizeof(log_file_buffer) );
         log_flusher_running = !pthread_create( &log_flusher_thread, NULL, log_flusher, NULL );
+        /* Above the program's threads (59) and below the audio feeder (56), so
+         * it is read even when they are all busy waiting. */
+        if (R_SUCCEEDED( threadCreate( &stall_watch_thread, stall_watch, NULL, NULL, 0x8000, 0x38, -2 ) ) &&
+            R_FAILED( threadStart( &stall_watch_thread ) ))
+            threadClose( &stall_watch_thread );
+        else stall_watch_running = 1;
     }
     /* The launcher can access SteamGridDB before a game is selected. */
     log_memory_map( "start-up" );

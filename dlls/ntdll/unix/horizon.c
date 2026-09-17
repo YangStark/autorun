@@ -14371,11 +14371,23 @@ failed:
             u32 page_info = 0;
             struct horizon_mapping *held;
             char blocker[128] = "";
+            u64 at = (u64)(uintptr_t)requested, end = at + size;
 
-            if (R_SUCCEEDED( svcQueryMemory( &info, &page_info, (u64)(uintptr_t)requested ) ))
-                snprintf( blocker, sizeof(blocker), " in the way: %010llx+%llx type=%u perm=%u attr=%u",
-                          (unsigned long long)info.addr, (unsigned long long)info.size,
-                          (unsigned)info.type, (unsigned)info.perm, (unsigned)info.attr );
+            /* The first block in the range that is not free, which is the one
+             * refusing it: the range often begins with free pages and runs into
+             * something further along. */
+            while (at < end && R_SUCCEEDED( svcQueryMemory( &info, &page_info, at ) ))
+            {
+                if (info.type != MemType_Unmapped)
+                {
+                    snprintf( blocker, sizeof(blocker), " in the way: %010llx+%llx type=%u perm=%u attr=%u",
+                              (unsigned long long)info.addr, (unsigned long long)info.size,
+                              (unsigned)info.type, (unsigned)info.perm, (unsigned)info.attr );
+                    break;
+                }
+                if (!info.size || info.addr + info.size <= at) break;
+                at = info.addr + info.size;
+            }
             pthread_mutex_lock( &mapping_mutex );
             if ((held = find_overlap_mapping( requested, size )))
                 snprintf( blocker + strlen( blocker ), sizeof(blocker) - strlen( blocker ),
