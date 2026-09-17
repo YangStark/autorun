@@ -34,11 +34,24 @@ package('package-wow64-opengl.py', WINE_NX_OPENGL_BASE=str(build / 'audio-sd-car
 package('package-wow64-d3d9.py', WINE_NX_D3D9_BASE=str(build / 'opengl-sd-card/switch/wine'))
 package('package-wow64-war3.py', WINE_NX_WAR3_BASE=str(build / 'd3d9-sd-card/switch/wine'))
 
+# The card runs Direct3D 9 through DXVK, so the runtime it carries has to be the
+# one linked with mesa-switch: NVK behind winevulkan. Building
+# build-switch-wow64-dynarec writes its own runtime, without Vulkan, over the NRO
+# the checkpoints stage, and a game on DXVK then dies with "Failed to create
+# Vulkan instance". Take it from the Mesa build and say so if it is not there.
+mesa_nro = probe / 'build-switch-wow64-mesa-switch/wine-nx-runtime.nro'
+assert mesa_nro.is_file(), f'{mesa_nro} is missing; build it with -DWINE_NX_MESA_SWITCH_DIR'
+assert b'a Vulkan surface has the screen' in mesa_nro.read_bytes(), \
+    f'{mesa_nro} has no Vulkan display driver; it is not the mesa-switch build'
+assert f'nx-wow64-dynarec-{marker}'.encode() + b'\0' in mesa_nro.read_bytes(), \
+    f'{mesa_nro} is stale; rebuild the runtime for build {marker}'
+
 # The WarCraft III stage already left the other checkpoints' READMEs out, which
 # describe one checkpoint each; its own is kept next to this package's.
 shutil.rmtree(stage_root, ignore_errors=True)
 shutil.copytree(build / 'war3-sd-card/switch/wine', stage,
                 ignore=shutil.ignore_patterns('*.log', '.DS_Store', 'BUILD-*-README.txt'))
+shutil.copy2(mesa_nro, stage / 'wine-nx-runtime.nro')
 
 # What the Need for Speed games import that no checkpoint stages: NFSU2's
 # SPEED2.EXE, and the XtendedInput dinput8.dll in its folder (which loads the

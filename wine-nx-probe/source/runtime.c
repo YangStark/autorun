@@ -50,7 +50,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-130"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-131"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -58,6 +58,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define MAX_IMPORT_DEPTH 16
 
 extern void wine_nx_runtime_platform_init(void);
+extern void wine_nx_runtime_network_init(void);
 extern void wine_nx_runtime_environment_init(void);
 extern NTSTATUS wine_nx_loader_bootstrap( const UNICODE_STRING *main_nt_name );
 extern NTSTATUS wine_nx_loader_fixup_main_imports(void);
@@ -1923,6 +1924,8 @@ int main( int argc, char **argv )
         setvbuf( log_file, log_file_buffer, _IOFBF, sizeof(log_file_buffer) );
         log_flusher_running = !pthread_create( &flusher, NULL, log_flusher, NULL );
     }
+    /* The launcher can access SteamGridDB before a game is selected. */
+    wine_nx_runtime_network_init();
 
     autorun = read_bool_file( RUNTIME_DIR "/run-entry.txt" );
     wine_nx_runtime_verbose = read_bool_file( RUNTIME_DIR "/verbose.txt" );
