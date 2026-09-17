@@ -139,6 +139,8 @@ void ui_start_screen( struct ui *ui );
 
 void ui_fill( struct ui *ui, int x, int y, int w, int h, SDL_Color color );
 void ui_border( struct ui *ui, int x, int y, int w, int h, int thickness, SDL_Color color );
+/* An outline that follows the rounded shape, for anything ui_rounded drew. */
+void ui_rounded_border( struct ui *ui, int x, int y, int w, int h, int radius, int thickness, SDL_Color color );
 void ui_fill_circle( struct ui *ui, float cx, float cy, float radius, SDL_Color color );
 void ui_rounded( struct ui *ui, int x, int y, int w, int h, int radius, SDL_Color color );
 void ui_panel( struct ui *ui, int x, int y, int w, int h );
@@ -208,6 +210,10 @@ struct ui_list
 {
     int selection, top;
     int started;
+    /* ui_settings_run: whether the sections or the rows have the focus, and
+     * whether the row in focus is being changed rather than moved between. */
+    int in_rows;
+    int editing;
 };
 
 enum ui_action
@@ -224,9 +230,14 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
                             const struct ui_row *rows, int count, int can_reset );
 
 /* Settings, as a section list beside the rows of the section in focus: each row
- * carries its own description, and shows a switch, a value or an arrow. L and R
- * change section, so Left and Right are still the row's own. group selects the
- * section on entry and is left on the one the user ends in. */
+ * carries its own description, and shows a switch, a value or an arrow.
+ *
+ * One thing is in focus at a time and the arrows reach all of it: up and down
+ * within the sections or the rows, left back to the sections, right into them.
+ * A acts -- a switch turns over, a row that opens something opens it, and a row
+ * with a value of its own is taken hold of, after which left and right change it
+ * and A or B lets go. group selects the section on entry and is left on the one
+ * the user ends in. */
 enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char *title, const char *context,
                                 const char *const *groups, int group_count,
                                 const struct ui_row *rows, int count, int can_reset, int *group );

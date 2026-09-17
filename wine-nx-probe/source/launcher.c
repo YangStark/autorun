@@ -951,8 +951,8 @@ static void draw_card( struct launcher *l, int index, int x, int y, const struct
         }
         /* The plate the cover sits on, lit from above, as the focused cover on
          * Home has: the two views frame the selection the same way. */
-        ui_rounded( ui, x - 5, y - 5, g->card + 10, g->card + 10, 18, (SDL_Color){ 150, 160, 176, 120 } );
-        ui_rounded_texture( ui, ui_sheen( ui ), NULL, (SDL_Rect){ x - 5, y - 5, g->card + 10, g->card + 10 }, 18,
+        ui_rounded( ui, x - 3, y - 3, g->card + 6, g->card + 6, 17, (SDL_Color){ 150, 160, 176, 120 } );
+        ui_rounded_texture( ui, ui_sheen( ui ), NULL, (SDL_Rect){ x - 3, y - 3, g->card + 6, g->card + 6 }, 17,
                             (SDL_Color){ 252, 253, 255, 235 } );
     }
     else

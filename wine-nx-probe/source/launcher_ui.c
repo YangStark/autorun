@@ -97,6 +97,50 @@ static void fill_arc( struct ui *ui, float cx, float cy, float radius, float a0,
     SDL_RenderGeometry( ui->renderer, NULL, vertices, 3 * segments, NULL, 0 );
 }
 
+/* The same wedge, hollow: two arcs joined into a band, for the corners of a
+ * rounded outline. */
+static void stroke_arc( struct ui *ui, float cx, float cy, float outer, float inner,
+                        float a0, float a1, SDL_Color color )
+{
+    SDL_Vertex vertices[6 * 32];
+    int i, segments = 32;
+
+    for (i = 0; i < segments; i++)
+    {
+        float s = a0 + (a1 - a0) * i / segments, e = a0 + (a1 - a0) * (i + 1) / segments;
+        SDL_Vertex *v = vertices + 6 * i;
+        SDL_FPoint so = { cx + cosf( s ) * outer, cy + sinf( s ) * outer };
+        SDL_FPoint eo = { cx + cosf( e ) * outer, cy + sinf( e ) * outer };
+        SDL_FPoint si = { cx + cosf( s ) * inner, cy + sinf( s ) * inner };
+        SDL_FPoint ei = { cx + cosf( e ) * inner, cy + sinf( e ) * inner };
+
+        v[0] = (SDL_Vertex){ so, color, { 0, 0 } };
+        v[1] = (SDL_Vertex){ eo, color, { 0, 0 } };
+        v[2] = (SDL_Vertex){ si, color, { 0, 0 } };
+        v[3] = (SDL_Vertex){ si, color, { 0, 0 } };
+        v[4] = (SDL_Vertex){ eo, color, { 0, 0 } };
+        v[5] = (SDL_Vertex){ ei, color, { 0, 0 } };
+    }
+    SDL_RenderGeometry( ui->renderer, NULL, vertices, 6 * segments, NULL, 0 );
+}
+
+/* An outline that follows a rounded rectangle, rather than a rectangle drawn
+ * around one: four sides and four corner bands. */
+void ui_rounded_border( struct ui *ui, int x, int y, int w, int h, int radius, int thickness, SDL_Color color )
+{
+    if (radius * 2 > w) radius = w / 2;
+    if (radius * 2 > h) radius = h / 2;
+    if (thickness > radius) thickness = radius;
+    ui_fill( ui, x + radius, y, w - 2 * radius, thickness, color );
+    ui_fill( ui, x + radius, y + h - thickness, w - 2 * radius, thickness, color );
+    ui_fill( ui, x, y + radius, thickness, h - 2 * radius, color );
+    ui_fill( ui, x + w - thickness, y + radius, thickness, h - 2 * radius, color );
+    stroke_arc( ui, x + radius, y + radius, radius, radius - thickness, M_PI, 1.5 * M_PI, color );
+    stroke_arc( ui, x + w - radius, y + radius, radius, radius - thickness, 1.5 * M_PI, 2 * M_PI, color );
+    stroke_arc( ui, x + w - radius, y + h - radius, radius, radius - thickness, 0, 0.5 * M_PI, color );
+    stroke_arc( ui, x + radius, y + h - radius, radius, radius - thickness, 0.5 * M_PI, M_PI, color );
+}
+
 void ui_fill_circle( struct ui *ui, float cx, float cy, float radius, SDL_Color color )
 {
     fill_arc( ui, cx, cy, radius, 0, 2 * M_PI, color );
@@ -1138,7 +1182,7 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
 {
     /* The same width and the same flat surfaces as the settings screens: one
      * language for every list the launcher shows. */
-    const int column_x = 40, column_w = 1280 - 2 * column_x;
+    const int column_x = UI_HEADER_MARGIN, column_w = 1280 - 2 * UI_HEADER_MARGIN;
     const int visible = (ui->height - LIST_TOP - 86) / ROW_HEIGHT;
     struct ui_input input;
     int i;
@@ -1289,11 +1333,11 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
  * rest, each with its name, the line that says what it does, and what it is set
  * to on the right: a switch, a value, or an arrow into a screen of its own.
  */
-#define SET_SIDEBAR_X    40
+#define SET_SIDEBAR_X    UI_HEADER_MARGIN
 #define SET_SIDEBAR_W    248
 #define SET_GROUP_H      54
 #define SET_ROW_X        (SET_SIDEBAR_X + SET_SIDEBAR_W + 32)
-#define SET_ROW_H        104
+#define SET_ROW_H        112
 
 static void ui_switch( struct ui *ui, int x, int y, int on, int current, int disabled )
 {
@@ -1309,22 +1353,32 @@ static void ui_switch( struct ui *ui, int x, int y, int on, int current, int dis
 }
 
 /* The arrow that says a row opens something of its own. */
-static void ui_chevron( struct ui *ui, int x, int y, SDL_Color color )
+/* A chevron, pointing right for direction 1 and left for -1. */
+static void ui_chevron_dir( struct ui *ui, int x, int y, int direction, SDL_Color color )
 {
     int i;
 
     for (i = 0; i < 8; i++)
     {
-        ui_rounded( ui, x + 8 - i, y + 8 - i, 2, 2, 1, color );
-        ui_rounded( ui, x + 8 - i, y + 8 + i, 2, 2, 1, color );
+        int cx = direction > 0 ? x + 8 - i : x + i;
+
+        ui_rounded( ui, cx, y + 8 - i, 2, 2, 1, color );
+        ui_rounded( ui, cx, y + 8 + i, 2, 2, 1, color );
     }
+}
+
+static void ui_chevron( struct ui *ui, int x, int y, SDL_Color color )
+{
+    ui_chevron_dir( ui, x, y, 1, color );
 }
 
 enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char *title, const char *context,
                                 const char *const *groups, int group_count,
                                 const struct ui_row *rows, int count, int can_reset, int *group )
 {
-    const int row_w = 1280 - SET_ROW_X - 56;
+    /* The rows end where the clock and the battery begin, as everything else on
+     * the screen does. */
+    const int row_w = 1280 - UI_HEADER_MARGIN - SET_ROW_X;
     const int visible = (ui->height - LIST_TOP - 86) / SET_ROW_H;
     int index[64], shown, i;
     struct ui_input input;
@@ -1400,34 +1454,57 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
             {
             case UI_UP: direction = -1; break;
             case UI_DOWN: direction = 1; break;
-            case UI_L: section = -1; break;
-            case UI_R: section = 1; break;
-            case UI_LEFT: if (!row->disabled && row->adjustable) return UI_ACTION_LEFT; break;
-            case UI_RIGHT: if (!row->disabled && row->adjustable) return UI_ACTION_RIGHT; break;
-            case UI_A: if (!row->disabled) return UI_ACTION_CHOOSE; break;
-            case UI_B: return UI_ACTION_BACK;
-            case UI_Y: if (can_reset && !row->disabled && row->adjustable) return UI_ACTION_RESET; break;
+            case UI_LEFT:
+                /* Holding a value, left changes it; otherwise it is the way back
+                 * to the sections. */
+                if (list->editing) return UI_ACTION_LEFT;
+                if (list->in_rows) list->in_rows = 0;
+                break;
+            case UI_RIGHT:
+                if (list->editing) return UI_ACTION_RIGHT;
+                if (!list->in_rows && shown) list->in_rows = 1;
+                break;
+            case UI_A:
+                if (!list->in_rows) { if (shown) list->in_rows = 1; break; }
+                if (row->disabled) break;
+                /* A switch turns over where it stands. A row with a value of its
+                 * own is taken hold of, and let go of the same way; everything
+                 * else simply happens. */
+                if (row->kind == UI_ROW_SWITCH) return UI_ACTION_CHOOSE;
+                if (row->adjustable) { list->editing = !list->editing; break; }
+                return UI_ACTION_CHOOSE;
+            case UI_B:
+                if (list->editing) { list->editing = 0; break; }
+                if (list->in_rows) { list->in_rows = 0; break; }
+                return UI_ACTION_BACK;
+            case UI_Y:
+                if (can_reset && list->in_rows && !row->disabled && row->adjustable) return UI_ACTION_RESET;
+                break;
             case UI_X:
-                if (row->help)
+                if (list->in_rows && row->help)
                 {
                     ui_message( ui, row->label, row->help );
                     ui_start_screen( ui );
                 }
                 break;
             }
-            if (section)
+            (void)section;
+            if (direction && !list->editing)
             {
-                *group = (*group + section + group_count) % group_count;
-                list->selection = list->top = 0;
-                break;      /* the section's rows are gathered again next frame */
-            }
-            if (direction)
-            {
-                int next = list->selection;
+                if (!list->in_rows)
+                {
+                    *group = (*group + direction + group_count) % group_count;
+                    list->selection = list->top = 0;
+                    break;  /* the section's rows are gathered again next frame */
+                }
+                else
+                {
+                    int next = list->selection;
 
-                do next = (next + direction + shown) % shown;
-                while (rows[index[next]].disabled && next != list->selection);
-                list->selection = next;
+                    do next = (next + direction + shown) % shown;
+                    while (rows[index[next]].disabled && next != list->selection);
+                    list->selection = next;
+                }
             }
         }
         if (!ui->running) break;
@@ -1449,10 +1526,14 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
             int y = LIST_TOP + i * SET_GROUP_H;
             int text_y = y + (SET_GROUP_H - TTF_FontHeight( ui->normal )) / 2;
 
-            if (i == *group)
+            /* Only what has the focus is framed, so there is one highlight on
+             * the screen and it is plain which arrows do what. */
+            if (i == *group && !list->in_rows)
             {
                 ui_rounded( ui, SET_SIDEBAR_X, y + 2, SET_SIDEBAR_W, SET_GROUP_H - 8, 12,
-                            (SDL_Color){ 255, 255, 255, 30 } );
+                            (SDL_Color){ 255, 255, 255, 26 } );
+                ui_rounded_border( ui, SET_SIDEBAR_X, y + 2, SET_SIDEBAR_W, SET_GROUP_H - 8, 12, 1,
+                                   (SDL_Color){ 236, 240, 246, 130 } );
             }
             ui_text_fit( ui, ui->normal, SET_SIDEBAR_X + 22, text_y, SET_SIDEBAR_W - 40, groups[i],
                          i == *group ? ui->value : ui->dim, i == *group );
@@ -1475,9 +1556,15 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
 
             /* The rows stand on the background. Only the one in focus is drawn
              * at all, and lightly: the reference keeps the screen flat. */
-            if (current)
+            if (current && list->in_rows)
+            {
                 ui_rounded( ui, SET_ROW_X, y + 4, row_w, SET_ROW_H - 10, 12,
                             (SDL_Color){ 255, 255, 255, 26 } );
+                /* Held, the row is outlined brighter, so it is plain that left
+                 * and right now change it rather than move away from it. */
+                ui_rounded_border( ui, SET_ROW_X, y + 4, row_w, SET_ROW_H - 10, 12, list->editing ? 2 : 1,
+                                   (SDL_Color){ 236, 240, 246, list->editing ? 220 : 130 } );
+            }
             ui_text_fit( ui, ui->normal, SET_ROW_X + 30, y + 12, label_w, r->label, color, current );
             if (r->help)
                 ui_text_wrapped( ui, ui->small, SET_ROW_X + 30, y + 44, label_w, 2, r->help, ui->dim, 0 );
@@ -1493,9 +1580,17 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
                     ui_text_fit( ui, ui->small, right - 26 - value_w,
                                  y + (SET_ROW_H - 10 - TTF_FontHeight( ui->small )) / 2 + 4, value_w + 4,
                                  r->value, current ? ui->value : ui->dim, current );
-                /* The arrow says the row opens something. A row that changes
-                 * where it stands says so with the Left and Right hints. */
-                if (!r->adjustable)
+                /* The arrow says the row opens something. A row held for
+                 * changing puts one on either side of the value instead, which
+                 * is what left and right now do. */
+                if (current && list->editing && r->adjustable)
+                {
+                    int mid = y + (SET_ROW_H - 10) / 2 - 4;
+
+                    ui_chevron_dir( ui, right - 42 - value_w, mid, -1, ui->value );
+                    ui_chevron_dir( ui, right - 14, mid, 1, ui->value );
+                }
+                else if (!r->adjustable)
                     ui_chevron( ui, right - 14, y + (SET_ROW_H - 10) / 2 - 4,
                                 r->disabled ? ui->dim : current ? ui->value : ui->dim );
                 break;
@@ -1510,12 +1605,27 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
             ui_rounded( ui, SET_ROW_X + row_w + 14, LIST_TOP + 4 + (track_h - thumb) * list->top / (shown - visible),
                         5, thumb, 3, ui->selection );
         }
-        if (group_count > 1) hints[hint_count++] = (struct ui_hint){ UI_L, NULL };
-        if (group_count > 1) hints[hint_count++] = (struct ui_hint){ UI_R, "Section" };
-        if (any_adjustable) hints[hint_count++] = (struct ui_hint){ UI_LEFT, NULL };
-        if (any_adjustable) hints[hint_count++] = (struct ui_hint){ UI_RIGHT, "Change" };
-        if (!row->disabled) hints[hint_count++] = (struct ui_hint){ UI_A, row->adjustable ? "Next" : "Choose" };
-        hints[hint_count++] = (struct ui_hint){ UI_B, "Back" };
+        (void)any_adjustable;
+        if (list->editing)
+        {
+            hints[hint_count++] = (struct ui_hint){ UI_LEFT, NULL };
+            hints[hint_count++] = (struct ui_hint){ UI_RIGHT, "Change" };
+            if (can_reset) hints[hint_count++] = (struct ui_hint){ UI_Y, "Default" };
+            hints[hint_count++] = (struct ui_hint){ UI_A, "Done" };
+        }
+        else if (list->in_rows)
+        {
+            hints[hint_count++] = (struct ui_hint){ UI_LEFT, "Sections" };
+            if (!row->disabled)
+                hints[hint_count++] = (struct ui_hint){ UI_A, row->kind == UI_ROW_SWITCH ? "Turn over" :
+                                                             row->adjustable ? "Change" : "Choose" };
+            hints[hint_count++] = (struct ui_hint){ UI_B, "Back" };
+        }
+        else
+        {
+            hints[hint_count++] = (struct ui_hint){ UI_RIGHT, "Settings" };
+            hints[hint_count++] = (struct ui_hint){ UI_B, "Back" };
+        }
         ui_hints_right( ui, hints, hint_count, ui->width - 34, ui->height - 34 );
         ui_fade( ui );
         ui_present( ui );
