@@ -26,6 +26,14 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
 /* A line in wine-nx-runtime.log (runtime.c). */
 void wine_nx_runtime_trace( const char *msg );
 
+/* What launcher_platform_status found. */
+#define LAUNCHER_STATUS_CLOCK   1
+#define LAUNCHER_STATUS_BATTERY 2
+
+/* The time of day and the battery charge shown in the header. Returns the
+ * LAUNCHER_STATUS_* bits for what it could read; the rest is left alone. */
+int launcher_platform_status( int *hour, int *minute, int *battery, int *charging );
+
 #ifndef __SWITCH__
 /* A host build (tests/launcher_host.c) supplies what the Switch build takes from libnx. */
 int launcher_platform_font( const void **data, size_t *size );

@@ -1,21 +1,19 @@
 /*
  * The launcher as a text menu on the console, for when SDL cannot draw the
- * graphical one (launcher.c): the Windows programs under drive_c, driven by
+ * graphical one (launcher.c): explicitly registered games, driven by
  * the controller.
  */
 #include <switch.h>
 
-#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/stat.h>
 
+#include "launcher_catalog.h"
 #include "launcher_list.h"
 
 #define LAUNCHER_ROWS  36      /* the console is 80x45 */
-#define LAUNCHER_DEPTH 3       /* drive_c and two folder levels below it */
 #define LAUNCHER_REPEAT_DELAY_NS 400000000ull
 #define LAUNCHER_REPEAT_NS       70000000ull
 
@@ -23,42 +21,23 @@ typedef int (*launcher_machine_fn)( const char *path, unsigned short *machine );
 
 static struct launcher_entry launcher_entries[LAUNCHER_MAX_ENTRIES];
 
-static void launcher_scan( const char *dir, const char *dos_dir, int depth, int *count,
-                           launcher_machine_fn machine_of )
+static void launcher_load_catalog( const char *runtime_dir, int *count, launcher_machine_fn machine_of )
 {
-    struct dirent *entry;
-    DIR *handle;
-
-    if (!(handle = opendir( dir ))) return;
-    while (*count < LAUNCHER_MAX_ENTRIES && (entry = readdir( handle )))
+    struct launcher_catalog catalog;
+    char path[512];
+    int i;
+    snprintf( path, sizeof(path), "%s/%s", runtime_dir, LAUNCHER_CATALOG_FILE );
+    if (launcher_catalog_load( &catalog, path ) != LAUNCHER_CATALOG_OK) return;
+    for (i = 0; i < catalog.count && *count < LAUNCHER_MAX_ENTRIES; i++)
     {
         struct launcher_entry *item = &launcher_entries[*count];
-        char path[sizeof(item->path)], dos[sizeof(item->dos)];
-        struct stat st;
-        int is_dir;
-
-        if (entry->d_name[0] == '.') continue;
-        if ((size_t)snprintf( path, sizeof(path), "%s/%s", dir, entry->d_name ) >= sizeof(path)) continue;
-        if ((size_t)snprintf( dos, sizeof(dos), "%s\\%s", dos_dir, entry->d_name ) >= sizeof(dos)) continue;
-        if (entry->d_type == DT_DIR) is_dir = 1;
-        else if (entry->d_type == DT_REG) is_dir = 0;
-        else if (stat( path, &st )) continue;
-        else is_dir = S_ISDIR( st.st_mode );
-
-        if (is_dir)
+        if (!machine_of( catalog.entries[i].path, &item->machine ) &&
+            launcher_dos_path( catalog.entries[i].path, item->dos, sizeof(item->dos) ))
         {
-            /* Wine's own files are under windows. */
-            if (!depth && !strcasecmp( entry->d_name, "windows" )) continue;
-            if (depth + 1 < LAUNCHER_DEPTH) launcher_scan( path, dos, depth + 1, count, machine_of );
-        }
-        else if (launcher_is_exe( entry->d_name ) && !machine_of( path, &item->machine ))
-        {
-            memcpy( item->path, path, sizeof(path) );
-            memcpy( item->dos, dos, sizeof(dos) );
+            snprintf( item->path, sizeof(item->path), "%s", catalog.entries[i].path );
             (*count)++;
         }
     }
-    closedir( handle );
 }
 
 static void launcher_write_line( const char *runtime_dir, const char *name, const char *text )
@@ -82,8 +61,8 @@ static void launcher_draw( const char *build, int count, int selected, int first
     printf( "Choose a Windows program from sdmc:/switch/wine/drive_c\n\n" );
     if (!count)
     {
-        printf( CONSOLE_YELLOW "No Windows programs (.exe) were found.\n" CONSOLE_RESET );
-        printf( "Copy programs into sdmc:/switch/wine/drive_c, then start Wine-NX again.\n" );
+        printf( CONSOLE_YELLOW "No registered games are available.\n" CONSOLE_RESET );
+        printf( "Start the graphical launcher and use Add Game to choose an executable.\n" );
     }
     for (i = first; i < count && i < first + LAUNCHER_ROWS; i++)
     {
@@ -120,7 +99,8 @@ int wine_nx_launcher_console_run( const char *drive_c, const char *runtime_dir, 
     u64 repeat_at = 0;
     PadState pad;
 
-    launcher_scan( drive_c, "C:", 0, &count, machine_of );
+    (void)drive_c;
+    launcher_load_catalog( runtime_dir, &count, machine_of );
     qsort( launcher_entries, count, sizeof(launcher_entries[0]), launcher_compare );
     selected = launcher_find( launcher_entries, count, target );
     snprintf( args_path, sizeof(args_path), "%s/args.txt", runtime_dir );

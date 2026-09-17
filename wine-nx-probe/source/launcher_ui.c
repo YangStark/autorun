@@ -10,6 +10,7 @@
 #include <switch.h>
 #endif
 
+#include "launcher_svg.h"
 #include "launcher_ui.h"
 
 #define FADE_MS          160
@@ -24,29 +25,6 @@ enum glyph
 {
     GLYPH_A, GLYPH_B, GLYPH_X, GLYPH_Y, GLYPH_PLUS, GLYPH_MINUS, GLYPH_L, GLYPH_R, GLYPH_LEFT, GLYPH_RIGHT,
     GLYPH_UP, GLYPH_DOWN, GLYPH_COUNT
-};
-
-struct theme_colors
-{
-    const char *name;
-    int animated;
-    SDL_Color background, text, dim, value, selection, panel, card, focus;
-};
-
-static const struct theme_colors themes[UI_THEME_COUNT] =
-{
-    [UI_THEME_BUBBLES] = { "Bubbles", 1, { 3, 82, 120, 255 }, { 245, 252, 255, 255 }, { 187, 229, 243, 255 },
-                           { 255, 255, 255, 255 }, { 111, 224, 249, 255 }, { 0, 67, 101, 180 },
-                           { 2, 75, 110, 207 }, { 17, 133, 169, 218 } },
-    [UI_THEME_GLOW]    = { "Glow", 1, { 8, 12, 24, 255 }, { 235, 239, 247, 255 }, { 151, 163, 184, 255 },
-                           { 255, 215, 120, 255 }, { 116, 200, 255, 255 }, { 16, 23, 39, 184 },
-                           { 22, 30, 49, 214 }, { 28, 69, 92, 208 } },
-    [UI_THEME_CLASSIC] = { "Classic", 0, { 22, 24, 30, 255 }, { 228, 230, 235, 255 }, { 150, 155, 165, 255 },
-                           { 255, 210, 100, 255 }, { 255, 170, 0, 255 }, { 28, 31, 40, 255 },
-                           { 24, 26, 34, 255 }, { 66, 56, 30, 235 } },
-    [UI_THEME_OLED]    = { "OLED", 0, { 0, 0, 0, 255 }, { 245, 247, 249, 255 }, { 145, 151, 158, 255 },
-                           { 255, 255, 255, 255 }, { 0, 210, 190, 255 }, { 4, 4, 5, 248 },
-                           { 8, 8, 10, 250 }, { 0, 58, 53, 245 } },
 };
 
 static char last_error[256];
@@ -76,30 +54,9 @@ static int platform_running(void)
 #endif
 }
 
-const char *ui_theme_name( enum ui_theme theme )
-{
-    return themes[theme].name;
-}
-
-void ui_set_theme( struct ui *ui, enum ui_theme theme )
-{
-    const struct theme_colors *colors = &themes[theme < UI_THEME_COUNT ? theme : UI_THEME_BUBBLES];
-
-    ui->theme = colors - themes;
-    ui->background = colors->background;
-    ui->text = colors->text;
-    ui->dim = colors->dim;
-    ui->value = colors->value;
-    ui->selection = colors->selection;
-    ui->panel = colors->panel;
-    ui->card = colors->card;
-    ui->focus = colors->focus;
-    ui->danger = (SDL_Color){ 255, 120, 120, 255 };
-}
-
 int ui_animated( const struct ui *ui )
 {
-    return ui->animations && themes[ui->theme].animated;
+    return ui->animations;
 }
 
 void ui_fill( struct ui *ui, int x, int y, int w, int h, SDL_Color color )
@@ -193,31 +150,25 @@ static SDL_Texture *make_glow( struct ui *ui )
     return texture;
 }
 
-/* A controller button: a dark disc (or pill for L and R) with a light label,
- * drawn three times larger than shown so its edge stays smooth when scaled down. */
+/* A controller button: a light disc (or pill for L and R) with a dark label, as
+ * GameHub draws them, three times larger than shown so its edge stays smooth. */
 static SDL_Texture *make_glyph( struct ui *ui, const char *label, int pill )
 {
     const int scale = 3, base = TTF_FontHeight( ui->small ) + 6;
     int height = base * scale, width = (pill ? base * 8 / 5 : base) * scale;
     SDL_Texture *texture = SDL_CreateTexture( ui->renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET,
                                               width, height );
-    static const SDL_Color layers[3] = { { 14, 16, 22, 255 }, { 92, 99, 114, 255 }, { 52, 57, 68, 255 } };
+    const SDL_Color disc = { 242, 244, 246, 255 };
     SDL_Surface *surface;
-    int i;
 
     if (!texture) return NULL;
     SDL_SetTextureBlendMode( texture, SDL_BLENDMODE_BLEND );
     SDL_SetRenderTarget( ui->renderer, texture );
     SDL_SetRenderDrawColor( ui->renderer, 0, 0, 0, 0 );
     SDL_RenderClear( ui->renderer );
-    for (i = 0; i < 3; i++)
-    {
-        int inset = i * scale;
-
-        if (pill) ui_rounded( ui, inset, inset, width - 2 * inset, height - 2 * inset, height / 2 - inset, layers[i] );
-        else ui_fill_circle( ui, width / 2.0f, height / 2.0f, height / 2.0f - inset, layers[i] );
-    }
-    if ((surface = TTF_RenderUTF8_Blended( ui->large, label, (SDL_Color){ 246, 248, 252, 255 } )))
+    if (pill) ui_rounded( ui, 0, 0, width, height, height / 2, disc );
+    else ui_fill_circle( ui, width / 2.0f, height / 2.0f, height / 2.0f, disc );
+    if ((surface = TTF_RenderUTF8_Blended( ui->large, label, (SDL_Color){ 18, 20, 24, 255 } )))
     {
         SDL_Texture *text = SDL_CreateTextureFromSurface( ui->renderer, surface );
         int h = height * 56 / 100, w = surface->w * h / (surface->h ? surface->h : 1);
@@ -241,7 +192,7 @@ static TTF_Font *open_font( const void *data, size_t size, int points )
     return stream ? TTF_OpenFontRW( stream, 1, points ) : NULL;
 }
 
-int ui_init( struct ui *ui, const void *font_data, size_t font_size, enum ui_theme theme, int animations )
+int ui_init( struct ui *ui, const void *font_data, size_t font_size, int animations )
 {
     static const struct { const char *label; int pill; } glyphs[GLYPH_COUNT] =
     {
@@ -258,7 +209,15 @@ int ui_init( struct ui *ui, const void *font_data, size_t font_size, enum ui_the
     ui->animations = animations;
     ui->running = 1;
     ui->highlight = -1;
-    ui_set_theme( ui, theme );
+    ui->background = (SDL_Color){ 9, 12, 13, 255 };
+    ui->text = (SDL_Color){ 239, 242, 239, 255 };
+    ui->dim = (SDL_Color){ 169, 176, 171, 255 };
+    ui->value = (SDL_Color){ 255, 255, 255, 255 };
+    ui->selection = (SDL_Color){ 226, 232, 226, 255 };
+    ui->panel = (SDL_Color){ 12, 16, 17, 242 };
+    ui->card = (SDL_Color){ 27, 33, 32, 245 };
+    ui->focus = (SDL_Color){ 42, 49, 46, 252 };
+    ui->danger = (SDL_Color){ 255, 120, 120, 255 };
 
     SDL_SetMainReady();
     SDL_SetHint( SDL_HINT_RENDER_SCALE_QUALITY, "linear" );
@@ -304,6 +263,7 @@ void ui_quit( struct ui *ui )
     for (i = 0; i < GLYPH_COUNT; i++)
         if (ui->glyphs[i]) SDL_DestroyTexture( ui->glyphs[i] );
     if (ui->glow) SDL_DestroyTexture( ui->glow );
+    if (ui->sheen) SDL_DestroyTexture( ui->sheen );
     if (ui->small) TTF_CloseFont( ui->small );
     if (ui->normal) TTF_CloseFont( ui->normal );
     if (ui->large) TTF_CloseFont( ui->large );
@@ -319,121 +279,114 @@ void ui_quit( struct ui *ui )
  * Backgrounds
  */
 
-static void draw_glow( struct ui *ui, SDL_Rect rect, SDL_Color color, double angle )
-{
-    if (!ui->glow) return;
-    SDL_SetTextureColorMod( ui->glow, color.r, color.g, color.b );
-    SDL_SetTextureAlphaMod( ui->glow, color.a );
-    SDL_RenderCopyEx( ui->renderer, ui->glow, NULL, &rect, angle, NULL, SDL_FLIP_NONE );
-}
-
-/* Tiny lights drifting sideways and pulsing. */
-static void draw_sparkles( struct ui *ui, float t, int count, float speed, SDL_Color color, int alpha )
-{
-    int i;
-
-    for (i = 0; i < count; i++)
-    {
-        float x = fmod( i * 0.371f + t * speed * (0.65f + (i % 5) * 0.11f), 1.12f ) - 0.06f;
-        float y = fmod( i * 0.217f + 0.11f * sin( t * 0.29f + i * 1.73f ) + 1.0f, 1.0f );
-        float pulse = 0.45f + 0.55f * sin( t * (0.9f + (i % 4) * 0.17f) + i );
-        int size = i % 9 ? 2 : 3;
-
-        color.a = alpha * (0.55f + 0.45f * pulse);
-        ui_fill( ui, x * ui->width, y * ui->height, size, size, color );
-    }
-}
-
-/* A light blue sea: a gradient, light shafts from the surface and rising bubbles. */
-static void draw_bubbles( struct ui *ui, float t )
-{
-    static const SDL_Color top = { 70, 198, 229, 255 }, middle = { 15, 147, 193, 255 }, bottom = { 3, 82, 120, 255 };
-    const int bands = 48;
-    int i, s;
-
-    for (i = 0; i < bands; i++)
-    {
-        float y = (i + 0.5f) / bands, k;
-        const SDL_Color *a, *b;
-        int y0 = i * ui->height / bands, y1 = (i + 1) * ui->height / bands;
-
-        if (y < 0.58f) { a = &top; b = &middle; k = y / 0.58f; }
-        else { a = &middle; b = &bottom; k = (y - 0.58f) / 0.42f; }
-        ui_fill( ui, 0, y0, ui->width, y1 - y0,
-                 (SDL_Color){ a->r + (b->r - a->r) * k, a->g + (b->g - a->g) * k, a->b + (b->b - a->b) * k, 255 } );
-    }
-    draw_glow( ui, (SDL_Rect){ -ui->width / 6, -ui->height / 3, ui->width * 4 / 3, ui->height * 2 / 3 },
-               (SDL_Color){ 197, 244, 255, 96 }, 0 );
-    for (i = 0; i < 7; i++)
-    {
-        float sway = sin( t * (0.10f + i * 0.013f) + i * 1.31f );
-        int w = ui->width * (11 + (i % 3) * 3) / 100;
-        int x = ui->width * (8 + i * 14) / 100 + sway * ui->width * 0.025f - w / 2;
-
-        draw_glow( ui, (SDL_Rect){ x, -ui->height / 3, w, ui->height * 4 / 3 },
-                   (SDL_Color){ 197, 244, 255, 23 + (i % 3) * 7 }, -9.0 + i * 2.7 + sway * 2.0 );
-    }
-    for (i = 0; i < 18; i++)
-    {
-        float y = 1.08f - fmod( i * 0.173f + t * (0.038f + (i % 5) * 0.007f), 1.18f );
-        float x = 0.05f + fmod( i * 0.283f, 0.90f ) + 0.032f * sin( t * (0.31f + (i % 4) * 0.04f) + i );
-        float fade = clampf( (1.10f - y) * 5, 0, 1 ), fade_top = clampf( (y + 0.12f) * 6, 0, 1 );
-        float radius = ui->height * (0.009f + (i % 6) * 0.0042f) * (i % 11 ? 1.0f : 1.5f);
-        int alpha = (fade < fade_top ? fade : fade_top) * (85 + (i % 4) * 24);
-        float cx = x * ui->width, cy = y * ui->height;
-        SDL_FPoint ring[25], shine[6];
-
-        if (alpha <= 0) continue;
-        draw_glow( ui, (SDL_Rect){ cx - radius * 2, cy - radius * 2, radius * 4, radius * 4 },
-                   (SDL_Color){ 180, 237, 255, alpha / 5 }, 0 );
-        SDL_SetRenderDrawColor( ui->renderer, 188, 240, 255, alpha );
-        for (s = 0; s < 2; s++)
-        {
-            int j;
-            for (j = 0; j <= 24; j++)
-                ring[j] = (SDL_FPoint){ cx + cos( j * 2 * M_PI / 24 ) * (radius - s), cy + sin( j * 2 * M_PI / 24 ) * (radius - s) };
-            SDL_RenderDrawLinesF( ui->renderer, ring, 25 );
-        }
-        for (s = 0; s < 6; s++)
-            shine[s] = (SDL_FPoint){ cx + cos( 3.55f + s * 0.13f ) * radius, cy + sin( 3.55f + s * 0.13f ) * radius };
-        SDL_SetRenderDrawColor( ui->renderer, 235, 252, 255, alpha + 55 > 255 ? 255 : alpha + 55 );
-        SDL_RenderDrawLinesF( ui->renderer, shine, 6 );
-    }
-    draw_sparkles( ui, t, 24, 0.008f, (SDL_Color){ 216, 246, 255, 255 }, 62 );
-}
-
-/* Night blue with slow colour clouds. */
-static void draw_glows( struct ui *ui, float t )
-{
-    static const struct { float x, y, radius; SDL_Color color; } glows[4] =
-    {
-        { 0.10f, 0.20f, 0.90f, { 45, 140, 255, 128 } },
-        { 0.84f, 0.34f, 0.78f, { 154, 75, 255, 112 } },
-        { 0.54f, 0.91f, 0.94f, { 0, 210, 190, 94 } },
-        { 0.42f, 0.48f, 0.58f, { 64, 125, 255, 67 } },
-    };
-    int i;
-
-    for (i = 0; i < 4; i++)
-    {
-        float x = glows[i].x + 0.12f * sin( t * (0.43f - i * 0.05f) + i * 1.7f );
-        float y = glows[i].y + 0.10f * cos( t * (0.37f - i * 0.03f) + i );
-        int d = ui->height * glows[i].radius;
-
-        draw_glow( ui, (SDL_Rect){ x * ui->width - d / 2, y * ui->height - d / 2, d, d }, glows[i].color, 0 );
-    }
-    draw_sparkles( ui, t, 28, 0.011f, (SDL_Color){ 182, 224, 255, 255 }, 88 );
-}
 
 void ui_background( struct ui *ui )
 {
-    float t = ui->animations ? SDL_GetTicks() / 1000.0f : 0;
-
     SDL_RenderSetClipRect( ui->renderer, NULL );
     SDL_SetRenderDrawColor( ui->renderer, ui->background.r, ui->background.g, ui->background.b, 255 );
     SDL_RenderClear( ui->renderer );
-    if (ui->theme == UI_THEME_BUBBLES) draw_bubbles( ui, t );
-    else if (ui->theme == UI_THEME_GLOW) draw_glows( ui, t );
+}
+
+void ui_gradient( struct ui *ui, int x, int y, int w, int h, SDL_Color from, SDL_Color to, int horizontal )
+{
+    SDL_Vertex vertices[4] =
+    {
+        { { x, y }, from, { 0, 0 } },
+        { { x + w, y }, horizontal ? to : from, { 0, 0 } },
+        { { x + w, y + h }, to, { 0, 0 } },
+        { { x, y + h }, horizontal ? from : to, { 0, 0 } },
+    };
+    static const int indices[6] = { 0, 1, 2, 0, 2, 3 };
+
+    SDL_RenderGeometry( ui->renderer, NULL, vertices, 4, indices, 6 );
+}
+
+/* Draw a texture inside rounded corners by clipping it to rows, which costs no
+ * render target and, unlike a fan of translucent triangles, leaves no seams. */
+void ui_rounded_texture( struct ui *ui, SDL_Texture *texture, const SDL_Rect *src, SDL_Rect rect, int radius,
+                         SDL_Color mod )
+{
+    int clipped = SDL_RenderIsClipEnabled( ui->renderer ), y;
+    SDL_Rect clip;
+
+    if (!texture || rect.w <= 0 || rect.h <= 0) return;
+    if (radius * 2 > rect.w) radius = rect.w / 2;
+    if (radius * 2 > rect.h) radius = rect.h / 2;
+    SDL_RenderGetClipRect( ui->renderer, &clip );
+    SDL_SetTextureColorMod( texture, mod.r, mod.g, mod.b );
+    SDL_SetTextureAlphaMod( texture, mod.a );
+    SDL_SetTextureBlendMode( texture, SDL_BLENDMODE_BLEND );
+    SDL_SetTextureScaleMode( texture, SDL_ScaleModeLinear );
+    for (y = 0; y < rect.h; )
+    {
+        int edge = y < radius ? radius - y - 1 : y >= rect.h - radius ? y - (rect.h - radius) : 0;
+        int inset = edge ? radius - (int)sqrt( radius * radius - edge * edge ) : 0;
+        int rows = y == radius ? rect.h - 2 * radius : 1;
+        SDL_Rect band = { rect.x + inset, rect.y + y, rect.w - 2 * inset, rows }, visible;
+
+        if (!clipped || SDL_IntersectRect( &clip, &band, &visible ))
+        {
+            SDL_RenderSetClipRect( ui->renderer, clipped ? &visible : &band );
+            SDL_RenderCopy( ui->renderer, texture, src, &rect );
+        }
+        y += rows;
+    }
+    SDL_RenderSetClipRect( ui->renderer, clipped ? &clip : NULL );
+}
+
+SDL_Texture *ui_sheen( struct ui *ui )
+{
+    SDL_Surface *surface;
+    int y;
+
+    if (ui->sheen) return ui->sheen;
+    if (!(surface = SDL_CreateRGBSurfaceWithFormat( 0, 1, 256, 32, SDL_PIXELFORMAT_RGBA32 ))) return NULL;
+    SDL_LockSurface( surface );
+    for (y = 0; y < 256; y++)
+    {
+        Uint8 *row = (Uint8 *)surface->pixels + y * surface->pitch;
+
+        row[0] = row[1] = row[2] = 255;
+        row[3] = 255 - y;
+    }
+    SDL_UnlockSurface( surface );
+    if ((ui->sheen = SDL_CreateTextureFromSurface( ui->renderer, surface )))
+        SDL_SetTextureBlendMode( ui->sheen, SDL_BLENDMODE_BLEND );
+    SDL_FreeSurface( surface );
+    return ui->sheen;
+}
+
+SDL_Texture *ui_svg_texture( struct ui *ui, const char *d, float view_x, float view_y, float view_w, float view_h,
+                             int size )
+{
+    unsigned char *mask = malloc( (size_t)size * size );
+    SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat( 0, size, size, 32, SDL_PIXELFORMAT_RGBA32 );
+    SDL_Texture *texture = NULL;
+    int x, y;
+
+    if (mask && surface && svg_path_mask( d, view_x, view_y, view_w, view_h, size, size, mask ))
+    {
+        SDL_LockSurface( surface );
+        for (y = 0; y < size; y++)
+        {
+            Uint8 *row = (Uint8 *)surface->pixels + y * surface->pitch;
+
+            for (x = 0; x < size; x++)
+            {
+                row[x * 4] = row[x * 4 + 1] = row[x * 4 + 2] = 255;
+                row[x * 4 + 3] = mask[y * size + x];
+            }
+        }
+        SDL_UnlockSurface( surface );
+        if ((texture = SDL_CreateTextureFromSurface( ui->renderer, surface )))
+        {
+            SDL_SetTextureBlendMode( texture, SDL_BLENDMODE_BLEND );
+            SDL_SetTextureScaleMode( texture, SDL_ScaleModeLinear );
+        }
+    }
+    if (surface) SDL_FreeSurface( surface );
+    free( mask );
+    return texture;
 }
 
 /***********************************************************************
@@ -671,10 +624,14 @@ static SDL_Texture *button_glyph( struct ui *ui, int button )
     return NULL;
 }
 
-void ui_footer( struct ui *ui, const struct ui_hint *hints, int count )
+enum hint_align { HINTS_CENTRED, HINTS_RIGHT };
+
+/* Hints on the line through y, centred on x or ending there. */
+static void draw_hints( struct ui *ui, const struct ui_hint *hints, int count, int x, int y, enum hint_align align,
+                        SDL_Color label_color )
 {
-    const int glyph_gap = 10, label_gap = 8, pair_gap = 26, y = ui->height - 26;
-    int i, x, total = 0, widths[UI_FOOTER_HINTS], heights[UI_FOOTER_HINTS];
+    const int glyph_gap = 10, label_gap = 8, pair_gap = 26;
+    int i, total = 0, widths[UI_FOOTER_HINTS], heights[UI_FOOTER_HINTS];
 
     if (count > UI_FOOTER_HINTS) count = UI_FOOTER_HINTS;
     for (i = 0; i < count; i++)
@@ -695,7 +652,7 @@ void ui_footer( struct ui *ui, const struct ui_hint *hints, int count )
     }
     if (count) total -= hints[count - 1].label && hints[count - 1].label[0] ? pair_gap : glyph_gap;
 
-    x = (ui->width - total) / 2;
+    x -= align == HINTS_RIGHT ? total : total / 2;
     ui->footer_count = 0;
     for (i = 0; i < count; i++)
     {
@@ -711,7 +668,7 @@ void ui_footer( struct ui *ui, const struct ui_hint *hints, int count )
         if (hints[i].label && hints[i].label[0])
         {
             if (glyph) x += label_gap;
-            ui_text( ui, ui->small, x, y - TTF_FontHeight( ui->small ) / 2, hints[i].label, ui->dim );
+            ui_text( ui, ui->small, x, y - TTF_FontHeight( ui->small ) / 2, hints[i].label, label_color );
             x += ui_text_width( ui, ui->small, hints[i].label );
         }
         if (hints[i].button != UI_NONE)
@@ -721,6 +678,16 @@ void ui_footer( struct ui *ui, const struct ui_hint *hints, int count )
         }
         x += hints[i].label && hints[i].label[0] ? pair_gap : glyph_gap;
     }
+}
+
+void ui_footer( struct ui *ui, const struct ui_hint *hints, int count )
+{
+    draw_hints( ui, hints, count, ui->width / 2, ui->height - 26, HINTS_CENTRED, ui->dim );
+}
+
+void ui_hints_right( struct ui *ui, const struct ui_hint *hints, int count, int right, int y )
+{
+    draw_hints( ui, hints, count, right, y, HINTS_RIGHT, ui->text );
 }
 
 void ui_start_screen( struct ui *ui )
@@ -765,7 +732,9 @@ void ui_draw_toast( struct ui *ui )
     h = TTF_FontHeight( ui->small ) + 12;
     card = ui->selection;
     card.a = 235 * alpha / 255;
-    text = (SDL_Color){ 10, 14, 20, alpha };
+    if (ui->selection.r * 3 + ui->selection.g * 6 + ui->selection.b < 1600)
+        text = (SDL_Color){ 255, 255, 255, alpha };
+    else text = (SDL_Color){ 10, 14, 20, alpha };
     ui_rounded( ui, (ui->width - w) / 2, ui->height - 78, w, h, h / 2, card );
     ui_text_fit( ui, ui->small, (ui->width - w) / 2 + 20, ui->height - 78 + 6, w - 40, ui->toast, text, 0 );
 }

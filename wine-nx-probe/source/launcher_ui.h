@@ -1,9 +1,7 @@
 /*
- * Drawing and input for the launcher, on SDL2's renderer: themes with animated
- * backgrounds, text, panels, the header and the footer of button hints, a list
- * of settings rows, dialogs, and controller, keyboard and touch input. Its look
- * follows the launcher of dolphin-nx by NaGaa95
- * (https://github.com/NaGaa95/dolphin-nx); the code is Wine-NX's own.
+ * Drawing and input for the launcher, on SDL2's renderer: the fixed Wine-NX
+ * visual system, text, panels, the header and the footer of button hints, a list
+ * of settings rows, dialogs, and controller, keyboard and touch input.
  */
 #ifndef WINE_NX_LAUNCHER_UI_H
 #define WINE_NX_LAUNCHER_UI_H
@@ -27,15 +25,6 @@ enum ui_button
     UI_DOWN = SDL_CONTROLLER_BUTTON_DPAD_DOWN,
     UI_LEFT = SDL_CONTROLLER_BUTTON_DPAD_LEFT,
     UI_RIGHT = SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
-};
-
-enum ui_theme
-{
-    UI_THEME_BUBBLES,
-    UI_THEME_GLOW,
-    UI_THEME_CLASSIC,
-    UI_THEME_OLED,
-    UI_THEME_COUNT
 };
 
 enum ui_touch
@@ -85,10 +74,9 @@ struct ui
     SDL_Renderer *renderer;
     int width, height;
     TTF_Font *small, *normal, *large;
-    SDL_Texture *glow;
+    SDL_Texture *glow, *sheen;
     SDL_Texture *glyphs[16];
 
-    enum ui_theme theme;
     int animations;
     SDL_Color background, text, dim, value, selection, panel, card, focus, danger;
 
@@ -122,15 +110,13 @@ struct ui
     Uint32 toast_until;
 };
 
-int  ui_init( struct ui *ui, const void *font_data, size_t font_size, enum ui_theme theme, int animations );
+int  ui_init( struct ui *ui, const void *font_data, size_t font_size, int animations );
 void ui_quit( struct ui *ui );
 /* Why ui_init failed. */
 const char *ui_error(void);
 /* Whether SDL got as far as a window, so the screen was in EGL's hands. */
 int  ui_screen_used(void);
-void ui_set_theme( struct ui *ui, enum ui_theme theme );
-const char *ui_theme_name( enum ui_theme theme );
-/* Whether the background moves: an animated theme with animations on. */
+/* Whether transitions should keep scheduling frames. */
 int  ui_animated( const struct ui *ui );
 
 /* A frame: ui_begin_frame, ui_poll until it returns 0, draw, ui_present, ui_wait. */
@@ -148,6 +134,18 @@ void ui_fill_circle( struct ui *ui, float cx, float cy, float radius, SDL_Color 
 void ui_rounded( struct ui *ui, int x, int y, int w, int h, int radius, SDL_Color color );
 void ui_panel( struct ui *ui, int x, int y, int w, int h );
 void ui_background( struct ui *ui );
+/* A rectangle shading from one colour at its top (or, when horizontal, its left) to another. */
+void ui_gradient( struct ui *ui, int x, int y, int w, int h, SDL_Color from, SDL_Color to, int horizontal );
+/* A texture inside rounded corners, tinted by mod: covers, and the light over them.
+ * src is the part of the texture to use, or NULL for all of it. */
+void ui_rounded_texture( struct ui *ui, SDL_Texture *texture, const SDL_Rect *src, SDL_Rect rect, int radius,
+                         SDL_Color mod );
+/* White fading to nothing downwards, to stretch over a shape as a sheen. */
+SDL_Texture *ui_sheen( struct ui *ui );
+/* A white icon from an SVG path (launcher_svg.h), size pixels square, to tint with
+ * SDL_SetTextureColorMod and SDL_SetTextureAlphaMod; NULL when it cannot be made. */
+SDL_Texture *ui_svg_texture( struct ui *ui, const char *d, float view_x, float view_y, float view_w, float view_h,
+                             int size );
 
 int  ui_text_width( struct ui *ui, TTF_Font *font, const char *text );
 void ui_text( struct ui *ui, TTF_Font *font, int x, int y, const char *text, SDL_Color color );
@@ -161,6 +159,8 @@ int  ui_text_wrapped( struct ui *ui, TTF_Font *font, int x, int y, int max_width
 
 void ui_header( struct ui *ui, const char *title, const char *context );
 void ui_footer( struct ui *ui, const struct ui_hint *hints, int count );
+/* The same hints, ending at right on the line through y, and tappable like the footer's. */
+void ui_hints_right( struct ui *ui, const struct ui_hint *hints, int count, int right, int y );
 void ui_fade( struct ui *ui );
 void ui_toast( struct ui *ui, const char *text, int milliseconds );
 void ui_draw_toast( struct ui *ui );

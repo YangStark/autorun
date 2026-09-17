@@ -17,10 +17,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
+#include <math.h>
+#include <sys/stat.h>
 
 #include <png.h>
 
 #include "launcher.h"
+#include "launcher_catalog.h"
 #include "launcher_ui.h"
 
 static char script[256][300];
@@ -54,6 +58,16 @@ int launcher_platform_prompt( const char *header, const char *initial, char *out
     snprintf( out, size, "%s", prompt_text );
     prompt_set = 0;
     return 1;
+}
+
+/* A fixed time and charge, so screenshots do not change from run to run. */
+int launcher_platform_status( int *hour, int *minute, int *battery, int *charging )
+{
+    *hour = 13;
+    *minute = 24;
+    *battery = 86;
+    *charging = 0;
+    return LAUNCHER_STATUS_CLOCK | LAUNCHER_STATUS_BATTERY;
 }
 
 void wine_nx_runtime_trace( const char *msg )
@@ -124,6 +138,21 @@ static void push_tap( int x, int y )
     SDL_PushEvent( &event );
 }
 
+static void push_swipe( int x, int y, int end_x, int end_y )
+{
+    SDL_Event event = {0};
+    event.type = SDL_FINGERDOWN;
+    event.tfinger.x = x / 1280.0f;
+    event.tfinger.y = y / 720.0f;
+    SDL_PushEvent( &event );
+    event.type = SDL_FINGERMOTION;
+    event.tfinger.x = end_x / 1280.0f;
+    event.tfinger.y = end_y / 720.0f;
+    SDL_PushEvent( &event );
+    event.type = SDL_FINGERUP;
+    SDL_PushEvent( &event );
+}
+
 static SDL_Keycode key_code( const char *name )
 {
     static const struct { const char *name; SDL_Keycode key; } keys[] =
@@ -152,7 +181,16 @@ static void on_frame( SDL_Renderer *renderer )
     while (script_pos < script_count)
     {
         char *line = script[script_pos++], arg[256];
-        int x, y;
+        int x, y, end_x, end_y;
+
+        fprintf( stderr, "launcher host step: %s\n", line );
+
+        if (sscanf( line, "swipe %d %d %d %d", &x, &y, &end_x, &end_y ) == 4)
+        {
+            push_swipe( x, y, end_x, end_y );
+            wait_frames = 1;
+            return;
+        }
 
         if (sscanf( line, "key %255s", arg ) == 1)
         {
@@ -191,6 +229,59 @@ static void on_frame( SDL_Renderer *renderer )
     }
 }
 
+/* Original procedural artwork for layout QA; these are not real game covers. */
+static void carousel_fixture(void)
+{
+    static const char *titles[] = { "Afterlight", "Drift", "Ember", "Frostline", "Horizon", "Nocturne", "Solstice", "Vanguard" };
+    static const unsigned char colors[][3] = { {160, 105, 75}, {42, 130, 160}, {170, 60, 40}, {65, 120, 150},
+                                               {125, 130, 72}, {66, 70, 125}, {164, 123, 48}, {65, 122, 108} };
+    struct launcher_catalog *catalog = calloc( 1, sizeof(*catalog) );
+    unsigned char *pixels = malloc( 320 * 480 * 4 );
+    int i, x, y;
+    assert( catalog && pixels );
+    launcher_catalog_init( catalog );
+    mkdir( "sdmc:", 0700 ); mkdir( "sdmc:/switch", 0700 ); mkdir( "sdmc:/switch/wine", 0700 );
+    mkdir( "sdmc:/switch/wine/drive_c", 0700 );
+    for (i = 0; i < 8; i++)
+    {
+        char folder[512], path[512];
+        unsigned char pe[128] = {0};
+        FILE *file;
+        int index;
+        png_image png = {0};
+        snprintf( folder, sizeof(folder), "sdmc:/switch/wine/drive_c/%s", titles[i] );
+        mkdir( folder, 0700 );
+        snprintf( path, sizeof(path), "%s/Game.exe", folder );
+        pe[0] = 'M'; pe[1] = 'Z'; pe[0x3c] = 64;
+        pe[64] = 'P'; pe[65] = 'E'; pe[68] = 0x4c; pe[69] = 1;
+        file = fopen( path, "wb" ); assert( file );
+        assert( fwrite( pe, 1, sizeof(pe), file ) == sizeof(pe) ); fclose( file );
+        index = launcher_catalog_add( catalog, path, titles[i] ); assert( index >= 0 );
+        /* Home lists what has been played, most recent first: play them in reverse
+         * so the row reads in the same order as the library's. */
+        catalog->entries[index].launched_order = 8 - i;
+        snprintf( path, sizeof(path), "%s/Game.wine-nx.txt", folder );
+        file = fopen( path, "w" ); assert( file ); fprintf( file, "title=%s\n", titles[i] ); fclose( file );
+        for (y = 0; y < 480; y++) for (x = 0; x < 320; x++)
+        {
+            int channel, offset = (y * 320 + x) * 4;
+            float light = 1.1f - y / 700.0f;
+            int sun = (x - 205) * (x - 205) + (y - 120) * (y - 120) < 36 * 36;
+            if (y > 255 + 55 * sinf( x * 0.016f + i )) light *= 0.7f;
+            if (y > 320 + 60 * sinf( x * 0.023f - i )) light *= 0.55f;
+            if (y > 405 + 25 * sinf( x * 0.04f )) light *= 0.5f;
+            for (channel = 0; channel < 3; channel++)
+                pixels[offset + channel] = sun ? 228 - channel * 12 : colors[i][channel] * light;
+            pixels[offset + 3] = 255;
+        }
+        snprintf( path, sizeof(path), "%s/cover.png", folder );
+        png.version = PNG_IMAGE_VERSION; png.width = 320; png.height = 480; png.format = PNG_FORMAT_RGBA;
+        assert( png_image_write_to_file( &png, path, 0, pixels, 0, NULL ) );
+    }
+    assert( launcher_catalog_save( catalog, "sdmc:/switch/wine/" LAUNCHER_CATALOG_FILE ) );
+    free( pixels ); free( catalog );
+}
+
 int main( int argc, char **argv )
 {
     struct wine_nx_launcher_options options = { "sdmc:/switch/wine", "nx-host-test", machine_of, 1, 0, 0, 0 };
@@ -211,7 +302,8 @@ int main( int argc, char **argv )
         if (line[0] && line[0] != '#') snprintf( script[script_count++], sizeof(script[0]), "%s", line );
     }
     fclose( file );
-    if (argc > 3) snprintf( target, sizeof(target), "%s", argv[3] );
+    if (argc > 3 && !strcmp( argv[3], "--carousel-fixture" )) carousel_fixture();
+    else if (argc > 3) snprintf( target, sizeof(target), "%s", argv[3] );
 
     ui_present_hook = on_frame;
     chosen = wine_nx_launcher_run( &options, target, sizeof(target) );

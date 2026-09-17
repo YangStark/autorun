@@ -293,7 +293,30 @@ touching now sets both bits, and a kind with nothing left pending clears both.
 `[DYNAREC]` reports are also logged only when the counters change, not every
 5 seconds in the launcher or after a program parks.
 
-`nx-wow64-dynarec-15` adds a launcher. Before, the runtime started whatever
+The launcher now uses an explicit game library and a controller-first Home
+screen. Home is a horizontal carousel of upright covers: the focused cover
+enlarges at the left while neighboring cards slide past it. The selected title,
+View Details button, and dimmed cover backdrop follow the selection. Library uses square cards and
+supports title search, favorites, and title/recent sorting. Press X on Home or
+Library to add a game: browse the SD card, choose a supported `.exe`, review
+it, and confirm. Adding a game does not start it. A opens Game Details, where
+the game can be started, favorited, configured, or removed from the library.
+Removing a game never deletes its executable or sidecar settings.
+
+Put a `cover.png` beside an executable to give it artwork, or use the catalog's
+existing artwork path fields. Images load on the icon worker and fall back to
+the executable icon when missing or invalid. Home crops artwork to 2:3 and
+Library to 1:1. Left/right or a horizontal swipe moves one game; tap a neighboring
+cover to focus it, and tap the focused cover or View Details to open its menu.
+
+The launcher no longer discovers every `.exe` below `drive_c`. Membership is
+stored in `launcher-library-v2.ini`. On first use, paths that were explicitly
+saved in the older `launcher-library.txt` are migrated; other executables must
+be added by the user. Missing executables remain visible and can be relocated
+from Game Details. `target.txt` restores selection only for a registered game.
+The console fallback reads the same catalog instead of scanning directories.
+
+`nx-wow64-dynarec-15` originally added a launcher. Before, the runtime started whatever
 `target.txt` named, and trying another program meant editing it on a computer.
 Starting the NRO without a program argument now shows a console menu before
 Wine initializes (`source/launcher.c`):

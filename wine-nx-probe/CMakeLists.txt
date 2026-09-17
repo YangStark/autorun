@@ -591,7 +591,9 @@ target_link_libraries(wine-nx-ntdll-file-smoke PRIVATE nx)
 add_executable(wine-nx-runtime
     source/runtime.c
     source/launcher.c
+    source/launcher_catalog.c
     source/launcher_console.c
+    source/launcher_svg.c
     source/launcher_ui.c
     source/runtime_platform.c
     source/sd_cache.c
@@ -747,7 +749,7 @@ endif()
 # functions come through eglGetProcAddress, so it works over either Mesa.
 find_library(SWITCH_SDL2 SDL2 HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_SDL2_TTF SDL2_ttf HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
-set_source_files_properties(source/launcher.c source/launcher_ui.c PROPERTIES
+set_source_files_properties(source/launcher.c source/launcher_catalog.c source/launcher_ui.c PROPERTIES
     INCLUDE_DIRECTORIES "$ENV{DEVKITPRO}/portlibs/switch/include/SDL2"
     COMPILE_DEFINITIONS _REENTRANT)
 target_link_libraries(wine-nx-runtime PRIVATE
