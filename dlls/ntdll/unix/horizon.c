@@ -14358,12 +14358,31 @@ failed:
     pthread_mutex_unlock( &mapping_mutex );
     {
         static LONG failures;
-        char msg[224];
+        char msg[352];
 
         if (__atomic_add_fetch( &failures, 1, __ATOMIC_RELAXED ) <= 16)
         {
-            snprintf( msg, sizeof(msg), "[HMAP] fixed replacement failed: %s addr=%p size=0x%lx prot=%#x errno=%d",
-                      stage, requested, (unsigned long)size, prot, saved_errno );
+            /* What is in the way, since the address was asked for and no other
+             * will do: the kernel's own word on the block that starts there, and
+             * this program's mapping of it when it is one of ours. A run that
+             * places a stack or an arena where a program later wants its own
+             * memory fails here and nowhere else. */
+            MemoryInfo info = {0};
+            u32 page_info = 0;
+            struct horizon_mapping *held;
+            char blocker[128] = "";
+
+            if (R_SUCCEEDED( svcQueryMemory( &info, &page_info, (u64)(uintptr_t)requested ) ))
+                snprintf( blocker, sizeof(blocker), " in the way: %010llx+%llx type=%u perm=%u attr=%u",
+                          (unsigned long long)info.addr, (unsigned long long)info.size,
+                          (unsigned)info.type, (unsigned)info.perm, (unsigned)info.attr );
+            pthread_mutex_lock( &mapping_mutex );
+            if ((held = find_overlap_mapping( requested, size )))
+                snprintf( blocker + strlen( blocker ), sizeof(blocker) - strlen( blocker ),
+                          ", ours %p+%lx", held->addr, (unsigned long)held->size );
+            pthread_mutex_unlock( &mapping_mutex );
+            snprintf( msg, sizeof(msg), "[HMAP] fixed replacement failed: %s addr=%p size=0x%lx prot=%#x errno=%d%s",
+                      stage, requested, (unsigned long)size, prot, saved_errno, blocker );
             wine_nx_runtime_trace( msg );
         }
     }

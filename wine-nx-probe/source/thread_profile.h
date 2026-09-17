@@ -28,6 +28,9 @@ unsigned int wine_nx_threads_other( void );
 unsigned int wine_nx_threads_program( void );
 /* A thread stopping at a quit point, or going back to work. */
 void wine_nx_thread_parked( int parked );
+/* Where every thread is standing: for a program that has stopped making progress
+ * without stopping. One line each, with the frames that could be walked. */
+void wine_nx_threads_report_stalled( void );
 /* Writes which threads have not stopped, by id and kind. */
 void wine_nx_threads_report_unparked( void );
 /* Called by a thread whose cores the program chose; the balancer leaves it. */

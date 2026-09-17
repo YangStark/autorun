@@ -450,6 +450,53 @@ static void name_site( uint32_t site, int guest, char *buf, size_t size )
     else snprintf( buf, size, "+%#x", (unsigned int)site );
 }
 
+/* Where every thread is standing, once nothing has moved for a while. A program
+ * waiting for something that will not come looks like an idle one from outside,
+ * and the only difference is where its threads are stopped. Each is paused just
+ * long enough to read it, as the sampler does, and set going again. */
+void wine_nx_threads_report_stalled( void )
+{
+    Handle self = threadGetCurHandle();
+    unsigned int i, reported = 0;
+
+    for (i = 0; i < NX_PROF_MAX_THREADS; i++)
+    {
+        uint64_t callers[NX_PROF_DEPTH];
+        char line[NX_PROF_LINE], where[96];
+        Handle handle = registry[i].handle;
+        unsigned int frames, f;
+        ThreadContext ctx;
+        Result rc;
+        int tries, len;
+
+        if (!handle || handle == self) continue;
+        if (R_FAILED( svcSetThreadActivity( handle, ThreadActivity_Paused ) )) continue;
+        for (tries = 0; R_FAILED( rc = svcGetThreadContext3( &ctx, handle ) ) && tries < 4; tries++)
+            svcSleepThread( 0 );
+        frames = R_SUCCEEDED( rc ) ? walk_callers( &ctx, callers ) : 0;
+        svcSetThreadActivity( handle, ThreadActivity_Runnable );
+        if (R_FAILED( rc )) continue;
+
+        name_address( ctx.pc.x, where, sizeof(where) );
+        len = snprintf( line, sizeof(line), "[STALL] thread %u%c at %s sp=%#lx lr=%#lx",
+                        registry[i].tid, registry[i].kind, where,
+                        (unsigned long)ctx.sp, (unsigned long)ctx.lr );
+        for (f = 0; f < frames; f++)
+        {
+            name_address( callers[f], where, sizeof(where) );
+            len = appendf( line, len, " < %s", where );
+        }
+        wine_nx_runtime_trace( line );
+        reported++;
+    }
+    {
+        char line[NX_PROF_LINE];
+
+        snprintf( line, sizeof(line), "[STALL] %u of %u threads read", reported, wine_nx_threads_other() );
+        wine_nx_runtime_trace( line );
+    }
+}
+
 /* Translated code by module, busiest first. */
 static void report_modules( const struct nx_prof_target *target, char *line )
 {

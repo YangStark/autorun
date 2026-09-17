@@ -51,7 +51,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-167"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-168"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -859,7 +859,7 @@ static void runtime_report_interpreter(void)
         extern unsigned int wine_nx_gl_explicit_flushes __attribute__((weak));
         extern int wine_nx_gl_pinned_memory __attribute__((weak));
         extern unsigned int wine_nx_syscall_counts[] __attribute__((weak));
-        static unsigned int calls, last_reads = ~0u, last_frames = ~0u;
+        static unsigned int calls, last_reads = ~0u, last_frames = ~0u, stalls;
         static u64 start;
         unsigned int reads = &wine_nx_file_reads ? __atomic_load_n( &wine_nx_file_reads, __ATOMIC_RELAXED ) : 0;
         unsigned int gl_frames = &wine_nx_gl_swaps ? __atomic_load_n( &wine_nx_gl_swaps, __ATOMIC_RELAXED ) : 0;
@@ -872,7 +872,24 @@ static void runtime_report_interpreter(void)
         char native[256] = "", gl[512] = "", audio[32] = "", systop[64] = "";
 
         if (!start) start = now;
-        if (++calls % 2 || (reads == last_reads && frames == last_frames)) return;
+        if (++calls % 2) return;
+        if (reads == last_reads && frames == last_frames)
+        {
+            /* Nothing read and nothing drawn since the last look. This line is
+             * quiet then, because a program sitting at a menu does that too --
+             * but a program waiting for something that will not come looks the
+             * same from outside, and the only difference is where its threads
+             * are standing. Say that, the first few times. */
+            if (stalls < 3)
+            {
+                log_line( "[STALL] nothing read or drawn since the last report; "
+                          "where the threads are standing" );
+                wine_nx_threads_report_stalled();
+                stalls++;
+            }
+            return;
+        }
+        stalls = 0;
         last_reads = reads;
         last_frames = frames;
         /* The three system calls made most since the last line, as id:calls: a
