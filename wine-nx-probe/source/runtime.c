@@ -51,7 +51,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-172"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-173"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -107,12 +107,13 @@ static int log_main_thread_set;
  * once a GUI app brings up the display driver we hand the screen over to the
  * framebuffer and stop driving the console (logs still go to the file). */
 static int wine_nx_console_active = 1;
-/* The console is left standing but stops being written to once a game is on its
- * way: with no launcher in between -- a program on the command line, or one
- * another forwarder handed over -- every line of the start-up would be printed
- * over the screen the game is about to draw on. It speaks again if the game
- * cannot be started, since then the screen is all there is to say so on. */
-static int wine_nx_console_quiet;
+/* The console is left standing but is not written to. The start-up has a few
+ * dozen lines to say and they all went to the screen, so every run began with a
+ * terminal filling up -- in front of the launcher, or in front of the game when
+ * no launcher was shown. They go to the log alone now. The console speaks for
+ * the one line that says which game is starting, and again if the game cannot
+ * be started, since then the screen is all there is to say so on. */
+static int wine_nx_console_quiet = 1;
 static Framebuffer wine_nx_fb;
 static int wine_nx_fb_ready;
 static pthread_mutex_t wine_nx_fb_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2794,6 +2795,9 @@ int main( int argc, char **argv )
      * what is lent now is the loader's, and everything after it is ours. */
     note_loader_lent_memory();
     consoleInit( NULL );
+    /* One empty frame, so the screen is this program's and blank from the start
+     * rather than whatever was on it before. */
+    consoleUpdate( NULL );
     mkdir( "sdmc:/switch", 0777 );
     mkdir( RUNTIME_DIR, 0777 );
     mkdir( WINE_DRIVE_C, 0777 );
@@ -2880,7 +2884,8 @@ int main( int argc, char **argv )
 
         if (!handed_over) snprintf( target, sizeof(target), "%s", argv[1] );
         name = strrchr( target, '/' );
-        /* The last thing the screen is told before the game has it. */
+        /* The one thing the screen is told, before the game has it. */
+        wine_nx_console_quiet = 0;
         log_line( "[TARGET] starting %s", name ? name + 1 : target );
         wine_nx_console_quiet = 1;
     }
