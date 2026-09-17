@@ -142,8 +142,10 @@ void ui_start_screen( struct ui *ui );
 
 void ui_fill( struct ui *ui, int x, int y, int w, int h, SDL_Color color );
 void ui_border( struct ui *ui, int x, int y, int w, int h, int thickness, SDL_Color color );
-/* An outline that follows the rounded shape, for anything ui_rounded drew. */
-void ui_rounded_border( struct ui *ui, int x, int y, int w, int h, int radius, int thickness, SDL_Color color );
+/* What has the focus: an outline the light travels around, dim over most of it
+ * and lit in the stretch the light is in. */
+void ui_animated_border( struct ui *ui, int x, int y, int w, int h, int radius, int thickness,
+                         SDL_Color dim, SDL_Color lit );
 void ui_fill_circle( struct ui *ui, float cx, float cy, float radius, SDL_Color color );
 void ui_rounded( struct ui *ui, int x, int y, int w, int h, int radius, SDL_Color color );
 void ui_panel( struct ui *ui, int x, int y, int w, int h );

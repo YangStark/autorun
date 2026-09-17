@@ -24,6 +24,9 @@
  * list lines up with the text of the header above it rather than sitting in
  * from it. */
 #define ROW_PADDING      12
+/* Everything that has the focus wears the same outline. */
+#define UI_FOCUS_DIM     (SDL_Color){ 150, 160, 176, 90 }
+#define UI_FOCUS_LIT     (SDL_Color){ 244, 247, 250, 255 }
 
 enum glyph
 {
@@ -101,48 +104,96 @@ static void fill_arc( struct ui *ui, float cx, float cy, float radius, float a0,
     SDL_RenderGeometry( ui->renderer, NULL, vertices, 3 * segments, NULL, 0 );
 }
 
-/* The same wedge, hollow: two arcs joined into a band, for the corners of a
- * rounded outline. */
-static void stroke_arc( struct ui *ui, float cx, float cy, float outer, float inner,
-                        float a0, float a1, SDL_Color color )
+/* The border tico-nx draws around what has the focus (src/ui/UIStyle.h,
+ * DrawAnimatedGradientBorder): a ribbon extruded along the rounded rectangle's
+ * perimeter, with a gradient running along it and travelling as time passes.
+ * Theirs samples a cyan-to-magenta strip; the launcher has one light and no
+ * colours, so the ribbon keeps its own and the band is what brightens it. */
+#define UI_BORDER_SEGMENTS 8
+#define UI_BORDER_POINTS   (4 * (UI_BORDER_SEGMENTS + 1))
+
+struct border_point { float x, y, nx, ny, dist; };
+
+static void border_arc( struct border_point *points, int *count, float *dist, float cx, float cy,
+                        float radius, float from, float to )
 {
-    SDL_Vertex vertices[6 * 32];
-    int i, segments = 32;
+    int i;
 
-    for (i = 0; i < segments; i++)
+    for (i = 0; i <= UI_BORDER_SEGMENTS; i++)
     {
-        float s = a0 + (a1 - a0) * i / segments, e = a0 + (a1 - a0) * (i + 1) / segments;
-        SDL_Vertex *v = vertices + 6 * i;
-        SDL_FPoint so = { cx + cosf( s ) * outer, cy + sinf( s ) * outer };
-        SDL_FPoint eo = { cx + cosf( e ) * outer, cy + sinf( e ) * outer };
-        SDL_FPoint si = { cx + cosf( s ) * inner, cy + sinf( s ) * inner };
-        SDL_FPoint ei = { cx + cosf( e ) * inner, cy + sinf( e ) * inner };
+        float a = from + (to - from) * i / UI_BORDER_SEGMENTS;
+        struct border_point *p = points + *count;
 
-        v[0] = (SDL_Vertex){ so, color, { 0, 0 } };
-        v[1] = (SDL_Vertex){ eo, color, { 0, 0 } };
-        v[2] = (SDL_Vertex){ si, color, { 0, 0 } };
-        v[3] = (SDL_Vertex){ si, color, { 0, 0 } };
-        v[4] = (SDL_Vertex){ eo, color, { 0, 0 } };
-        v[5] = (SDL_Vertex){ ei, color, { 0, 0 } };
+        p->nx = cosf( a );
+        p->ny = sinf( a );
+        p->x = cx + p->nx * radius;
+        p->y = cy + p->ny * radius;
+        if (*count) *dist += hypotf( p->x - p[-1].x, p->y - p[-1].y );
+        p->dist = *dist;
+        (*count)++;
     }
-    SDL_RenderGeometry( ui->renderer, NULL, vertices, 6 * segments, NULL, 0 );
 }
 
-/* An outline that follows a rounded rectangle, rather than a rectangle drawn
- * around one: four sides and four corner bands. */
-void ui_rounded_border( struct ui *ui, int x, int y, int w, int h, int radius, int thickness, SDL_Color color )
+/* Where along the band a point is, as a colour: dim over most of the ribbon,
+ * rising to lit in a narrow stretch that moves. */
+static SDL_Color border_tint( SDL_Color dim, SDL_Color lit, float u )
 {
+    float t = 0.5f + 0.5f * cosf( 2.0f * (float)M_PI * u );
+    SDL_Color c;
+
+    t = t * t * t;
+    c.r = (Uint8)(dim.r + (lit.r - dim.r) * t);
+    c.g = (Uint8)(dim.g + (lit.g - dim.g) * t);
+    c.b = (Uint8)(dim.b + (lit.b - dim.b) * t);
+    c.a = (Uint8)(dim.a + (lit.a - dim.a) * t);
+    return c;
+}
+
+void ui_animated_border( struct ui *ui, int x, int y, int w, int h, int radius, int thickness,
+                         SDL_Color dim, SDL_Color lit )
+{
+    struct border_point points[UI_BORDER_POINTS];
+    SDL_Vertex vertices[UI_BORDER_POINTS * 6];
+    float dist = 0, perimeter, half = thickness / 2.0f, phase = 0;
+    int count = 0, i;
+
+    if (w <= 0 || h <= 0) return;
     if (radius * 2 > w) radius = w / 2;
     if (radius * 2 > h) radius = h / 2;
-    if (thickness > radius) thickness = radius;
-    ui_fill( ui, x + radius, y, w - 2 * radius, thickness, color );
-    ui_fill( ui, x + radius, y + h - thickness, w - 2 * radius, thickness, color );
-    ui_fill( ui, x, y + radius, thickness, h - 2 * radius, color );
-    ui_fill( ui, x + w - thickness, y + radius, thickness, h - 2 * radius, color );
-    stroke_arc( ui, x + radius, y + radius, radius, radius - thickness, M_PI, 1.5 * M_PI, color );
-    stroke_arc( ui, x + w - radius, y + radius, radius, radius - thickness, 1.5 * M_PI, 2 * M_PI, color );
-    stroke_arc( ui, x + w - radius, y + h - radius, radius, radius - thickness, 0, 0.5 * M_PI, color );
-    stroke_arc( ui, x + radius, y + h - radius, radius, radius - thickness, 0.5 * M_PI, M_PI, color );
+    if (radius < 1) radius = 1;
+    if (half < 0.5f) half = 0.5f;
+
+    /* Clockwise from the left of the top-left corner. The straight sides need
+     * no points of their own: they are the stretch between one arc's last point
+     * and the next arc's first, and both carry the side's own normal. */
+    border_arc( points, &count, &dist, x + radius, y + radius, radius, (float)M_PI, 1.5f * (float)M_PI );
+    border_arc( points, &count, &dist, x + w - radius, y + radius, radius, 1.5f * (float)M_PI, 2.0f * (float)M_PI );
+    border_arc( points, &count, &dist, x + w - radius, y + h - radius, radius, 0, 0.5f * (float)M_PI );
+    border_arc( points, &count, &dist, x + radius, y + h - radius, radius, 0.5f * (float)M_PI, (float)M_PI );
+    perimeter = dist + hypotf( points[0].x - points[count - 1].x, points[0].y - points[count - 1].y );
+    if (perimeter <= 0) return;
+    if (ui->animations) phase = (SDL_GetTicks() % 2500) / 2500.0f;
+
+    for (i = 0; i < count; i++)
+    {
+        const struct border_point *a = points + i, *b = points + (i + 1) % count;
+        float d2 = i + 1 == count ? perimeter : b->dist;
+        SDL_Color c1 = border_tint( dim, lit, fmodf( a->dist / perimeter + phase, 1.0f ) );
+        SDL_Color c2 = border_tint( dim, lit, fmodf( d2 / perimeter + phase, 1.0f ) );
+        SDL_FPoint a_out = { a->x + a->nx * half, a->y + a->ny * half };
+        SDL_FPoint a_in = { a->x - a->nx * half, a->y - a->ny * half };
+        SDL_FPoint b_out = { b->x + b->nx * half, b->y + b->ny * half };
+        SDL_FPoint b_in = { b->x - b->nx * half, b->y - b->ny * half };
+        SDL_Vertex *v = vertices + 6 * i;
+
+        v[0] = (SDL_Vertex){ a_out, c1, { 0, 0 } };
+        v[1] = (SDL_Vertex){ b_out, c2, { 0, 0 } };
+        v[2] = (SDL_Vertex){ a_in, c1, { 0, 0 } };
+        v[3] = (SDL_Vertex){ a_in, c1, { 0, 0 } };
+        v[4] = (SDL_Vertex){ b_out, c2, { 0, 0 } };
+        v[5] = (SDL_Vertex){ b_in, c2, { 0, 0 } };
+    }
+    SDL_RenderGeometry( ui->renderer, NULL, vertices, 6 * count, NULL, 0 );
 }
 
 void ui_fill_circle( struct ui *ui, float cx, float cy, float radius, SDL_Color color )
@@ -1290,7 +1341,6 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
                      (SDL_Color){ 3, 6, 10, 20 }, 1 );
         ui_header_back( ui, title, context );
         column_w = ui->width - UI_HEADER_MARGIN - column_x;
-        if (column_x + column_w > ui->status_left - 16) column_w = ui->status_left - 16 - column_x;
         value_right = column_x + column_w - ROW_PADDING;
         bar = ui_highlight( ui, LIST_TOP + (list->selection - list->top) * ROW_HEIGHT + 2 );
         for (i = list->top; i < count && i < list->top + visible; i++)
@@ -1306,8 +1356,8 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
             /* Nothing is filled: what has the focus is outlined, so the colour
              * on the screen is the artwork's and the text's. */
             if (current)
-                ui_rounded_border( ui, column_x, (int)bar - 1, column_w, ROW_HEIGHT - 6, 12, 1,
-                                   (SDL_Color){ 236, 240, 246, 150 } );
+                ui_animated_border( ui, column_x, (int)bar - 1, column_w, ROW_HEIGHT - 6, 12, 2,
+                                    UI_FOCUS_DIM, UI_FOCUS_LIT );
             ui_text_fit( ui, ui->normal, column_x + ROW_PADDING, text_y, label_w, rows[i].label, color, current );
             if (value_w)
                 ui_text_fit( ui, ui->small, value_right - value_max,
@@ -1531,11 +1581,9 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
         ui_gradient( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 3, 6, 10, 156 },
                      (SDL_Color){ 3, 6, 10, 20 }, 1 );
         ui_header_back( ui, title, context );
-        /* The rows end at the margin, or before the clock and the battery when
-         * those reach further in, so that nothing a row carries -- and no edge
-         * of the outline around it -- stands under the reading. */
+        /* The rows reach the margin the battery's reading ends at, as the
+         * header's own content does. */
         controls_right = ui->width - UI_HEADER_MARGIN;
-        if (controls_right > ui->status_left - 16) controls_right = ui->status_left - 16;
         row_w = controls_right - SET_ROW_X;
         controls_right -= ROW_PADDING;
 
@@ -1549,8 +1597,8 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
             /* Only what has the focus is framed, so there is one highlight on
              * the screen and it is plain which arrows do what. */
             if (i == *group && !list->in_rows)
-                ui_rounded_border( ui, SET_SIDEBAR_X, y + 2, SET_SIDEBAR_W, SET_GROUP_H - 8, 12, 1,
-                                   (SDL_Color){ 236, 240, 246, 150 } );
+                ui_animated_border( ui, SET_SIDEBAR_X, y + 2, SET_SIDEBAR_W, SET_GROUP_H - 8, 12, 2,
+                                    UI_FOCUS_DIM, UI_FOCUS_LIT );
             ui_text_fit( ui, ui->normal, SET_SIDEBAR_X + ROW_PADDING, text_y,
                          SET_SIDEBAR_W - 2 * ROW_PADDING, groups[i],
                          i == *group ? ui->value : ui->dim, i == *group );
@@ -1575,9 +1623,11 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
             /* Nothing is filled: the row in focus is outlined, and held for
              * changing it is outlined brighter, so it is plain that left and
              * right now change it rather than move away from it. */
+            /* Held for changing, the ribbon thickens: the same light, plainly
+             * around something the arrows now act on. */
             if (current && list->in_rows)
-                ui_rounded_border( ui, SET_ROW_X, box_y, row_w, box_h, 12, list->editing ? 2 : 1,
-                                   (SDL_Color){ 236, 240, 246, list->editing ? 230 : 150 } );
+                ui_animated_border( ui, SET_ROW_X, box_y, row_w, box_h, 12, list->editing ? 4 : 2,
+                                    UI_FOCUS_DIM, UI_FOCUS_LIT );
 
             /* The name and the line under it are one block, standing in the
              * middle of the row however many lines the second one takes. */

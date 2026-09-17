@@ -1022,12 +1022,16 @@ static void draw_card( struct launcher *l, int index, int x, int y, const struct
 
 static void draw_library( struct launcher *l )
 {
-    static const struct ui_hint hints[] = { { UI_A, "Play" }, { UI_Y, "Options" }, { UI_X, "Add Game" } };
+    /* A does what is in focus: with the header in focus it is that, not the game
+     * the selection is remembered on. */
+    struct ui_hint hints[] = { { UI_A, "Play" }, { UI_Y, "Options" }, { UI_X, "Add Game" } };
     /* With nothing to act on, only adding a game means anything. */
     static const struct ui_hint empty_hints[] = { { UI_X, "Add Game" } };
     struct ui *ui = &l->ui;
     struct grid g;
     int shown, i;
+
+    if (l->zone == ZONE_HEADER) hints[0].label = "Select";
 
     draw_backdrop( l, l->visible_count ? l->visible[l->selection] : -1 );
     ui_fill( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 0, 0, 0, 120 } );
@@ -1161,6 +1165,13 @@ static void draw_shell( struct launcher *l, int home )
     int x = SHELL_MARGIN, right = ui->width - SHELL_MARGIN, i, width;
 
     ui_gradient( ui, 0, 0, ui->width, 150, (SDL_Color){ 0, 0, 0, 150 }, (SDL_Color){ 0, 0, 0, 0 }, 0 );
+    /* The clock and the battery first: Settings stands to the left of whatever
+     * they take, and the pill has to know where that is before it goes there. */
+    ui->status_left = right = draw_status( l, right, SHELL_Y );
+    right -= SHELL_GAP;
+    width = l->symbols[SYMBOL_SETTINGS] ? SHELL_ICON - 4 : 0;
+    right -= width;
+
     /* Where the pill is going, before anything is drawn over it. */
     {
         int target_x = 0, target_w = 0, at = SHELL_MARGIN;
@@ -1179,10 +1190,8 @@ static void draw_shell( struct launcher *l, int home )
         }
         if (l->zone == ZONE_HEADER && l->header_focus == SHELL_SETTINGS)
         {
-            int icon = l->symbols[SYMBOL_SETTINGS] ? SHELL_ICON - 4 : 0;
-
-            target_x = ui->width - SHELL_MARGIN - icon - 14;
-            target_w = icon + 28;
+            target_x = right - 14;
+            target_w = width + 28;
         }
         if (!target_w) l->pill_w = 0;      /* focus left the header; it starts again where it returns */
         else
@@ -1197,8 +1206,9 @@ static void draw_shell( struct launcher *l, int home )
                 l->pill_x += (target_x - l->pill_x) * 0.30f;
                 l->pill_w += (target_w - l->pill_w) * 0.30f;
             }
-            ui_rounded( ui, (int)(l->pill_x + 0.5f), SHELL_Y - 24, (int)(l->pill_w + 0.5f), 48, 24,
-                        (SDL_Color){ 255, 255, 255, 52 } );
+            ui_animated_border( ui, (int)(l->pill_x + 0.5f), SHELL_Y - 22, (int)(l->pill_w + 0.5f), 44,
+                                14, 2, (SDL_Color){ 150, 160, 176, 90 },
+                                (SDL_Color){ 244, 247, 250, 255 } );
         }
     }
     for (i = SHELL_HOME; i <= SHELL_ADD; i++)
@@ -1217,10 +1227,6 @@ static void draw_shell( struct launcher *l, int home )
         x += SHELL_GAP;
     }
 
-    ui->status_left = right = draw_status( l, right, SHELL_Y );
-    right -= SHELL_GAP;
-    width = l->symbols[SYMBOL_SETTINGS] ? SHELL_ICON - 4 : 0;
-    right -= width;
     draw_symbol( l, SYMBOL_SETTINGS, right, SHELL_Y,
                  l->zone == ZONE_HEADER && l->header_focus == SHELL_SETTINGS ? 255 : 190 );
     l->shell_hits[SHELL_SETTINGS] = (SDL_Rect){ right - SHELL_GAP / 2, 0, width + SHELL_GAP, UI_HEADER_HEIGHT };
@@ -1407,7 +1413,7 @@ static int draw_tag( struct ui *ui, int x, int cy, const char *text, int warning
 
 static void draw_home( struct launcher *l )
 {
-    static const struct ui_hint hints[] = { { UI_A, "Play" }, { UI_Y, "Options" }, { UI_X, "Add Game" } };
+    struct ui_hint hints[] = { { UI_A, "Play" }, { UI_Y, "Options" }, { UI_X, "Add Game" } };
     static const struct ui_hint empty_hints[] = { { UI_A, "Open Library" } };
     struct ui *ui = &l->ui;
     int i;
@@ -1480,6 +1486,7 @@ static void draw_home( struct launcher *l )
         if (p->missing)
             draw_tag( ui, title_x, HOME_TITLE_Y + TTF_FontHeight( ui->normal ) + 12, "Missing", 1 );
 
+        if (l->zone == ZONE_HEADER) hints[0].label = "Select";
         ui_hints_right( ui, hints, 3, ui->width - SHELL_MARGIN, HOME_HINT_Y );
     }
     ui_fade( ui );
