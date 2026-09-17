@@ -51,7 +51,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-168"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-169"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -107,6 +107,12 @@ static int log_main_thread_set;
  * once a GUI app brings up the display driver we hand the screen over to the
  * framebuffer and stop driving the console (logs still go to the file). */
 static int wine_nx_console_active = 1;
+/* The console is left standing but stops being written to once a game is on its
+ * way: with no launcher in between -- a program on the command line, or one
+ * another forwarder handed over -- every line of the start-up would be printed
+ * over the screen the game is about to draw on. It speaks again if the game
+ * cannot be started, since then the screen is all there is to say so on. */
+static int wine_nx_console_quiet;
 static Framebuffer wine_nx_fb;
 static int wine_nx_fb_ready;
 static pthread_mutex_t wine_nx_fb_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -210,7 +216,7 @@ static void log_line( const char *fmt, ... )
      * diagAbortWithResult) when driven from any thread but the one that
      * called consoleInit, including exception handlers running on Wine
      * secondary threads.  Off the main thread, log to the file only. */
-    int on_main = wine_nx_console_active &&
+    int on_main = wine_nx_console_active && !wine_nx_console_quiet &&
                   (!log_main_thread_set || pthread_equal( pthread_self(), log_main_thread ));
     char line[1024];
     va_list args;
@@ -2790,8 +2796,16 @@ int main( int argc, char **argv )
             log_line( "[LAUNCHER] started here by another forwarder: %s", target );
         }
     }
-    if (handed_over) { /* the game to start came with the handoff */ }
-    else if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
+    if (handed_over || (argc > 1 && argv[1] && argv[1][0]))
+    {
+        const char *name;
+
+        if (!handed_over) snprintf( target, sizeof(target), "%s", argv[1] );
+        name = strrchr( target, '/' );
+        /* The last thing the screen is told before the game has it. */
+        log_line( "[TARGET] starting %s", name ? name + 1 : target );
+        wine_nx_console_quiet = 1;
+    }
     else
     {
         struct wine_nx_launcher_options options =
@@ -3019,8 +3033,13 @@ int main( int argc, char **argv )
             log_line( "[RUN] entry returned %d", call_pe_entry_point( entry ) );
         }
         else if (autorun)
+        {
+            /* Nothing will draw now, so the screen goes back to being the only
+             * place this can be read without a computer. */
+            wine_nx_console_quiet = 0;
             log_line( "[BLOCK] run-entry.txt enabled, but loader status import=%08x attach=%08x",
                       ldr_status, attach_status );
+        }
     }
 
     park_forever();
