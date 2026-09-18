@@ -1,0 +1,1 @@
+@ stdcall DirectXSetupGetVersion(ptr ptr)

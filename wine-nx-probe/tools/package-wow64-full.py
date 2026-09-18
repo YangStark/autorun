@@ -186,6 +186,27 @@ Fallout New Vegas (GOG): xinput1_3, d3dx9_38 and the windowscodecs that loads it
 textures are staged, with msvcp110 and msvcr110 for Galaxy.dll and GalaxyWrp.dll.
 Its executable relocates, so it needs no forwarder.
 
+Halo: Combat Evolved: winspool.drv is staged, which is what Halo checks its own
+files with. Delete the ._ files a Mac leaves beside every file on the card if
+the game was copied from one: Halo loads every DLL in its Controls folder and
+one of those is not a DLL. Its menu takes the arrows and Enter, so put this
+beside HALO.EXE as HALO.keys.txt, which is applied over keys.txt:
+
+    UP=0x26
+    DOWN=0x28
+    LEFT=0x25
+    RIGHT=0x27
+    X=0x0d      Enter, to choose a menu item
+    Y=0x20      space, to jump
+    L=0x45      e, the action key
+    R=0x52      r, to reload
+    ZL=0x11     left control, to crouch
+    ZR=0x09     tab, the scores
+    MINUS=0x1b  Escape, to go back
+
+A and B stay the left and right mouse buttons, so A fires and clicks. Holding +
+and - together leaves the game whatever the keys say.
+
 Left 4 Dead 2: the engine will not start without bin\\valve_avi.dll, which is one
 of the app systems its launcher creates, and that imports AVIFIL32, so avifil32
 is staged; msvfw32, which avifil32 needs, was already there for WarCraft III's

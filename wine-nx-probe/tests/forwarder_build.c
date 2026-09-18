@@ -417,20 +417,22 @@ int main( int argc, char **argv )
     snprintf( nro_file, sizeof(nro_file), "%s/fake.nro", argv[3] );
     write_fake_nro( nro_file, "autorun-nro-nacp" );
 
-    tid = wine_nx_forwarder_title_id( nro_file, NULL, WINE_NX_SPACE_32BIT );
+    tid = wine_nx_forwarder_title_id( nro_file, NULL, WINE_NX_SPACE_32BIT_NO_ALIAS );
     assert( (tid >> 56) == 0x05 );
     assert( !(tid & 0xFFF) );
-    assert( tid == wine_nx_forwarder_title_id( nro_file, NULL, WINE_NX_SPACE_32BIT ) );
-    assert( tid != wine_nx_forwarder_title_id( nro_path, NULL, WINE_NX_SPACE_32BIT ) );
+    assert( tid == wine_nx_forwarder_title_id( nro_file, NULL, WINE_NX_SPACE_32BIT_NO_ALIAS ) );
+    assert( tid != wine_nx_forwarder_title_id( nro_path, NULL, WINE_NX_SPACE_32BIT_NO_ALIAS ) );
     /* The two a user can make are two entries: one must not replace the other. */
     assert( tid != wine_nx_forwarder_title_id( nro_file, NULL, WINE_NX_SPACE_36BIT ) );
     assert( tid != wine_nx_forwarder_title_id( nro_file, NULL, -1 ) );
+    /* And where it was before it asked for the space without the alias region. */
+    assert( tid != wine_nx_forwarder_title_id( nro_file, NULL, WINE_NX_SPACE_32BIT ) );
 
     memset( &request, 0, sizeof(request) );
     request.nro_path = nro_file;
     request.name = "Autorun 32-bit";
     request.author = "ticoverse.com";
-    request.address_space = WINE_NX_SPACE_32BIT;
+    request.address_space = WINE_NX_SPACE_32BIT_NO_ALIAS;
     request.icon = wine_nx_icon_32bit;
     request.icon_size = wine_nx_icon_32bit_size;
 
@@ -439,16 +441,20 @@ int main( int argc, char **argv )
     assert( registered == 3 );
     /* Its own entry's contents were taken away, and before anything was written. */
     assert( deleted_entity == tid && !deleted_after_write );
-    /* This entry and the generation before it, which is ours; never the id
-     * without the address space, which is sphaira's and the user's. */
-    assert( deleted_completely_count == 2 && deleted_completely[1] == tid );
-    assert( deleted_completely[0] != tid && deleted_completely[0] != wine_nx_forwarder_title_id( nro_file, NULL, -1 ) );
+    /* This entry, the generation before it and the entry it had in the plain
+     * 32-bit space, all ours; never the id without the address space, which is
+     * sphaira's and the user's. */
+    assert( deleted_completely_count == 3 && deleted_completely[2] == tid );
+    assert( deleted_completely[1] == wine_nx_forwarder_title_id( nro_file, NULL, WINE_NX_SPACE_32BIT ) );
+    for (int i = 0; i < deleted_completely_count; i++)
+        assert( deleted_completely[i] != wine_nx_forwarder_title_id( nro_file, NULL, -1 ) );
+    assert( deleted_completely[0] != tid );
 
     program = read_nca( 1, &program_size );
     control = read_nca( 2, &control_size );
     meta = read_nca( 3, &meta_size );
     check_program( program, program_size, nro_file );
-    check_exefs_npdm( program, WINE_NX_SPACE_32BIT, tid );
+    check_exefs_npdm( program, WINE_NX_SPACE_32BIT_NO_ALIAS, tid );
     check_control( control, control_size, "Autorun 32-bit", "ticoverse.com", "autorun-nro-nacp", tid );
     assert( nca_of( meta )->content_type == NCA_CONTENT_META );
     assert( nca_of( meta )->fs_header[0].fs_type == NCA_FS_PFS0 );

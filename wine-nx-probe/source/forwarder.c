@@ -940,7 +940,8 @@ unsigned long long wine_nx_forwarder_title_id( const char *nro_path, const char 
 }
 
 static Result forwarder_build_and_install( const struct wine_nx_forwarder *request, u64 tid, u64 old_tid,
-                                           u64 plain_tid, const u8 *header_key, const char **step )
+                                           u64 moved_tid, u64 plain_tid, const u8 *header_key,
+                                           const char **step )
 {
     struct buf program = {0}, control = {0}, meta = {0}, cnmt = {0};
     struct file_entry exefs[2], romfs[2], cnmt_entry;
@@ -1088,6 +1089,8 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
      * so there is nothing of the user's in one to lose. */
     *step = "taking away what was there";
     if (old_tid != tid && old_tid != plain_tid) nsDeleteApplicationCompletely( old_tid );
+    if (moved_tid != tid && moved_tid != plain_tid && moved_tid != old_tid)
+        nsDeleteApplicationCompletely( moved_tid );
     nsDeleteApplicationCompletely( tid );
     nsDeleteApplicationEntity( tid );
 
@@ -1183,7 +1186,7 @@ unsigned int wine_nx_forwarder_install( const struct wine_nx_forwarder *request,
 {
     const char *ignored = NULL;
     u8 header_kek[0x20], header_key[0x20];
-    u64 tid, old_tid, plain_tid;
+    u64 tid, old_tid, moved_tid, plain_tid;
     u64 hash[SHA256_HASH_SIZE / sizeof(u64)];
     Result rc;
 
@@ -1202,6 +1205,15 @@ unsigned int wine_nx_forwarder_install( const struct wine_nx_forwarder *request,
      * made for the same NRO, so they are taken away rather than left behind. */
     forwarder_hash( request->nro_path, request->args, 0, 0, hash );
     plain_tid = 0x0500000000000000ull | (hash[0] & 0x00FFFFFFFFFFF000ull);
+    /* Where this forwarder was before it moved to another address space: the
+     * 32-bit one asked for the space with the alias region until build 206, and
+     * the space is part of the name, so the entry it had under the old one is
+     * this same forwarder and goes with it. */
+    forwarder_hash( request->nro_path, request->args,
+                    request->address_space == WINE_NX_SPACE_32BIT_NO_ALIAS ? WINE_NX_SPACE_32BIT
+                                                                           : request->address_space,
+                    FORWARDER_GENERATION, hash );
+    moved_tid = 0x0500000000000000ull | (hash[0] & 0x00FFFFFFFFFFF000ull);
 
     *step = "asking for the console's key";
     if (R_FAILED( rc = splCryptoInitialize() )) return rc;
@@ -1215,7 +1227,7 @@ unsigned int wine_nx_forwarder_install( const struct wine_nx_forwarder *request,
     if (R_FAILED( rc = ncmInitialize() )) return rc;
     if (R_SUCCEEDED( rc = nsInitialize() ))
     {
-        rc = forwarder_build_and_install( request, tid, old_tid, plain_tid, header_key, step );
+        rc = forwarder_build_and_install( request, tid, old_tid, moved_tid, plain_tid, header_key, step );
         nsExit();
     }
     ncmExit();

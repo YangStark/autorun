@@ -954,7 +954,11 @@ static void prepare_devices(void)
     NtClose( hkey );
     if ((hkey = reg_create_ascii_key( NULL, directx_keyA, 0, NULL )))
     {
+        static const WCHAR installed_version_name[] = {'I','n','s','t','a','l','l','e','d','V','e','r','s','i','o','n',0};
+        static const BYTE installed_version[] = {0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00};
         reg_empty_key( hkey, NULL, TRUE );
+        set_reg_ascii_value( hkey, "Version", "4.09.00.0904" );
+        set_reg_value( hkey, installed_version_name, REG_BINARY, installed_version, sizeof(installed_version) );
         NtClose( hkey );
     }
 
