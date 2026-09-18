@@ -20,10 +20,8 @@
 #define STICK_RELEASE    8000
 #define LIST_TOP         124
 #define ROW_HEIGHT       64
-/* What a row keeps between its outline and its text. Small, so the text of a
- * list lines up with the text of the header above it rather than sitting in
- * from it. */
-#define ROW_PADDING      12
+/* What a row keeps between its outline and its text. */
+#define ROW_PADDING      20
 /* Everything that has the focus wears the same outline. */
 #define UI_FOCUS_DIM     (SDL_Color){ 150, 160, 176, 90 }
 #define UI_FOCUS_LIT     (SDL_Color){ 244, 247, 250, 255 }
@@ -346,7 +344,7 @@ int ui_init( struct ui *ui, const void *font_data, size_t font_size, int animati
     flags = SDL_WINDOW_FULLSCREEN;
 #endif
     ui_step( "SDL_CreateWindow" );
-    if (!(ui->window = SDL_CreateWindow( "Wine-NX", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+    if (!(ui->window = SDL_CreateWindow( "Autorun", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                          ui->width, ui->height, flags ))) goto fail;
     window_created = 1;
     /* SDL's software renderer draws the same, only slower, if the GPU one cannot start. */
@@ -582,6 +580,32 @@ void ui_text( struct ui *ui, TTF_Font *font, int x, int y, const char *text, SDL
     }
 }
 
+void ui_text_opening( struct ui *ui, TTF_Font *font, int x, int y, const char *text, SDL_Color color, float open )
+{
+    struct ui_text_entry *entry;
+    SDL_Rect clip, dst, previous;
+    SDL_bool clipped;
+
+    if (open <= 0.01f || !text[0]) return;
+    if (open >= 0.99f || !(entry = text_entry( ui, font, text, color, 0 )))
+    {
+        if (open >= 0.99f) ui_text( ui, font, x, y, text, color );
+        return;
+    }
+    /* Revealed from the left, out of the icon it belongs to, and faded with it:
+     * the text stays where it will end up, so what shows is always its start. */
+    clipped = SDL_RenderIsClipEnabled( ui->renderer );
+    SDL_RenderGetClipRect( ui->renderer, &previous );
+    clip = (SDL_Rect){ x, 0, (int)(entry->width * open + 0.5f), ui->height };
+    if (clipped && !SDL_IntersectRect( &clip, &previous, &clip )) return;
+    dst = (SDL_Rect){ x, y, entry->width, entry->height };
+    SDL_RenderSetClipRect( ui->renderer, &clip );
+    SDL_SetTextureAlphaMod( entry->texture, (Uint8)(255 * open) );
+    SDL_RenderCopy( ui->renderer, entry->texture, NULL, &dst );
+    SDL_SetTextureAlphaMod( entry->texture, 255 );
+    SDL_RenderSetClipRect( ui->renderer, clipped ? &previous : NULL );
+}
+
 void ui_text_centered( struct ui *ui, TTF_Font *font, int cx, int y, const char *text, SDL_Color color )
 {
     ui_text( ui, font, cx - ui_text_width( ui, font, text ) / 2, y, text, color );
@@ -709,7 +733,7 @@ void ui_header( struct ui *ui, const char *title, const char *context )
 
     ui_fill( ui, 0, 0, ui->width, band, ui->panel );
     if (!ui_animated( ui )) ui_fill( ui, 0, band, ui->width, 2, ui->selection );
-    ui_text( ui, ui->normal, 28, (band - TTF_FontHeight( ui->normal )) / 2, "Wine-NX", ui->value );
+    ui_text( ui, ui->normal, 28, (band - TTF_FontHeight( ui->normal )) / 2, "Autorun", ui->value );
     ui_text_centered( ui, ui->large, ui->width / 2, (band - TTF_FontHeight( ui->large )) / 2, title, ui->value );
     title_right = ui->width / 2 + ui_text_width( ui, ui->large, title ) / 2;
     if (context && context[0])
@@ -1241,7 +1265,8 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
     const int column_x = UI_HEADER_MARGIN;
     const int visible = (ui->height - LIST_TOP - 86) / ROW_HEIGHT;
     struct ui_input input;
-    int column_w = 1280 - 2 * UI_HEADER_MARGIN, value_right, i;
+    SDL_Rect clip;
+    int column_w = 1280 - 2 * UI_HEADER_MARGIN, value_right, first, i;
 
     if (!list->started)
     {
@@ -1310,13 +1335,14 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
                 }
                 break;
             }
+            /* The ends of the list stop: rolling round to the far end, and
+             * scrolling the whole way to get there, is not what a list does. */
             if (direction)
             {
-                int next = list->selection;
+                int next = list->selection + direction;
 
-                do next = (next + direction + count) % count;
-                while (rows[next].disabled && next != list->selection);
-                list->selection = next;
+                while (next >= 0 && next < count && rows[next].disabled) next += direction;
+                if (next >= 0 && next < count) list->selection = next;
             }
         }
         if (!ui->running) break;
@@ -1325,6 +1351,13 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
         if (list->selection >= list->top + visible) list->top = list->selection - visible + 1;
         if (list->top > count - visible) list->top = count - visible;
         if (list->top < 0) list->top = 0;
+        /* The rows slide under the highlight rather than jumping a row at a
+         * time beneath it: both are eased the same, so while the list scrolls
+         * the highlight stands still on the screen. */
+        if (!ui->animations || !list->started_scroll) list->scroll = (float)(list->top * ROW_HEIGHT);
+        else list->scroll += (list->top * ROW_HEIGHT - list->scroll) * 0.30f;
+        if (fabsf( list->top * ROW_HEIGHT - list->scroll ) < 0.5f) list->scroll = (float)(list->top * ROW_HEIGHT);
+        list->started_scroll = 1;
         row = rows + list->selection;
 
         /* Options use the same calm, layered surface as Home: a dark sheet
@@ -1341,11 +1374,19 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
                      (SDL_Color){ 3, 6, 10, 20 }, 1 );
         ui_header_back( ui, title, context );
         column_w = ui->width - UI_HEADER_MARGIN - column_x;
+        /* A list long enough to scroll gives the bar its room out of its own
+         * width, so the bar stays inside the margin rather than past it. */
+        if (count > visible) column_w -= 22;
         value_right = column_x + column_w - ROW_PADDING;
-        bar = ui_highlight( ui, LIST_TOP + (list->selection - list->top) * ROW_HEIGHT + 2 );
-        for (i = list->top; i < count && i < list->top + visible; i++)
+        bar = ui_highlight( ui, LIST_TOP + list->selection * ROW_HEIGHT + 2 ) - list->scroll;
+        /* A row half in and half out while the list slides is cut, not drawn
+         * over the header or the hints. */
+        clip = (SDL_Rect){ 0, LIST_TOP - 2, ui->width, visible * ROW_HEIGHT + 4 };
+        SDL_RenderSetClipRect( ui->renderer, &clip );
+        first = (int)(list->scroll / ROW_HEIGHT);
+        for (i = first; i < count && i <= first + visible; i++)
         {
-            int y = LIST_TOP + (i - list->top) * ROW_HEIGHT, current = i == list->selection;
+            int y = LIST_TOP + (int)(i * ROW_HEIGHT - list->scroll), current = i == list->selection;
             int text_y = y + (ROW_HEIGHT - TTF_FontHeight( ui->normal )) / 2;
             int value_w = rows[i].value[0] ? ui_text_width( ui, ui->small, rows[i].value ) : 0;
             int value_max = value_w < column_w / 3 ? value_w : column_w / 3;
@@ -1364,13 +1405,16 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
                              text_y + (TTF_FontHeight( ui->normal ) - TTF_FontHeight( ui->small )) / 2,
                              column_w / 3, rows[i].value, current ? ui->value : ui->dim, current );
         }
+        SDL_RenderSetClipRect( ui->renderer, NULL );
         if (count > visible)
         {
             int track_h = visible * ROW_HEIGHT - 12, thumb = track_h * visible / count;
 
             if (thumb < 16) thumb = 16;
             ui_rounded( ui, column_x + column_w + 12, LIST_TOP + 4, 5, track_h, 3, (SDL_Color){ 66, 73, 85, 160 } );
-            ui_rounded( ui, column_x + column_w + 12, LIST_TOP + 4 + (track_h - thumb) * list->top / (count - visible),
+            ui_rounded( ui, column_x + column_w + 12,
+                        LIST_TOP + 4 + (int)((track_h - thumb) * list->scroll /
+                                             ((count - visible) * ROW_HEIGHT)),
                         5, thumb, 3, ui->selection );
         }
         if (any_adjustable) hints[hint_count++] = (struct ui_hint){ UI_LEFT, NULL };
@@ -1395,8 +1439,11 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
  * to on the right: a switch, a value, or an arrow into a screen of its own.
  */
 #define SET_SIDEBAR_X    UI_HEADER_MARGIN
-#define SET_SIDEBAR_W    248
-#define SET_GROUP_H      54
+#define SET_SIDEBAR_W    286
+#define SET_GROUP_H      62
+/* A section stands further in from its outline than a row does: the names are
+ * short, and the outline around them is the widest thing on the screen. */
+#define SET_SIDEBAR_PAD  26
 #define SET_ROW_X        (SET_SIDEBAR_X + SET_SIDEBAR_W + 32)
 #define SET_ROW_H        112
 
@@ -1599,8 +1646,8 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
             if (i == *group && !list->in_rows)
                 ui_animated_border( ui, SET_SIDEBAR_X, y + 2, SET_SIDEBAR_W, SET_GROUP_H - 8, 12, 2,
                                     UI_FOCUS_DIM, UI_FOCUS_LIT );
-            ui_text_fit( ui, ui->normal, SET_SIDEBAR_X + ROW_PADDING, text_y,
-                         SET_SIDEBAR_W - 2 * ROW_PADDING, groups[i],
+            ui_text_fit( ui, ui->normal, SET_SIDEBAR_X + SET_SIDEBAR_PAD, text_y,
+                         SET_SIDEBAR_W - 2 * SET_SIDEBAR_PAD, groups[i],
                          i == *group ? ui->value : ui->dim, i == *group );
         }
 

@@ -47,11 +47,13 @@
 #define FOOTER_SPACE   38
 
 /* Home and Library's header, laid out after GameHub's at 1280x720. */
-enum shell_tab { SHELL_HOME, SHELL_LIBRARY, SHELL_ADD, SHELL_SETTINGS, SHELL_TABS };
+enum shell_tab { SHELL_HOME, SHELL_LIBRARY, SHELL_SETTINGS, SHELL_TABS };
 #define SHELL_Y        UI_HEADER_CENTRE
 #define SHELL_ICON     30
 #define SHELL_MARGIN   UI_HEADER_MARGIN   /* which Home's content keeps too */
-#define SHELL_GAP      36
+#define SHELL_GAP      44
+/* What the header's pill keeps between its outline and the item inside it. */
+#define SHELL_PADDING  22
 
 /* Home: the games that have been played, most recent first, as 2:3 covers. The
  * focused one is larger and never moves; the row slides through it, so choosing
@@ -160,6 +162,9 @@ struct launcher
     /* Where the header's pill stands and how wide it is, eased toward the item
      * in focus so it slides between them instead of jumping. */
     float pill_x, pill_w;
+    /* How much of each header item's name is out, eased toward 1 for the view
+     * being shown and 0 for the rest, so one name closes as the other opens. */
+    float label_open[SHELL_TABS];
     /* Where the last frame drew what a tap can hit. */
     SDL_Rect shell_hits[SHELL_TABS], add_hit;
     /* The programs whose artwork is behind Home, fading from the previous one; -1 for none. */
@@ -959,11 +964,11 @@ static void draw_card( struct launcher *l, int index, int x, int y, const struct
             SDL_SetTextureAlphaMod( ui->glow, 40 );
             SDL_RenderCopy( ui->renderer, ui->glow, NULL, &rect );
         }
-        /* The plate the cover sits on, lit from above, as the focused cover on
-         * Home has: the two views frame the selection the same way. */
-        ui_rounded( ui, x - 3, y - 3, g->card + 6, g->card + 6, 17, (SDL_Color){ 150, 160, 176, 120 } );
-        ui_rounded_texture( ui, ui_sheen( ui ), NULL, (SDL_Rect){ x - 3, y - 3, g->card + 6, g->card + 6 }, 17,
-                            (SDL_Color){ 252, 253, 255, 235 } );
+        /* The same light that goes round what has the focus everywhere else,
+         * rather than a plate of its own: the two views frame the selection the
+         * same way, and the way the rest of the launcher does. */
+        ui_animated_border( ui, x - 3, y - 3, g->card + 6, g->card + 6, 17, 3,
+                            (SDL_Color){ 150, 160, 176, 90 }, (SDL_Color){ 244, 247, 250, 255 } );
     }
     else
     {
@@ -1101,14 +1106,16 @@ static void draw_battery( struct ui *ui, int x, int cy, int percent, int chargin
     ui_fill( ui, x + 3, y + 3, level, h - 6, charging ? (SDL_Color){ 124, 222, 146, 255 } : line );
 }
 
-/* How wide a header item is: its icon, and the name when it is the current view. */
-static int shell_width( struct launcher *l, int tab, int active )
+static const char *const shell_labels[SHELL_TABS] = { "Home", "Library" };
+
+/* How wide a header item is: its icon, and as much of the name as is out. */
+static int shell_width( struct launcher *l, int tab )
 {
-    static const char *labels[SHELL_TABS] = { "Home", "Library" };
     int width = 0;
 
     if (l->symbols[tab]) SDL_QueryTexture( l->symbols[tab], NULL, NULL, &width, NULL );
-    if (active && labels[tab]) width += 12 + ui_text_width( &l->ui, l->ui.normal, labels[tab] );
+    if (shell_labels[tab])
+        width += (int)((12 + ui_text_width( &l->ui, l->ui.normal, shell_labels[tab] )) * l->label_open[tab] + 0.5f);
     return width;
 }
 
@@ -1159,12 +1166,22 @@ static void draw_shell( struct launcher *l, int home )
     {
         [SHELL_HOME] = { SYMBOL_HOME, "Home" },
         [SHELL_LIBRARY] = { SYMBOL_LIBRARY, "Library" },
-        [SHELL_ADD] = { SYMBOL_ADD, "Add Game" },
     };
     struct ui *ui = &l->ui;
     int x = SHELL_MARGIN, right = ui->width - SHELL_MARGIN, i, width;
 
     ui_gradient( ui, 0, 0, ui->width, 150, (SDL_Color){ 0, 0, 0, 150 }, (SDL_Color){ 0, 0, 0, 0 }, 0 );
+    /* One name closes as the other opens, and everything after them moves with
+     * it: the widths below are measured from where they have got to. */
+    for (i = SHELL_HOME; i < SHELL_TABS; i++)
+    {
+        float target = i == (home ? SHELL_HOME : SHELL_LIBRARY) ? 1.0f : 0.0f;
+
+        if (!ui->animations) l->label_open[i] = target;
+        else l->label_open[i] += (target - l->label_open[i]) * 0.22f;
+        if (fabsf( target - l->label_open[i] ) < 0.004f) l->label_open[i] = target;
+    }
+
     /* The clock and the battery first: Settings stands to the left of whatever
      * they take, and the pill has to know where that is before it goes there. */
     ui->status_left = right = draw_status( l, right, SHELL_Y );
@@ -1176,22 +1193,21 @@ static void draw_shell( struct launcher *l, int home )
     {
         int target_x = 0, target_w = 0, at = SHELL_MARGIN;
 
-        for (i = SHELL_HOME; i <= SHELL_ADD; i++)
+        for (i = SHELL_HOME; i <= SHELL_LIBRARY; i++)
         {
-            int active = i == (home ? SHELL_HOME : SHELL_LIBRARY);
-            int item_w = shell_width( l, i, active );
+            int item_w = shell_width( l, i );
 
             if (l->zone == ZONE_HEADER && l->header_focus == i)
             {
-                target_x = at - 14;
-                target_w = item_w + 28;
+                target_x = at - SHELL_PADDING;
+                target_w = item_w + 2 * SHELL_PADDING;
             }
             at += item_w + SHELL_GAP;
         }
         if (l->zone == ZONE_HEADER && l->header_focus == SHELL_SETTINGS)
         {
-            target_x = right - 14;
-            target_w = width + 28;
+            target_x = right - SHELL_PADDING;
+            target_w = width + 2 * SHELL_PADDING;
         }
         if (!target_w) l->pill_w = 0;      /* focus left the header; it starts again where it returns */
         else
@@ -1206,22 +1222,24 @@ static void draw_shell( struct launcher *l, int home )
                 l->pill_x += (target_x - l->pill_x) * 0.30f;
                 l->pill_w += (target_w - l->pill_w) * 0.30f;
             }
-            ui_animated_border( ui, (int)(l->pill_x + 0.5f), SHELL_Y - 22, (int)(l->pill_w + 0.5f), 44,
+            ui_animated_border( ui, (int)(l->pill_x + 0.5f), SHELL_Y - 24, (int)(l->pill_w + 0.5f), 48,
                                 14, 2, (SDL_Color){ 150, 160, 176, 90 },
                                 (SDL_Color){ 244, 247, 250, 255 } );
         }
     }
-    for (i = SHELL_HOME; i <= SHELL_ADD; i++)
+    for (i = SHELL_HOME; i <= SHELL_LIBRARY; i++)
     {
-        int active = i == (home ? SHELL_HOME : SHELL_LIBRARY), focused = l->zone == ZONE_HEADER && l->header_focus == i;
+        int focused = l->zone == ZONE_HEADER && l->header_focus == i;
+        float lit = focused ? 1.0f : l->label_open[i];
         int start = x;
 
-        x += draw_symbol( l, tabs[i].symbol, x, SHELL_Y, active || focused ? 255 : 150 );
-        if (active)
+        x += draw_symbol( l, tabs[i].symbol, x, SHELL_Y, 150 + (int)(105 * lit) );
+        if (tabs[i].label && l->label_open[i] > 0.01f)
         {
-            x += 12;
-            ui_text( ui, ui->normal, x, SHELL_Y - TTF_FontHeight( ui->normal ) / 2, tabs[i].label, ui->value );
-            x += ui_text_width( ui, ui->normal, tabs[i].label );
+            x += (int)(12 * l->label_open[i] + 0.5f);
+            ui_text_opening( ui, ui->normal, x, SHELL_Y - TTF_FontHeight( ui->normal ) / 2, tabs[i].label,
+                             ui->value, l->label_open[i] );
+            x += (int)(ui_text_width( ui, ui->normal, tabs[i].label ) * l->label_open[i] + 0.5f);
         }
         l->shell_hits[i] = (SDL_Rect){ start - SHELL_GAP / 2, 0, x - start + SHELL_GAP, UI_HEADER_HEIGHT };
         x += SHELL_GAP;
@@ -1354,11 +1372,11 @@ static void draw_carousel_card( struct launcher *l, int index, SDL_Rect rect, fl
             SDL_SetTextureAlphaMod( ui->glow, strength * 40 / 255 );
             SDL_RenderCopy( ui->renderer, ui->glow, NULL, &glow );
         }
-        /* The plate the cover sits on: a dim edge all round, lit from above like glass. */
-        ui_rounded( ui, x - 3, y - 3, w + 6, h + 6, HOME_RADIUS + 3,
-                    (SDL_Color){ 150, 160, 176, strength * 120 / 255 } );
-        ui_rounded_texture( ui, ui_sheen( ui ), NULL, (SDL_Rect){ x - 3, y - 3, w + 6, h + 6 }, HOME_RADIUS + 3,
-                            (SDL_Color){ 252, 253, 255, strength * 235 / 255 } );
+        /* The light that goes round what has the focus, coming up as the cover
+         * comes into the middle. */
+        ui_animated_border( ui, x - 3, y - 3, w + 6, h + 6, HOME_RADIUS + 3, 3,
+                            (SDL_Color){ 150, 160, 176, strength * 90 / 255 },
+                            (SDL_Color){ 244, 247, 250, strength } );
     }
     ui_rounded( ui, x, y, w, h, HOME_RADIUS, (SDL_Color){ 30, 33, 36, 255 } );
     if (p->icon && p->icon_is_art) draw_cover( ui, p, rect, HOME_RADIUS, 225 + (int)(30 * focus), 255 );
@@ -1655,7 +1673,7 @@ static int start_program( struct launcher *l, struct program *p, char *target, s
 
         snprintf( message, sizeof(message),
                   "%s is linked for a fixed address in the low 4 GB and carries no relocations, so it can "
-                  "only run where that address exists. This forwarder started Wine-NX with a %d-bit address "
+                  "only run where that address exists. This forwarder started Autorun with a %d-bit address "
                   "space, which begins above it.%s",
                   p->title, l->options->address_space_bits,
                   id && l->options->launch_title ?
@@ -1824,7 +1842,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
             enum launcher_address_space needs = launcher_program_address_space( p->path );
 
             ADD_ROW( ROW_ADDRESS, SECTION_GRAPHICS, "Address space",
-                     "What the game needs of the address space Horizon gives Wine-NX. A game linked for a "
+                     "What the game needs of the address space Horizon gives Autorun. A game linked for a "
                      "fixed address in the low 4 GB runs only under a forwarder made with 32 bits; the "
                      "forwarder decides this, and a game that needs one it was not given is not started." );
             row->adjustable = 1;
@@ -1915,7 +1933,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
                 }
                 if (!describe_program( l, &replacement, selected ))
                 {
-                    ui_message( ui, "Locate executable", "Wine-NX cannot run this executable." );
+                    ui_message( ui, "Locate executable", "Autorun cannot run this executable." );
                     break;
                 }
                 snprintf( p->path, sizeof(p->path), "%s", replacement.path );
@@ -2138,14 +2156,14 @@ static const struct { const char *name, *value, *help; } credits[] =
     { "dolphin-nx", "NaGaa95, reference",
       "https://github.com/NaGaa95/dolphin-nx\nA Nintendo Switch port used as a platform reference." },
     { "Atmosphere", "Atmosphere-NX, reference",
-      "https://github.com/Atmosphere-NX/Atmosphere\nIts kernel source is how Wine-NX learns what Horizon's memory calls allow." },
+      "https://github.com/Atmosphere-NX/Atmosphere\nIts kernel source is how Autorun learns what Horizon's memory calls allow." },
     { "tico-dolphin", "ticohq, reference",
       "https://github.com/ticohq/tico-dolphin\nJIT and exception handling on Horizon." },
     { "WineBox64 NX", "Ibnuard, reference",
       "https://github.com/Ibnuard/winebox64_nx\nA proof of concept running x86-64 Wine under Box64 on Horizon; "
-      "reference for Wine-NX's Box64 and libnx integration." },
+      "reference for Autorun's Box64 and libnx integration." },
     { "sphaira", "ITotalJustice, NaGaa95",
-      "https://github.com/NaGaa95/sphaira\nForwarders that start Wine-NX with a 32-bit address space." },
+      "https://github.com/NaGaa95/sphaira\nForwarders that start Autorun with a 32-bit address space." },
 };
 #define CREDIT_COUNT (sizeof(credits) / sizeof(credits[0]))
 
@@ -2249,7 +2267,7 @@ static void settings_menu( struct launcher *l )
         rows[SET_VERSION].adjustable = 0;
         snprintf( rows[SET_CREDITS].label, sizeof(rows[0].label), "Credits" );
         snprintf( rows[SET_CREDITS].value, sizeof(rows[0].value), "Wine, Box64, DXVK, Mesa..." );
-        rows[SET_CREDITS].help = "The projects and platform references used by Wine-NX.";
+        rows[SET_CREDITS].help = "The projects and platform references used by Autorun.";
         rows[SET_CREDITS].adjustable = 0;
 
         action = ui_settings_run( ui, &list, "Settings", NULL, sections,
@@ -2501,7 +2519,7 @@ static int add_game( struct launcher *l )
     }
     if (!describe_program( l, &program, path ))
     {
-        ui_message( &l->ui, "Add Game", "Wine-NX cannot run this executable." );
+        ui_message( &l->ui, "Add Game", "Autorun cannot run this executable." );
         return -1;
     }
     snprintf( message, sizeof(message), "%s\n\n%s\n\nAdd this game to your library?", program.title, program.dos );
@@ -2652,13 +2670,11 @@ static int run_library( struct launcher *l, char *target, size_t size )
 
                     if (to_home != home) ui_start_screen( ui );
                     home = to_home;
-                    l->zone = ZONE_CONTENT;
+                    /* The view changes under it; what the D-pad is on does not,
+                     * so the next press still moves along the header. */
                     input.button = UI_NONE;
                     break;
                 }
-                case SHELL_ADD:
-                    input.button = UI_X;
-                    break;
                 default:
                     settings_menu( l );
                     rebuild_lists( l, keep );
@@ -2786,7 +2802,7 @@ static int run_library( struct launcher *l, char *target, size_t size )
                     l->zone = ZONE_CONTENT;
                     break;
                 }
-                if (ui_confirm( ui, "Quit", "Close Wine-NX and go back to the Homebrew Menu?", "Quit" )) return 0;
+                if (ui_confirm( ui, "Quit", "Close Autorun and go back to the Homebrew Menu?", "Quit" )) return 0;
                 ui_start_screen( ui );
                 break;
             }

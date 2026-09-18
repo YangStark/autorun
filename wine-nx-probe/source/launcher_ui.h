@@ -166,6 +166,9 @@ SDL_Texture *ui_svg_texture( struct ui *ui, const char *d, float view_x, float v
 int  ui_text_width( struct ui *ui, TTF_Font *font, const char *text );
 void ui_text( struct ui *ui, TTF_Font *font, int x, int y, const char *text, SDL_Color color );
 void ui_text_centered( struct ui *ui, TTF_Font *font, int cx, int y, const char *text, SDL_Color color );
+/* Text on its way in or out: at open 1 all of it, at 0 none, and between the
+ * two revealed from the left and faded, for a label that comes and goes. */
+void ui_text_opening( struct ui *ui, TTF_Font *font, int x, int y, const char *text, SDL_Color color, float open );
 void ui_text_right( struct ui *ui, TTF_Font *font, int right, int y, const char *text, SDL_Color color );
 /* Text cut to max_width with an ellipsis, or, when scroll is set, moving back and forth. */
 void ui_text_fit( struct ui *ui, TTF_Font *font, int x, int y, int max_width, const char *text,
@@ -215,6 +218,10 @@ struct ui_list
 {
     int selection, top;
     int started;
+    /* How far the rows have slid, eased toward top * ROW_HEIGHT so the list
+     * scrolls under the highlight instead of jumping a row at a time. */
+    float scroll;
+    int started_scroll;
     /* ui_settings_run: whether the sections or the rows have the focus, and
      * whether the row in focus is being changed rather than moved between. */
     int in_rows;
