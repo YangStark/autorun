@@ -787,8 +787,11 @@ void ui_header_back( struct ui *ui, const char *title, const char *context )
         ui_rounded( ui, x + i, cy + i, 2, 2, 1, ui->value );
     }
     ui_fill( ui, x + 2, cy - 1, 18, 2, ui->value );
-    ui_text( ui, ui->normal, x + 38, cy - TTF_FontHeight( ui->normal ) / 2, title, ui->value );
-    x += 38 + ui_text_width( ui, ui->normal, title ) + 20;
+    /* Room around it for the light to go round, when the cursor is on it. */
+    if (ui->back_focused)
+        ui_animated_border( ui, x - 14, cy - 22, 48, 44, 14, 2, UI_FOCUS_DIM, UI_FOCUS_LIT );
+    ui_text( ui, ui->normal, x + 50, cy - TTF_FontHeight( ui->normal ) / 2, title, ui->value );
+    x += 50 + ui_text_width( ui, ui->normal, title ) + 20;
     if (context && context[0])
     {
         int room = ui->width - 300 - x;
@@ -1391,9 +1394,12 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
             case UI_DOWN: direction = 1; break;
             case UI_L: list->selection = list->selection - visible < 0 ? 0 : list->selection - visible; break;
             case UI_R: list->selection = list->selection + visible >= count ? count - 1 : list->selection + visible; break;
-            case UI_LEFT: if (!row->disabled && row->adjustable) return UI_ACTION_LEFT; break;
-            case UI_RIGHT: if (!row->disabled && row->adjustable) return UI_ACTION_RIGHT; break;
-            case UI_A: if (!row->disabled) return UI_ACTION_CHOOSE; break;
+            case UI_LEFT: if (!list->in_header && !row->disabled && row->adjustable) return UI_ACTION_LEFT; break;
+            case UI_RIGHT: if (!list->in_header && !row->disabled && row->adjustable) return UI_ACTION_RIGHT; break;
+            case UI_A:
+                if (list->in_header) return UI_ACTION_BACK;
+                if (!row->disabled) return UI_ACTION_CHOOSE;
+                break;
             case UI_B: return UI_ACTION_BACK;
             case UI_Y: if (can_reset && !row->disabled && row->adjustable) return UI_ACTION_RESET; break;
             case UI_X:
@@ -1405,13 +1411,19 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
                 break;
             }
             /* The ends of the list stop: rolling round to the far end, and
-             * scrolling the whole way to get there, is not what a list does. */
+             * scrolling the whole way to get there, is not what a list does.
+             * Above the first row is the arrow back. */
             if (direction)
             {
                 int next = list->selection + direction;
 
-                while (next >= 0 && next < count && rows[next].disabled) next += direction;
-                if (next >= 0 && next < count) list->selection = next;
+                if (list->in_header) { if (direction > 0) list->in_header = 0; }
+                else
+                {
+                    while (next >= 0 && next < count && rows[next].disabled) next += direction;
+                    if (next >= 0 && next < count) list->selection = next;
+                    else if (direction < 0) list->in_header = 1;
+                }
             }
         }
         if (!ui->running) break;
@@ -1441,7 +1453,9 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
         }
         ui_gradient( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 3, 6, 10, 156 },
                      (SDL_Color){ 3, 6, 10, 20 }, 1 );
+        ui->back_focused = list->in_header;
         ui_header_back( ui, title, context );
+        ui->back_focused = 0;
         column_w = ui->width - UI_HEADER_MARGIN - column_x;
         /* A list long enough to scroll gives the bar its room out of its own
          * width, so the bar stays inside the margin rather than past it. */
@@ -1465,7 +1479,7 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
             any_adjustable |= rows[i].adjustable && !rows[i].disabled;
             /* Nothing is filled: what has the focus is outlined, so the colour
              * on the screen is the artwork's and the text's. */
-            if (current)
+            if (current && !list->in_header)
                 ui_animated_border( ui, column_x, (int)bar - 1, column_w, ROW_HEIGHT - 6, 12, 2,
                                     UI_FOCUS_DIM, UI_FOCUS_LIT );
             ui_text_fit( ui, ui->normal, column_x + ROW_PADDING, text_y, label_w, rows[i].label, color, current );
@@ -1486,12 +1500,21 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
                                              ((count - visible) * ROW_HEIGHT)),
                         5, thumb, 3, ui->selection );
         }
-        if (any_adjustable) hints[hint_count++] = (struct ui_hint){ UI_LEFT, NULL };
-        if (any_adjustable) hints[hint_count++] = (struct ui_hint){ UI_RIGHT, "Change" };
-        if (!row->disabled) hints[hint_count++] = (struct ui_hint){ UI_A, row->adjustable ? "Next" : "Choose" };
-        if (row->help) hints[hint_count++] = (struct ui_hint){ UI_X, "Info" };
-        if (can_reset && row->adjustable && !row->disabled) hints[hint_count++] = (struct ui_hint){ UI_Y, "Default" };
-        hints[hint_count++] = (struct ui_hint){ UI_B, "Back" };
+        if (list->in_header)
+        {
+            hints[hint_count++] = (struct ui_hint){ UI_A, "Back" };
+            hints[hint_count++] = (struct ui_hint){ UI_DOWN, "List" };
+        }
+        else
+        {
+            if (any_adjustable) hints[hint_count++] = (struct ui_hint){ UI_LEFT, NULL };
+            if (any_adjustable) hints[hint_count++] = (struct ui_hint){ UI_RIGHT, "Change" };
+            if (!row->disabled) hints[hint_count++] = (struct ui_hint){ UI_A, row->adjustable ? "Next" : "Choose" };
+            if (row->help) hints[hint_count++] = (struct ui_hint){ UI_X, "Info" };
+            if (can_reset && row->adjustable && !row->disabled)
+                hints[hint_count++] = (struct ui_hint){ UI_Y, "Default" };
+            hints[hint_count++] = (struct ui_hint){ UI_B, "Back" };
+        }
         ui_hints_right( ui, hints, hint_count, ui->width - 34, ui->height - 34 );
         ui_fade( ui );
         ui_present( ui );
@@ -1636,14 +1659,16 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
             case UI_LEFT:
                 /* Holding a value, left changes it; otherwise it is the way back
                  * to the sections. */
-                if (list->editing) return UI_ACTION_LEFT;
+                if (list->editing || list->in_header) { if (list->editing) return UI_ACTION_LEFT; break; }
                 if (list->in_rows) list->in_rows = 0;
                 break;
             case UI_RIGHT:
                 if (list->editing) return UI_ACTION_RIGHT;
+                if (list->in_header) break;
                 if (!list->in_rows && shown) list->in_rows = 1;
                 break;
             case UI_A:
+                if (list->in_header) return UI_ACTION_BACK;
                 if (!list->in_rows) { if (shown) list->in_rows = 1; break; }
                 if (row->disabled) break;
                 /* A switch turns over where it stands. A row with a value of its
@@ -1654,7 +1679,7 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
                 return UI_ACTION_CHOOSE;
             case UI_B:
                 if (list->editing) { list->editing = 0; break; }
-                if (list->in_rows) { list->in_rows = 0; break; }
+                if (!list->in_header && list->in_rows) { list->in_rows = 0; break; }
                 return UI_ACTION_BACK;
             case UI_Y:
                 if (can_reset && list->in_rows && !row->disabled && row->adjustable) return UI_ACTION_RESET;
@@ -1670,19 +1695,29 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
             (void)section;
             if (direction && !list->editing)
             {
-                if (!list->in_rows)
+                /* Up out of the top of whichever pane has the focus lands on the
+                 * arrow back, and down comes off it again. */
+                if (list->in_header)
                 {
-                    *group = (*group + direction + group_count) % group_count;
-                    list->selection = list->top = 0;
-                    break;  /* the section's rows are gathered again next frame */
+                    if (direction > 0) list->in_header = 0;
+                }
+                else if (!list->in_rows)
+                {
+                    if (direction < 0 && !*group) list->in_header = 1;
+                    else if (*group + direction >= 0 && *group + direction < group_count)
+                    {
+                        *group += direction;
+                        list->selection = list->top = 0;
+                        break;  /* the section's rows are gathered again next frame */
+                    }
                 }
                 else
                 {
-                    int next = list->selection;
+                    int next = list->selection + direction;
 
-                    do next = (next + direction + shown) % shown;
-                    while (rows[index[next]].disabled && next != list->selection);
-                    list->selection = next;
+                    while (next >= 0 && next < shown && rows[index[next]].disabled) next += direction;
+                    if (next >= 0 && next < shown) list->selection = next;
+                    else if (direction < 0) list->in_header = 1;
                 }
             }
         }
@@ -1696,7 +1731,9 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
         ui_background( ui );
         ui_gradient( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 3, 6, 10, 156 },
                      (SDL_Color){ 3, 6, 10, 20 }, 1 );
+        ui->back_focused = list->in_header;
         ui_header_back( ui, title, context );
+        ui->back_focused = 0;
         /* The rows reach the margin the battery's reading ends at, as the
          * header's own content does. */
         controls_right = ui->width - UI_HEADER_MARGIN;
@@ -1712,7 +1749,7 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
 
             /* Only what has the focus is framed, so there is one highlight on
              * the screen and it is plain which arrows do what. */
-            if (i == *group && !list->in_rows)
+            if (i == *group && !list->in_rows && !list->in_header)
                 ui_animated_border( ui, SET_SIDEBAR_X, y + 2, SET_SIDEBAR_W, SET_GROUP_H - 8, 12, 2,
                                     UI_FOCUS_DIM, UI_FOCUS_LIT );
             ui_text_fit( ui, ui->normal, SET_SIDEBAR_X + SET_SIDEBAR_PAD, text_y,
@@ -1741,7 +1778,7 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
              * right now change it rather than move away from it. */
             /* Held for changing, the ribbon thickens: the same light, plainly
              * around something the arrows now act on. */
-            if (current && list->in_rows)
+            if (current && list->in_rows && !list->in_header)
                 ui_animated_border( ui, SET_ROW_X, box_y, row_w, box_h, 12, list->editing ? 4 : 2,
                                     UI_FOCUS_DIM, UI_FOCUS_LIT );
 
@@ -1789,7 +1826,12 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
                         5, thumb, 3, ui->selection );
         }
         (void)any_adjustable;
-        if (list->editing)
+        if (list->in_header)
+        {
+            hints[hint_count++] = (struct ui_hint){ UI_A, "Back" };
+            hints[hint_count++] = (struct ui_hint){ UI_DOWN, "Settings" };
+        }
+        else if (list->editing)
         {
             hints[hint_count++] = (struct ui_hint){ UI_LEFT, NULL };
             hints[hint_count++] = (struct ui_hint){ UI_RIGHT, "Change" };

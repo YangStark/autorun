@@ -98,6 +98,8 @@ struct ui
     /* Where the left of the clock and the battery came out, so that nothing a
      * screen draws on the right stands underneath them. */
     int status_left;
+    /* Whether the arrow back has the focus, for the header to frame it. */
+    int back_focused;
 
     SDL_GameController *controller;
     int held;
@@ -232,6 +234,8 @@ struct ui_list
      * whether the row in focus is being changed rather than moved between. */
     int in_rows;
     int editing;
+    /* Whether the focus has gone up to the arrow back in the header. */
+    int in_header;
 };
 
 enum ui_action
