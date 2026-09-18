@@ -1521,6 +1521,102 @@ enum program_row
 };
 
 static int file_browser_pick( struct launcher *l, char *target, size_t size );
+/* Making one. The console gives a program its address space when it creates the
+ * process, so the only way to have a 32-bit one is to be opened by an entry that
+ * asked for it: this builds that entry and installs it. */
+static void make_forwarder( struct launcher *l )
+{
+    static const struct { int bits; const char *label, *name, *help; } kinds[] =
+    {
+        { 32, "32-bit", "Autorun 32-bit",
+          "The low 4 GB, which a game linked for a fixed address there needs. Named as the 32-bit forwarder "
+          "as soon as it is made, so games that need it are sent to it." },
+        { 36, "Default (36-bit)", "Autorun",
+          "The address space Autorun runs in from the Homebrew Menu, for everything else. Worth having so "
+          "Autorun has an entry of its own on the home menu." },
+    };
+    struct ui *ui = &l->ui;
+    struct ui_row rows[2];
+    struct ui_list list = {0};
+    char message[768];
+    const char *step = NULL;
+    unsigned long long id = 0;
+    unsigned int rc;
+    int i;
+
+    if (!l->options->install_forwarder) return;
+
+    /* A forwarder is an entry in the console's own list of installed
+     * applications, which is what Nintendo's servers are shown. Say so before
+     * anything is written, and say which system memory this is. */
+    snprintf( message, sizeof(message),
+              "A forwarder is installed as an application, in the same list the console reports when it goes "
+              "online. Consoles have been banned for homebrew entries in that list.\n\n%s\n\n"
+              "Make one only on an emuMMC, and keep that emuMMC offline.",
+              l->options->emummc > 0 ?
+              "This console booted from an emuMMC, which is where a forwarder belongs." :
+              l->options->emummc == 0 ?
+              "This console booted from its real system memory, not an emuMMC. A forwarder made here goes "
+              "into the list the console reports." :
+              "Atmosphere did not say which system memory this console booted from, so Autorun cannot tell "
+              "whether this is an emuMMC." );
+    if (!ui_confirm( ui, "Forwarders and bans", message, "I understand" ))
+    {
+        ui_start_screen( ui );
+        return;
+    }
+    ui_start_screen( ui );
+
+    memset( rows, 0, sizeof(rows) );
+    for (i = 0; i < 2; i++)
+    {
+        snprintf( rows[i].label, sizeof(rows[i].label), "%s", kinds[i].label );
+        snprintf( rows[i].value, sizeof(rows[i].value), "%s", kinds[i].name );
+        rows[i].help = kinds[i].help;
+    }
+    if (ui_list_run( ui, &list, "Make a forwarder", l->options->nro_path, rows, 2, 0 ) != UI_ACTION_CHOOSE)
+    {
+        ui_start_screen( ui );
+        return;
+    }
+    i = list.selection;
+
+    /* One frame saying what is happening: building the three parts and writing
+     * them takes a moment, and nothing is drawn while it does. */
+    ui_background( ui );
+    ui_header_back( ui, "Make a forwarder", kinds[i].name );
+    ui_text_centered( ui, ui->large, ui->width / 2, ui->height / 2 - 30, "Making the forwarder...", ui->value );
+    ui_present( ui );
+
+    rc = l->options->install_forwarder( kinds[i].bits, kinds[i].name, &id, &step );
+    ui_start_screen( ui );
+    if (rc)
+    {
+        snprintf( message, sizeof(message),
+                  "The console refused while %s. It returned 0x%X.\n\nThe forwarder is written where the "
+                  "console keeps installed applications, which needs Atmosphere.",
+                  step ? step : "working", rc );
+        ui_message( ui, "Could not make the forwarder", message );
+        ui_start_screen( ui );
+        return;
+    }
+    if (kinds[i].bits == 32)
+    {
+        char value[32];
+
+        snprintf( value, sizeof(value), "%016llX", id );
+        launcher_kv_set( &l->look, "forwarder-32bit", value );
+        launcher_kv_set( &l->look, "forwarder-32bit-name", kinds[i].name );
+    }
+    snprintf( message, sizeof(message),
+              "%s is on the home menu.%s\n\nOpening Autorun from it starts it in that address space; the "
+              "Homebrew Menu always gives the one this console defaults to.",
+              kinds[i].name,
+              kinds[i].bits == 32 ? " Games that need the low 4 GB are sent to it from now on." : "" );
+    ui_message( ui, "Forwarder made", message );
+    ui_start_screen( ui );
+}
+
 static void save_look( struct launcher *l );
 
 static void download_artwork( struct launcher *l, struct program *p )
@@ -1650,6 +1746,24 @@ static int address_space_fits( struct launcher *l, struct program *p )
            program_address_space( p ) != LAUNCHER_ADDRESS_LOW;
 }
 
+/* The forwarder named under Settings, and whether the console still has it.
+ * name comes back as what it was called when it was named. */
+static unsigned long long chosen_forwarder( struct launcher *l, char *name, size_t size, int *installed )
+{
+    char value[64] = "";
+    unsigned long long id;
+
+    if (name && size) name[0] = 0;
+    if (installed) *installed = 0;
+    if (!launcher_kv_get( &l->look, "forwarder-32bit", value, sizeof(value) ) || !value[0]) return 0;
+    if (!(id = strtoull( value, NULL, 16 ))) return 0;
+    if (name && size && (!launcher_kv_get( &l->look, "forwarder-32bit-name", name, size ) || !name[0]))
+        snprintf( name, size, "%s", value );
+    /* Without the console to ask, take it on trust rather than refuse. */
+    if (installed) *installed = !l->options->title_installed || l->options->title_installed( id );
+    return id;
+}
+
 static int start_program( struct launcher *l, struct program *p, char *target, size_t size )
 {
     struct ui *ui = &l->ui;
@@ -1663,28 +1777,26 @@ static int start_program( struct launcher *l, struct program *p, char *target, s
     }
     if (!address_space_fits( l, p ))
     {
-        char message[640], forwarder[64] = "", name[128] = "";
-        unsigned long long id = 0;
+        char message[640], name[128] = "";
+        int installed = 0;
+        unsigned long long id = chosen_forwarder( l, name, sizeof(name), &installed );
 
-        if (launcher_kv_get( &l->look, "forwarder-32bit", forwarder, sizeof(forwarder) ) && forwarder[0])
-            id = strtoull( forwarder, NULL, 16 );
-        if (!launcher_kv_get( &l->look, "forwarder-32bit-name", name, sizeof(name) ) || !name[0])
-            snprintf( name, sizeof(name), "%s", forwarder );
-
-        snprintf( message, sizeof(message),
-                  "%s is linked for a fixed address in the low 4 GB and carries no relocations, so it can "
-                  "only run where that address exists. This forwarder started Autorun with a %d-bit address "
-                  "space, which begins above it.%s",
-                  p->title, l->options->address_space_bits,
-                  id && l->options->launch_title ?
-                  " The console can close this forwarder and open the 32-bit one, which starts the game by "
-                  "itself." :
-                  " Open the game from a forwarder made with a 32-bit address space, or name that forwarder "
-                  "under Settings and it will be offered here. Address space under Game Options says what a "
-                  "game needs." );
-        if (!id || !l->options->launch_title || !ui_confirm( ui, "Needs a 32-bit forwarder", message, "Open it there" ))
+        /* Named, still installed, and the console will open it: nothing to ask
+         * about -- the game goes there. */
+        if (!id || !installed || !l->options->launch_title)
         {
-            if (!id || !l->options->launch_title) ui_message( ui, "Needs a 32-bit forwarder", message );
+            snprintf( message, sizeof(message),
+                      "%s is linked for a fixed address in the low 4 GB and carries no relocations, so it can "
+                      "only run where that address exists. This forwarder started Autorun with a %d-bit address "
+                      "space, which begins above it.%s",
+                      p->title, l->options->address_space_bits,
+                      id && !installed ?
+                      " The 32-bit forwarder named under Settings is not installed any more. Name one that is, "
+                      "or make a new one, and the game will be sent there." :
+                      " Open the game from a forwarder made with a 32-bit address space, or name that forwarder "
+                      "under Settings and it will be sent there. Address space under Game Options says what a "
+                      "game needs." );
+            ui_message( ui, "Needs a 32-bit forwarder", message );
             return 0;
         }
         /* The game goes on the card before the forwarder is asked for, because
@@ -2052,7 +2164,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 enum settings_row
 {
     SET_HIDDEN, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_STEAMGRIDDB,
-    SET_FORWARDER, SET_VERSION,
+    SET_FORWARDER, SET_MAKE_FORWARDER, SET_VERSION,
     SET_CREDITS, SETTINGS_ROWS
 };
 
@@ -2216,7 +2328,8 @@ static void settings_menu( struct launcher *l )
             [SET_VERBOSE] = SET_SECTION_DEFAULTS, [SET_PROFILE] = SET_SECTION_DEFAULTS,
             [SET_WINDOWS] = SET_SECTION_DEFAULTS,
             [SET_STEAMGRIDDB] = SET_SECTION_ARTWORK,
-            [SET_FORWARDER] = SET_SECTION_SYSTEM, [SET_VERSION] = SET_SECTION_SYSTEM,
+            [SET_FORWARDER] = SET_SECTION_SYSTEM, [SET_MAKE_FORWARDER] = SET_SECTION_SYSTEM,
+            [SET_VERSION] = SET_SECTION_SYSTEM,
             [SET_CREDITS] = SET_SECTION_SYSTEM,
         };
 
@@ -2253,14 +2366,30 @@ static void settings_menu( struct launcher *l )
         rows[SET_STEAMGRIDDB].help = "Used to automatically download the community's highest-rated square, portrait and hero artwork.";
         rows[SET_STEAMGRIDDB].adjustable = 0;
         snprintf( rows[SET_FORWARDER].label, sizeof(rows[0].label), "32-bit forwarder" );
-        snprintf( rows[SET_FORWARDER].value, sizeof(rows[0].value), "%s",
-                  launcher_kv_get( &l->look, "forwarder-32bit-name", path, sizeof(path) ) && path[0] ? path :
-                  launcher_kv_get( &l->look, "forwarder-32bit", path, sizeof(path) ) && path[0] ? path : "Not set" );
+        {
+            char name[128];
+            int installed;
+
+            if (!chosen_forwarder( l, name, sizeof(name), &installed ))
+                snprintf( rows[SET_FORWARDER].value, sizeof(rows[0].value), "Not set" );
+            else
+                snprintf( rows[SET_FORWARDER].value, sizeof(rows[0].value), "%s%s", name,
+                          installed ? "" : " (gone)" );
+        }
         rows[SET_FORWARDER].help = "The forwarder made with a 32-bit address space, for games that need the low "
                                    "4 GB. A game that needs it is offered to that forwarder, which the console "
                                    "opens in this one's place and which starts the game by itself.";
         rows[SET_FORWARDER].adjustable = 0;
         rows[SET_FORWARDER].disabled = !l->options->list_titles || !l->options->launch_title;
+        snprintf( rows[SET_MAKE_FORWARDER].label, sizeof(rows[0].label), "Make a forwarder" );
+        snprintf( rows[SET_MAKE_FORWARDER].value, sizeof(rows[0].value), "%s",
+                  l->options->install_forwarder ? "32-bit or default" : "Unavailable" );
+        rows[SET_MAKE_FORWARDER].help = "Installs an entry on the home menu that opens Autorun in the address "
+                                        "space it was made with. A 32-bit one is what a game linked for the low "
+                                        "4 GB needs, and it is named above as soon as it is made. Only on an "
+                                        "emuMMC: an installed entry is what the console reports online.";
+        rows[SET_MAKE_FORWARDER].adjustable = 0;
+        rows[SET_MAKE_FORWARDER].disabled = !l->options->install_forwarder;
         snprintf( rows[SET_VERSION].label, sizeof(rows[0].label), "Runtime" );
         snprintf( rows[SET_VERSION].value, sizeof(rows[0].value), "%s", l->options->build );
         rows[SET_VERSION].disabled = 1;
@@ -2310,6 +2439,9 @@ static void settings_menu( struct launcher *l )
         }
         case SET_FORWARDER:
             if (action == UI_ACTION_CHOOSE) choose_forwarder( l );
+            break;
+        case SET_MAKE_FORWARDER:
+            if (action == UI_ACTION_CHOOSE) make_forwarder( l );
             break;
 
         case SET_CREDITS:

@@ -79,6 +79,10 @@ struct ui
     int width, height;
     TTF_Font *small, *normal, *large;
     SDL_Texture *glow, *sheen;
+    /* The frame is drawn into screen and copied out at the end of it, so that a
+     * modal can keep the screen it opened over in snapshot and dim it. Either
+     * may be NULL, and then a modal simply has no screen behind it. */
+    SDL_Texture *screen, *snapshot;
     SDL_Texture *glyphs[16];
 
     int animations;

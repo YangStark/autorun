@@ -23,6 +23,7 @@
 #include "unix_private.h"
 #include "horizon_private.h"
 #include "launcher.h"
+#include "forwarder.h"
 #include "launcher_list.h"
 #include "launcher_settings.h"
 #include "pointer_cursor.h"
@@ -51,7 +52,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-180"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-181"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -2751,6 +2752,74 @@ static int launcher_titles( struct wine_nx_launcher_title *titles, int max )
     return written;
 }
 
+/* Which system memory the console booted from. Atmosphere answers through a
+ * configuration item of its own; without it there is no way to tell, and the
+ * caller says so rather than guessing. */
+static int runtime_on_emummc( void )
+{
+    const SplConfigItem ExosphereEmummcType = (SplConfigItem)65007;
+    u64 type = 0;
+    int result = -1;
+
+    if (R_SUCCEEDED( splInitialize() ))
+    {
+        if (R_SUCCEEDED( splGetConfig( ExosphereEmummcType, &type ) )) result = type != 0;
+        splExit();
+    }
+    return result;
+}
+
+/* Build a forwarder that starts this NRO in the address space bits asks for,
+ * and install it, so a game that needs the low 4 GB has somewhere to go. */
+static unsigned int launcher_install_forwarder( int bits, const char *name, unsigned long long *id,
+                                                const char **step )
+{
+    struct wine_nx_forwarder request =
+    {
+        .nro_path = own_nro,
+        .args = NULL,
+        .name = name,
+        .author = "Autorun",
+        .address_space = bits == 32 ? WINE_NX_SPACE_32BIT : WINE_NX_SPACE_36BIT,
+        .icon = bits == 32 ? wine_nx_icon_32bit : wine_nx_icon_any,
+        .icon_size = bits == 32 ? wine_nx_icon_32bit_size : wine_nx_icon_any_size,
+    };
+    unsigned int rc;
+
+    if (id) *id = wine_nx_forwarder_title_id( own_nro, NULL );
+    rc = wine_nx_forwarder_install( &request, step );
+    log_line( "[LAUNCHER] %d-bit forwarder %016llx: rc=0x%x%s%s", bits,
+              id ? *id : 0ull, rc, rc && step && *step ? " at " : "", rc && step && *step ? *step : "" );
+    return rc;
+}
+
+/* Whether an application is still installed. The records alone answer it, so
+ * this does not ask the console for every application's name as the listing
+ * above does. */
+static int launcher_title_installed( unsigned long long id )
+{
+    NsApplicationRecord *records;
+    const int page = 64;
+    s32 offset = 0, found = 0;
+    int installed = 0;
+
+    if (!id) return 0;
+    if (!(records = calloc( page, sizeof(*records) ))) return 0;
+    if (R_SUCCEEDED( nsInitialize() ))
+    {
+        do
+        {
+            if (R_FAILED( nsListApplicationRecord( records, page, offset, &found ) )) break;
+            for (s32 i = 0; i < found && !installed; i++)
+                if (records[i].application_id == id) installed = 1;
+            offset += found;
+        } while (found == page && !installed);
+        nsExit();
+    }
+    free( records );
+    return installed;
+}
+
 /* Asks the console to close this application and open that one. */
 static int launcher_launch_title( unsigned long long id )
 {
@@ -2894,12 +2963,16 @@ int main( int argc, char **argv )
         struct wine_nx_launcher_options options =
         {
             .runtime_dir = RUNTIME_DIR,
+            .nro_path = own_nro,
+            .emummc = runtime_on_emummc(),
             .build = WINE_NX_RUNTIME_BUILD,
             .machine_of = launcher_machine,
             .address_space_bits = runtime_address_space_bits(),
             .title_id = runtime_title_id(),
             .list_titles = launcher_titles,
             .launch_title = launcher_launch_title,
+            .title_installed = launcher_title_installed,
+            .install_forwarder = launcher_install_forwarder,
 #ifdef WINE_NX_MESA_SWITCH
             .vulkan = 1,
 #endif

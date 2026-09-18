@@ -588,8 +588,21 @@ target_link_options(wine-nx-ntdll-file-smoke PRIVATE -Wl,--gc-sections)
 
 target_link_libraries(wine-nx-ntdll-file-smoke PRIVATE nx)
 
+# The homebrew loader a forwarder is built around: the same nx-hbloader sphaira
+# uses, built here as the exefs of the program NCA the launcher installs. Its
+# own address space is patched into the NPDM when a forwarder is made.
+add_executable(wine-nx-hbl
+    hbl/source/main.c
+    hbl/source/trampoline.s
+)
+set_target_properties(wine-nx-hbl PROPERTIES SUFFIX ".elf" C_STANDARD 11 C_EXTENSIONS ON)
+target_compile_definitions(wine-nx-hbl PRIVATE VERSION="3.0.0")
+target_link_options(wine-nx-hbl PRIVATE -Wl,-wrap,exit)
+target_link_libraries(wine-nx-hbl PRIVATE nx)
+
 add_executable(wine-nx-runtime
     source/runtime.c
+    "${CMAKE_CURRENT_BINARY_DIR}/forwarder_embed.c"
     source/launcher.c
     source/launcher_catalog.c
     source/launcher_console.c
@@ -607,6 +620,7 @@ add_executable(wine-nx-runtime
     source/compositor.c
     source/compositor_gl.c
     source/compositor_egl.c
+    source/forwarder.c
     $<TARGET_OBJECTS:wine-horizon-real>
     $<TARGET_OBJECTS:wine-server-real>
     $<TARGET_OBJECTS:wine-sync-real>
@@ -632,6 +646,47 @@ add_executable(wine-nx-runtime
 )
 
 set_target_properties(wine-nx-runtime PROPERTIES SUFFIX ".elf")
+
+# What the launcher carries to build a forwarder with: the loader's exefs and
+# the icons the console shows for each of the two it can make.
+find_program(ELF2NSO elf2nso HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")
+find_program(NPDMTOOL npdmtool HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")
+if(ELF2NSO AND NPDMTOOL)
+    set(HBL_NSO "${CMAKE_CURRENT_BINARY_DIR}/hbl-main")
+    set(HBL_NPDM "${CMAKE_CURRENT_BINARY_DIR}/hbl-main.npdm")
+    add_custom_command(
+        OUTPUT "${HBL_NSO}"
+        COMMAND "${ELF2NSO}" "$<TARGET_FILE:wine-nx-hbl>" "${HBL_NSO}"
+        DEPENDS wine-nx-hbl
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${HBL_NPDM}"
+        COMMAND "${NPDMTOOL}" "${CMAKE_CURRENT_SOURCE_DIR}/hbl/hbl.json" "${HBL_NPDM}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/hbl/hbl.json"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/forwarder_embed.c"
+        COMMAND "${CMAKE_COMMAND}" -E env python3
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/make-embed.py"
+                "${CMAKE_CURRENT_BINARY_DIR}/forwarder_embed.c"
+                wine_nx_hbl_main "${HBL_NSO}"
+                wine_nx_hbl_npdm "${HBL_NPDM}"
+                wine_nx_icon_32bit "${CMAKE_CURRENT_SOURCE_DIR}/assets/autorun-32.jpg"
+                wine_nx_icon_any "${CMAKE_CURRENT_SOURCE_DIR}/assets/autorun.jpg"
+        DEPENDS "${HBL_NSO}" "${HBL_NPDM}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/assets/autorun-32.jpg"
+                "${CMAKE_CURRENT_SOURCE_DIR}/assets/autorun.jpg"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/make-embed.py"
+        VERBATIM
+    )
+else()
+    message(FATAL_ERROR "elf2nso and npdmtool are needed to build the forwarder loader")
+endif()
+# libnx's service macros use C11's static_assert, which the rest of the tree,
+# built as gnu99, does not have.
+set_source_files_properties(source/forwarder.c PROPERTIES COMPILE_OPTIONS "-std=gnu11")
 set_source_files_properties(source/audio_unix.c source/xinput_unix.c PROPERTIES COMPILE_DEFINITIONS WINE_UNIX_LIB)
 target_include_directories(wine-nx-runtime PRIVATE "${WINE_NX_PE_BUILD_DIR}/include")
 

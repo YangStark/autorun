@@ -282,10 +282,24 @@ static void carousel_fixture(void)
     free( pixels ); free( catalog );
 }
 
+/* Nothing can be installed from here: the screens leading to it are what this
+ * harness is for, and the failure they show is the one a console without
+ * Atmosphere would give. */
+static unsigned int install_forwarder( int bits, const char *name, unsigned long long *id, const char **step )
+{
+    (void)bits;
+    (void)name;
+    if (id) *id = 0x0500DEADBEEF1000ull;
+    if (step) *step = "opening the content store";
+    return 0x4A8;
+}
+
 int main( int argc, char **argv )
 {
     struct wine_nx_launcher_options options = { .runtime_dir = "sdmc:/switch/wine", .build = "nx-host-test",
-                                                .machine_of = machine_of, .vulkan = 1 };
+                                                .nro_path = "sdmc:/switch/wine/wine-nx-runtime.nro",
+                                                .emummc = -1, .machine_of = machine_of, .vulkan = 1,
+                                                .install_forwarder = install_forwarder };
     char target[512] = "", line[300];
     FILE *file;
     int chosen;

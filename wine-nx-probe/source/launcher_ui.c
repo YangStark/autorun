@@ -256,6 +256,7 @@ static SDL_Texture *make_glyph( struct ui *ui, const char *label, int pill )
     SDL_Texture *texture = SDL_CreateTexture( ui->renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET,
                                               width, height );
     const SDL_Color disc = { 242, 244, 246, 255 };
+    SDL_Texture *previous = SDL_GetRenderTarget( ui->renderer );
     SDL_Surface *surface;
 
     if (!texture) return NULL;
@@ -278,7 +279,7 @@ static SDL_Texture *make_glyph( struct ui *ui, const char *label, int pill )
         }
         SDL_FreeSurface( surface );
     }
-    SDL_SetRenderTarget( ui->renderer, NULL );
+    SDL_SetRenderTarget( ui->renderer, previous );
     return texture;
 }
 
@@ -354,6 +355,20 @@ int ui_init( struct ui *ui, const void *font_data, size_t font_size, int animati
         goto fail;
     SDL_RenderSetLogicalSize( ui->renderer, ui->width, ui->height );
     SDL_SetRenderDrawBlendMode( ui->renderer, SDL_BLENDMODE_BLEND );
+    /* The frame is drawn into a texture and copied out at the end of it, so a
+     * modal can keep what it opened over and stand on a dimmed copy of it. A
+     * renderer that cannot do this simply leaves both NULL, and a modal has a
+     * plain background instead. */
+    ui->screen = SDL_CreateTexture( ui->renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET,
+                                    ui->width, ui->height );
+    ui->snapshot = SDL_CreateTexture( ui->renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET,
+                                      ui->width, ui->height );
+    if (!ui->screen || !ui->snapshot)
+    {
+        if (ui->screen) SDL_DestroyTexture( ui->screen );
+        if (ui->snapshot) SDL_DestroyTexture( ui->snapshot );
+        ui->screen = ui->snapshot = NULL;
+    }
     ui_step( "fonts" );
     if (!(ui->small = open_font( font_data, font_size, 20 )) || !(ui->normal = open_font( font_data, font_size, 26 )) ||
         !(ui->large = open_font( font_data, font_size, 40 ))) goto fail;
@@ -380,6 +395,8 @@ void ui_quit( struct ui *ui )
         if (ui->glyphs[i]) SDL_DestroyTexture( ui->glyphs[i] );
     if (ui->glow) SDL_DestroyTexture( ui->glow );
     if (ui->sheen) SDL_DestroyTexture( ui->sheen );
+    if (ui->screen) SDL_DestroyTexture( ui->screen );
+    if (ui->snapshot) SDL_DestroyTexture( ui->snapshot );
     if (ui->small) TTF_CloseFont( ui->small );
     if (ui->normal) TTF_CloseFont( ui->normal );
     if (ui->large) TTF_CloseFont( ui->large );
@@ -980,7 +997,17 @@ int ui_begin_frame( struct ui *ui )
     }
     ui->scrolling_text = 0;
     repeat_held( ui );
+    if (ui->screen) SDL_SetRenderTarget( ui->renderer, ui->screen );
     return 1;
+}
+
+/* Keep what is on the screen now, for a modal to dim and stand over. */
+static void ui_keep_screen( struct ui *ui )
+{
+    if (!ui->screen || !ui->snapshot) return;
+    SDL_SetRenderTarget( ui->renderer, ui->snapshot );
+    SDL_RenderCopy( ui->renderer, ui->screen, NULL, NULL );
+    SDL_SetRenderTarget( ui->renderer, ui->screen );
 }
 
 static enum ui_touch feed_touch( struct ui *ui, int type, float x, float y, int *steps )
@@ -1147,6 +1174,11 @@ void (*ui_present_hook)( SDL_Renderer *renderer );
 void ui_present( struct ui *ui )
 {
     ui_draw_toast( ui );
+    if (ui->screen)
+    {
+        SDL_SetRenderTarget( ui->renderer, NULL );
+        SDL_RenderCopy( ui->renderer, ui->screen, NULL, NULL );
+    }
     if (ui_present_hook) ui_present_hook( ui->renderer );
     SDL_RenderPresent( ui->renderer );
 }
@@ -1197,28 +1229,56 @@ void ui_wait( struct ui *ui )
  * Dialogs and lists
  */
 
+/* A modal: the screen it opened over, dimmed, with a panel standing on it.
+ * Without a copy of that screen there is nothing to dim, and it falls back to
+ * the launcher's own background. */
 static void draw_card( struct ui *ui, const char *title, const char *heading, const char *text,
                        const struct ui_hint *hints, int hint_count )
 {
-    /* The same screen as the settings and the lists: the name at the top with
-     * the arrow back, what it has to say below it, and the buttons at the
-     * bottom right. What it says is the screen, not a card laid over one. */
-    const int x = UI_HEADER_MARGIN, w = ui->width - 2 * UI_HEADER_MARGIN;
-    int y = LIST_TOP;
+    const int margin = 40, hints_h = 52;
+    int w = ui->width - 2 * UI_HEADER_MARGIN, x, y, h, lines, title_h, text_w;
 
-    ui_background( ui );
-    ui_gradient( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 3, 6, 10, 156 },
-                 (SDL_Color){ 3, 6, 10, 20 }, 1 );
-    ui_header_back( ui, title, NULL );
-    /* The header already says the name; a heading repeats it only when it says
-     * something else. */
+    if (w > 820) w = 820;
+    text_w = w - 2 * margin;
+    title_h = TTF_FontHeight( ui->large );
+    lines = wrap_text( ui, ui->normal, 0, 0, text_w, 14, text, ui->text, 0, 0 );
+    h = margin + title_h + 20 + lines * (TTF_FontHeight( ui->normal ) + 4) + hints_h + margin / 2;
+    if (heading && strcmp( heading, title )) h += TTF_FontHeight( ui->large ) + 10;
+    x = (ui->width - w) / 2;
+    y = (ui->height - h) / 2;
+    if (y < 40) y = 40;
+
+    if (ui->snapshot)
+    {
+        SDL_RenderCopy( ui->renderer, ui->snapshot, NULL, NULL );
+        ui_fill( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 4, 7, 11, 205 } );
+    }
+    else
+    {
+        ui_background( ui );
+        ui_gradient( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 3, 6, 10, 156 },
+                     (SDL_Color){ 3, 6, 10, 20 }, 1 );
+    }
+
+    /* The panel: a shadow under it so it reads as standing over the screen, the
+     * launcher's own card colour, and the light that goes round what has the
+     * focus -- which, while a modal is up, is the modal. */
+    ui_rounded( ui, x + 6, y + 10, w, h, 22, (SDL_Color){ 0, 0, 0, 120 } );
+    ui_rounded( ui, x, y, w, h, 22, (SDL_Color){ 22, 27, 30, 250 } );
+    ui_rounded_texture( ui, ui_sheen( ui ), NULL, (SDL_Rect){ x, y, w, h / 3 }, 22,
+                        (SDL_Color){ 255, 255, 255, 14 } );
+    ui_animated_border( ui, x, y, w, h, 22, 2, UI_FOCUS_DIM, UI_FOCUS_LIT );
+
+    y += margin;
+    ui_text_fit( ui, ui->large, x + margin, y, text_w, title, ui->value, 0 );
+    y += title_h + 20;
     if (heading && strcmp( heading, title ))
     {
-        ui_text_fit( ui, ui->large, x, LIST_TOP, w, heading, ui->value, 0 );
-        y = LIST_TOP + TTF_FontHeight( ui->large ) + 26;
+        ui_text_fit( ui, ui->large, x + margin, y, text_w, heading, ui->value, 0 );
+        y += TTF_FontHeight( ui->large ) + 10;
     }
-    ui_text_wrapped( ui, ui->normal, x, y, w, 12, text, ui->text, 0 );
-    ui_hints_right( ui, hints, hint_count, ui->width - 34, ui->height - 34 );
+    ui_text_wrapped( ui, ui->normal, x + margin, y, text_w, 14, text, ui->text, 0 );
+    ui_hints_right( ui, hints, hint_count, x + w - margin, y + lines * (TTF_FontHeight( ui->normal ) + 4) + 26 );
     ui_fade( ui );
 }
 
@@ -1227,6 +1287,7 @@ static int run_card( struct ui *ui, const char *title, const char *heading, cons
 {
     struct ui_input input;
 
+    ui_keep_screen( ui );
     ui_start_screen( ui );
     while (ui_begin_frame( ui ))
     {

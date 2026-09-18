@@ -28,6 +28,25 @@ clang -std=gnu11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-
 
 clang -std=gnu11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
     "$probe/tests/launcher_catalog.c" "$probe/source/launcher_catalog.c" -o "$build/launcher_catalog"
+
+# The three NCAs a forwarder is made of, built here and taken apart again: the
+# loader's NPDM comes out of whichever build dir has one, since it is what the
+# address space is patched into.
+npdm=""
+for dir in build-switch-wow64-dynarec build-switch-wow64-mesa-switch build-switch-wow64; do
+    [ -f "$probe/$dir/hbl-main.npdm" ] && { npdm="$probe/$dir/hbl-main.npdm"; break; }
+done
+if [ -n "$npdm" ]; then
+    mkdir -p "$build/switch-shim" "$build/ncas"
+    cp "$probe/tests/switch_shim.h" "$build/switch-shim/switch.h"
+    clang -std=gnu11 -Wall -Wextra -Werror -Wno-unused-parameter -O1 -g \
+        -fsanitize=address,undefined -fno-omit-frame-pointer \
+        -I "$probe/tests" -I "$build/switch-shim" \
+        "$probe/tests/forwarder_build.c" -o "$build/forwarder_build"
+    "$build/forwarder_build" "$npdm" "$probe/assets/autorun-32.jpg" "$build/ncas"
+else
+    echo "forwarder: skipped, no hbl-main.npdm in any build directory"
+fi
 "$build/launcher_catalog"
 
 clang -std=gnu11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
