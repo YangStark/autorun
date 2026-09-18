@@ -43,6 +43,7 @@
 #define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
+#include "wine/asm.h"
 #include "wine/debug.h"
 #include "wine/rbtree.h"
 #include "unix_private.h"
@@ -245,6 +246,79 @@ static void horizon_resume_exception( ThreadExceptionDump *ctx )
         horizon_restore_exception_context_x9( ctx );
     horizon_restore_exception_context( ctx );
 }
+
+/* The other half of the restore below: a context of this thread as it is here,
+ * which continuing returns to. Windows takes one on the way into an APC so the
+ * routine can say where to carry on, and wow64's NtContinue hands it back when
+ * the program's 32-bit routine has run. Everything the restore puts back has to
+ * be here, the callee-saved q registers included, or it would come back as
+ * zeroes. Returns 0 when taken and 1 when continued, as setjmp does. */
+extern int horizon_capture_context( CONTEXT *context );
+
+C_ASSERT( offsetof(CONTEXT, ContextFlags) == 0x00 );
+C_ASSERT( offsetof(CONTEXT, Cpsr) == 0x04 );
+C_ASSERT( offsetof(CONTEXT, X0) == 0x08 );
+C_ASSERT( offsetof(CONTEXT, Fp) == 0xf0 );
+C_ASSERT( offsetof(CONTEXT, Lr) == 0xf8 );
+C_ASSERT( offsetof(CONTEXT, Sp) == 0x100 );
+C_ASSERT( offsetof(CONTEXT, Pc) == 0x108 );
+C_ASSERT( offsetof(CONTEXT, V) == 0x110 );
+C_ASSERT( offsetof(CONTEXT, Fpcr) == 0x310 );
+C_ASSERT( offsetof(CONTEXT, Fpsr) == 0x314 );
+C_ASSERT( CONTEXT_ARM64_FULL == 0x400007 );
+
+__ASM_GLOBAL_FUNC( horizon_capture_context,
+                   "stp x0,  x1,  [x0, #0x08]\n\t"
+                   "stp x2,  x3,  [x0, #0x18]\n\t"
+                   "stp x4,  x5,  [x0, #0x28]\n\t"
+                   "stp x6,  x7,  [x0, #0x38]\n\t"
+                   "stp x8,  x9,  [x0, #0x48]\n\t"
+                   "stp x10, x11, [x0, #0x58]\n\t"
+                   "stp x12, x13, [x0, #0x68]\n\t"
+                   "stp x14, x15, [x0, #0x78]\n\t"
+                   "stp x16, x17, [x0, #0x88]\n\t"
+                   "stp x18, x19, [x0, #0x98]\n\t"
+                   "stp x20, x21, [x0, #0xa8]\n\t"
+                   "stp x22, x23, [x0, #0xb8]\n\t"
+                   "stp x24, x25, [x0, #0xc8]\n\t"
+                   "stp x26, x27, [x0, #0xd8]\n\t"
+                   "stp x28, x29, [x0, #0xe8]\n\t"
+                   "str x30,      [x0, #0xf8]\n\t"
+                   "mov x1, sp\n\t"
+                   "str x1,       [x0, #0x100]\n\t"
+                   "adr x1, 1f\n\t"
+                   "str x1,       [x0, #0x108]\n\t"
+                   "stp q0,  q1,  [x0, #0x110]\n\t"
+                   "stp q2,  q3,  [x0, #0x130]\n\t"
+                   "stp q4,  q5,  [x0, #0x150]\n\t"
+                   "stp q6,  q7,  [x0, #0x170]\n\t"
+                   "stp q8,  q9,  [x0, #0x190]\n\t"
+                   "stp q10, q11, [x0, #0x1b0]\n\t"
+                   "stp q12, q13, [x0, #0x1d0]\n\t"
+                   "stp q14, q15, [x0, #0x1f0]\n\t"
+                   "stp q16, q17, [x0, #0x210]\n\t"
+                   "stp q18, q19, [x0, #0x230]\n\t"
+                   "stp q20, q21, [x0, #0x250]\n\t"
+                   "stp q22, q23, [x0, #0x270]\n\t"
+                   "stp q24, q25, [x0, #0x290]\n\t"
+                   "stp q26, q27, [x0, #0x2b0]\n\t"
+                   "stp q28, q29, [x0, #0x2d0]\n\t"
+                   "stp q30, q31, [x0, #0x2f0]\n\t"
+                   "mrs x1, nzcv\n\t"
+                   "str w1,       [x0, #0x04]\n\t"
+                   "mrs x1, fpcr\n\t"
+                   "str w1,       [x0, #0x310]\n\t"
+                   "mrs x1, fpsr\n\t"
+                   "str w1,       [x0, #0x314]\n\t"
+                   "mov w1, #1\n\t"
+                   "str x1,       [x0, #0x08]\n\t"   /* x0 is 1 on the way back */
+                   "mov w1, #7\n\t"
+                   "movk w1, #0x40, lsl #16\n\t"
+                   "str w1,       [x0]\n\t"           /* CONTEXT_ARM64_FULL */
+                   "mov w0, #0\n\t"
+                   "ret\n"
+                   "1:\tmov w0, #1\n\t"
+                   "ret" )
 
 /* Cooperative NtContinue/RtlRestoreContext return. Like the exception restore
  * above, x17 is the final branch scratch register. This is not a replacement

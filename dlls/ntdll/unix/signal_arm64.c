@@ -86,6 +86,8 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
     return STATUS_NOT_IMPLEMENTED;
 }
 
+extern int horizon_capture_context( CONTEXT *context );
+
 NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
 {
     WOW64_CPURESERVED *cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
@@ -108,17 +110,26 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
                                           get_cpu_area( IMAGE_FILE_MACHINE_I386 ), ctx, FALSE );
 }
 
+/* Windows leaves the wait through KiUserApcDispatcher, which calls the routine
+ * on the thread's own stack and continues the context it was given. Here the
+ * routine is called where the wait ends, with a context of this place, and the
+ * wait's status is what the caller gets -- STATUS_USER_APC, which is the
+ * WAIT_IO_COMPLETION a program waiting alertably looks for.
+ *
+ * The context matters for a 32-bit program: wow64 hands it to
+ * Wow64ApcRoutine, which runs the program's own routine in a simulation of its
+ * own and leaves it by continuing that context, which comes back here. */
 NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,
                                    ULONG_PTR arg3, PNTAPCFUNC func, NTSTATUS status )
 {
-    (void)context;
-    (void)flags;
-    (void)arg1;
-    (void)arg2;
-    (void)arg3;
-    (void)func;
-    (void)status;
-    return STATUS_NOT_IMPLEMENTED;
+    void (WINAPI *dispatch)( ULONG_PTR, ULONG_PTR, ULONG_PTR, CONTEXT * ) = (void *)func;
+    CONTEXT here;
+
+    if (flags) FIXME( "flags %#x are not supported.\n", flags );
+    if (!horizon_capture_context( &here )) dispatch( arg1, arg2, arg3, &here );
+    /* A context the caller wants resumed instead of returning to it. */
+    if (context) return signal_set_full_context( context );
+    return status;
 }
 
 void call_raise_user_exception_dispatcher(void)
