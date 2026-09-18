@@ -184,6 +184,10 @@ typedef struct { int handle; } NcmContentStorage;
 typedef struct { int handle; } NcmContentMetaDatabase;
 typedef struct { int handle; } Service;
 typedef int SplConfigItem;
+#define MAKEHOSVERSION(major, minor, micro) (((u32)(major) << 16) | ((u32)(minor) << 8) | (u32)(micro))
+Result splInitialize( void );
+void splExit( void );
+Result splGetConfig( SplConfigItem item, u64 *out );
 
 static inline void ncmU64ToContentInfoSize( u64 size, NcmContentInfo *info )
 {

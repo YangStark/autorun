@@ -54,6 +54,16 @@ Result ncmInitialize( void ) { return 0; }
 void ncmExit( void ) {}
 Result nsInitialize( void ) { return 0; }
 void nsExit( void ) {}
+/* A console on Atmosphere 1.8.0, where the debug flags moved: the version is
+ * packed with the major at bit 56, minor at 48 and micro at 40. */
+Result splInitialize( void ) { return 0; }
+void splExit( void ) {}
+Result splGetConfig( SplConfigItem item, u64 *out )
+{
+    if (item != 65000) return 1;
+    *out = (1ull << 56) | (8ull << 48) | (0ull << 40);
+    return 0;
+}
 Result splCryptoInitialize( void ) { return 0; }
 void splCryptoExit( void ) {}
 Result splCryptoGenerateAesKek( const void *src, u32 generation, u32 option, void *out )
@@ -296,6 +306,25 @@ static void check_exefs_npdm( const u8 *data, int address_space, u64 tid )
     acid = (const struct npdm_acid *)((const u8 *)meta + meta->acid_offset);
     assert( !memcmp( &aci0->magic, "ACI0", 4 ) && !memcmp( &acid->magic, "ACID", 4 ) );
     assert( aci0->program_id == tid && acid->program_id_min == tid && acid->program_id_max == tid );
+    /* ForceDebug (bit 19) and nothing else in the debug flags, in both the
+     * ACI0 and the ACID: what the loader needs on Atmosphere 1.8.0 and later. */
+    {
+        const u8 *kac[2] = { (const u8 *)aci0 + aci0->kac_offset, (const u8 *)acid + acid->kac_offset };
+        u32 sizes[2] = { aci0->kac_size, acid->kac_size };
+        int found = 0, k;
+
+        for (k = 0; k < 2; k++)
+            for (i = 0; i < sizes[k]; i += 4)
+            {
+                u32 capability;
+
+                memcpy( &capability, kac[k] + i, 4 );
+                if ((capability & 0x1FFFF) != 0xFFFF) continue;
+                assert( capability == (BIT( 19 ) | 0xFFFF) );
+                found++;
+            }
+        assert( found == 2 );
+    }
 }
 
 static void check_control( const u8 *data, size_t size, const char *name, const char *author,
@@ -418,7 +447,7 @@ int main( int argc, char **argv )
     free( control );
     free( meta );
 
-    puts( "forwarder: title ids, program exefs and romfs, the address space in the NPDM, the control romfs "
-          "and the NACP it inherits, and taking the old entry away before writing passed" );
+    puts( "forwarder: title ids, program exefs and romfs, the address space and ForceDebug in the NPDM, the "
+          "control romfs and the NACP it inherits, and taking the old entry away before writing passed" );
     return 0;
 }

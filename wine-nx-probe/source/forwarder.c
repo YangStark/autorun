@@ -662,6 +662,24 @@ static u32 npdm_kernel_flags( void )
     return descriptor << 4;
 }
 
+/* Atmosphere 1.8.0 moved the NPDM's debug flags for HOS 19: the bit npdmtool
+ * writes for hbl.json's force_debug_prod is ForceDebugProd now, and what the
+ * loader needs to map an NRO's code is ForceDebug, the bit after it. sphaira
+ * asks Exosphere its version and picks the new bit when it is that new; so
+ * does this, or the forwarder installs and then cannot start the NRO. */
+static int exosphere_moved_debug_flags( void )
+{
+    const SplConfigItem ExosphereApiVersion = (SplConfigItem)65000;
+    u64 version = 0;
+    int moved = 0;
+
+    if (R_FAILED( splInitialize() )) return 0;
+    if (R_SUCCEEDED( splGetConfig( ExosphereApiVersion, &version ) ))
+        moved = (version >> 40) >= MAKEHOSVERSION( 1, 8, 0 );
+    splExit();
+    return moved;
+}
+
 static int npdm_patch( u8 *npdm, size_t size, u64 tid, int address_space )
 {
     const u8 ADDRESS_SPACE_SHIFT = 1;
@@ -687,6 +705,13 @@ static int npdm_patch( u8 *npdm, size_t size, u64 tid, int address_space )
 
     patched = npdm_patch_capability( npdm, meta.aci0_offset + aci0.kac_offset, aci0.kac_size, 3, flags );
     patched &= npdm_patch_capability( npdm, meta.acid_offset + acid.kac_offset, acid.kac_size, 3, flags );
+    /* The debug flags capability is the one ending in sixteen ones; it is
+     * replaced whole, so only ForceDebug is left set in it. */
+    if (exosphere_moved_debug_flags())
+    {
+        npdm_patch_capability( npdm, meta.aci0_offset + aci0.kac_offset, aci0.kac_size, 16, BIT( 19 ) );
+        npdm_patch_capability( npdm, meta.acid_offset + acid.kac_offset, acid.kac_size, 16, BIT( 19 ) );
+    }
 
     memcpy( npdm, &meta, sizeof(meta) );
     memcpy( npdm + meta.aci0_offset, &aci0, sizeof(aci0) );
