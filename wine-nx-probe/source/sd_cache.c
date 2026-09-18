@@ -92,10 +92,14 @@ static void sd_cache_report_short_read( struct _reent *r, void *fd, long long go
 {
     static unsigned int reported;
     const struct sd_cache_file *file;
+    int failure = errno;
     off_t at, end;
     char message[384];
 
-    if (reported >= 8) return;
+    if (reported >= 16) return;
+    /* A file the program never opened for reading is the runtime's own stdout
+     * or stderr, and refusing to read it is not the card holding data back. */
+    if (got < 0 && (failure == EBADF || failure == EACCES || failure == EPERM)) return;
     if ((at = sd_cache_base->seek_r( r, fd, 0, SEEK_CUR )) == -1) return;
     if ((end = sd_cache_base->seek_r( r, fd, 0, SEEK_END )) == -1) return;
     sd_cache_base->seek_r( r, fd, at, SEEK_SET );

@@ -331,6 +331,7 @@ struct horizon_fd_queue
 #define HORIZON_REQ_SET_THREAD_INFO 16
 #define HORIZON_REQ_SUSPEND_THREAD 17
 #define HORIZON_REQ_RESUME_THREAD 18
+#define HORIZON_REQ_QUEUE_APC 19
 #define HORIZON_REQ_CLOSE_HANDLE 21
 #define HORIZON_REQ_SET_HANDLE_INFO 22
 #define HORIZON_REQ_DUP_HANDLE 23
@@ -477,6 +478,7 @@ struct horizon_fd_queue
 #define HORIZON_STATUS_SUCCESS 0
 #define HORIZON_STATUS_OBJECT_NAME_EXISTS 0x40000000u
 #define HORIZON_STATUS_ALERTED 0x00000101u
+#define HORIZON_STATUS_USER_APC 0x000000c0u
 #define HORIZON_STATUS_TIMEOUT 0x00000102u
 #define HORIZON_STATUS_PENDING 0x00000103u
 #define HORIZON_STATUS_UNSUCCESSFUL 0xc0000001u
@@ -959,6 +961,24 @@ struct horizon_select_reply
     struct horizon_server_reply_header header;
     unsigned int apc_handle;
     int signaled;
+};
+
+/* The wait is alertable: a user APC waiting for this thread runs instead. */
+#define HORIZON_SELECT_ALERTABLE 1
+
+struct horizon_queue_apc_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+    unsigned int reserve_handle;
+    /* followed by the call, an apc_call the client built */
+};
+
+struct horizon_queue_apc_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int handle;
+    int self;
 };
 
 struct horizon_object_attributes
@@ -2650,6 +2670,20 @@ struct horizon_server_connection
     unsigned int completion_wait_handle;
 };
 
+/* An apc_call is a few dozen bytes; anything larger is not one. */
+#define HORIZON_USER_APC_MAX 512
+
+/* A user APC a thread has been given and has not yet waited alertably for:
+ * ReadFileEx's completion routine, QueueUserAPC's function. The call is the
+ * client's own apc_call, kept as it arrived and handed back untouched, so the
+ * server needs to know nothing of its shape. */
+struct horizon_user_apc
+{
+    struct horizon_user_apc *next;
+    unsigned int size;
+    unsigned char call[1];
+};
+
 struct horizon_server_object
 {
     unsigned int id;
@@ -2662,6 +2696,7 @@ struct horizon_server_object
     struct horizon_mutex_state mutex;
     struct horizon_thread_state thread;
     struct horizon_server_object *thread_next;
+    struct horizon_user_apc *apc_first, *apc_last;
     unsigned int rootdir;
     unsigned int name_len;
     unsigned char *name;
@@ -3916,6 +3951,14 @@ static void horizon_server_free_object( struct horizon_server_object *object )
             break;
         }
     }
+    while (object->apc_first)
+    {
+        struct horizon_user_apc *apc = object->apc_first;
+
+        object->apc_first = apc->next;
+        free( apc );
+    }
+    object->apc_last = NULL;
     horizon_completion_clear( &object->completion );
     if (object->wait_port && !--object->wait_port->refs) horizon_server_free_object( object->wait_port );
     if (object->file_completion && !--object->file_completion->refs)
@@ -11969,13 +12012,69 @@ static int horizon_server_select_polls_locked( const struct horizon_select_reque
     }
 }
 
+/* Windows runs a thread's user APCs when it waits alertably, oldest first, and
+ * the wait ends with STATUS_USER_APC rather than performing the wait: that is
+ * how ReadFileEx's completion routine is called and how SleepEx returns
+ * WAIT_IO_COMPLETION. The caller holds horizon_server_objects_mutex. */
+static unsigned int horizon_server_queue_user_apc_locked( struct horizon_server_object *thread,
+                                                          const unsigned char *call, unsigned int size )
+{
+    struct horizon_user_apc *apc;
+
+    if (!size || size > HORIZON_USER_APC_MAX) return HORIZON_STATUS_INVALID_PARAMETER;
+    if (!(apc = calloc( 1, offsetof( struct horizon_user_apc, call[size] ) ))) return HORIZON_STATUS_NO_MEMORY;
+    memcpy( apc->call, call, size );
+    apc->size = size;
+    if (thread->apc_last) thread->apc_last->next = apc;
+    else thread->apc_first = apc;
+    thread->apc_last = apc;
+    /* The thread may already be asleep in a wait of its own. */
+    horizon_server_signal_changed_locked();
+    return HORIZON_STATUS_SUCCESS;
+}
+
+static struct horizon_user_apc *horizon_server_take_user_apc_locked( struct horizon_server_object *thread )
+{
+    struct horizon_user_apc *apc;
+
+    if (!thread || !(apc = thread->apc_first)) return NULL;
+    if (!(thread->apc_first = apc->next)) thread->apc_last = NULL;
+    apc->next = NULL;
+    return apc;
+}
+
+static int horizon_server_handle_queue_apc( struct horizon_server_connection *connection,
+                                            const unsigned char *message,
+                                            const unsigned char *data, unsigned int data_size )
+{
+    const struct horizon_queue_apc_request *request = (const void *)message;
+    struct horizon_queue_apc_reply reply;
+    struct horizon_server_object *thread;
+    unsigned int status;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if ((thread = horizon_server_get_thread_locked( request->handle, &status )))
+    {
+        /* A queue_apc with no call asks only whether the thread is this one. */
+        if (data_size) status = horizon_server_queue_user_apc_locked( thread, data, data_size );
+        reply.self = connection->thread == thread;
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    reply.header.error = status;
+    /* Only a system APC is answered with a handle to collect a result from. */
+    reply.handle = 0;
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
 static int horizon_server_handle_select( struct horizon_server_connection *connection,
                                          const unsigned char *message,
                                          const unsigned char *data, unsigned int data_size )
 {
     const struct horizon_select_request *request = (const void *)message;
+    struct horizon_user_apc *apc = NULL;
     struct horizon_select_reply reply;
-    int polls;
+    int polls, ret;
 
     memset( &reply, 0, sizeof(reply) );
     /* Each client has its own server connection/thread. A pending wait sleeps on
@@ -11993,6 +12092,14 @@ static int horizon_server_handle_select( struct horizon_server_connection *conne
         LARGE_INTEGER now;
         long long timeout = HORIZON_SERVER_WAIT_SLICE;
 
+        /* Before the wait itself, as Windows does: an APC that arrived while
+         * the thread ran is due the moment it waits alertably. */
+        if ((request->flags & HORIZON_SELECT_ALERTABLE) &&
+            (apc = horizon_server_take_user_apc_locked( connection->thread )))
+        {
+            reply.header.error = HORIZON_STATUS_USER_APC;
+            break;
+        }
         horizon_server_update_timers_locked();
         reply.header.error = horizon_server_select_status( request, data, data_size, initial );
         if (reply.header.error != HORIZON_STATUS_TIMEOUT || !request->timeout) break;
@@ -12020,6 +12127,15 @@ static int horizon_server_handle_select( struct horizon_server_connection *conne
 
     TRACE( "Horizon server select size %u timeout %lld status %08x.\n",
            request->size, request->timeout, reply.header.error );
+    if (apc)
+    {
+        unsigned int size = min( apc->size, request->header.reply_size );
+
+        reply.header.reply_size = size;
+        ret = horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), apc->call, size );
+        free( apc );
+        return ret;
+    }
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
 }
 
@@ -12135,6 +12251,10 @@ static void *horizon_server_thread( void *param )
             break;
         case HORIZON_REQ_SET_ASYNC_DIRECT_RESULT:
             status = horizon_server_handle_set_async_direct_result( connection, message );
+            break;
+        case HORIZON_REQ_QUEUE_APC:
+            status = horizon_server_handle_queue_apc( connection, message, request_data,
+                                                      header->request_size );
             break;
         case HORIZON_REQ_CLOSE_HANDLE:
             status = horizon_server_handle_close_handle( connection, message );
