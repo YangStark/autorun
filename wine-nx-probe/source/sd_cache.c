@@ -25,6 +25,8 @@ unsigned int wine_nx_sd_reads;         /* read requests sent to the FS service *
 unsigned int wine_nx_sd_hits;          /* reads the cache served without one */
 unsigned long long wine_nx_sd_read_ns; /* time spent in those requests */
 
+extern void wine_nx_runtime_trace( const char *msg );
+
 static const devoptab_t *sd_cache_base;
 static devoptab_t sd_cache_device;
 static pthread_mutex_t sd_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -82,6 +84,33 @@ static int sd_cache_close( struct _reent *r, void *fd )
     return sd_cache_base->close_r( r, fd );
 }
 
+/* A read that stops short of what was asked for, before the end of the file,
+ * hands a program half of what it wanted with nothing to say so. Halo reports
+ * that one of its files is missing or corrupted and never says which, so a card
+ * that answers a request with less than it holds has to be visible. */
+static void sd_cache_report_short_read( struct _reent *r, void *fd, long long got, size_t len )
+{
+    static unsigned int reported;
+    const struct sd_cache_file *file;
+    off_t at, end;
+    char message[384];
+
+    if (reported >= 8) return;
+    if ((at = sd_cache_base->seek_r( r, fd, 0, SEEK_CUR )) == -1) return;
+    if ((end = sd_cache_base->seek_r( r, fd, 0, SEEK_END )) == -1) return;
+    sd_cache_base->seek_r( r, fd, at, SEEK_SET );
+    /* The file really ending there is a short read of its own. */
+    if (got >= 0 && (long long)at >= (long long)end) return;
+    reported++;
+    pthread_mutex_lock( &sd_cache_mutex );
+    file = sd_cache_find( sd_cache_files, fd );
+    snprintf( message, sizeof(message), "[FS] %s gave %lld of %u bytes, at %lld of %lld",
+              file && file->path ? file->path : "a file on the card", got, (unsigned int)len,
+              (long long)at - (got > 0 ? got : 0), (long long)end );
+    pthread_mutex_unlock( &sd_cache_mutex );
+    wine_nx_runtime_trace( message );
+}
+
 static ssize_t sd_cache_read_file( struct _reent *r, void *fd, char *ptr, size_t len )
 {
     struct sd_cache_fill_ctx ctx = { r, fd };
@@ -91,7 +120,13 @@ static ssize_t sd_cache_read_file( struct _reent *r, void *fd, char *ptr, size_t
     char *copy;
     off_t pos;
 
-    if (!len || len >= SD_CACHE_DIRECT || !(copy = malloc( len ))) return sd_cache_base_read( r, fd, ptr, len );
+    if (!len || len >= SD_CACHE_DIRECT || !(copy = malloc( len )))
+    {
+        ssize_t direct = sd_cache_base_read( r, fd, ptr, len );
+
+        if (len && (size_t)direct != len) sd_cache_report_short_read( r, fd, direct, len );
+        return direct;
+    }
 
     pthread_mutex_lock( &sd_cache_mutex );
     if (!sd_cache_off && (file = sd_cache_find( sd_cache_files, fd )) && file->cacheable &&
@@ -109,7 +144,14 @@ static ssize_t sd_cache_read_file( struct _reent *r, void *fd, char *ptr, size_t
         if (!fills) __atomic_add_fetch( &wine_nx_sd_hits, 1, __ATOMIC_RELAXED );
     }
     free( copy );
-    if (got == SD_CACHE_BYPASS) return sd_cache_base_read( r, fd, ptr, len );
+    if (got == SD_CACHE_BYPASS)
+    {
+        ssize_t direct = sd_cache_base_read( r, fd, ptr, len );
+
+        if ((size_t)direct != len) sd_cache_report_short_read( r, fd, direct, len );
+        return direct;
+    }
+    if ((size_t)got != len) sd_cache_report_short_read( r, fd, got, len );
     return (ssize_t)got;  /* -1 keeps the errno of the failed request */
 }
 

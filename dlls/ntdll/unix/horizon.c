@@ -8842,6 +8842,22 @@ static int horizon_server_handle_get_desktop_window( struct horizon_server_conne
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
 }
 
+/* A program that cannot open one of its own files usually says so in its own
+ * words -- Halo reports that one of its files is missing or corrupted -- and
+ * never says which, so the log names the ones it asked for and did not get.
+ * The loader probes for a DLL in every directory of its search path, so the
+ * ones below the Wine tree are its search and not a program's own file. */
+static void horizon_report_missing_file( const char *path, unsigned int status )
+{
+    static LONG reported;
+    char message[384];
+
+    if (strstr( path, "/windows/" ) || strstr( path, "/Windows/" )) return;
+    if (__atomic_add_fetch( &reported, 1, __ATOMIC_RELAXED ) > 64) return;
+    snprintf( message, sizeof(message), "[FS] %s could not be opened: status %08x", path, status );
+    wine_nx_runtime_trace( message );
+}
+
 static int horizon_server_handle_create_file( struct horizon_server_connection *connection,
                                               const unsigned char *message,
                                               const unsigned char *data, unsigned int data_size )
@@ -8937,6 +8953,7 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
     }
 
     if (fd != -1) close( fd );
+    if (reply.header.error && filename) horizon_report_missing_file( filename, reply.header.error );
     if (is_dir)
         horizon_trace( "[HZDIR] create path=%s handle=%08x err=%08x\n",
                        filename ? filename : "<null>", reply.handle, reply.header.error );
