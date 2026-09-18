@@ -150,6 +150,8 @@ void ui_border( struct ui *ui, int x, int y, int w, int h, int thickness, SDL_Co
  * and lit in the stretch the light is in. */
 void ui_animated_border( struct ui *ui, int x, int y, int w, int h, int radius, int thickness,
                          SDL_Color dim, SDL_Color lit );
+/* The same outline with nothing travelling round it. */
+void ui_outline( struct ui *ui, int x, int y, int w, int h, int radius, int thickness, SDL_Color color );
 void ui_fill_circle( struct ui *ui, float cx, float cy, float radius, SDL_Color color );
 void ui_rounded( struct ui *ui, int x, int y, int w, int h, int radius, SDL_Color color );
 void ui_panel( struct ui *ui, int x, int y, int w, int h );

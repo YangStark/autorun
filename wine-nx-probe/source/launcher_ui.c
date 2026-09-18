@@ -19,7 +19,7 @@
 #define STICK_PRESS      18000
 #define STICK_RELEASE    8000
 #define LIST_TOP         124
-#define ROW_HEIGHT       64
+#define ROW_HEIGHT       58
 /* What a row keeps between its outline and its text. */
 #define ROW_PADDING      20
 /* Everything that has the focus wears the same outline. */
@@ -145,6 +145,12 @@ static SDL_Color border_tint( SDL_Color dim, SDL_Color lit, float u )
     c.b = (Uint8)(dim.b + (lit.b - dim.b) * t);
     c.a = (Uint8)(dim.a + (lit.a - dim.a) * t);
     return c;
+}
+
+/* The same ribbon with nothing travelling round it. */
+void ui_outline( struct ui *ui, int x, int y, int w, int h, int radius, int thickness, SDL_Color color )
+{
+    ui_animated_border( ui, x, y, w, h, radius, thickness, color, color );
 }
 
 void ui_animated_border( struct ui *ui, int x, int y, int w, int h, int radius, int thickness,
@@ -370,8 +376,8 @@ int ui_init( struct ui *ui, const void *font_data, size_t font_size, int animati
         ui->screen = ui->snapshot = NULL;
     }
     ui_step( "fonts" );
-    if (!(ui->small = open_font( font_data, font_size, 20 )) || !(ui->normal = open_font( font_data, font_size, 26 )) ||
-        !(ui->large = open_font( font_data, font_size, 40 ))) goto fail;
+    if (!(ui->small = open_font( font_data, font_size, 18 )) || !(ui->normal = open_font( font_data, font_size, 23 )) ||
+        !(ui->large = open_font( font_data, font_size, 32 ))) goto fail;
     ui->glow = make_glow( ui );
     for (i = 0; i < GLYPH_COUNT; i++) ui->glyphs[i] = make_glyph( ui, glyphs[i].label, glyphs[i].pill );
     ui_step( "controllers" );
@@ -1235,15 +1241,15 @@ void ui_wait( struct ui *ui )
 static void draw_card( struct ui *ui, const char *title, const char *heading, const char *text,
                        const struct ui_hint *hints, int hint_count )
 {
-    const int margin = 40, hints_h = 52;
+    const int margin = 34, hints_h = 48;
     int w = ui->width - 2 * UI_HEADER_MARGIN, x, y, h, lines, title_h, text_w;
 
-    if (w > 820) w = 820;
+    if (w > 700) w = 700;
     text_w = w - 2 * margin;
-    title_h = TTF_FontHeight( ui->large );
-    lines = wrap_text( ui, ui->normal, 0, 0, text_w, 14, text, ui->text, 0, 0 );
-    h = margin + title_h + 20 + lines * (TTF_FontHeight( ui->normal ) + 4) + hints_h + margin / 2;
-    if (heading && strcmp( heading, title )) h += TTF_FontHeight( ui->large ) + 10;
+    title_h = TTF_FontHeight( ui->normal );
+    lines = wrap_text( ui, ui->small, 0, 0, text_w, 14, text, ui->text, 0, 0 );
+    h = margin + title_h + 16 + lines * (TTF_FontHeight( ui->small ) + 4) + hints_h + margin / 2;
+    if (heading && strcmp( heading, title )) h += TTF_FontHeight( ui->normal ) + 8;
     x = (ui->width - w) / 2;
     y = (ui->height - h) / 2;
     if (y < 40) y = 40;
@@ -1267,18 +1273,20 @@ static void draw_card( struct ui *ui, const char *title, const char *heading, co
     ui_rounded( ui, x, y, w, h, 22, (SDL_Color){ 22, 27, 30, 250 } );
     ui_rounded_texture( ui, ui_sheen( ui ), NULL, (SDL_Rect){ x, y, w, h / 3 }, 22,
                         (SDL_Color){ 255, 255, 255, 14 } );
-    ui_animated_border( ui, x, y, w, h, 22, 2, UI_FOCUS_DIM, UI_FOCUS_LIT );
+    /* A modal is not what has the focus in the sense the light means: it is the
+     * only thing there is, so its edge stands still. */
+    ui_outline( ui, x, y, w, h, 22, 1, (SDL_Color){ 236, 240, 246, 120 } );
 
     y += margin;
-    ui_text_fit( ui, ui->large, x + margin, y, text_w, title, ui->value, 0 );
-    y += title_h + 20;
+    ui_text_fit( ui, ui->normal, x + margin, y, text_w, title, ui->value, 0 );
+    y += title_h + 16;
     if (heading && strcmp( heading, title ))
     {
-        ui_text_fit( ui, ui->large, x + margin, y, text_w, heading, ui->value, 0 );
-        y += TTF_FontHeight( ui->large ) + 10;
+        ui_text_fit( ui, ui->normal, x + margin, y, text_w, heading, ui->value, 0 );
+        y += TTF_FontHeight( ui->normal ) + 8;
     }
-    ui_text_wrapped( ui, ui->normal, x + margin, y, text_w, 14, text, ui->text, 0 );
-    ui_hints_right( ui, hints, hint_count, x + w - margin, y + lines * (TTF_FontHeight( ui->normal ) + 4) + 26 );
+    ui_text_wrapped( ui, ui->small, x + margin, y, text_w, 14, text, ui->text, 0 );
+    ui_hints_right( ui, hints, hint_count, x + w - margin, y + lines * (TTF_FontHeight( ui->small ) + 4) + 24 );
     ui_fade( ui );
 }
 
@@ -1501,12 +1509,12 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
  */
 #define SET_SIDEBAR_X    UI_HEADER_MARGIN
 #define SET_SIDEBAR_W    286
-#define SET_GROUP_H      62
+#define SET_GROUP_H      56
 /* A section stands further in from its outline than a row does: the names are
  * short, and the outline around them is the widest thing on the screen. */
 #define SET_SIDEBAR_PAD  26
 #define SET_ROW_X        (SET_SIDEBAR_X + SET_SIDEBAR_W + 32)
-#define SET_ROW_H        112
+#define SET_ROW_H        100
 
 static void ui_switch( struct ui *ui, int x, int y, int on, int current, int disabled )
 {

@@ -1521,103 +1521,103 @@ enum program_row
 };
 
 static int file_browser_pick( struct launcher *l, char *target, size_t size );
-/* Making one. The console gives a program its address space when it creates the
- * process, so the only way to have a 32-bit one is to be opened by an entry that
- * asked for it: this builds that entry and installs it. */
+static void save_look( struct launcher *l );
+
+/* What making one costs, in the fewest words that still say it, and this
+ * console's own answer to the question it raises. */
+static int confirm_forwarder( struct launcher *l, int bits )
+{
+    struct ui *ui = &l->ui;
+    char message[320];
+
+    snprintf( message, sizeof(message),
+              "A %d-bit forwarder is installed as an application. Consoles have been banned for homebrew "
+              "in that list.\n\nUse emuMMC only. %s",
+              bits,
+              l->options->emummc > 0 ? "This console is on emuMMC." :
+              l->options->emummc == 0 ? "This console is NOT on emuMMC." :
+              "Atmosphere did not say which this console is on." );
+    return ui_confirm( ui, "Install forwarder", message, "Install" );
+}
+
+/* Build it, say where it went wrong if it did, and name it as the 32-bit one. */
+static int install_forwarder( struct launcher *l, int bits, unsigned long long *id )
+{
+    static const char *const names[] = { "Autorun 32-bit", "Autorun" };
+    const char *name = names[bits == 32 ? 0 : 1];
+    struct ui *ui = &l->ui;
+    const char *step = NULL;
+    char message[256], value[32];
+    unsigned int rc;
+
+    if (!l->options->install_forwarder) return 0;
+    if (!confirm_forwarder( l, bits )) { ui_start_screen( ui ); return 0; }
+
+    /* One frame saying what is happening: building the three parts and writing
+     * them takes a moment, and nothing is drawn while it does. */
+    ui_start_screen( ui );
+    ui_background( ui );
+    ui_header_back( ui, "Install forwarder", name );
+    ui_text_centered( ui, ui->large, ui->width / 2, ui->height / 2 - 30, "Installing...", ui->value );
+    ui_present( ui );
+
+    rc = l->options->install_forwarder( bits, name, id, &step );
+    ui_start_screen( ui );
+    if (rc)
+    {
+        snprintf( message, sizeof(message), "The console refused while %s.\n\nResult 0x%X.",
+                  step ? step : "working", rc );
+        ui_message( ui, "Could not install", message );
+        ui_start_screen( ui );
+        return 0;
+    }
+    if (bits == 32)
+    {
+        snprintf( value, sizeof(value), "%016llX", id ? *id : 0ull );
+        launcher_kv_set( &l->look, "forwarder-32bit", value );
+        launcher_kv_set( &l->look, "forwarder-32bit-name", name );
+        save_look( l );
+    }
+    return 1;
+}
+
+/* Settings: either of the two, made on the spot. */
 static void make_forwarder( struct launcher *l )
 {
-    static const struct { int bits; const char *label, *name, *help; } kinds[] =
+    static const struct { int bits; const char *label, *value, *help; } kinds[] =
     {
         { 32, "32-bit", "Autorun 32-bit",
-          "The low 4 GB, which a game linked for a fixed address there needs. Named as the 32-bit forwarder "
-          "as soon as it is made, so games that need it are sent to it." },
-        { 36, "Default (36-bit)", "Autorun",
-          "The address space Autorun runs in from the Homebrew Menu, for everything else. Worth having so "
-          "Autorun has an entry of its own on the home menu." },
+          "For games linked for a fixed address in the low 4 GB. Named as the 32-bit forwarder once made." },
+        { 36, "Default", "Autorun",
+          "The address space Autorun gets from the Homebrew Menu, for everything else." },
     };
     struct ui *ui = &l->ui;
     struct ui_row rows[2];
     struct ui_list list = {0};
-    char message[768];
-    const char *step = NULL;
     unsigned long long id = 0;
-    unsigned int rc;
+    char message[192];
     int i;
 
     if (!l->options->install_forwarder) return;
-
-    /* A forwarder is an entry in the console's own list of installed
-     * applications, which is what Nintendo's servers are shown. Say so before
-     * anything is written, and say which system memory this is. */
-    snprintf( message, sizeof(message),
-              "A forwarder is installed as an application, in the same list the console reports when it goes "
-              "online. Consoles have been banned for homebrew entries in that list.\n\n%s\n\n"
-              "Make one only on an emuMMC, and keep that emuMMC offline.",
-              l->options->emummc > 0 ?
-              "This console booted from an emuMMC, which is where a forwarder belongs." :
-              l->options->emummc == 0 ?
-              "This console booted from its real system memory, not an emuMMC. A forwarder made here goes "
-              "into the list the console reports." :
-              "Atmosphere did not say which system memory this console booted from, so Autorun cannot tell "
-              "whether this is an emuMMC." );
-    if (!ui_confirm( ui, "Forwarders and bans", message, "I understand" ))
-    {
-        ui_start_screen( ui );
-        return;
-    }
-    ui_start_screen( ui );
-
     memset( rows, 0, sizeof(rows) );
     for (i = 0; i < 2; i++)
     {
         snprintf( rows[i].label, sizeof(rows[i].label), "%s", kinds[i].label );
-        snprintf( rows[i].value, sizeof(rows[i].value), "%s", kinds[i].name );
+        snprintf( rows[i].value, sizeof(rows[i].value), "%s", kinds[i].value );
         rows[i].help = kinds[i].help;
     }
-    if (ui_list_run( ui, &list, "Make a forwarder", l->options->nro_path, rows, 2, 0 ) != UI_ACTION_CHOOSE)
+    if (ui_list_run( ui, &list, "Make a forwarder", NULL, rows, 2, 0 ) != UI_ACTION_CHOOSE)
     {
         ui_start_screen( ui );
         return;
     }
     i = list.selection;
-
-    /* One frame saying what is happening: building the three parts and writing
-     * them takes a moment, and nothing is drawn while it does. */
-    ui_background( ui );
-    ui_header_back( ui, "Make a forwarder", kinds[i].name );
-    ui_text_centered( ui, ui->large, ui->width / 2, ui->height / 2 - 30, "Making the forwarder...", ui->value );
-    ui_present( ui );
-
-    rc = l->options->install_forwarder( kinds[i].bits, kinds[i].name, &id, &step );
-    ui_start_screen( ui );
-    if (rc)
-    {
-        snprintf( message, sizeof(message),
-                  "The console refused while %s. It returned 0x%X.\n\nThe forwarder is written where the "
-                  "console keeps installed applications, which needs Atmosphere.",
-                  step ? step : "working", rc );
-        ui_message( ui, "Could not make the forwarder", message );
-        ui_start_screen( ui );
-        return;
-    }
-    if (kinds[i].bits == 32)
-    {
-        char value[32];
-
-        snprintf( value, sizeof(value), "%016llX", id );
-        launcher_kv_set( &l->look, "forwarder-32bit", value );
-        launcher_kv_set( &l->look, "forwarder-32bit-name", kinds[i].name );
-    }
-    snprintf( message, sizeof(message),
-              "%s is on the home menu.%s\n\nOpening Autorun from it starts it in that address space; the "
-              "Homebrew Menu always gives the one this console defaults to.",
-              kinds[i].name,
-              kinds[i].bits == 32 ? " Games that need the low 4 GB are sent to it from now on." : "" );
-    ui_message( ui, "Forwarder made", message );
+    if (!install_forwarder( l, kinds[i].bits, &id )) return;
+    snprintf( message, sizeof(message), "%s is on the home menu.", kinds[i].value );
+    ui_message( ui, "Installed", message );
     ui_start_screen( ui );
 }
 
-static void save_look( struct launcher *l );
 
 static void download_artwork( struct launcher *l, struct program *p )
 {
@@ -1777,7 +1777,7 @@ static int start_program( struct launcher *l, struct program *p, char *target, s
     }
     if (!address_space_fits( l, p ))
     {
-        char message[640], name[128] = "";
+        char message[320], name[128] = "";
         int installed = 0;
         unsigned long long id = chosen_forwarder( l, name, sizeof(name), &installed );
 
@@ -1786,18 +1786,22 @@ static int start_program( struct launcher *l, struct program *p, char *target, s
         if (!id || !installed || !l->options->launch_title)
         {
             snprintf( message, sizeof(message),
-                      "%s is linked for a fixed address in the low 4 GB and carries no relocations, so it can "
-                      "only run where that address exists. This forwarder started Autorun with a %d-bit address "
-                      "space, which begins above it.%s",
-                      p->title, l->options->address_space_bits,
-                      id && !installed ?
-                      " The 32-bit forwarder named under Settings is not installed any more. Name one that is, "
-                      "or make a new one, and the game will be sent there." :
-                      " Open the game from a forwarder made with a 32-bit address space, or name that forwarder "
-                      "under Settings and it will be sent there. Address space under Game Options says what a "
-                      "game needs." );
-            ui_message( ui, "Needs a 32-bit forwarder", message );
-            return 0;
+                      "%s%s needs the low 4 GB of memory. Autorun is running with %d bits, which begins "
+                      "above it.\n\nA 32-bit forwarder starts Autorun where the game fits.",
+                      id && !installed ? "The 32-bit forwarder is gone. " : "", p->title,
+                      l->options->address_space_bits );
+            if (!l->options->install_forwarder || !l->options->launch_title)
+            {
+                ui_message( ui, "32-bit forwarder needed", message );
+                return 0;
+            }
+            if (!ui_confirm( ui, "32-bit forwarder needed", message, "Install now" ))
+            {
+                ui_start_screen( ui );
+                return 0;
+            }
+            if (!install_forwarder( l, 32, &id )) return 0;
+            installed = 1;
         }
         /* The game goes on the card before the forwarder is asked for, because
          * once the console takes the request nothing here runs again. */
@@ -1815,9 +1819,8 @@ static int start_program( struct launcher *l, struct program *p, char *target, s
             return 0;
         }
         remove( path );
-        snprintf( message, sizeof(message), "The console refused to open %s. It has to be installed, and this "
-                  "forwarder has to be the application that is running.", name );
-        ui_message( ui, "Could not open the forwarder", message );
+        snprintf( message, sizeof(message), "The console refused to open %s.", name[0] ? name : "the forwarder" );
+        ui_message( ui, "Could not open it", message );
         return 0;
     }
     p->missing = 0;
