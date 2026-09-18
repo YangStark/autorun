@@ -675,9 +675,11 @@ if(ELF2NSO AND NPDMTOOL)
                 wine_nx_hbl_npdm "${HBL_NPDM}"
                 wine_nx_icon_32bit "${CMAKE_CURRENT_SOURCE_DIR}/assets/autorun-32.jpg"
                 wine_nx_icon_any "${CMAKE_CURRENT_SOURCE_DIR}/assets/autorun.jpg"
+                wine_nx_logo "${CMAKE_CURRENT_SOURCE_DIR}/assets/logo.png"
         DEPENDS "${HBL_NSO}" "${HBL_NPDM}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/assets/autorun-32.jpg"
                 "${CMAKE_CURRENT_SOURCE_DIR}/assets/autorun.jpg"
+                "${CMAKE_CURRENT_SOURCE_DIR}/assets/logo.png"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/make-embed.py"
         VERBATIM
     )
@@ -812,6 +814,8 @@ find_library(SWITCH_SDL2_TTF SDL2_ttf HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib
 set_source_files_properties(source/launcher.c source/launcher_catalog.c source/launcher_ui.c source/steamgriddb.c PROPERTIES
     INCLUDE_DIRECTORIES "$ENV{DEVKITPRO}/portlibs/switch/include/SDL2"
     COMPILE_DEFINITIONS _REENTRANT)
+# The mark in the corner is only there in the build that generates it.
+set_property(SOURCE source/launcher.c APPEND PROPERTY COMPILE_DEFINITIONS WINE_NX_HAS_EMBEDDED_LOGO)
 target_link_libraries(wine-nx-runtime PRIVATE
     ${SWITCH_SDL2_TTF} ${SWITCH_SDL2}
     ${SWITCH_CURL} ${SWITCH_MBEDTLS} ${SWITCH_MBEDX509} ${SWITCH_MBEDCRYPTO}
@@ -946,14 +950,15 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${RUNTIME_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX Runtime" "ticoverse.com" "0.1.0" "${RUNTIME_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Autorun" "ticoverse.com" "0.0.1" "${RUNTIME_NACP_FILE}"
         VERBATIM
     )
 
     add_custom_command(
         OUTPUT "${RUNTIME_NRO_FILE}"
         COMMAND "${ELF2NRO}" "$<TARGET_FILE:wine-nx-runtime>" "${RUNTIME_NRO_FILE}" "--nacp=${RUNTIME_NACP_FILE}"
-        DEPENDS wine-nx-runtime "${RUNTIME_NACP_FILE}"
+                "--icon=${CMAKE_CURRENT_SOURCE_DIR}/assets/autorun.jpg"
+        DEPENDS wine-nx-runtime "${RUNTIME_NACP_FILE}" "${CMAKE_CURRENT_SOURCE_DIR}/assets/autorun.jpg"
         VERBATIM
     )
 

@@ -56,6 +56,9 @@ extern const unsigned char wine_nx_icon_32bit[];
 extern const size_t wine_nx_icon_32bit_size;
 extern const unsigned char wine_nx_icon_any[];
 extern const size_t wine_nx_icon_any_size;
+/* The mark the launcher shows in the corner of its own screens. */
+extern const unsigned char wine_nx_logo[];
+extern const size_t wine_nx_logo_size;
 #endif
 
 #endif

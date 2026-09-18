@@ -100,6 +100,8 @@ struct ui
     int status_left;
     /* Whether the arrow back has the focus, for the header to frame it. */
     int back_focused;
+    /* How many modals are open: only the first dims what is behind it. */
+    int modal_depth;
 
     SDL_GameController *controller;
     int held;
@@ -201,6 +203,9 @@ float ui_highlight( struct ui *ui, float target_y );
 void ui_message( struct ui *ui, const char *title, const char *text );
 /* A question answered with A (returns 1) or B (returns 0). */
 int  ui_confirm( struct ui *ui, const char *title, const char *text, const char *yes );
+/* A question with more than two answers: returns the button that was pressed,
+ * or UI_B for the way out. */
+int  ui_ask( struct ui *ui, const char *title, const char *text, const struct ui_hint *hints, int count );
 
 /* A list of settings rows. ui_list_run draws it and handles input until the
  * user acts on a row, then returns the action for the row at list->selection;

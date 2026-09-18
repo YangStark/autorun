@@ -32,6 +32,9 @@
 #endif
 
 #include "launcher.h"
+#ifdef WINE_NX_HAS_EMBEDDED_LOGO
+#include "forwarder.h"
+#endif
 #include "launcher_catalog.h"
 #include "launcher_icons.h"
 #include "launcher_list.h"
@@ -154,6 +157,8 @@ struct launcher
     Uint32 carousel_tick;
     SDL_Rect carousel_hits[LAUNCHER_MAX_ENTRIES];
     SDL_Texture *symbols[SYMBOL_COUNT];
+    /* The mark in the corner of the shell, from assets/logo.png. */
+    SDL_Texture *logo;
     /* Home's own list: the programs that have been started, most recent first. */
     int history[LAUNCHER_MAX_ENTRIES];
     int history_count, history_selection;
@@ -351,6 +356,33 @@ static int is_root( const char *dir )
  * Programs
  */
 
+/* The folder a program sits in, when that is a name rather than a place to put
+ * a binary: FalloutNV.exe says nothing, "Fallout New Vegas" says what it is.
+ * Returns 0 for the usual containers, and for the drive itself. */
+static int folder_title( const char *path, char *out, size_t size )
+{
+    static const char *const containers[] =
+    {
+        "bin", "bin32", "bin64", "binaries", "game", "games", "data", "app", "apps", "system",
+        "win32", "win64", "x86", "x64", "release", "debug", "drive_c", "program files",
+        "program files (x86)", "steamapps", "common", "exe", "build",
+    };
+    const char *end, *start;
+    size_t length, i;
+
+    if (!(end = strrchr( path, '/' )) && !(end = strrchr( path, '\\' ))) return 0;
+    for (start = end; start > path; start--)
+        if (start[-1] == '/' || start[-1] == '\\') break;
+    if (start >= end) return 0;
+    length = end - start;
+    if (length >= size) return 0;
+    for (i = 0; i < sizeof(containers) / sizeof(containers[0]); i++)
+        if (strlen( containers[i] ) == length && !strncasecmp( start, containers[i], length )) return 0;
+    memcpy( out, start, length );
+    out[length] = 0;
+    return 1;
+}
+
 static void load_program_settings( struct launcher *l, struct program *p )
 {
     char path[520];
@@ -372,7 +404,7 @@ static void load_program_settings( struct launcher *l, struct program *p )
 
     if (p->settings.title[0]) snprintf( p->title, sizeof(p->title), "%s", p->settings.title );
     else if (p->resource_title[0]) snprintf( p->title, sizeof(p->title), "%s", p->resource_title );
-    else
+    else if (!folder_title( p->path, p->title, sizeof(p->title) ))
     {
         snprintf( p->title, sizeof(p->title), "%s", file_name( p->path ) );
         if ((len = strlen( p->title )) > 4 && !strcasecmp( p->title + len - 4, ".exe" )) p->title[len - 4] = 0;
@@ -414,6 +446,7 @@ static void describe_catalog_program( struct launcher *l, struct program *p,
     }
     else p->missing = 1;
     if (!p->title[0] && entry->title[0]) snprintf( p->title, sizeof(p->title), "%s", entry->title );
+    if (!p->title[0] && folder_title( p->path, p->title, sizeof(p->title) )) return;
     if (!p->title[0])
     {
         size_t len;
@@ -640,6 +673,33 @@ static int decode_png( struct launcher_icon *icon )
     icon->height = image.height;
     icon->size = PNG_IMAGE_SIZE( image );
     return 1;
+}
+
+/* The mark the shell shows in its corner, carried inside the runtime. */
+static SDL_Texture *load_logo( struct launcher *l )
+{
+#ifdef WINE_NX_HAS_EMBEDDED_LOGO
+    struct launcher_icon icon;
+    SDL_Texture *texture = NULL;
+    SDL_Surface *surface;
+
+    memset( &icon, 0, sizeof(icon) );
+    icon.size = wine_nx_logo_size;
+    if (!icon.size || !(icon.data = malloc( icon.size ))) return NULL;
+    memcpy( icon.data, wine_nx_logo, icon.size );
+    if (!decode_png( &icon )) { free( icon.data ); return NULL; }
+    if ((surface = SDL_CreateRGBSurfaceWithFormatFrom( icon.data, icon.width, icon.height, 32,
+                                                       icon.width * 4, SDL_PIXELFORMAT_ABGR8888 )))
+    {
+        texture = SDL_CreateTextureFromSurface( l->ui.renderer, surface );
+        SDL_FreeSurface( surface );
+    }
+    free( icon.data );
+    return texture;
+#else
+    (void)l;
+    return NULL;
+#endif
 }
 
 /* Cover files are optional. Decode on the existing worker, with bounded input. */
@@ -877,6 +937,7 @@ struct grid
 };
 
 static void draw_shell( struct launcher *l, int home );
+static void draw_footprint( struct launcher *l );
 static void draw_backdrop( struct launcher *l, int current );
 static void draw_cover( struct ui *ui, const struct program *p, SDL_Rect rect, int radius, int brightness,
                         int alpha );
@@ -1248,6 +1309,34 @@ static void draw_shell( struct launcher *l, int home )
     draw_symbol( l, SYMBOL_SETTINGS, right, SHELL_Y,
                  l->zone == ZONE_HEADER && l->header_focus == SHELL_SETTINGS ? 255 : 190 );
     l->shell_hits[SHELL_SETTINGS] = (SDL_Rect){ right - SHELL_GAP / 2, 0, width + SHELL_GAP, UI_HEADER_HEIGHT };
+    draw_footprint( l );
+}
+
+/* The mark, and over it the address space the console gave this process --
+ * which is what decides whether a game can be started at all -- at the left of
+ * the line the button hints keep at the right. */
+static void draw_footprint( struct launcher *l )
+{
+    struct ui *ui = &l->ui;
+    char text[64];
+    int height = 92, width, h;
+
+    if (l->logo)
+    {
+        SDL_Rect rect;
+
+        SDL_QueryTexture( l->logo, NULL, NULL, &width, &h );
+        rect.h = height;
+        rect.w = h ? width * height / h : height;
+        rect.x = SHELL_MARGIN - 10;
+        rect.y = HOME_HINT_Y - height / 2 - 14;
+        SDL_SetTextureAlphaMod( l->logo, 55 );
+        SDL_RenderCopy( ui->renderer, l->logo, NULL, &rect );
+        SDL_SetTextureAlphaMod( l->logo, 255 );
+    }
+    if (!l->options->address_space_bits) return;
+    snprintf( text, sizeof(text), "Running %d-bit address space", l->options->address_space_bits );
+    ui_text( ui, ui->small, SHELL_MARGIN, HOME_HINT_Y - TTF_FontHeight( ui->small ) / 2, text, ui->dim );
 }
 
 static SDL_Rect cover_crop( const struct program *p, int width, int height )
@@ -1581,39 +1670,15 @@ static int install_forwarder( struct launcher *l, int bits, unsigned long long *
     return 1;
 }
 
-/* Settings: either of the two, made on the spot. */
-static void make_forwarder( struct launcher *l )
+/* Settings: one of the two, made on the spot. */
+static void make_forwarder( struct launcher *l, int bits )
 {
-    static const struct { int bits; const char *label, *value, *help; } kinds[] =
-    {
-        { 32, "32-bit", "Autorun 32-bit",
-          "For games linked for a fixed address in the low 4 GB. Named as the 32-bit forwarder once made." },
-        { 36, "Default", "Autorun",
-          "The address space Autorun gets from the Homebrew Menu, for everything else." },
-    };
     struct ui *ui = &l->ui;
-    struct ui_row rows[2];
-    struct ui_list list = {0};
     unsigned long long id = 0;
     char message[192];
-    int i;
 
-    if (!l->options->install_forwarder) return;
-    memset( rows, 0, sizeof(rows) );
-    for (i = 0; i < 2; i++)
-    {
-        snprintf( rows[i].label, sizeof(rows[i].label), "%s", kinds[i].label );
-        snprintf( rows[i].value, sizeof(rows[i].value), "%s", kinds[i].value );
-        rows[i].help = kinds[i].help;
-    }
-    if (ui_list_run( ui, &list, "Make a forwarder", NULL, rows, 2, 0 ) != UI_ACTION_CHOOSE)
-    {
-        ui_start_screen( ui );
-        return;
-    }
-    i = list.selection;
-    if (!install_forwarder( l, kinds[i].bits, &id )) return;
-    snprintf( message, sizeof(message), "%s is on the home menu.", kinds[i].value );
+    if (!install_forwarder( l, bits, &id )) return;
+    snprintf( message, sizeof(message), "%s is on the home menu.", bits == 32 ? "Autorun 32-bit" : "Autorun" );
     ui_message( ui, "Installed", message );
     ui_start_screen( ui );
 }
@@ -2167,7 +2232,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 enum settings_row
 {
     SET_HIDDEN, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_STEAMGRIDDB,
-    SET_FORWARDER, SET_MAKE_FORWARDER, SET_VERSION,
+    SET_FORWARDER, SET_MAKE_32BIT, SET_MAKE_MAIN,
     SET_CREDITS, SETTINGS_ROWS
 };
 
@@ -2331,8 +2396,8 @@ static void settings_menu( struct launcher *l )
             [SET_VERBOSE] = SET_SECTION_DEFAULTS, [SET_PROFILE] = SET_SECTION_DEFAULTS,
             [SET_WINDOWS] = SET_SECTION_DEFAULTS,
             [SET_STEAMGRIDDB] = SET_SECTION_ARTWORK,
-            [SET_FORWARDER] = SET_SECTION_SYSTEM, [SET_MAKE_FORWARDER] = SET_SECTION_SYSTEM,
-            [SET_VERSION] = SET_SECTION_SYSTEM,
+            [SET_FORWARDER] = SET_SECTION_SYSTEM, [SET_MAKE_32BIT] = SET_SECTION_SYSTEM,
+            [SET_MAKE_MAIN] = SET_SECTION_SYSTEM,
             [SET_CREDITS] = SET_SECTION_SYSTEM,
         };
 
@@ -2384,19 +2449,22 @@ static void settings_menu( struct launcher *l )
                                    "opens in this one's place and which starts the game by itself.";
         rows[SET_FORWARDER].adjustable = 0;
         rows[SET_FORWARDER].disabled = !l->options->list_titles || !l->options->launch_title;
-        snprintf( rows[SET_MAKE_FORWARDER].label, sizeof(rows[0].label), "Make a forwarder" );
-        snprintf( rows[SET_MAKE_FORWARDER].value, sizeof(rows[0].value), "%s",
-                  l->options->install_forwarder ? "32-bit or default" : "Unavailable" );
-        rows[SET_MAKE_FORWARDER].help = "Installs an entry on the home menu that opens Autorun in the address "
-                                        "space it was made with. A 32-bit one is what a game linked for the low "
-                                        "4 GB needs, and it is named above as soon as it is made. Only on an "
-                                        "emuMMC: an installed entry is what the console reports online.";
-        rows[SET_MAKE_FORWARDER].adjustable = 0;
-        rows[SET_MAKE_FORWARDER].disabled = !l->options->install_forwarder;
-        snprintf( rows[SET_VERSION].label, sizeof(rows[0].label), "Runtime" );
-        snprintf( rows[SET_VERSION].value, sizeof(rows[0].value), "%s", l->options->build );
-        rows[SET_VERSION].disabled = 1;
-        rows[SET_VERSION].adjustable = 0;
+        snprintf( rows[SET_MAKE_32BIT].label, sizeof(rows[0].label), "Make a 32-bit forwarder" );
+        snprintf( rows[SET_MAKE_32BIT].value, sizeof(rows[0].value), "%s",
+                  l->options->install_forwarder ? "Autorun 32-bit" : "Unavailable" );
+        rows[SET_MAKE_32BIT].help = "For games linked for a fixed address in the low 4 GB, which only run with "
+                                    "32 bits. Named above as soon as it is made, and games that need it are "
+                                    "sent to it. Only on an emuMMC: an installed entry is what the console "
+                                    "reports online.";
+        rows[SET_MAKE_32BIT].adjustable = 0;
+        rows[SET_MAKE_32BIT].disabled = !l->options->install_forwarder;
+        snprintf( rows[SET_MAKE_MAIN].label, sizeof(rows[0].label), "Make an Autorun forwarder" );
+        snprintf( rows[SET_MAKE_MAIN].value, sizeof(rows[0].value), "%s",
+                  l->options->install_forwarder ? "Autorun" : "Unavailable" );
+        rows[SET_MAKE_MAIN].help = "Autorun itself on the home menu, in the address space the Homebrew Menu "
+                                   "gives it, so it opens without going through it. Only on an emuMMC.";
+        rows[SET_MAKE_MAIN].adjustable = 0;
+        rows[SET_MAKE_MAIN].disabled = !l->options->install_forwarder;
         snprintf( rows[SET_CREDITS].label, sizeof(rows[0].label), "Credits" );
         snprintf( rows[SET_CREDITS].value, sizeof(rows[0].value), "Wine, Box64, DXVK, Mesa..." );
         rows[SET_CREDITS].help = "The projects and platform references used by Autorun.";
@@ -2443,8 +2511,11 @@ static void settings_menu( struct launcher *l )
         case SET_FORWARDER:
             if (action == UI_ACTION_CHOOSE) choose_forwarder( l );
             break;
-        case SET_MAKE_FORWARDER:
-            if (action == UI_ACTION_CHOOSE) make_forwarder( l );
+        case SET_MAKE_32BIT:
+            if (action == UI_ACTION_CHOOSE) make_forwarder( l, 32 );
+            break;
+        case SET_MAKE_MAIN:
+            if (action == UI_ACTION_CHOOSE) make_forwarder( l, 36 );
             break;
 
         case SET_CREDITS:
@@ -2657,11 +2728,31 @@ static int add_game( struct launcher *l )
         ui_message( &l->ui, "Add Game", "Autorun cannot run this executable." );
         return -1;
     }
-    snprintf( message, sizeof(message), "%s\n\n%s\n\nAdd this game to your library?", program.title, program.dos );
-    if (!ui_confirm( &l->ui, "Review Game", message, "Add" ))
+    for (;;)
     {
-        launcher_log( "[LAUNCHER] Add Game cancelled during review" );
-        return -1;
+        static const struct ui_hint hints[] = { { UI_A, "Add" }, { UI_X, "Rename" }, { UI_B, "Cancel" } };
+        char name[128];
+        int answer;
+
+        snprintf( message, sizeof(message), "%s\n\n%s\n\nAdd this game to your library?",
+                  program.title, program.dos );
+        answer = ui_ask( &l->ui, "Review Game", message, hints, 3 );
+        if (answer == UI_A) break;
+        if (answer != UI_X)
+        {
+            launcher_log( "[LAUNCHER] Add Game cancelled during review" );
+            return -1;
+        }
+        /* Named before it is added, because the name is what the library is
+         * sorted and searched by. It is kept in the file beside the program. */
+        snprintf( name, sizeof(name), "%s", program.title );
+        if (launcher_platform_prompt( "Name", name, name, sizeof(name) ) && name[0])
+        {
+            snprintf( program.settings.title, sizeof(program.settings.title), "%s", name );
+            snprintf( program.title, sizeof(program.title), "%s", name );
+            save_program_settings( l, &program );
+        }
+        ui_start_screen( &l->ui );
     }
     if (l->program_count >= LAUNCHER_MAX_ENTRIES)
     {
@@ -3022,6 +3113,7 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
             l->symbols[i] = ui_svg_texture( &l->ui, symbols[i].icon->d, symbols[i].icon->x, symbols[i].icon->y,
                                             symbols[i].icon->width, symbols[i].icon->height, symbols[i].size );
     }
+    l->logo = load_logo( l );
     l->backdrop = l->backdrop_previous = -1;
     start_icons( l );
     started = SDL_GetTicks();
@@ -3055,6 +3147,7 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
     stop_icons( l );
     for (i = 0; i < SYMBOL_COUNT; i++)
         if (l->symbols[i]) SDL_DestroyTexture( l->symbols[i] );
+    if (l->logo) SDL_DestroyTexture( l->logo );
     ui_quit( &l->ui );
     launcher_platform_font_release();
     return ret;

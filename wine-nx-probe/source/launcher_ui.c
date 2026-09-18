@@ -1259,8 +1259,10 @@ static void draw_card( struct ui *ui, const char *title, const char *heading, co
 
     if (ui->snapshot)
     {
+        /* The snapshot of a modal already carries the veil that was drawn over
+         * the screen behind it, so only the first one dims. */
         SDL_RenderCopy( ui->renderer, ui->snapshot, NULL, NULL );
-        ui_fill( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 4, 7, 11, 205 } );
+        if (ui->modal_depth < 2) ui_fill( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 4, 7, 11, 205 } );
     }
     else
     {
@@ -1293,26 +1295,43 @@ static void draw_card( struct ui *ui, const char *title, const char *heading, co
     ui_fade( ui );
 }
 
-static int run_card( struct ui *ui, const char *title, const char *heading, const char *text,
+/* Which button answered, so a card can offer more than yes and no. */
+static int ask_card( struct ui *ui, const char *title, const char *heading, const char *text,
                      const struct ui_hint *hints, int hint_count )
 {
     struct ui_input input;
+    int answer = UI_B, i;
 
     ui_keep_screen( ui );
+    ui->modal_depth++;
     ui_start_screen( ui );
     while (ui_begin_frame( ui ))
     {
         while (ui_poll( ui, &input ))
         {
-            if (input.button == UI_A) return 1;
-            if (input.button == UI_B) return 0;
-            if (input.touch == UI_TOUCH_TAP && hint_count == 1) return 1;
+            if (input.button == UI_B) goto done;
+            for (i = 0; i < hint_count; i++)
+                if (hints[i].button == input.button) { answer = input.button; goto done; }
+            if (input.touch == UI_TOUCH_TAP && hint_count == 1) { answer = UI_A; goto done; }
         }
         draw_card( ui, title, heading, text, hints, hint_count );
         ui_present( ui );
         ui_wait( ui );
     }
-    return 0;
+done:
+    ui->modal_depth--;
+    return answer;
+}
+
+static int run_card( struct ui *ui, const char *title, const char *heading, const char *text,
+                     const struct ui_hint *hints, int hint_count )
+{
+    return ask_card( ui, title, heading, text, hints, hint_count ) == UI_A;
+}
+
+int ui_ask( struct ui *ui, const char *title, const char *text, const struct ui_hint *hints, int count )
+{
+    return ask_card( ui, title, title, text, hints, count );
 }
 
 void ui_message( struct ui *ui, const char *title, const char *text )
