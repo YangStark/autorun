@@ -48,7 +48,9 @@ extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 void nx_window_trace( const char *format, ... )
 {
     static LONG lines;
-    char buffer[256];
+    /* Long enough for everything a box says: the sentence that matters is
+     * usually the last control in it. */
+    char buffer[512];
     va_list args;
 
     if (!&wine_nx_runtime_trace || __atomic_add_fetch( &lines, 1, __ATOMIC_RELAXED ) > 256) return;

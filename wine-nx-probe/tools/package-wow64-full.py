@@ -129,6 +129,14 @@ while queue:
 for name in GAME_DLLS:
     assert 'Arch: i386\n' in readobj('--file-headers', syswow64 / dll_name(name)), name
 
+# A program of our own that does what a game does, for the times a game says
+# only that something went wrong. The launcher lists it beside the games.
+apc_test = stage / 'drive_c/APC Test/apc-test.exe'
+apc_test.parent.mkdir(parents=True, exist_ok=True)
+subprocess.run([str(toolchain / 'i686-w64-mingw32-clang'), '-O1', '-mwindows',
+                '-o', str(apc_test), str(probe / 'tests/win32/apc-test.c')], check=True)
+assert 'Arch: i386\n' in readobj('--file-headers', apc_test)
+
 # The launcher lists every program in drive_c; target.txt only preselects one.
 (stage / 'target.txt').write_text('sdmc:/switch/wine/drive_c/WarCraft III Setup/war3-setup.exe\n')
 (stage / 'run-entry.txt').write_text('1\n')

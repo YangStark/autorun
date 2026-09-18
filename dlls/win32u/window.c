@@ -4801,7 +4801,7 @@ void update_window_state( HWND hwnd )
  * the sentence that says why it stopped is the text of a control inside it. */
 static int nx_append_window_text( HWND hwnd, char *line, int at, int size )
 {
-    WCHAR text[128];
+    WCHAR text[256];
     int len, i;
 
     if ((len = NtUserInternalGetWindowText( hwnd, text, ARRAY_SIZE(text) )) <= 0) return at;
@@ -4815,7 +4815,7 @@ static int nx_append_window_text( HWND hwnd, char *line, int at, int size )
 
 static void nx_trace_window_words( HWND hwnd )
 {
-    char line[200];
+    char line[440];
     HWND child;
     int at = 0, shown = 0;
 
