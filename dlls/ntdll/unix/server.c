@@ -489,6 +489,21 @@ static int wait_select_reply( void *cookie )
  */
 static NTSTATUS invoke_user_apc( CONTEXT *context, const struct user_apc *apc, NTSTATUS status )
 {
+#ifdef __SWITCH__
+    {
+        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+        static LONG reported;
+        char message[192];
+
+        if (&wine_nx_runtime_trace && __atomic_add_fetch( &reported, 1, __ATOMIC_RELAXED ) <= 8)
+        {
+            snprintf( message, sizeof(message), "[APC] calling %p with %p, %p, %p",
+                      wine_server_get_ptr( apc->func ), (void *)apc->args[0],
+                      (void *)apc->args[1], (void *)apc->args[2] );
+            wine_nx_runtime_trace( message );
+        }
+    }
+#endif
     return call_user_apc_dispatcher( context, apc->flags, apc->args[0], apc->args[1], apc->args[2],
                                      wine_server_get_ptr( apc->func ), status );
 }

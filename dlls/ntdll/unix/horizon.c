@@ -12012,6 +12012,18 @@ static int horizon_server_select_polls_locked( const struct horizon_select_reque
     }
 }
 
+/* Whether a program's completion routines are being called at all: a handful of
+ * lines, since a program that uses them uses them for everything it reads. */
+static void horizon_report_user_apc( const char *what, unsigned int tid, unsigned int size, unsigned int status )
+{
+    static LONG reported;
+    char message[192];
+
+    if (__atomic_add_fetch( &reported, 1, __ATOMIC_RELAXED ) > 8) return;
+    snprintf( message, sizeof(message), "[APC] %s %04x, %u bytes, status %08x", what, tid, size, status );
+    wine_nx_runtime_trace( message );
+}
+
 /* Windows runs a thread's user APCs when it waits alertably, oldest first, and
  * the wait ends with STATUS_USER_APC rather than performing the wait: that is
  * how ReadFileEx's completion routine is called and how SleepEx returns
@@ -12060,6 +12072,7 @@ static int horizon_server_handle_queue_apc( struct horizon_server_connection *co
         if (data_size) status = horizon_server_queue_user_apc_locked( thread, data, data_size );
         reply.self = connection->thread == thread;
     }
+    horizon_report_user_apc( "queued for thread", thread ? thread->thread.tid : 0, data_size, status );
     pthread_mutex_unlock( &horizon_server_objects_mutex );
     reply.header.error = status;
     /* Only a system APC is answered with a handle to collect a result from. */
@@ -12098,6 +12111,7 @@ static int horizon_server_handle_select( struct horizon_server_connection *conne
             (apc = horizon_server_take_user_apc_locked( connection->thread )))
         {
             reply.header.error = HORIZON_STATUS_USER_APC;
+            horizon_report_user_apc( "run by thread", connection->thread->thread.tid, apc->size, 0 );
             break;
         }
         horizon_server_update_timers_locked();
