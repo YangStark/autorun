@@ -62,6 +62,7 @@ Result splCryptoGenerateAesKey( const void *kek, const void *src, void *out )
 { (void)kek; memcpy( out, src, 0x10 ); return 0; }
 
 static int placeholders;
+static int registered;
 static char placeholder_path[512];
 
 Result ncmOpenContentStorage( NcmContentStorage *out, NcmStorageId id ) { (void)id; out->handle = 1; return 0; }
@@ -89,7 +90,9 @@ Result ncmContentStorageWritePlaceHolder( NcmContentStorage *cs, const NcmPlaceH
 }
 Result ncmContentStorageDelete( NcmContentStorage *cs, const NcmContentId *id ) { (void)cs; (void)id; return 0; }
 Result ncmContentStorageRegister( NcmContentStorage *cs, const NcmContentId *content, const NcmPlaceHolderId *id )
-{ (void)cs; (void)content; (void)id; return 0; }
+{ (void)cs; (void)content; (void)id; registered++; return 0; }
+Result ncmContentStorageHas( NcmContentStorage *cs, bool *out, const NcmContentId *id )
+{ (void)cs; (void)id; *out = true; return 0; }
 Result ncmOpenContentMetaDatabase( NcmContentMetaDatabase *out, NcmStorageId id ) { (void)id; out->handle = 1; return 0; }
 void ncmContentMetaDatabaseClose( NcmContentMetaDatabase *db ) { (void)db; }
 Result ncmContentMetaDatabaseSet( NcmContentMetaDatabase *db, const NcmContentMetaKey *key,
@@ -368,6 +371,7 @@ int main( int argc, char **argv )
 
     assert( !wine_nx_forwarder_install( &request, &step ) );
     assert( !step );
+    assert( registered == 3 );
     /* Its own entry's contents were taken away, and before anything was written. */
     assert( deleted_entity == tid && !deleted_after_write );
     assert( deleted_completely_count == 3 );

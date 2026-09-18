@@ -52,7 +52,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-187"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-188"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -2771,6 +2771,12 @@ static int runtime_on_emummc( void )
 
 /* Build a forwarder that starts this NRO in the address space bits asks for,
  * and install it, so a game that needs the low 4 GB has somewhere to go. */
+/* What the forwarder installer has to say, as it says it. */
+static void log_line_plain( const char *line )
+{
+    log_line( "%s", line );
+}
+
 static unsigned int launcher_install_forwarder( int bits, const char *name, unsigned long long *id,
                                                 const char **step )
 {
@@ -2786,6 +2792,7 @@ static unsigned int launcher_install_forwarder( int bits, const char *name, unsi
     };
     unsigned int rc;
 
+    wine_nx_forwarder_report = log_line_plain;
     if (id) *id = wine_nx_forwarder_title_id( own_nro, NULL, request.address_space );
     rc = wine_nx_forwarder_install( &request, step );
     log_line( "[LAUNCHER] %d-bit forwarder %016llx: rc=0x%x%s%s", bits,

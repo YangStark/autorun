@@ -42,6 +42,9 @@ struct wine_nx_forwarder
  * the same entry -- and two spaces are two entries. */
 unsigned long long wine_nx_forwarder_title_id( const char *nro_path, const char *args, int address_space );
 
+/* Where the installer says what the console made of what it wrote. */
+extern void (*wine_nx_forwarder_report)( const char *line );
+
 /* Build the forwarder and install it. Returns 0, or the Result that failed;
  * step, when given, is left pointing at what was being done. */
 unsigned int wine_nx_forwarder_install( const struct wine_nx_forwarder *request, const char **step );

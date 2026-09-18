@@ -21,6 +21,9 @@
 
 #include "forwarder.h"
 
+/* Where a line about what was written goes, when the runtime gives it one. */
+void (*wine_nx_forwarder_report)( const char *line );
+
 /* The key the NCA header is encrypted with is derived from these, the same two
  * constants every tool that builds an NCA uses. */
 static const u8 HEADER_KEK_SRC[0x10] = {
@@ -831,6 +834,10 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
     NcmContentStorage storage;
     NcmContentMetaDatabase database;
     Service manager;
+    /* Where sphaira puts a forwarder, which is where the ones that work on a
+     * console are: the card, not the console's own memory. The three places
+     * that name a storage have to name the same one. */
+    const NcmStorageId storage_id = NcmStorageId_SdCard;
     Result rc = 0;
     int i;
 
@@ -901,7 +908,7 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
     cnmt_header.meta_header.content_count = 2;
     cnmt_header.meta_header.content_meta_count = 1;
     cnmt_header.meta_header.attributes = 0;
-    cnmt_header.meta_header.storage_id = NcmStorageId_BuiltInUser;
+    cnmt_header.meta_header.storage_id = storage_id;
     extended.patch_id = tid | 0x800;
     for (i = 0; i < 2; i++)
     {
@@ -932,7 +939,7 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
 
     memset( &record, 0, sizeof(record) );
     record.key = meta_key;
-    record.storage_id = NcmStorageId_BuiltInUser;
+    record.storage_id = storage_id;
 
     memset( &meta_data, 0, sizeof(meta_data) );
     meta_data.header = cnmt_header.meta_header;
@@ -952,7 +959,7 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
     ncas[0] = &program;
     ncas[1] = &control;
     ncas[2] = &meta;
-    if (R_FAILED( rc = ncmOpenContentStorage( &storage, NcmStorageId_BuiltInUser ) )) goto done;
+    if (R_FAILED( rc = ncmOpenContentStorage( &storage, storage_id ) )) goto done;
     for (i = 0; i < 3; i++)
     {
         NcmContentId content_id;
@@ -972,7 +979,7 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
     if (R_FAILED( rc )) goto done;
 
     *step = "updating the database";
-    if (R_FAILED( rc = ncmOpenContentMetaDatabase( &database, NcmStorageId_BuiltInUser ) )) goto done;
+    if (R_FAILED( rc = ncmOpenContentMetaDatabase( &database, storage_id ) )) goto done;
     rc = ncmContentMetaDatabaseSet( &database, &meta_key, &meta_data, sizeof(meta_data) );
     if (R_SUCCEEDED( rc )) rc = ncmContentMetaDatabaseCommit( &database );
     ncmContentMetaDatabaseClose( &database );
@@ -987,6 +994,33 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
     rc = ns_push_application_record( &manager, tid, &record, 1 );
     if (R_SUCCEEDED( rc )) ns_invalidate_control_cache( &manager, tid );
     if (hosversionAtLeast( 3, 0, 0 )) serviceClose( &manager );
+
+    /* Read back what was written, so a forwarder that the console will not
+     * show says which part of it the console cannot find. */
+    if (R_SUCCEEDED( rc ) && wine_nx_forwarder_report )
+    {
+        NcmContentStorage check;
+        char message[256];
+        int held[3] = { -1, -1, -1 };
+
+        if (R_SUCCEEDED( ncmOpenContentStorage( &check, storage_id ) ))
+        {
+            for (i = 0; i < 3; i++)
+            {
+                NcmContentId content_id;
+                bool has = false;
+
+                memcpy( &content_id, hashes[i], sizeof(content_id) );
+                held[i] = R_SUCCEEDED( ncmContentStorageHas( &check, &has, &content_id ) ) ? has : -1;
+            }
+            ncmContentStorageClose( &check );
+        }
+        snprintf( message, sizeof(message),
+                  "[FORWARDER] %016llx on storage %d: program %d control %d meta %d, sizes %u/%u/%u",
+                  (unsigned long long)tid, (int)storage_id, held[0], held[1], held[2],
+                  (unsigned)program.size, (unsigned)control.size, (unsigned)meta.size );
+        wine_nx_forwarder_report( message );
+    }
 
 done:
     buf_free( &program );

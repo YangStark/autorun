@@ -168,7 +168,7 @@ typedef struct { u32 parent, sibling; u64 dataOff, dataSize; u32 nextHash, nameL
 typedef enum { NcmContentType_Meta = 0, NcmContentType_Program = 1, NcmContentType_Control = 3 } NcmContentType;
 typedef enum { NcmContentMetaType_Application = 0x80 } NcmContentMetaType;
 typedef enum { NcmContentInstallType_Full = 0 } NcmContentInstallType;
-typedef enum { NcmStorageId_BuiltInUser = 3 } NcmStorageId;
+typedef enum { NcmStorageId_BuiltInUser = 3, NcmStorageId_SdCard = 5 } NcmStorageId;
 
 typedef struct { u8 c[0x10]; } NcmContentId;
 typedef struct { u8 c[0x10]; } NcmPlaceHolderId;
@@ -212,6 +212,7 @@ Result ncmContentStorageWritePlaceHolder( NcmContentStorage *cs, const NcmPlaceH
 Result ncmContentStorageDelete( NcmContentStorage *cs, const NcmContentId *id );
 Result ncmContentStorageRegister( NcmContentStorage *cs, const NcmContentId *content,
                                   const NcmPlaceHolderId *id );
+Result ncmContentStorageHas( NcmContentStorage *cs, bool *out, const NcmContentId *id );
 Result ncmOpenContentMetaDatabase( NcmContentMetaDatabase *out, NcmStorageId id );
 void ncmContentMetaDatabaseClose( NcmContentMetaDatabase *db );
 Result ncmContentMetaDatabaseSet( NcmContentMetaDatabase *db, const NcmContentMetaKey *key,
