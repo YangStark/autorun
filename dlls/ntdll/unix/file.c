@@ -2786,11 +2786,50 @@ static NTSTATUS read_directory_data_stat( struct dir_data *data, const char *uni
  *
  * Read a directory using the POSIX readdir interface; helper for NtQueryDirectoryFile.
  */
+#ifdef __SWITCH__
+
+extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+
+/* A card is formatted FAT, which has nowhere to keep a file's resource fork, so
+ * macOS writes the fork of FILE as a second file named ._FILE beside it. That is
+ * AppleDouble, and it is the same thing NTFS keeps in an alternate data stream,
+ * which no directory listing shows. Nothing on the Windows side of the card can
+ * read one, and a program that loads everything in a directory finds four
+ * kilobytes of Apple metadata where a DLL should be: Halo asks for every DLL in
+ * its Controls directory, gets STATUS_INVALID_IMAGE_FORMAT for ._CONTROLS.DLL,
+ * and reports that one of its own files is missing or corrupted. A fork is
+ * listed only once the file it belongs to is gone, when it is a file of its own
+ * that the owner may want to delete. */
+static BOOL is_resource_fork( const char *name )
+{
+    struct stat st;
+
+    if (name[0] != '.' || name[1] != '_' || !name[2]) return FALSE;
+    return !stat( name + 2, &st );
+}
+
+static void report_hidden_resource_forks( unsigned int count )
+{
+    static int reported;
+    char msg[MAX_DIR_ENTRY_LEN + 64], dir[MAX_DIR_ENTRY_LEN];
+
+    if (!count || reported || !&wine_nx_runtime_trace) return;
+    reported = 1;
+    if (!getcwd( dir, sizeof(dir) )) strcpy( dir, "." );
+    snprintf( msg, sizeof(msg), "[FS] %u macOS resource forks (._ files) hidden in %s", count, dir );
+    wine_nx_runtime_trace( msg );
+}
+
+#endif  /* __SWITCH__ */
+
 static NTSTATUS read_directory_data_readdir( struct dir_data *data, const UNICODE_STRING *mask )
 {
     struct dirent *de;
     NTSTATUS status = STATUS_NO_MEMORY;
     DIR *dir = opendir( "." );
+#ifdef __SWITCH__
+    unsigned int forks = 0;
+#endif
 
     if (!dir) return STATUS_NO_SUCH_FILE;
 
@@ -2799,11 +2838,21 @@ static NTSTATUS read_directory_data_readdir( struct dir_data *data, const UNICOD
     while ((de = readdir( dir )))
     {
         if (!strcmp( de->d_name, "." ) || !strcmp( de->d_name, ".." )) continue;
+#ifdef __SWITCH__
+        if (is_resource_fork( de->d_name ))
+        {
+            forks++;
+            continue;
+        }
+#endif
         if (!append_entry( data, de->d_name, NULL, mask )) goto done;
     }
     status = STATUS_SUCCESS;
 
 done:
+#ifdef __SWITCH__
+    report_hidden_resource_forks( forks );
+#endif
     closedir( dir );
     return status;
 }
