@@ -126,6 +126,21 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
     CONTEXT here;
 
     if (flags) FIXME( "flags %#x are not supported.\n", flags );
+    if (!context && get_cpu_area( IMAGE_FILE_MACHINE_I386 ))
+    {
+        /* A 32-bit program reads the status out of Eax, and wow64 takes its
+         * registers as they are here, runs the routine in a simulation of its
+         * own, and puts them back: the status has to be there beforehand, the
+         * way the native path puts it in X0. Only the integer registers, so
+         * this does not count as replacing the program's context. */
+        I386_CONTEXT wow = { CONTEXT_I386_INTEGER };
+
+        if (!get_thread_wow64_context( GetCurrentThread(), &wow, sizeof(wow) ))
+        {
+            wow.Eax = status;
+            set_thread_wow64_context( GetCurrentThread(), &wow, sizeof(wow) );
+        }
+    }
     if (!horizon_capture_context( &here )) dispatch( arg1, arg2, arg3, &here );
     /* A context the caller wants resumed instead of returning to it. */
     if (context) return signal_set_full_context( context );
