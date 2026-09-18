@@ -9264,6 +9264,40 @@ static char *horizon_server_dir_mask_from_utf16( const unsigned char *data, unsi
     return mask;
 }
 
+/* A card is formatted FAT, which has nowhere to keep a file's resource fork, so
+ * macOS writes the fork of FILE to a second file named ._FILE beside it. That is
+ * AppleDouble, and it is the same thing NTFS keeps in an alternate data stream,
+ * which no directory listing shows. Nothing on the Windows side of the card can
+ * read one, and a program that loads everything in a directory finds four
+ * kilobytes of Apple metadata where a DLL should be: Halo asks for every DLL in
+ * its Controls directory, loads ._CONTROLS.DLL, is told the image is invalid,
+ * and reports that one of its own files is missing or corrupted. A fork is
+ * listed only once the file it belongs to is gone, when it is a file of its own
+ * that the owner may want to delete. */
+static int horizon_dir_entry_is_resource_fork( const char *dir, const char *name )
+{
+    struct stat st;
+    char *path;
+    int fork;
+
+    if (name[0] != '.' || name[1] != '_' || !name[2]) return 0;
+    if (!(path = horizon_dir_entry_path( dir, name + 2 ))) return 0;
+    fork = !stat( path, &st );
+    free( path );
+    return fork;
+}
+
+static void horizon_report_resource_fork( const char *dir, const char *name )
+{
+    static int reported;
+    char message[384];
+
+    if (reported) return;
+    reported = 1;
+    snprintf( message, sizeof(message), "[FS] %s/%s is a macOS resource fork, kept out of the listing", dir, name );
+    wine_nx_runtime_trace( message );
+}
+
 static int horizon_server_handle_query_directory_file( struct horizon_server_connection *connection,
                                                        const unsigned char *message,
                                                        const unsigned char *data, unsigned int data_size )
@@ -9332,6 +9366,11 @@ static int horizon_server_handle_query_directory_file( struct horizon_server_con
             while ((de = readdir( dir )))
             {
                 if (!strcmp( de->d_name, "." ) || !strcmp( de->d_name, ".." )) continue;
+                if (horizon_dir_entry_is_resource_fork( object->file_name, de->d_name ))
+                {
+                    horizon_report_resource_fork( object->file_name, de->d_name );
+                    continue;
+                }
                 name = de->d_name;
                 break;
             }
