@@ -1334,6 +1334,74 @@ int ui_ask( struct ui *ui, const char *title, const char *text, const struct ui_
     return ask_card( ui, title, title, text, hints, count );
 }
 
+/* A short list inside a modal: the panel of a card, with the items in it and
+ * the light round the one in focus. Returns the item chosen, or -1. */
+int ui_menu( struct ui *ui, const char *title, const char *const *items, int count, int selection )
+{
+    static const struct ui_hint hints[] = { { UI_A, "Choose" }, { UI_B, "Close" } };
+    const int margin = 28, item_h = 52, hints_h = 34;
+    struct ui_input input;
+    int w = 420, h, x, y, top, i, chosen = -1;
+
+    if (count <= 0) return -1;
+    if (selection < 0 || selection >= count) selection = 0;
+    /* Its own height, so the hints stand under the last item rather than on it. */
+    h = margin + TTF_FontHeight( ui->normal ) + 14 + count * item_h + 14 + hints_h + margin / 2;
+    x = (ui->width - w) / 2;
+    y = (ui->height - h) / 2;
+
+    ui_keep_screen( ui );
+    ui->modal_depth++;
+    ui_start_screen( ui );
+    while (ui_begin_frame( ui ))
+    {
+        while (ui_poll( ui, &input ))
+        {
+            if (input.button == UI_B || input.button == UI_PLUS) goto done;
+            if (input.button == UI_A) { chosen = selection; goto done; }
+            if (input.button == UI_UP && selection > 0) selection--;
+            if (input.button == UI_DOWN && selection + 1 < count) selection++;
+            if (input.touch == UI_TOUCH_TAP)
+            {
+                int hit = (input.y - (y + margin + TTF_FontHeight( ui->normal ) + 14)) / item_h;
+
+                if (input.x < x || input.x >= x + w || hit < 0 || hit >= count) continue;
+                chosen = hit;
+                goto done;
+            }
+        }
+        if (ui->snapshot)
+        {
+            SDL_RenderCopy( ui->renderer, ui->snapshot, NULL, NULL );
+            if (ui->modal_depth < 2) ui_fill( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 4, 7, 11, 205 } );
+        }
+        else ui_background( ui );
+        ui_rounded( ui, x + 6, y + 10, w, h, 22, (SDL_Color){ 0, 0, 0, 120 } );
+        ui_rounded( ui, x, y, w, h, 22, (SDL_Color){ 22, 27, 30, 250 } );
+        ui_rounded_texture( ui, ui_sheen( ui ), NULL, (SDL_Rect){ x, y, w, h / 3 }, 22,
+                            (SDL_Color){ 255, 255, 255, 14 } );
+        ui_outline( ui, x, y, w, h, 22, 1, (SDL_Color){ 236, 240, 246, 120 } );
+        ui_text_fit( ui, ui->normal, x + margin, y + margin, w - 2 * margin, title, ui->value, 0 );
+        top = y + margin + TTF_FontHeight( ui->normal ) + 14;
+        for (i = 0; i < count; i++)
+        {
+            int row = top + i * item_h;
+
+            if (i == selection)
+                ui_animated_border( ui, x + 14, row + 2, w - 28, item_h - 6, 12, 2, UI_FOCUS_DIM, UI_FOCUS_LIT );
+            ui_text_fit( ui, ui->normal, x + 14 + ROW_PADDING, row + (item_h - TTF_FontHeight( ui->normal )) / 2,
+                         w - 28 - 2 * ROW_PADDING, items[i], i == selection ? ui->value : ui->text, 0 );
+        }
+        ui_hints_right( ui, hints, 2, x + w - margin, y + h - margin / 2 - hints_h / 2 );
+        ui_fade( ui );
+        ui_present( ui );
+        ui_wait( ui );
+    }
+done:
+    ui->modal_depth--;
+    return chosen;
+}
+
 void ui_message( struct ui *ui, const char *title, const char *text )
 {
     static const struct ui_hint hints[] = { { UI_A, "OK" } };
@@ -1871,6 +1939,7 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
             hints[hint_count++] = (struct ui_hint){ UI_B, "Back" };
         }
         ui_hints_right( ui, hints, hint_count, ui->width - 34, ui->height - 34 );
+        if (ui->footer_mark) ui->footer_mark( ui->header_status_data );
         ui_fade( ui );
         ui_present( ui );
         ui_wait( ui );

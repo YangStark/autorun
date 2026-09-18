@@ -52,7 +52,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-184"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-185"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -2779,7 +2779,7 @@ static unsigned int launcher_install_forwarder( int bits, const char *name, unsi
         .nro_path = own_nro,
         .args = NULL,
         .name = name,
-        .author = "Autorun",
+        .author = "ticoverse.com",
         .address_space = bits == 32 ? WINE_NX_SPACE_32BIT : WINE_NX_SPACE_36BIT,
         .icon = bits == 32 ? wine_nx_icon_32bit : wine_nx_icon_any,
         .icon_size = bits == 32 ? wine_nx_icon_32bit_size : wine_nx_icon_any_size,

@@ -1090,9 +1090,9 @@ static void draw_library( struct launcher *l )
 {
     /* A does what is in focus: with the header in focus it is that, not the game
      * the selection is remembered on. */
-    struct ui_hint hints[] = { { UI_A, "Play" }, { UI_Y, "Options" }, { UI_X, "Add Game" } };
-    /* With nothing to act on, only adding a game means anything. */
-    static const struct ui_hint empty_hints[] = { { UI_X, "Add Game" } };
+    struct ui_hint hints[] = { { UI_A, "Play" }, { UI_Y, "Options" }, { UI_PLUS, "Menu" } };
+    /* With nothing to act on, only the menu means anything. */
+    static const struct ui_hint empty_hints[] = { { UI_PLUS, "Menu" } };
     struct ui *ui = &l->ui;
     struct grid g;
     int shown, i;
@@ -1132,7 +1132,7 @@ static void draw_library( struct launcher *l )
                           l->program_count ? "No games match this view" : "Your library is empty", ui->value );
         ui_text_wrapped( ui, ui->normal, ui->width / 2, ui->height / 2, 900, 3,
                          l->program_count ? "Change the search or favorite filter, or show hidden games in Settings."
-                                          : "Press X to browse for a Windows executable and add your first game.",
+                                          : "Press + and choose Add game to browse for a Windows executable.",
                          ui->dim, 1 );
     }
     if (l->visible_count) ui_hints_right( ui, hints, sizeof(hints) / sizeof(hints[0]), ui->width - SHELL_MARGIN, HOME_HINT_Y );
@@ -1309,16 +1309,18 @@ static void draw_shell( struct launcher *l, int home )
     draw_symbol( l, SYMBOL_SETTINGS, right, SHELL_Y,
                  l->zone == ZONE_HEADER && l->header_focus == SHELL_SETTINGS ? 255 : 190 );
     l->shell_hits[SHELL_SETTINGS] = (SDL_Rect){ right - SHELL_GAP / 2, 0, width + SHELL_GAP, UI_HEADER_HEIGHT };
-    draw_footprint( l );
+    if (home) draw_footprint( l );
 }
 
 /* The mark, and beside it the address space when it is the low one -- which is
  * the only one worth saying, because it is the only one that changes what can
- * be started. At the left of the line the button hints keep at the right. */
+ * be started. Home and the settings keep it; the library is covers, and one
+ * more thing in the corner is one too many. */
 static void draw_footprint( struct launcher *l )
 {
     struct ui *ui = &l->ui;
-    int height = 56, x = SHELL_MARGIN, width, h;
+    const int line = HOME_HINT_Y - 12;
+    int height = 44, x = SHELL_MARGIN, width, h;
 
     if (l->logo)
     {
@@ -1328,13 +1330,19 @@ static void draw_footprint( struct launcher *l )
         rect.h = height;
         rect.w = h ? width * height / h : height;
         rect.x = x;
-        rect.y = HOME_HINT_Y - height / 2;
+        rect.y = line - height / 2;
         SDL_RenderCopy( ui->renderer, l->logo, NULL, &rect );
-        x += rect.w + 14;
+        x += rect.w + 12;
     }
     if (l->options->address_space_bits != 32) return;
-    ui_text( ui, ui->small, x, HOME_HINT_Y - TTF_FontHeight( ui->small ) / 2,
+    ui_text( ui, ui->small, x, line - TTF_FontHeight( ui->small ) / 2,
              "Running 32-bit address space", ui->dim );
+}
+
+/* What the settings screens ask for through the ui. */
+static void footer_mark( void *data )
+{
+    draw_footprint( data );
 }
 
 static SDL_Rect cover_crop( const struct program *p, int width, int height )
@@ -1518,7 +1526,7 @@ static int draw_tag( struct ui *ui, int x, int cy, const char *text, int warning
 
 static void draw_home( struct launcher *l )
 {
-    struct ui_hint hints[] = { { UI_A, "Play" }, { UI_Y, "Options" }, { UI_X, "Add Game" } };
+    struct ui_hint hints[] = { { UI_A, "Play" }, { UI_Y, "Options" }, { UI_PLUS, "Menu" } };
     static const struct ui_hint empty_hints[] = { { UI_A, "Open Library" } };
     struct ui *ui = &l->ui;
     int i;
@@ -3001,17 +3009,7 @@ static int run_library( struct launcher *l, char *target, size_t size )
                 ui_start_screen( ui );
                 break;
             case UI_X:
-            {
-                int added_index = add_game( l );
-
-                if (added_index >= 0)
-                {
-                    rebuild_lists( l, added_index );
-                    show_library( l, &home, ui );
-                }
-                ui_start_screen( ui );
                 break;
-            }
             case UI_MINUS:
                 if (home) settings_menu( l );
                 else library_menu( l );
@@ -3019,7 +3017,30 @@ static int run_library( struct launcher *l, char *target, size_t size )
                 ui_start_screen( ui );
                 break;
             case UI_PLUS:
-                return 0;
+            {
+                static const char *const items[] = { "Add game", "Exit Autorun" };
+                int chosen = ui_menu( ui, "Autorun", items, 2, 0 );
+
+                ui_start_screen( ui );
+                if (chosen == 1)
+                {
+                    if (ui_confirm( ui, "Exit Autorun", "Close Autorun and go back to the Homebrew Menu?",
+                                    "Exit" )) return 0;
+                    ui_start_screen( ui );
+                }
+                else if (!chosen)
+                {
+                    int added_index = add_game( l );
+
+                    if (added_index >= 0)
+                    {
+                        rebuild_lists( l, added_index );
+                        show_library( l, &home, ui );
+                    }
+                    ui_start_screen( ui );
+                }
+                break;
+            }
             case UI_B:
                 if (l->zone != ZONE_CONTENT)
                 {
@@ -3089,6 +3110,7 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
      * handed to it once it stands. */
     l->ui.header_status = header_status;
     l->ui.header_status_data = l;
+    l->ui.footer_mark = footer_mark;
 
     {
         SDL_RendererInfo info;

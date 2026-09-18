@@ -227,7 +227,7 @@ static void check_exefs_npdm( const u8 *data, int address_space, u64 tid )
     assert( aci0->program_id == tid && acid->program_id_min == tid && acid->program_id_max == tid );
 }
 
-static void check_control( const u8 *data, size_t size, const char *name, u64 tid )
+static void check_control( const u8 *data, size_t size, const char *name, const char *author, u64 tid )
 {
     const struct nca_header *header = nca_of( data );
     u64 start = (u64)header->fs_table[0].media_start_offset * 0x200;
@@ -261,6 +261,8 @@ static void check_control( const u8 *data, size_t size, const char *name, u64 ti
     }
     assert( found == 3 );
     assert( titles && !strcmp( titles[0].name, name ) && !strcmp( titles[15].name, name ) );
+    /* The publisher the console shows beside the name, in every language. */
+    assert( !strcmp( titles[0].author, author ) && !strcmp( titles[15].author, author ) );
     (void)tid;
 }
 
@@ -287,7 +289,7 @@ int main( int argc, char **argv )
     memset( &request, 0, sizeof(request) );
     request.nro_path = nro_path;
     request.name = "Autorun 32-bit";
-    request.author = "Autorun";
+    request.author = "ticoverse.com";
     request.address_space = WINE_NX_SPACE_32BIT;
     request.icon = wine_nx_icon_32bit;
     request.icon_size = wine_nx_icon_32bit_size;
@@ -309,7 +311,7 @@ int main( int argc, char **argv )
     meta = read_nca( 3, &meta_size );
     check_program( program, program_size, nro_path );
     check_exefs_npdm( program, WINE_NX_SPACE_32BIT, tid );
-    check_control( control, control_size, "Autorun 32-bit", tid );
+    check_control( control, control_size, "Autorun 32-bit", "ticoverse.com", tid );
     assert( nca_of( meta )->content_type == NCA_CONTENT_META );
     assert( nca_of( meta )->fs_header[0].fs_type == NCA_FS_PFS0 );
     assert( nca_of( meta )->size == meta_size );

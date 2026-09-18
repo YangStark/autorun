@@ -95,6 +95,9 @@ struct ui
      * them; any screen's header can ask for them through this. */
     void (*header_status)( void *data, int right, int y );
     void *header_status_data;
+    /* The mark the launcher puts in the corner, for the screens it does not
+     * draw itself. Given header_status_data. */
+    void (*footer_mark)( void *data );
     /* Where the left of the clock and the battery came out, so that nothing a
      * screen draws on the right stands underneath them. */
     int status_left;
@@ -206,6 +209,8 @@ int  ui_confirm( struct ui *ui, const char *title, const char *text, const char 
 /* A question with more than two answers: returns the button that was pressed,
  * or UI_B for the way out. */
 int  ui_ask( struct ui *ui, const char *title, const char *text, const struct ui_hint *hints, int count );
+/* A short list inside a modal. Returns the item chosen, or -1 for the way out. */
+int  ui_menu( struct ui *ui, const char *title, const char *const *items, int count, int selection );
 
 /* A list of settings rows. ui_list_run draws it and handles input until the
  * user acts on a row, then returns the action for the row at list->selection;
