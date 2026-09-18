@@ -37,9 +37,10 @@ struct wine_nx_forwarder
     size_t icon_size;
 };
 
-/* The application id a forwarder for this NRO and these arguments would have.
- * It comes from them alone, so the same request always names the same entry. */
-unsigned long long wine_nx_forwarder_title_id( const char *nro_path, const char *args );
+/* The application id a forwarder for this NRO, these arguments and this address
+ * space would have. It comes from them alone, so the same request always names
+ * the same entry -- and two spaces are two entries. */
+unsigned long long wine_nx_forwarder_title_id( const char *nro_path, const char *args, int address_space );
 
 /* Build the forwarder and install it. Returns 0, or the Result that failed;
  * step, when given, is left pointing at what was being done. */

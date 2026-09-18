@@ -759,20 +759,30 @@ static Result ns_invalidate_control_cache( Service *manager, u64 tid )
  * Putting the three together and handing them over
  */
 
-unsigned long long wine_nx_forwarder_title_id( const char *nro_path, const char *args )
+/* The id comes from what the entry starts and how, and the address space is
+ * part of how: two forwarders for the same NRO differing only in that are two
+ * entries, not one overwriting the other. */
+static void forwarder_hash( const char *nro_path, const char *args, int address_space, u64 *hash )
 {
-    char full[1024], both[2048];
-    u64 hash[SHA256_HASH_SIZE / sizeof(u64)];
+    char full[1024], both[2100];
 
     if (args && args[0]) snprintf( full, sizeof(full), "%s %s", nro_path, args );
     else snprintf( full, sizeof(full), "%s", nro_path );
-    snprintf( both, sizeof(both), "%s%s", nro_path, full );
+    if (address_space < 0) snprintf( both, sizeof(both), "%s%s", nro_path, full );
+    else snprintf( both, sizeof(both), "%s%s\naddress-space=%d", nro_path, full, address_space );
     sha256CalculateHash( hash, both, strlen( both ) );
+}
+
+unsigned long long wine_nx_forwarder_title_id( const char *nro_path, const char *args, int address_space )
+{
+    u64 hash[SHA256_HASH_SIZE / sizeof(u64)];
+
+    forwarder_hash( nro_path, args, address_space, hash );
     return 0x0500000000000000ull | (hash[0] & 0x00FFFFFFFFFFF000ull);
 }
 
 static Result forwarder_build_and_install( const struct wine_nx_forwarder *request, u64 tid, u64 old_tid,
-                                           const u8 *header_key, const char **step )
+                                           u64 plain_tid, const u8 *header_key, const char **step )
 {
     struct buf program = {0}, control = {0}, meta = {0}, cnmt = {0};
     struct file_entry exefs[2], romfs[2], cnmt_entry;
@@ -926,8 +936,11 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
         if (R_FAILED( rc = nsGetApplicationManagerInterface( &manager ) )) goto done;
     }
     else manager = *nsGetServiceSession_ApplicationManagerInterface();
-    /* An earlier forwarder for the same NRO, under the id sphaira once used. */
+    /* Earlier forwarders for this NRO: the one a build before this named
+     * without the address space, and the id sphaira once used. Left alone they
+     * are a second entry for the same thing, with contents nothing points at. */
     nsDeleteApplicationCompletely( old_tid );
+    if (plain_tid != tid) nsDeleteApplicationCompletely( plain_tid );
     nsDeleteApplicationEntity( tid );
     rc = ns_push_application_record( &manager, tid, &record, 1 );
     if (R_SUCCEEDED( rc )) ns_invalidate_control_cache( &manager, tid );
@@ -948,8 +961,7 @@ unsigned int wine_nx_forwarder_install( const struct wine_nx_forwarder *request,
 {
     const char *ignored = NULL;
     u8 header_kek[0x20], header_key[0x20];
-    u64 tid, old_tid;
-    char full[1024], both[2048];
+    u64 tid, old_tid, plain_tid;
     u64 hash[SHA256_HASH_SIZE / sizeof(u64)];
     Result rc;
 
@@ -958,11 +970,13 @@ unsigned int wine_nx_forwarder_install( const struct wine_nx_forwarder *request,
     if (!request || !request->nro_path || !request->icon || !request->icon_size)
         return MAKERESULT( Module_Libnx, LibnxError_BadInput );
 
-    if (request->args && request->args[0]) snprintf( full, sizeof(full), "%s %s", request->nro_path, request->args );
-    else snprintf( full, sizeof(full), "%s", request->nro_path );
-    snprintf( both, sizeof(both), "%s%s", request->nro_path, full );
-    sha256CalculateHash( hash, both, strlen( both ) );
+    forwarder_hash( request->nro_path, request->args, request->address_space, hash );
     tid = 0x0500000000000000ull | (hash[0] & 0x00FFFFFFFFFFF000ull);
+    /* What this NRO's forwarder was called before the address space was part of
+     * the name, and what sphaira calls one: both are the same entry as this,
+     * made for the same NRO, so they are taken away rather than left behind. */
+    forwarder_hash( request->nro_path, request->args, -1, hash );
+    plain_tid = 0x0500000000000000ull | (hash[0] & 0x00FFFFFFFFFFF000ull);
     old_tid = 0x0100000000000000ull | (hash[0] & 0x00FFFFFFFFFFF000ull);
 
     *step = "asking for the console's key";
@@ -977,7 +991,7 @@ unsigned int wine_nx_forwarder_install( const struct wine_nx_forwarder *request,
     if (R_FAILED( rc = ncmInitialize() )) return rc;
     if (R_SUCCEEDED( rc = nsInitialize() ))
     {
-        rc = forwarder_build_and_install( request, tid, old_tid, header_key, step );
+        rc = forwarder_build_and_install( request, tid, old_tid, plain_tid, header_key, step );
         nsExit();
     }
     ncmExit();

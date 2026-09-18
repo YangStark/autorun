@@ -16,20 +16,29 @@
 char shim_out_dir[512];
 
 /* The hash only has to be a hash: what is checked here is the shape of what it
- * is taken over, not the console's acceptance of it. */
+ * is taken over, not the console's acceptance of it. Every byte has to reach
+ * every word, though, or two inputs that differ by one would come out alike. */
 void sha256CalculateHash( void *dst, const void *src, size_t size )
 {
     const u8 *bytes = src;
     u64 state[4] = { 0x6a09e667f3bcc908ull, 0xbb67ae8584caa73bull, 0x3c6ef372fe94f82bull, 0xa54ff53a5f1d36f1ull };
+    u64 rolling = 0xcbf29ce484222325ull;
     size_t i;
+    int w;
 
     for (i = 0; i < size; i++)
     {
-        int slot = i & 3;
-        state[slot] = (state[slot] ^ bytes[i]) * 0x100000001b3ull;
-        state[slot] ^= state[slot] >> 29;
+        rolling = (rolling ^ bytes[i]) * 0x100000001b3ull;
+        rolling ^= rolling >> 29;
     }
-    state[0] ^= size;
+    rolling ^= size;
+    for (w = 0; w < 4; w++)
+    {
+        state[w] ^= rolling;
+        state[w] *= 0x100000001b3ull;
+        state[w] ^= state[w] >> 31;
+        rolling = rolling * 6364136223846793005ull + 1442695040888963407ull;
+    }
     memcpy( dst, state, 0x20 );
 }
 
@@ -262,7 +271,7 @@ int main( int argc, char **argv )
     const char *step = NULL;
     size_t program_size, control_size, meta_size;
     u8 *program, *control, *meta;
-    u64 tid;
+    u64 tid, other;
 
     if (argc < 4)
     {
@@ -283,11 +292,14 @@ int main( int argc, char **argv )
     request.icon = wine_nx_icon_32bit;
     request.icon_size = wine_nx_icon_32bit_size;
 
-    tid = wine_nx_forwarder_title_id( nro_path, NULL );
+    tid = wine_nx_forwarder_title_id( nro_path, NULL, WINE_NX_SPACE_32BIT );
     assert( (tid >> 56) == 0x05 );
     assert( !(tid & 0xFFF) );
-    assert( tid == wine_nx_forwarder_title_id( nro_path, NULL ) );
-    assert( tid != wine_nx_forwarder_title_id( "sdmc:/other.nro", NULL ) );
+    assert( tid == wine_nx_forwarder_title_id( nro_path, NULL, WINE_NX_SPACE_32BIT ) );
+    assert( tid != wine_nx_forwarder_title_id( "sdmc:/other.nro", NULL, WINE_NX_SPACE_32BIT ) );
+    /* The two a user can make are two entries: one must not replace the other. */
+    assert( tid != wine_nx_forwarder_title_id( nro_path, NULL, WINE_NX_SPACE_36BIT ) );
+    assert( tid != wine_nx_forwarder_title_id( nro_path, NULL, -1 ) );
 
     assert( !wine_nx_forwarder_install( &request, &step ) );
     assert( !step );
@@ -305,10 +317,12 @@ int main( int argc, char **argv )
     /* And the default space, which is the only thing that differs. */
     request.address_space = WINE_NX_SPACE_36BIT;
     request.name = "Autorun";
+    /* Its own entry: the same NRO in another address space is another thing. */
+    assert( (other = wine_nx_forwarder_title_id( nro_path, NULL, WINE_NX_SPACE_36BIT )) != tid );
     assert( !wine_nx_forwarder_install( &request, &step ) );
     free( program );
     program = read_nca( 4, &program_size );
-    check_exefs_npdm( program, WINE_NX_SPACE_36BIT, tid );
+    check_exefs_npdm( program, WINE_NX_SPACE_36BIT, other );
     free( program );
     free( control );
     free( meta );

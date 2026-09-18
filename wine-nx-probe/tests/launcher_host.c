@@ -298,7 +298,7 @@ int main( int argc, char **argv )
 {
     struct wine_nx_launcher_options options = { .runtime_dir = "sdmc:/switch/wine", .build = "nx-host-test",
                                                 .nro_path = "sdmc:/switch/wine/wine-nx-runtime.nro",
-                                                .emummc = -1, .address_space_bits = 36,
+                                                .emummc = -1, .address_space_bits = 32,
                                                 .machine_of = machine_of, .vulkan = 1,
                                                 .install_forwarder = install_forwarder };
     char target[512] = "", line[300];

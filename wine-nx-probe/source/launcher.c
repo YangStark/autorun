@@ -1312,14 +1312,13 @@ static void draw_shell( struct launcher *l, int home )
     draw_footprint( l );
 }
 
-/* The mark, and over it the address space the console gave this process --
- * which is what decides whether a game can be started at all -- at the left of
- * the line the button hints keep at the right. */
+/* The mark, and beside it the address space when it is the low one -- which is
+ * the only one worth saying, because it is the only one that changes what can
+ * be started. At the left of the line the button hints keep at the right. */
 static void draw_footprint( struct launcher *l )
 {
     struct ui *ui = &l->ui;
-    char text[64];
-    int height = 92, width, h;
+    int height = 56, x = SHELL_MARGIN, width, h;
 
     if (l->logo)
     {
@@ -1328,15 +1327,14 @@ static void draw_footprint( struct launcher *l )
         SDL_QueryTexture( l->logo, NULL, NULL, &width, &h );
         rect.h = height;
         rect.w = h ? width * height / h : height;
-        rect.x = SHELL_MARGIN - 10;
-        rect.y = HOME_HINT_Y - height / 2 - 14;
-        SDL_SetTextureAlphaMod( l->logo, 55 );
+        rect.x = x;
+        rect.y = HOME_HINT_Y - height / 2;
         SDL_RenderCopy( ui->renderer, l->logo, NULL, &rect );
-        SDL_SetTextureAlphaMod( l->logo, 255 );
+        x += rect.w + 14;
     }
-    if (!l->options->address_space_bits) return;
-    snprintf( text, sizeof(text), "Running %d-bit address space", l->options->address_space_bits );
-    ui_text( ui, ui->small, SHELL_MARGIN, HOME_HINT_Y - TTF_FontHeight( ui->small ) / 2, text, ui->dim );
+    if (l->options->address_space_bits != 32) return;
+    ui_text( ui, ui->small, x, HOME_HINT_Y - TTF_FontHeight( ui->small ) / 2,
+             "Running 32-bit address space", ui->dim );
 }
 
 static SDL_Rect cover_crop( const struct program *p, int width, int height )

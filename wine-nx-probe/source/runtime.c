@@ -52,7 +52,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-183"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-184"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -2786,7 +2786,7 @@ static unsigned int launcher_install_forwarder( int bits, const char *name, unsi
     };
     unsigned int rc;
 
-    if (id) *id = wine_nx_forwarder_title_id( own_nro, NULL );
+    if (id) *id = wine_nx_forwarder_title_id( own_nro, NULL, request.address_space );
     rc = wine_nx_forwarder_install( &request, step );
     log_line( "[LAUNCHER] %d-bit forwarder %016llx: rc=0x%x%s%s", bits,
               id ? *id : 0ull, rc, rc && step && *step ? " at " : "", rc && step && *step ? *step : "" );
