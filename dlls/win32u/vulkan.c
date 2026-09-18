@@ -1974,7 +1974,9 @@ static BOOL get_surface_rect( HWND hwnd, RECT *rect, UINT dpi )
 static void adjust_surface_capabilities( struct vulkan_instance *instance, struct surface *surface,
                                          VkSurfaceCapabilitiesKHR *capabilities )
 {
-    RECT client_rect;
+    VkExtent2D host_max = capabilities->maxImageExtent;
+    RECT client_rect = {0};
+    UINT width, height;
 
     /* Many Windows games, for example Strange Brigade, No Man's Sky, Path of Exile
      * and World War Z, do not expect that maxImageCount can be set to 0.
@@ -1987,13 +1989,25 @@ static void adjust_surface_capabilities( struct vulkan_instance *instance, struc
 
     /* Update the image extents to match what the Win32 WSI would provide. */
     /* FIXME: handle DPI scaling, somehow */
-    get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) );
-    capabilities->minImageExtent.width = client_rect.right - client_rect.left;
-    capabilities->minImageExtent.height = client_rect.bottom - client_rect.top;
-    capabilities->maxImageExtent.width = client_rect.right - client_rect.left;
-    capabilities->maxImageExtent.height = client_rect.bottom - client_rect.top;
-    capabilities->currentExtent.width = client_rect.right - client_rect.left;
-    capabilities->currentExtent.height = client_rect.bottom - client_rect.top;
+    if (!get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ))
+    {
+        /* Nothing to take them from: what the driver said stands. Reading them
+         * out of the rect anyway takes them from whatever was on the stack,
+         * and an extent of millions is a swapchain no device can make. */
+        WARN( "surface %p, hwnd %p has no rect to take the extents from\n", surface, surface->hwnd );
+        return;
+    }
+    width = client_rect.right - client_rect.left;
+    height = client_rect.bottom - client_rect.top;
+    /* Never more than the device can make, whatever the rect said. */
+    if (host_max.width && width > host_max.width) width = host_max.width;
+    if (host_max.height && height > host_max.height) height = host_max.height;
+    capabilities->minImageExtent.width = width;
+    capabilities->minImageExtent.height = height;
+    capabilities->maxImageExtent.width = width;
+    capabilities->maxImageExtent.height = height;
+    capabilities->currentExtent.width = width;
+    capabilities->currentExtent.height = height;
 }
 
 static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( VkPhysicalDevice client_physical_device, VkSurfaceKHR client_surface,
