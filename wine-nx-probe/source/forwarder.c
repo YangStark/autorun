@@ -695,6 +695,33 @@ static int npdm_patch( u8 *npdm, size_t size, u64 tid, int address_space )
  * The NACP, which is what the home menu reads
  */
 
+/* The NACP of an NRO, out of the assets that follow its code: the one nacptool
+ * wrote, with every field it fills, rather than one built here out of zeroes.
+ * sphaira starts a forwarder from the NRO's own, and the fields nobody thinks
+ * to set are exactly the ones that make the home menu refuse an entry. */
+static int nacp_from_nro( const char *nro_path, NacpStruct *nacp )
+{
+    struct { u32 magic; u32 version; u64 icon_offset, icon_size, nacp_offset, nacp_size; } assets;
+    u32 nro_size = 0;
+    FILE *file;
+    int ok = 0;
+
+    if (!nro_path || !nro_path[0] || !(file = fopen( nro_path, "rb" ))) return 0;
+    /* "NRO0" at 0x10, and the size of the code at 0x18: the assets follow it. */
+    if (fseek( file, 0x10, SEEK_SET ) || fread( &assets.magic, 1, 4, file ) != 4 ||
+        memcmp( &assets.magic, "NRO0", 4 )) goto done;
+    if (fseek( file, 0x18, SEEK_SET ) || fread( &nro_size, 1, 4, file ) != 4 || !nro_size) goto done;
+    if (fseek( file, nro_size, SEEK_SET ) || fread( &assets, 1, sizeof(assets), file ) != sizeof(assets)) goto done;
+    if (memcmp( &assets.magic, "ASET", 4 ) || assets.nacp_size < sizeof(*nacp)) goto done;
+    if (fseek( file, nro_size + assets.nacp_offset, SEEK_SET ) ||
+        fread( nacp, 1, sizeof(*nacp), file ) != sizeof(*nacp)) goto done;
+    ok = 1;
+
+done:
+    fclose( file );
+    return ok;
+}
+
 static void nacp_build( NacpStruct *nacp, const char *name, const char *author, u64 tid )
 {
     unsigned int i;
@@ -703,7 +730,6 @@ static void nacp_build( NacpStruct *nacp, const char *name, const char *author, 
      * libnx has called the field around them from one version to the next. */
     NacpLanguageEntry *titles = (NacpLanguageEntry *)nacp;
 
-    memset( nacp, 0, sizeof(*nacp) );
     for (i = 0; i < 16; i++)
     {
         snprintf( titles[i].name, sizeof(titles[i].name), "%s", name );
@@ -849,6 +875,9 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
 
     /* The control: the name and the icon the home menu shows. */
     *step = "building the control";
+    /* Its own NACP when it can be read, so the forwarder inherits every field
+     * nacptool fills; zeroes with the few that matter set, when it cannot. */
+    if (!nacp_from_nro( request->nro_path, nacp )) memset( nacp, 0, sizeof(*nacp) );
     nacp_build( nacp, request->name, request->author, tid );
     romfs[0] = (struct file_entry){ "/control.nacp", nacp, sizeof(*nacp) };
     romfs[1] = (struct file_entry){ "/icon_AmericanEnglish.dat", request->icon, request->icon_size };

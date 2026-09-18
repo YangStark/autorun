@@ -153,6 +153,39 @@ static void *load_file( const char *path, size_t *size )
     return data;
 }
 
+/* An NRO with assets, so the path that reads the NACP out of one is the path
+ * the test walks: code, then ASET, then a NACP with something recognisable in
+ * a field the builder never sets. */
+static void write_fake_nro( const char *path, const char *isbn )
+{
+    u8 header[0x40] = {0};
+    u8 assets[0x38] = {0};
+    u8 *nacp = calloc( 1, 0x4000 );
+    u32 nro_size = sizeof(header);
+    u64 value;
+    FILE *file = fopen( path, "wb" );
+
+    assert( file && nacp );
+    memcpy( header + 0x10, "NRO0", 4 );
+    memcpy( header + 0x18, &nro_size, 4 );
+    memcpy( assets, "ASET", 4 );
+    value = sizeof(assets);            /* icon, empty */
+    memcpy( assets + 0x08, &value, 8 );
+    value = 0;
+    memcpy( assets + 0x10, &value, 8 );
+    value = sizeof(assets);            /* the NACP follows the header */
+    memcpy( assets + 0x18, &value, 8 );
+    value = 0x4000;
+    memcpy( assets + 0x20, &value, 8 );
+    /* Isbn is at 0x3000 and nothing in the builder touches it. */
+    memcpy( nacp + 0x3000, isbn, strlen( isbn ) );
+    fwrite( header, 1, sizeof(header), file );
+    fwrite( assets, 1, sizeof(assets), file );
+    fwrite( nacp, 1, 0x4000, file );
+    fclose( file );
+    free( nacp );
+}
+
 static u8 *read_nca( int index, size_t *size )
 {
     char path[512];
@@ -245,7 +278,8 @@ static void check_exefs_npdm( const u8 *data, int address_space, u64 tid )
     assert( aci0->program_id == tid && acid->program_id_min == tid && acid->program_id_max == tid );
 }
 
-static void check_control( const u8 *data, size_t size, const char *name, const char *author, u64 tid )
+static void check_control( const u8 *data, size_t size, const char *name, const char *author,
+                           const char *isbn, u64 tid )
 {
     const struct nca_header *header = nca_of( data );
     u64 start = (u64)header->fs_table[0].media_start_offset * 0x200;
@@ -254,6 +288,7 @@ static void check_control( const u8 *data, size_t size, const char *name, const 
     const romfs_header *romfs = (const romfs_header *)base;
     const romfs_dir *root = (const romfs_dir *)(base + romfs->dirTableOff);
     const NacpLanguageEntry *titles = NULL;
+    const u8 *nacp = NULL;
     u32 offset;
     int found = 0;
 
@@ -270,7 +305,8 @@ static void check_control( const u8 *data, size_t size, const char *name, const 
         memcpy( entry, at + sizeof(file), file.nameLen < sizeof(entry) ? file.nameLen : sizeof(entry) - 1 );
         if (!strcmp( entry, "control.nacp" ))
         {
-            titles = (const NacpLanguageEntry *)(base + romfs->fileDataOff + file.dataOff);
+            nacp = base + romfs->fileDataOff + file.dataOff;
+            titles = (const NacpLanguageEntry *)nacp;
             assert( file.dataSize == sizeof(NacpStruct) );
             found |= 1;
         }
@@ -281,6 +317,10 @@ static void check_control( const u8 *data, size_t size, const char *name, const 
     assert( titles && !strcmp( titles[0].name, name ) && !strcmp( titles[15].name, name ) );
     /* The publisher the console shows beside the name, in every language. */
     assert( !strcmp( titles[0].author, author ) && !strcmp( titles[15].author, author ) );
+    /* Carried over from the NRO's own NACP rather than built out of zeroes. */
+    if (isbn) assert( !memcmp( nacp + 0x3000, isbn, strlen( isbn ) ) );
+    /* Not rated, in every region. */
+    for (offset = 0; offset < 0x20; offset++) assert( nacp[0x3040 + offset] == 0xFF );
     (void)tid;
 }
 
@@ -288,6 +328,7 @@ int main( int argc, char **argv )
 {
     static const char nro_path[] = "sdmc:/switch/wine/wine-nx-runtime.nro";
     struct wine_nx_forwarder request;
+    char nro_file[512];
     const char *step = NULL;
     size_t program_size, control_size, meta_size;
     u8 *program, *control, *meta;
@@ -304,37 +345,41 @@ int main( int argc, char **argv )
     wine_nx_hbl_main = calloc( 1, wine_nx_hbl_main_size );
     snprintf( shim_out_dir, sizeof(shim_out_dir), "%s", argv[3] );
 
+    /* The builder reads the NACP out of this, so it has to be a real file. */
+    snprintf( nro_file, sizeof(nro_file), "%s/fake.nro", argv[3] );
+    write_fake_nro( nro_file, "autorun-nro-nacp" );
+
+    tid = wine_nx_forwarder_title_id( nro_file, NULL, WINE_NX_SPACE_32BIT );
+    assert( (tid >> 56) == 0x05 );
+    assert( !(tid & 0xFFF) );
+    assert( tid == wine_nx_forwarder_title_id( nro_file, NULL, WINE_NX_SPACE_32BIT ) );
+    assert( tid != wine_nx_forwarder_title_id( nro_path, NULL, WINE_NX_SPACE_32BIT ) );
+    /* The two a user can make are two entries: one must not replace the other. */
+    assert( tid != wine_nx_forwarder_title_id( nro_file, NULL, WINE_NX_SPACE_36BIT ) );
+    assert( tid != wine_nx_forwarder_title_id( nro_file, NULL, -1 ) );
+
     memset( &request, 0, sizeof(request) );
-    request.nro_path = nro_path;
+    request.nro_path = nro_file;
     request.name = "Autorun 32-bit";
     request.author = "ticoverse.com";
     request.address_space = WINE_NX_SPACE_32BIT;
     request.icon = wine_nx_icon_32bit;
     request.icon_size = wine_nx_icon_32bit_size;
 
-    tid = wine_nx_forwarder_title_id( nro_path, NULL, WINE_NX_SPACE_32BIT );
-    assert( (tid >> 56) == 0x05 );
-    assert( !(tid & 0xFFF) );
-    assert( tid == wine_nx_forwarder_title_id( nro_path, NULL, WINE_NX_SPACE_32BIT ) );
-    assert( tid != wine_nx_forwarder_title_id( "sdmc:/other.nro", NULL, WINE_NX_SPACE_32BIT ) );
-    /* The two a user can make are two entries: one must not replace the other. */
-    assert( tid != wine_nx_forwarder_title_id( nro_path, NULL, WINE_NX_SPACE_36BIT ) );
-    assert( tid != wine_nx_forwarder_title_id( nro_path, NULL, -1 ) );
-
     assert( !wine_nx_forwarder_install( &request, &step ) );
     assert( !step );
     /* Its own entry's contents were taken away, and before anything was written. */
     assert( deleted_entity == tid && !deleted_after_write );
     assert( deleted_completely_count == 3 );
-    assert( deleted_completely[1] == wine_nx_forwarder_title_id( nro_path, NULL, -1 ) );
+    assert( deleted_completely[1] == wine_nx_forwarder_title_id( nro_file, NULL, -1 ) );
     assert( deleted_completely[2] == tid );
 
     program = read_nca( 1, &program_size );
     control = read_nca( 2, &control_size );
     meta = read_nca( 3, &meta_size );
-    check_program( program, program_size, nro_path );
+    check_program( program, program_size, nro_file );
     check_exefs_npdm( program, WINE_NX_SPACE_32BIT, tid );
-    check_control( control, control_size, "Autorun 32-bit", "ticoverse.com", tid );
+    check_control( control, control_size, "Autorun 32-bit", "ticoverse.com", "autorun-nro-nacp", tid );
     assert( nca_of( meta )->content_type == NCA_CONTENT_META );
     assert( nca_of( meta )->fs_header[0].fs_type == NCA_FS_PFS0 );
     assert( nca_of( meta )->size == meta_size );
@@ -343,7 +388,7 @@ int main( int argc, char **argv )
     request.address_space = WINE_NX_SPACE_36BIT;
     request.name = "Autorun";
     /* Its own entry: the same NRO in another address space is another thing. */
-    assert( (other = wine_nx_forwarder_title_id( nro_path, NULL, WINE_NX_SPACE_36BIT )) != tid );
+    assert( (other = wine_nx_forwarder_title_id( nro_file, NULL, WINE_NX_SPACE_36BIT )) != tid );
     assert( !wine_nx_forwarder_install( &request, &step ) );
     free( program );
     program = read_nca( 4, &program_size );
@@ -352,7 +397,7 @@ int main( int argc, char **argv )
     free( control );
     free( meta );
 
-    puts( "forwarder: title ids, program exefs and romfs, the address space in the NPDM, and the control "
-          "romfs passed" );
+    puts( "forwarder: title ids, program exefs and romfs, the address space in the NPDM, the control romfs "
+          "and the NACP it inherits, and taking the old entry away before writing passed" );
     return 0;
 }
