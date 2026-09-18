@@ -52,7 +52,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-192"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-193"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -2892,6 +2892,11 @@ int main( int argc, char **argv )
             threadClose( &stall_watch_thread );
         else stall_watch_running = 1;
     }
+    /* First, before anything else: which build this is and which file it was
+     * started from. Without it a log from an older NRO on the card reads just
+     * like one from the new one. */
+    log_line( "[BUILD] %s from %s (address space %d bits)", WINE_NX_RUNTIME_BUILD, own_nro,
+              runtime_address_space_bits() );
     /* The launcher can access SteamGridDB before a game is selected. */
     log_memory_map( "start-up" );
     log_line( "[MAP] start-up: %d regions the loader already had lent", loader_lent_count );
