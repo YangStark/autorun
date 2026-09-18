@@ -64,6 +64,7 @@
 #include "horizon_read_redirect.h"
 #include "horizon_object_dirs.h"
 #include "horizon_keyboard.h"
+#include "horizon_mouse.h"
 #include "horizon_free_range.h"
 
 #include <errno.h>
@@ -704,12 +705,7 @@ unsigned int horizon_set_process_machine( unsigned short machine )
 #define HORIZON_IMDT_KEYBOARD 0x01
 #define HORIZON_WM_INPUT 0x00ff
 #define HORIZON_RIM_INPUT 0
-#define HORIZON_MOUSEEVENTF_MOVE 0x0001
-#define HORIZON_MOUSEEVENTF_LEFTDOWN 0x0002
-#define HORIZON_MOUSEEVENTF_LEFTUP 0x0004
-#define HORIZON_MOUSEEVENTF_RIGHTDOWN 0x0008
-#define HORIZON_MOUSEEVENTF_RIGHTUP 0x0010
-#define HORIZON_MOUSEEVENTF_ABSOLUTE 0x8000
+/* The MOUSEEVENTF_* a hardware message carries are in horizon_mouse.h. */
 #define HORIZON_SET_CARET_POS 0x01
 #define HORIZON_SET_CARET_HIDE 0x02
 #define HORIZON_SET_CARET_STATE 0x04
@@ -2678,6 +2674,8 @@ struct horizon_input_message
     unsigned int data_flags;         /* hardware_msg_data.flags */
     int raw_keyboard;                /* WM_INPUT, carrying raw */
     struct horizon_raw_keyboard raw;
+    int raw_mouse;                   /* WM_INPUT, carrying raw_m */
+    struct horizon_raw_mouse raw_m;
     struct horizon_input_message *next;
 };
 
@@ -7314,6 +7312,34 @@ static unsigned int horizon_server_queue_key_locked( struct horizon_user_window 
     return HORIZON_STATUS_SUCCESS;
 }
 
+/* WM_INPUT for a raw mouse registration, which is how DirectInput 8 reads the
+ * mouse. The cursor position rides along, as server/queue.c sends it. */
+static unsigned int horizon_server_queue_raw_mouse_locked( struct horizon_user_window *window, int x, int y,
+                                                           unsigned int time, unsigned long long info,
+                                                           const struct horizon_raw_mouse *raw )
+{
+    struct horizon_input_message *queued;
+
+    if (!window) return HORIZON_STATUS_SUCCESS;
+    if (!(queued = calloc( 1, sizeof(*queued) ))) return HORIZON_STATUS_NO_MEMORY;
+    queued->id = horizon_next_input_message_id++;
+    if (!queued->id) queued->id = horizon_next_input_message_id++;
+    queued->tid = window->tid;
+    queued->win = window->handle;
+    queued->msg = HORIZON_WM_INPUT;
+    queued->wparam = HORIZON_RIM_INPUT;
+    queued->x = x;
+    queued->y = y;
+    queued->time = time;
+    queued->info = info;
+    queued->device = HORIZON_IMDT_MOUSE;
+    queued->raw_mouse = 1;
+    queued->raw_m = *raw;
+    *horizon_input_messages_tail = queued;
+    horizon_input_messages_tail = &queued->next;
+    return HORIZON_STATUS_SUCCESS;
+}
+
 static void horizon_server_remove_input_message_locked( struct horizon_input_message *message )
 {
     struct horizon_input_message **ptr;
@@ -7456,10 +7482,12 @@ static int horizon_server_handle_send_hardware_message( struct horizon_server_co
     struct horizon_send_hardware_message_reply reply;
     struct horizon_input_shm *input;
     struct horizon_desktop_shm *desktop;
-    struct horizon_user_window *target = NULL;
+    struct horizon_user_window *target = NULL, *raw_target = NULL;
+    const struct horizon_rawinput_device *raw_device = NULL;
     struct horizon_obj_locator desktop_locator;
+    struct horizon_raw_mouse raw;
     unsigned int status = HORIZON_STATUS_SUCCESS, time, flags, target_handle = 0, i;
-    int x, y;
+    int x, y, dx = 0, dy = 0, legacy = 1;
 
     if (request->input.type == HORIZON_INPUT_KEYBOARD)
         return horizon_server_handle_send_keyboard( connection, request );
@@ -7476,16 +7504,33 @@ static int horizon_server_handle_send_hardware_message( struct horizon_server_co
         reply.prev_x = desktop->cursor.x;
         reply.prev_y = desktop->cursor.y;
         flags = mouse->flags;
+        raw_device = horizon_rawinput_find( horizon_rawinput_devices, horizon_rawinput_device_count,
+                                            HORIZON_RAWINPUT_USAGE_MOUSE );
+        /* A program that asked for the mouse alone gets no mouse messages and
+         * leaves the cursor where it is, as RIDEV_NOLEGACY says. */
+        legacy = !raw_device || !(raw_device->flags & HORIZON_RIDEV_NOLEGACY);
         if (flags & HORIZON_MOUSEEVENTF_MOVE)
         {
             x = (flags & HORIZON_MOUSEEVENTF_ABSOLUTE) ? mouse->x : desktop->cursor.x + mouse->x;
             y = (flags & HORIZON_MOUSEEVENTF_ABSOLUTE) ? mouse->y : desktop->cursor.y + mouse->y;
+            /* What the mouse did, before the screen's edges are applied: a view
+             * being turned must not stop because the cursor reached a corner. */
+            dx = x - desktop->cursor.x;
+            dy = y - desktop->cursor.y;
             if (x < desktop->cursor.clip.left) x = desktop->cursor.clip.left;
             if (y < desktop->cursor.clip.top) y = desktop->cursor.clip.top;
             if (x >= desktop->cursor.clip.right) x = desktop->cursor.clip.right - 1;
             if (y >= desktop->cursor.clip.bottom) y = desktop->cursor.clip.bottom - 1;
-            desktop->cursor.x = x;
-            desktop->cursor.y = y;
+            if (legacy)
+            {
+                desktop->cursor.x = x;
+                desktop->cursor.y = y;
+            }
+            else
+            {
+                x = desktop->cursor.x;
+                y = desktop->cursor.y;
+            }
         }
         else
         {
@@ -7501,7 +7546,14 @@ static int horizon_server_handle_send_hardware_message( struct horizon_server_co
         if (target) target_handle = target->handle;
         horizon_server_log_mouse_target_locked( target, x, y, input->capture );
 
-        if ((flags & HORIZON_MOUSEEVENTF_MOVE) &&
+        if (raw_device)
+        {
+            raw_target = raw_device->target ? horizon_server_find_window_locked( raw_device->target ) : target;
+            horizon_raw_mouse_event( flags, dx, dy, mouse->info, &raw );
+            if ((status = horizon_server_queue_raw_mouse_locked( raw_target, x, y, time, mouse->info, &raw )))
+                goto done;
+        }
+        if (legacy && (flags & HORIZON_MOUSEEVENTF_MOVE) &&
             (status = horizon_server_queue_mouse_locked( target, HORIZON_WM_MOUSEMOVE,
                                                          horizon_mouse_buttons, x, y, time,
                                                          mouse->info )))
@@ -7515,6 +7567,7 @@ static int horizon_server_handle_send_hardware_message( struct horizon_server_co
             else horizon_mouse_buttons &= ~event->mk;
             input->keystate[event->vk] = event->down ? 0x80 : 0;
             desktop->keystate[event->vk] = event->down ? 0x80 : 0;
+            if (!legacy) continue;
             if ((status = horizon_server_queue_mouse_locked( target, event->msg,
                                                              horizon_mouse_buttons, x, y, time,
                                                              mouse->info )))
@@ -7523,7 +7576,13 @@ static int horizon_server_handle_send_hardware_message( struct horizon_server_co
         input->keystate_serial++;
         desktop->keystate_serial++;
 done:
-        if (target)
+        if (raw_target)
+        {
+            struct horizon_msgq *queue = horizon_server_queue_locked( raw_target->tid );
+
+            if (queue) horizon_msgq_touch( queue, HORIZON_MSGQ_QS_RAWINPUT );
+        }
+        if (target && legacy)
         {
             struct horizon_msgq *queue = horizon_server_queue_locked( target->tid );
 
@@ -7533,8 +7592,8 @@ done:
                 horizon_msgq_touch( queue, (flags & ~(HORIZON_MOUSEEVENTF_MOVE | HORIZON_MOUSEEVENTF_ABSOLUTE))
                                            ? HORIZON_MSGQ_QS_MOUSEBUTTON : 0 );
             }
-            horizon_server_refresh_queues_locked();
         }
+        if (target || raw_target) horizon_server_refresh_queues_locked();
         reply.new_x = desktop->cursor.x;
         reply.new_y = desktop->cursor.y;
         horizon_server_flush_input_locked();
@@ -8704,7 +8763,9 @@ static int horizon_server_handle_get_message( struct horizon_server_connection *
     const struct horizon_get_message_request *request = (const void *)message;
     struct horizon_get_message_reply reply;
     struct horizon_hardware_msg_data hardware;
-    unsigned char hardware_raw[sizeof(struct horizon_hardware_msg_data) + sizeof(struct horizon_raw_keyboard)];
+    unsigned char hardware_raw[sizeof(struct horizon_hardware_msg_data) +
+                               (sizeof(struct horizon_raw_mouse) > sizeof(struct horizon_raw_keyboard)
+                                ? sizeof(struct horizon_raw_mouse) : sizeof(struct horizon_raw_keyboard))];
     struct horizon_input_message *queued;
     struct horizon_posted_message **posted = NULL;
     struct horizon_win_timer *timer = NULL;
@@ -8824,13 +8885,22 @@ static int horizon_server_handle_get_message( struct horizon_server_connection *
                 hardware.rawinput.usage = HORIZON_RAWINPUT_USAGE_KEYBOARD;
                 memcpy( hardware_raw + sizeof(hardware), &queued->raw, sizeof(queued->raw) );
             }
+            else if (queued->raw_mouse)
+            {
+                /* And RAWMOUSE for one, the same way. */
+                hardware.size += sizeof(queued->raw_m);
+                hardware.rawinput.type = HORIZON_RIM_TYPEMOUSE;
+                hardware.rawinput.device = HORIZON_WINE_MOUSE_HANDLE;
+                hardware.rawinput.usage = HORIZON_RAWINPUT_USAGE_MOUSE;
+                memcpy( hardware_raw + sizeof(hardware), &queued->raw_m, sizeof(queued->raw_m) );
+            }
             memcpy( hardware_raw, &hardware, sizeof(hardware) );
             reply.total = hardware.size;
             reply.header.reply_size = hardware.size;
             reply_data = hardware_raw;
             reply_data_size = hardware.size;
             /* No accept_hardware_message follows raw input: PM_REMOVE takes it, as in server/queue.c. */
-            if (queued->raw_keyboard && (request->flags & HORIZON_PM_REMOVE))
+            if ((queued->raw_keyboard || queued->raw_mouse) && (request->flags & HORIZON_PM_REMOVE))
                 horizon_server_remove_input_message_locked( queued );
             found = 1;
             break;

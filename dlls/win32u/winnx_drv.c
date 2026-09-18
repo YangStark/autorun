@@ -707,6 +707,18 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
     wine_nx_pointer_flags( last_buttons, buttons, pressed, released, &first, &second );
     if (moved || first) wine_nx_send_mouse( x, y, (moved ? MOUSEEVENTF_MOVE : 0) | first );
     if (second) wine_nx_send_mouse( x, y, second );
+    if (moved)
+    {
+        POINT pos;
+
+        /* The cursor ends up where the server put it, which is not where the
+         * stick pushed once a program has taken the mouse for itself: it is
+         * told the movement and the cursor stays still. Follow it, keeping the
+         * motion Wine has not been handed, or the stick would come to rest
+         * against an edge and a view being turned would stop with it. */
+        if (NtUserGetCursorPos( &pos ) && (pos.x != x || pos.y != y))
+            wine_nx_pointer_set_pos( pos.x, pos.y );
+    }
     if (first) nxdrv_trace( "[NXINPUT] buttons=%x flags=%x,%x x=%d", buttons, first, second, x );
     else if (moved) nxdrv_trace_hot( "[NXINPUT] move x=%d y=%d buttons=%x", x, y, buttons, 0 );
     last_buttons = buttons;
