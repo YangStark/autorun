@@ -750,6 +750,19 @@ done:
     return ok;
 }
 
+/* What a NACP needs when there was no NRO to take one from: what nacptool
+ * would have filled that the patch below does not touch. */
+static void nacp_defaults( NacpStruct *nacp )
+{
+    memset( nacp, 0, sizeof(*nacp) );
+    /* Not rated, which is 0xFF in every region; all zeroes is "rated 0". */
+    memset( nacp->rating_age, 0xFF, sizeof(nacp->rating_age) );
+    snprintf( nacp->display_version, sizeof(nacp->display_version), "%s", "1.0.0" );
+}
+
+/* What makes a NACP this forwarder's, applied to the NRO's own: the fields
+ * sphaira's patch_nacp sets, and no others -- the rest are nacptool's, which
+ * is what the forwarders that work on a console carry. */
 static void nacp_build( NacpStruct *nacp, const char *name, const char *author, u64 tid )
 {
     unsigned int i;
@@ -763,22 +776,24 @@ static void nacp_build( NacpStruct *nacp, const char *name, const char *author, 
         snprintf( titles[i].name, sizeof(titles[i].name), "%s", name );
         snprintf( titles[i].author, sizeof(titles[i].author), "%s", author );
     }
-    /* Not rated, which is 0xFF in every region. All zeroes is "rated 0", which
-     * is a rating, and the home menu reads it as one. */
-    memset( nacp->rating_age, 0xFF, sizeof(nacp->rating_age) );
-    snprintf( nacp->display_version, sizeof(nacp->display_version), "%s", "1.0.0" );
+    /* The one field changed that sphaira leaves alone. The home menu takes the
+     * console's own language when the NACP says it is supported, and then asks
+     * for that language's icon. nacptool leaves Portuguese out, so a console
+     * set to it falls back to English and finds the one icon there is; saying
+     * all sixteen are supported sent it after icon_Portuguese.dat, which does
+     * not exist, and the tile waited for it for ever. English alone is the
+     * language there is an icon for, so every console lands on it. */
+    nacp->supported_language_flag = 1u << 0;    /* AmericanEnglish */
     nacp->startup_user_account = 0;             /* no profile to pick */
     nacp->user_account_switch_lock = 0;
     nacp->add_on_content_registration_type = 1; /* on demand */
-    nacp->attribute_flag = 0;
-    nacp->supported_language_flag = 0xFFFF;
     nacp->screenshot = 0;                       /* allowed */
     nacp->video_capture = 2;                    /* automatic */
-    nacp->data_loss_confirmation = 0;
-    nacp->play_log_policy = 0;
     nacp->logo_type = 2;
     nacp->logo_handling = 0;
+    nacp->data_loss_confirmation = 0;
     nacp->required_network_service_license_on_launch = 0;
+    nacp->application_error_code_category = 0;
     memcpy( &nacp->application_error_code_category, "autorun", 7 );
     nacp->presence_group_id = tid;
     nacp->save_data_owner_id = tid;
@@ -786,11 +801,17 @@ static void nacp_build( NacpStruct *nacp, const char *name, const char *author, 
     nacp->add_on_content_base_id = tid ^ 0x1000;
     for (i = 0; i < sizeof(nacp->local_communication_id) / sizeof(nacp->local_communication_id[0]); i++)
         nacp->local_communication_id[i] = tid;
+    nacp->play_log_policy = 0;
+    nacp->play_log_query_capability = 0;
     /* No saves, so nothing to make room for. */
     nacp->user_account_save_data_size = 0;
     nacp->user_account_save_data_journal_size = 0;
     nacp->device_save_data_size = 0;
     nacp->device_save_data_journal_size = 0;
+    nacp->user_account_save_data_size_max = 0;
+    nacp->user_account_save_data_journal_size_max = 0;
+    nacp->device_save_data_size_max = 0;
+    nacp->device_save_data_journal_size_max = 0;
 }
 
 /***********************************************************************
@@ -962,7 +983,7 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
     *step = "building the control";
     /* Its own NACP when it can be read, so the forwarder inherits every field
      * nacptool fills; zeroes with the few that matter set, when it cannot. */
-    if (!nacp_from_nro( request->nro_path, nacp )) memset( nacp, 0, sizeof(*nacp) );
+    if (!nacp_from_nro( request->nro_path, nacp )) nacp_defaults( nacp );
     nacp_build( nacp, request->name, request->author, tid );
     romfs[0] = (struct file_entry){ "/control.nacp", nacp, sizeof(*nacp) };
     romfs[1] = (struct file_entry){ "/icon_AmericanEnglish.dat", request->icon, request->icon_size };

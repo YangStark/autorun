@@ -186,6 +186,12 @@ static void *load_file( const char *path, size_t *size )
 /* An NRO with assets, so the path that reads the NACP out of one is the path
  * the test walks: code, then ASET, then a NACP with something recognisable in
  * a field the builder never sets. */
+static const u8 nacptool_ratings[0x20] =
+{
+    0x0c, 0xff, 0xff, 0x0a, 0xff, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0d, 0x0d, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+};
+
 static void write_fake_nro( const char *path, const char *isbn )
 {
     u8 header[0x40] = {0};
@@ -209,6 +215,9 @@ static void write_fake_nro( const char *path, const char *isbn )
     memcpy( assets + 0x20, &value, 8 );
     /* Isbn is at 0x3000 and nothing in the builder touches it. */
     memcpy( nacp + 0x3000, isbn, strlen( isbn ) );
+    /* The rating ages nacptool writes, and the languages it says are there. */
+    memcpy( nacp + 0x3040, nacptool_ratings, sizeof(nacptool_ratings) );
+    memcpy( nacp + 0x302C, &(u32){ 0xbff }, 4 );
     fwrite( header, 1, sizeof(header), file );
     fwrite( assets, 1, sizeof(assets), file );
     fwrite( nacp, 1, 0x4000, file );
@@ -368,8 +377,18 @@ static void check_control( const u8 *data, size_t size, const char *name, const 
     assert( !strcmp( titles[0].author, author ) && !strcmp( titles[15].author, author ) );
     /* Carried over from the NRO's own NACP rather than built out of zeroes. */
     if (isbn) assert( !memcmp( nacp + 0x3000, isbn, strlen( isbn ) ) );
-    /* Not rated, in every region. */
-    for (offset = 0; offset < 0x20; offset++) assert( nacp[0x3040 + offset] == 0xFF );
+    /* The languages the NACP claims are the languages there are icons for: the
+     * home menu asks for the icon of whichever it picks, and waits for ever for
+     * one that is not there. */
+    {
+        u32 languages;
+
+        memcpy( &languages, nacp + 0x302C, 4 );
+        assert( languages == 1 );
+    }
+    /* The rest is the NRO's, as nacptool wrote it: the ratings are kept, not
+     * flattened -- only what sphaira patches, and the language, are changed. */
+    assert( !memcmp( nacp + 0x3040, nacptool_ratings, sizeof(nacptool_ratings) ) );
     (void)tid;
 }
 
