@@ -99,8 +99,26 @@ Result ncmContentMetaDatabaseCommit( NcmContentMetaDatabase *db ) { (void)db; re
 static Service manager_service;
 Result nsGetApplicationManagerInterface( Service *out ) { *out = manager_service; return 0; }
 Service *nsGetServiceSession_ApplicationManagerInterface( void ) { return &manager_service; }
-Result nsDeleteApplicationCompletely( u64 id ) { (void)id; return 0; }
-Result nsDeleteApplicationEntity( u64 id ) { (void)id; return 0; }
+/* What was taken away, and whether anything had been written by then: the
+ * contents of an entry must go before the new ones are registered, or they are
+ * the same ones and they go with them. */
+static u64 deleted_completely[4];
+static int deleted_completely_count;
+static u64 deleted_entity;
+static int deleted_after_write;
+
+Result nsDeleteApplicationCompletely( u64 id )
+{
+    if (placeholders) deleted_after_write = 1;
+    if (deleted_completely_count < 4) deleted_completely[deleted_completely_count++] = id;
+    return 0;
+}
+Result nsDeleteApplicationEntity( u64 id )
+{
+    if (placeholders) deleted_after_write = 1;
+    deleted_entity = id;
+    return 0;
+}
 void serviceClose( Service *s ) { (void)s; }
 int hosversionAtLeast( int major, int minor, int micro ) { (void)major; (void)minor; (void)micro; return 1; }
 
@@ -305,6 +323,11 @@ int main( int argc, char **argv )
 
     assert( !wine_nx_forwarder_install( &request, &step ) );
     assert( !step );
+    /* Its own entry's contents were taken away, and before anything was written. */
+    assert( deleted_entity == tid && !deleted_after_write );
+    assert( deleted_completely_count == 3 );
+    assert( deleted_completely[1] == wine_nx_forwarder_title_id( nro_path, NULL, -1 ) );
+    assert( deleted_completely[2] == tid );
 
     program = read_nca( 1, &program_size );
     control = read_nca( 2, &control_size );

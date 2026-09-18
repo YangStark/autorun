@@ -709,6 +709,9 @@ static void nacp_build( NacpStruct *nacp, const char *name, const char *author, 
         snprintf( titles[i].name, sizeof(titles[i].name), "%s", name );
         snprintf( titles[i].author, sizeof(titles[i].author), "%s", author );
     }
+    /* Not rated, which is 0xFF in every region. All zeroes is "rated 0", which
+     * is a rating, and the home menu reads it as one. */
+    memset( nacp->rating_age, 0xFF, sizeof(nacp->rating_age) );
     snprintf( nacp->display_version, sizeof(nacp->display_version), "%s", "1.0.0" );
     nacp->startup_user_account = 0;             /* no profile to pick */
     nacp->user_account_switch_lock = 0;
@@ -808,6 +811,22 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
     if (!(header = calloc( 1, sizeof(*header) )) || !(nacp = calloc( 1, sizeof(*nacp) )) ||
         !(npdm = malloc( wine_nx_hbl_npdm_size )))
     { rc = MAKERESULT( Module_Libnx, LibnxError_OutOfMemory ); goto done; }
+
+    /* Everything that has to go, before anything is written. What this NRO's
+     * forwarder was called before the address space was part of the name, and
+     * the id sphaira uses, are other entries for the same thing. This entry's
+     * own contents go too: built again they are byte for byte what they were,
+     * so they are named the same, and taking them away afterwards -- which is
+     * the order sphaira writes in -- would take away the ones just written and
+     * leave the entry pointing at nothing. */
+    *step = "taking away what was there";
+    nsDeleteApplicationCompletely( old_tid );
+    if (plain_tid != tid) nsDeleteApplicationCompletely( plain_tid );
+    /* The whole entry, record and contents: an entry left half there from a
+     * write that went wrong is mended by being replaced, not added to. There is
+     * nothing of the user's in a forwarder to lose -- it keeps no saves. */
+    nsDeleteApplicationCompletely( tid );
+    nsDeleteApplicationEntity( tid );
 
     if (request->args && request->args[0])
         snprintf( args, sizeof(args), "%s %s", request->nro_path, request->args );
@@ -936,12 +955,6 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
         if (R_FAILED( rc = nsGetApplicationManagerInterface( &manager ) )) goto done;
     }
     else manager = *nsGetServiceSession_ApplicationManagerInterface();
-    /* Earlier forwarders for this NRO: the one a build before this named
-     * without the address space, and the id sphaira once used. Left alone they
-     * are a second entry for the same thing, with contents nothing points at. */
-    nsDeleteApplicationCompletely( old_tid );
-    if (plain_tid != tid) nsDeleteApplicationCompletely( plain_tid );
-    nsDeleteApplicationEntity( tid );
     rc = ns_push_application_record( &manager, tid, &record, 1 );
     if (R_SUCCEEDED( rc )) ns_invalidate_control_cache( &manager, tid );
     if (hosversionAtLeast( 3, 0, 0 )) serviceClose( &manager );
