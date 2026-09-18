@@ -439,9 +439,10 @@ int main( int argc, char **argv )
     assert( registered == 3 );
     /* Its own entry's contents were taken away, and before anything was written. */
     assert( deleted_entity == tid && !deleted_after_write );
-    /* Only this entry: the id without the address space is sphaira's, and
-     * whatever is installed under it is the user's, not ours to remove. */
-    assert( deleted_completely_count == 1 && deleted_completely[0] == tid );
+    /* This entry and the generation before it, which is ours; never the id
+     * without the address space, which is sphaira's and the user's. */
+    assert( deleted_completely_count == 2 && deleted_completely[1] == tid );
+    assert( deleted_completely[0] != tid && deleted_completely[0] != wine_nx_forwarder_title_id( nro_file, NULL, -1 ) );
 
     program = read_nca( 1, &program_size );
     control = read_nca( 2, &control_size );

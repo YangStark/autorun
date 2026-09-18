@@ -908,14 +908,25 @@ static void compare_with_installed( u64 other_tid, NcmStorageId storage_id, cons
 /* The id comes from what the entry starts and how, and the address space is
  * part of how: two forwarders for the same NRO differing only in that are two
  * entries, not one overwriting the other. */
-static void forwarder_hash( const char *nro_path, const char *args, int address_space, u64 *hash )
+/* Which ids the forwarders have had. The console keeps an application's name
+ * and icon by its id -- ns across reboots, the home menu in its own copy -- so
+ * an id that was once installed broken can go on showing broken whatever is
+ * installed under it later. Each generation is a new id nothing has seen;
+ * the one before is this program's own and is taken away when the new one
+ * goes in. Generation 0 is sphaira's naming, which is never ours to touch. */
+#define FORWARDER_GENERATION 2
+
+static void forwarder_hash( const char *nro_path, const char *args, int address_space, int generation,
+                            u64 *hash )
 {
-    char full[1024], both[2100];
+    char full[1024], both[2200];
 
     if (args && args[0]) snprintf( full, sizeof(full), "%s %s", nro_path, args );
     else snprintf( full, sizeof(full), "%s", nro_path );
-    if (address_space < 0) snprintf( both, sizeof(both), "%s%s", nro_path, full );
-    else snprintf( both, sizeof(both), "%s%s\naddress-space=%d", nro_path, full, address_space );
+    if (!generation) snprintf( both, sizeof(both), "%s%s", nro_path, full );
+    else if (generation == 1) snprintf( both, sizeof(both), "%s%s\naddress-space=%d", nro_path, full, address_space );
+    else snprintf( both, sizeof(both), "%s%s\naddress-space=%d\nautorun-forwarder=%d", nro_path, full,
+                   address_space, generation );
     sha256CalculateHash( hash, both, strlen( both ) );
 }
 
@@ -923,7 +934,8 @@ unsigned long long wine_nx_forwarder_title_id( const char *nro_path, const char 
 {
     u64 hash[SHA256_HASH_SIZE / sizeof(u64)];
 
-    forwarder_hash( nro_path, args, address_space, hash );
+    if (address_space < 0) forwarder_hash( nro_path, args, 0, 0, hash );
+    else forwarder_hash( nro_path, args, address_space, FORWARDER_GENERATION, hash );
     return 0x0500000000000000ull | (hash[0] & 0x00FFFFFFFFFFF000ull);
 }
 
@@ -1075,9 +1087,9 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
      * went wrong is mended by being replaced -- a forwarder keeps no saves,
      * so there is nothing of the user's in one to lose. */
     *step = "taking away what was there";
+    if (old_tid != tid && old_tid != plain_tid) nsDeleteApplicationCompletely( old_tid );
     nsDeleteApplicationCompletely( tid );
     nsDeleteApplicationEntity( tid );
-    (void)old_tid;
 
     /* Written where the console keeps installed applications. */
     *step = "writing the contents";
@@ -1114,7 +1126,19 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
     }
     else manager = *nsGetServiceSession_ApplicationManagerInterface();
     rc = ns_push_application_record( &manager, tid, &record, 1 );
-    if (R_SUCCEEDED( rc )) ns_invalidate_control_cache( &manager, tid );
+    if (R_SUCCEEDED( rc ))
+    {
+        Result invalidated = ns_invalidate_control_cache( &manager, tid );
+
+        if (wine_nx_forwarder_report)
+        {
+            char message[128];
+
+            snprintf( message, sizeof(message), "[FORWARDER] %016llx pushed; control cache invalidated rc=0x%x",
+                      (unsigned long long)tid, (unsigned)invalidated );
+            wine_nx_forwarder_report( message );
+        }
+    }
     if (hosversionAtLeast( 3, 0, 0 )) serviceClose( &manager );
 
     /* Read back what was written, so a forwarder that the console will not
@@ -1168,14 +1192,16 @@ unsigned int wine_nx_forwarder_install( const struct wine_nx_forwarder *request,
     if (!request || !request->nro_path || !request->icon || !request->icon_size)
         return MAKERESULT( Module_Libnx, LibnxError_BadInput );
 
-    forwarder_hash( request->nro_path, request->args, request->address_space, hash );
+    forwarder_hash( request->nro_path, request->args, request->address_space, FORWARDER_GENERATION, hash );
     tid = 0x0500000000000000ull | (hash[0] & 0x00FFFFFFFFFFF000ull);
+    /* The generation before: this program's own, and very likely broken. */
+    forwarder_hash( request->nro_path, request->args, request->address_space, FORWARDER_GENERATION - 1, hash );
+    old_tid = 0x0500000000000000ull | (hash[0] & 0x00FFFFFFFFFFF000ull);
     /* What this NRO's forwarder was called before the address space was part of
      * the name, and what sphaira calls one: both are the same entry as this,
      * made for the same NRO, so they are taken away rather than left behind. */
-    forwarder_hash( request->nro_path, request->args, -1, hash );
+    forwarder_hash( request->nro_path, request->args, 0, 0, hash );
     plain_tid = 0x0500000000000000ull | (hash[0] & 0x00FFFFFFFFFFF000ull);
-    old_tid = 0x0100000000000000ull | (hash[0] & 0x00FFFFFFFFFFF000ull);
 
     *step = "asking for the console's key";
     if (R_FAILED( rc = splCryptoInitialize() )) return rc;
