@@ -52,7 +52,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-196"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-197"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -73,6 +73,11 @@ extern const char *wine_nx_loader_last_export_diag(void);
 extern int wine_nx_sd_cache_install(void);
 
 static FILE *log_file;
+/* A second copy, kept from the moment a program starts. The next run of the
+ * launcher opens wine-nx-runtime.log afresh and what the program did is gone
+ * with it, so a program's own log is a file of its own, which only the next
+ * run of that same program writes over. */
+static FILE *game_log_file;
 
 struct runtime_module
 {
@@ -287,9 +292,60 @@ static void log_line( const char *fmt, ... )
         if (dropped) fprintf( log_file, "[LOG] %u lines dropped while the card was busy\n", dropped );
         fwrite( line, 1, len, log_file );
         if (!log_flusher_running || log_line_is_urgent( line )) fflush( log_file );
+        if (game_log_file)
+        {
+            fwrite( line, 1, len, game_log_file );
+            if (!log_flusher_running || log_line_is_urgent( line )) fflush( game_log_file );
+        }
         pthread_mutex_unlock( &log_mutex );
     }
     if (on_main && strncmp( line, "[SYSCALL]", 9 )) consoleUpdate( NULL );
+}
+
+/* A program's own log, kept from the moment it is about to start: everything
+ * the runtime has said so far, and everything it says from here. The launcher's
+ * next run opens wine-nx-runtime.log afresh, and without this the run that
+ * mattered is gone before it can be read off the card. */
+static void open_game_log( const char *target )
+{
+    char path[512], name[128];
+    const char *base = strrchr( target, '/' );
+    FILE *sofar;
+    size_t i, len;
+
+    if (!log_file) return;
+    base = base ? base + 1 : target;
+    if (!base[0]) return;
+    for (i = 0; base[i] && i < sizeof(name) - 1; i++)
+    {
+        char c = base[i];
+
+        /* A name a card can hold, and one word: "Halo - Combat Evolved" is a
+         * folder, but HALO.EXE is what the file is called. */
+        name[i] = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                  c == '.' || c == '-' || c == '_' ? c : '-';
+    }
+    name[i] = 0;
+    if ((len = strlen( name )) > 4 && !strcasecmp( name + len - 4, ".exe" )) name[len - 4] = 0;
+    snprintf( path, sizeof(path), "%s/game-%s.log", RUNTIME_DIR, name );
+
+    pthread_mutex_lock( &log_mutex );
+    fflush( log_file );
+    if ((game_log_file = fopen( path, "w" )))
+    {
+        /* What was said before this point, so the file stands on its own. */
+        if ((sofar = fopen( RUNTIME_DIR "/wine-nx-runtime.log", "r" )))
+        {
+            char chunk[4096];
+            size_t got;
+
+            while ((got = fread( chunk, 1, sizeof(chunk), sofar )) > 0) fwrite( chunk, 1, got, game_log_file );
+            fclose( sofar );
+        }
+        fflush( game_log_file );
+    }
+    pthread_mutex_unlock( &log_mutex );
+    log_line( "[LOG] this run is kept in %s", path );
 }
 
 static void stall_watch( void *arg )
@@ -3061,6 +3117,7 @@ int main( int argc, char **argv )
         }
     }
 
+    open_game_log( target );
     log_line( "wine-nx-runtime: generic Wine ntdll PE loader path" );
     log_line( "[BUILD] %s", WINE_NX_RUNTIME_BUILD );
     log_line( "[SDCACHE] %s", sd_cache ? "sdmc reads cached: 128 KB chunks, 8 per file, 32 MB in all"
