@@ -4795,6 +4795,38 @@ void update_window_state( HWND hwnd )
  *
  * Implementation of ShowWindow and ShowWindowAsync.
  */
+#ifdef __SWITCH__
+/* What a window says, and what the windows inside it say. A program that stops
+ * with a box of its own leaves nothing in the log but the box's title, while
+ * the sentence that says why it stopped is the text of a control inside it. */
+static int nx_append_window_text( HWND hwnd, char *line, int at, int size )
+{
+    WCHAR text[128];
+    int len, i;
+
+    if ((len = NtUserInternalGetWindowText( hwnd, text, ARRAY_SIZE(text) )) <= 0) return at;
+    if (at + 4 >= size) return at;
+    if (at) at += snprintf( line + at, size - at, " | " );
+    for (i = 0; i < len && at + 2 < size; i++)
+        line[at++] = (text[i] >= ' ' && text[i] < 0x7f) ? (char)text[i] : ' ';
+    line[at] = 0;
+    return at;
+}
+
+static void nx_trace_window_words( HWND hwnd )
+{
+    char line[200];
+    HWND child;
+    int at = 0, shown = 0;
+
+    at = nx_append_window_text( hwnd, line, at, sizeof(line) );
+    for (child = get_window_relative( hwnd, GW_CHILD ); child && shown < 6;
+         child = get_window_relative( child, GW_HWNDNEXT ), shown++)
+        at = nx_append_window_text( child, line, at, sizeof(line) );
+    if (at) nx_window_trace( "[NXWIN] hwnd %p says %s", hwnd, line );
+}
+#endif
+
 static BOOL show_window( HWND hwnd, INT cmd )
 {
     WND *win;
@@ -4816,9 +4848,12 @@ static BOOL show_window( HWND hwnd, INT cmd )
      * leaving popups, dialogs and child controls under application control. */
     nx_fullscreen = !(style & (WS_CHILD | WS_POPUP)) && !get_window_relative( hwnd, GW_OWNER );
     if (!(style & WS_CHILD))
+    {
         nx_window_trace( "[NXWIN] thread %04x shows hwnd %p with %d (style %#x, visible %d%s)",
                          (int)GetCurrentThreadId(), hwnd, cmd, (int)style, was_visible,
                          is_iconic( hwnd ) ? ", minimized" : "" );
+        nx_trace_window_words( hwnd );
+    }
     if (nx_fullscreen && (cmd == SW_SHOW || cmd == SW_SHOWNORMAL || cmd == SW_SHOWDEFAULT))
         cmd = SW_SHOWMAXIMIZED;
 #endif

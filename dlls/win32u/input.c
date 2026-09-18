@@ -51,7 +51,7 @@ void nx_window_trace( const char *format, ... )
     char buffer[256];
     va_list args;
 
-    if (!&wine_nx_runtime_trace || __atomic_add_fetch( &lines, 1, __ATOMIC_RELAXED ) > 64) return;
+    if (!&wine_nx_runtime_trace || __atomic_add_fetch( &lines, 1, __ATOMIC_RELAXED ) > 256) return;
     va_start( args, format );
     vsnprintf( buffer, sizeof(buffer), format, args );
     va_end( args );
