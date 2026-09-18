@@ -72,12 +72,16 @@ FALLOUT_DLLS = 'xinput1_3 msvcp110 msvcr110 d3dx9_38 windowscodecs'.split()
 # engine cannot start without, and that imports AVIFIL32. msvfw32, which it
 # needs in turn, is already staged for WarCraft III's movies.
 SOURCE_DLLS = ['avifil32']
+# Halo's keystone.dll is what checks that its own files are whole, and it
+# imports WINSPOOL.DRV. Without it keystone does not load, the check cannot
+# run, and Halo stops with "one of the Halo PC files is missing or corrupted".
+HALO_DLLS = ['winspool.drv']
 # The runtime staged here is the one linked with Mesa, so the card can run
 # Vulkan; the DXVK overlay adds DXVK's d3d9 in C:\\dxvk, which needs Wine's
 # 32-bit loader in syswow64. vulkan-1 loads winevulkan by hand and imports
 # nothing else of it, so no import walk reaches either: name both.
 VULKAN_DLLS = 'vulkan-1 winevulkan'.split()
-GAME_DLLS = NFS_DLLS + FALLOUT_DLLS + SOURCE_DLLS + VULKAN_DLLS
+GAME_DLLS = NFS_DLLS + FALLOUT_DLLS + SOURCE_DLLS + HALO_DLLS + VULKAN_DLLS
 pe = probe / 'build-wine-wow64-pe'
 toolchain = probe / 'toolchains/llvm-mingw-20260505-ucrt-macos-universal/bin'
 env = dict(os.environ, PATH=f'{toolchain}:/opt/homebrew/opt/bison/bin:' + os.environ['PATH'])
