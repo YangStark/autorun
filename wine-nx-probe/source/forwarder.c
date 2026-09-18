@@ -791,6 +791,74 @@ static Result ns_invalidate_control_cache( Service *manager, u64 tid )
  * Putting the three together and handing them over
  */
 
+/* A forwarder for the same NRO that something else installed -- sphaira names
+ * one by the path and the arguments alone, which is the id here without the
+ * address space. Read its contents back and say where ours first differ from
+ * them, so a forwarder the console refuses can be held against one it takes. */
+static void compare_with_installed( u64 other_tid, NcmStorageId storage_id, const struct buf *const *ours )
+{
+    static const char *const names[3] = { "program", "control", "meta" };
+    static const u8 types[3] = { NcmContentType_Program, NcmContentType_Control, NcmContentType_Meta };
+    NcmContentMetaDatabase db;
+    NcmContentStorage cs;
+    NcmContentMetaKey key;
+    NcmContentInfo infos[8];
+    char message[320];
+    s32 total = 0, written = 0, count = 0;
+    int i, j;
+
+    if (!wine_nx_forwarder_report) return;
+    if (R_FAILED( ncmOpenContentMetaDatabase( &db, storage_id ) )) return;
+    if (R_SUCCEEDED( ncmContentMetaDatabaseList( &db, &total, &written, &key, 1, NcmContentMetaType_Application,
+                                                 other_tid, 0, UINT64_MAX, NcmContentInstallType_Full ) ) && written)
+        ncmContentMetaDatabaseListContentInfo( &db, &count, infos, 8, &key, 0 );
+    ncmContentMetaDatabaseClose( &db );
+    if (!written || count <= 0)
+    {
+        snprintf( message, sizeof(message), "[FORWARDER] nothing installed as %016llx to hold ours against",
+                  (unsigned long long)other_tid );
+        wine_nx_forwarder_report( message );
+        return;
+    }
+    if (R_FAILED( ncmOpenContentStorage( &cs, storage_id ) )) return;
+    for (i = 0; i < count; i++)
+    {
+        s64 size = 0;
+        u8 *theirs;
+        size_t limit, at, common, k;
+
+        for (j = 0; j < 3; j++) if (infos[i].content_type == types[j]) break;
+        if (j == 3) continue;
+        if (R_FAILED( ncmContentStorageGetSizeFromContentId( &cs, &size, &infos[i].content_id ) ) || size <= 0)
+            continue;
+        limit = (size_t)size;
+        if (!(theirs = malloc( limit ))) continue;
+        if (R_SUCCEEDED( ncmContentStorageReadContentIdFile( &cs, theirs, limit, &infos[i].content_id, 0 ) ))
+        {
+            char mine[24] = "", other[24] = "";
+
+            common = limit < ours[j]->size ? limit : ours[j]->size;
+            for (at = 0; at < common && theirs[at] == ours[j]->data[at]; at++) ;
+            if (at == common && limit == ours[j]->size)
+                snprintf( message, sizeof(message), "[FORWARDER] %s: the same, %u bytes",
+                          names[j], (unsigned)limit );
+            else
+            {
+                for (k = 0; k < 8 && at + k < limit; k++)
+                    snprintf( other + 2 * k, 3, "%02x", theirs[at + k] );
+                for (k = 0; k < 8 && at + k < ours[j]->size; k++)
+                    snprintf( mine + 2 * k, 3, "%02x", ours[j]->data[at + k] );
+                snprintf( message, sizeof(message),
+                          "[FORWARDER] %s: theirs %u ours %u, differ at %#x: %s against %s",
+                          names[j], (unsigned)limit, (unsigned)ours[j]->size, (unsigned)at, other, mine );
+            }
+            wine_nx_forwarder_report( message );
+        }
+        free( theirs );
+    }
+    ncmContentStorageClose( &cs );
+}
+
 /* The id comes from what the entry starts and how, and the address space is
  * part of how: two forwarders for the same NRO differing only in that are two
  * entries, not one overwriting the other. */
@@ -845,21 +913,6 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
         !(npdm = malloc( wine_nx_hbl_npdm_size )))
     { rc = MAKERESULT( Module_Libnx, LibnxError_OutOfMemory ); goto done; }
 
-    /* Everything that has to go, before anything is written. What this NRO's
-     * forwarder was called before the address space was part of the name, and
-     * the id sphaira uses, are other entries for the same thing. This entry's
-     * own contents go too: built again they are byte for byte what they were,
-     * so they are named the same, and taking them away afterwards -- which is
-     * the order sphaira writes in -- would take away the ones just written and
-     * leave the entry pointing at nothing. */
-    *step = "taking away what was there";
-    nsDeleteApplicationCompletely( old_tid );
-    if (plain_tid != tid) nsDeleteApplicationCompletely( plain_tid );
-    /* The whole entry, record and contents: an entry left half there from a
-     * write that went wrong is mended by being replaced, not added to. There is
-     * nothing of the user's in a forwarder to lose -- it keeps no saves. */
-    nsDeleteApplicationCompletely( tid );
-    nsDeleteApplicationEntity( tid );
 
     if (request->args && request->args[0])
         snprintf( args, sizeof(args), "%s %s", request->nro_path, request->args );
@@ -954,11 +1007,34 @@ static Result forwarder_build_and_install( const struct wine_nx_forwarder *reque
     meta_data.infos[1] = contents[0].info;
     meta_data.infos[2] = contents[1].info;
 
-    /* Written where the console keeps installed applications. */
-    *step = "writing the contents";
+    /* Held against a forwarder for the same NRO that something else installed,
+     * while that one is still there: sphaira names one by the path and the
+     * arguments alone, which is this id without the address space. */
     ncas[0] = &program;
     ncas[1] = &control;
     ncas[2] = &meta;
+    if (plain_tid != tid) compare_with_installed( plain_tid, storage_id, ncas );
+
+    /* Everything that has to go, before anything is written. What this NRO's
+     * forwarder was called before the address space was part of the name, and
+     * the id sphaira uses, are other entries for the same thing. This entry's
+     * own contents go too: built again they are byte for byte what they were,
+     * so they are named the same, and taking them away afterwards -- which is
+     * the order sphaira writes in -- would take away the ones just written and
+     * leave the entry pointing at nothing. */
+    /* Only this entry, and only ever this entry. The id without the address
+     * space is the one sphaira gives a forwarder for the same NRO, so it is
+     * very likely one the user made and is using; it is not ours to remove.
+     * Record and contents both, so an entry left half there by a write that
+     * went wrong is mended by being replaced -- a forwarder keeps no saves,
+     * so there is nothing of the user's in one to lose. */
+    *step = "taking away what was there";
+    nsDeleteApplicationCompletely( tid );
+    nsDeleteApplicationEntity( tid );
+    (void)old_tid;
+
+    /* Written where the console keeps installed applications. */
+    *step = "writing the contents";
     if (R_FAILED( rc = ncmOpenContentStorage( &storage, storage_id ) )) goto done;
     for (i = 0; i < 3; i++)
     {

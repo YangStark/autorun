@@ -213,6 +213,14 @@ Result ncmContentStorageDelete( NcmContentStorage *cs, const NcmContentId *id );
 Result ncmContentStorageRegister( NcmContentStorage *cs, const NcmContentId *content,
                                   const NcmPlaceHolderId *id );
 Result ncmContentStorageHas( NcmContentStorage *cs, bool *out, const NcmContentId *id );
+Result ncmContentStorageGetSizeFromContentId( NcmContentStorage *cs, s64 *out, const NcmContentId *id );
+Result ncmContentStorageReadContentIdFile( NcmContentStorage *cs, void *out, size_t size,
+                                           const NcmContentId *id, s64 offset );
+Result ncmContentMetaDatabaseList( NcmContentMetaDatabase *db, s32 *total, s32 *written, NcmContentMetaKey *keys,
+                                   s32 count, NcmContentMetaType type, u64 id, u64 id_min, u64 id_max,
+                                   NcmContentInstallType install_type );
+Result ncmContentMetaDatabaseListContentInfo( NcmContentMetaDatabase *db, s32 *written, NcmContentInfo *infos,
+                                              s32 count, const NcmContentMetaKey *key, s32 start );
 Result ncmOpenContentMetaDatabase( NcmContentMetaDatabase *out, NcmStorageId id );
 void ncmContentMetaDatabaseClose( NcmContentMetaDatabase *db );
 Result ncmContentMetaDatabaseSet( NcmContentMetaDatabase *db, const NcmContentMetaKey *key,

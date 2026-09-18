@@ -93,6 +93,23 @@ Result ncmContentStorageRegister( NcmContentStorage *cs, const NcmContentId *con
 { (void)cs; (void)content; (void)id; registered++; return 0; }
 Result ncmContentStorageHas( NcmContentStorage *cs, bool *out, const NcmContentId *id )
 { (void)cs; (void)id; *out = true; return 0; }
+/* Nothing else is installed here, so there is nothing to hold ours against. */
+Result ncmContentStorageGetSizeFromContentId( NcmContentStorage *cs, s64 *out, const NcmContentId *id )
+{ (void)cs; (void)id; *out = 0; return 1; }
+Result ncmContentStorageReadContentIdFile( NcmContentStorage *cs, void *out, size_t size,
+                                           const NcmContentId *id, s64 offset )
+{ (void)cs; (void)out; (void)size; (void)id; (void)offset; return 1; }
+Result ncmContentMetaDatabaseList( NcmContentMetaDatabase *db, s32 *total, s32 *written, NcmContentMetaKey *keys,
+                                   s32 count, NcmContentMetaType type, u64 id, u64 id_min, u64 id_max,
+                                   NcmContentInstallType install_type )
+{
+    (void)db; (void)keys; (void)count; (void)type; (void)id; (void)id_min; (void)id_max; (void)install_type;
+    *total = *written = 0;
+    return 0;
+}
+Result ncmContentMetaDatabaseListContentInfo( NcmContentMetaDatabase *db, s32 *written, NcmContentInfo *infos,
+                                              s32 count, const NcmContentMetaKey *key, s32 start )
+{ (void)db; (void)infos; (void)count; (void)key; (void)start; *written = 0; return 0; }
 Result ncmOpenContentMetaDatabase( NcmContentMetaDatabase *out, NcmStorageId id ) { (void)id; out->handle = 1; return 0; }
 void ncmContentMetaDatabaseClose( NcmContentMetaDatabase *db ) { (void)db; }
 Result ncmContentMetaDatabaseSet( NcmContentMetaDatabase *db, const NcmContentMetaKey *key,
@@ -374,9 +391,9 @@ int main( int argc, char **argv )
     assert( registered == 3 );
     /* Its own entry's contents were taken away, and before anything was written. */
     assert( deleted_entity == tid && !deleted_after_write );
-    assert( deleted_completely_count == 3 );
-    assert( deleted_completely[1] == wine_nx_forwarder_title_id( nro_file, NULL, -1 ) );
-    assert( deleted_completely[2] == tid );
+    /* Only this entry: the id without the address space is sphaira's, and
+     * whatever is installed under it is the user's, not ours to remove. */
+    assert( deleted_completely_count == 1 && deleted_completely[0] == tid );
 
     program = read_nca( 1, &program_size );
     control = read_nca( 2, &control_size );
