@@ -2841,6 +2841,8 @@ struct horizon_server_object
     unsigned int file_access;
     unsigned int file_options;
     int file_delete;                /* FileDispositionInformation asked for deletion at last close */
+    unsigned int file_sharing;      /* FILE_SHARE_* it was opened with, when file_shared */
+    int file_shared;                /* opened by create_file, whose sharing mode is known */
     int file_is_dir;
     unsigned int dir_enum_index;
     int dir_queried;                /* a directory query has run on this handle */
@@ -9200,6 +9202,29 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
     }
     else if (!reply.header.error)
     {
+        /* Windows refuses what the handles already open on the file do not
+         * share, before the file system is asked. */
+        unsigned int existing_access = 0, existing_sharing = 7;
+        const struct horizon_server_handle_entry *other;
+
+        pthread_mutex_lock( &horizon_server_objects_mutex );
+        for (other = horizon_server_handles; other; other = other->next)
+        {
+            const struct horizon_server_object *object = other->object;
+
+            if (object->type != HORIZON_SERVER_OBJECT_FILE || !object->file_shared || object->file_fd == -1 ||
+                !object->file_name || !horizon_unix_path_equal( object->file_name, filename ))
+                continue;
+            existing_access |= object->file_access;
+            existing_sharing &= object->file_sharing;
+        }
+        pthread_mutex_unlock( &horizon_server_objects_mutex );
+        if (horizon_file_sharing_violation( existing_access, existing_sharing,
+                                            horizon_file_map_access( request->access ), request->sharing ))
+            reply.header.error = HORIZON_STATUS_SHARING_VIOLATION;
+    }
+    if (!reply.header.error && !is_dir)
+    {
         fd = open( filename, flags, 0666 );
         if (fd == -1)
         {
@@ -9218,6 +9243,10 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
                     if (!(stored_name = strdup( filename ))) reply.header.error = HORIZON_STATUS_NO_MEMORY;
                 }
             }
+            /* The SD card refuses to open a file for writing while it is
+             * open (FS result 0xe02, EIO in libnx), where Windows might share. */
+            else if (open_errno == EIO && fsdevGetLastResult() == 0xe02)
+                reply.header.error = HORIZON_STATUS_SHARING_VIOLATION;
             else reply.header.error = horizon_server_errno_status( open_errno );
         }
         else if (!(stored_name = strdup( filename ))) reply.header.error = HORIZON_STATUS_NO_MEMORY;
@@ -9233,6 +9262,8 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
             entry->object->file_access = horizon_file_map_access( request->access );
             entry->object->file_options = request->options;
             entry->object->file_is_dir = is_dir;
+            entry->object->file_sharing = request->sharing;
+            entry->object->file_shared = !is_dir;
             reply.handle = entry->handle;
             stored_name = NULL;
             fd = -1;

@@ -17,6 +17,28 @@ static inline unsigned int horizon_file_map_access( unsigned int access )
     return mapped;
 }
 
+/* wineserver's check_sharing for a regular file: the handles the path already
+ * has open allow what all their sharing modes allow and use what any of them
+ * uses (access mapped, sharing as FILE_SHARE_*). A new handle may not use what
+ * they do not share, nor refuse to share what they use -- unless it asks for
+ * no data access at all, as an attributes query does. The Sims 2 opens each
+ * of its packages to read, sharing reads only, then to write while that handle
+ * is open: Windows answers that with a sharing violation. */
+static inline int horizon_file_sharing_violation( unsigned int existing_access, unsigned int existing_sharing,
+                                                  unsigned int access, unsigned int sharing )
+{
+    const unsigned int read = 0x0021, write = 0x0006, del = 0x00010000; /* READ_DATA|EXECUTE, WRITE|APPEND_DATA */
+
+    if (((access & read) && !(existing_sharing & 1)) ||   /* FILE_SHARE_READ */
+        ((access & write) && !(existing_sharing & 2)) ||  /* FILE_SHARE_WRITE */
+        ((access & del) && !(existing_sharing & 4)))      /* FILE_SHARE_DELETE */
+        return 1;
+    if (!(access & (read | write | del))) return 0;
+    return ((existing_access & read) && !(sharing & 1)) ||
+           ((existing_access & write) && !(sharing & 2)) ||
+           ((existing_access & del) && !(sharing & 4));
+}
+
 /* FILE_APPEND_DATA is also included in GENERIC_WRITE. Only an append-only
  * handle should force O_APPEND; normal writable handles must support seeking. */
 static inline int horizon_file_access_mode( unsigned int access )

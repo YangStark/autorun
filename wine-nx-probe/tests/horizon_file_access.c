@@ -26,6 +26,24 @@ int main(void)
     assert(horizon_file_map_access(access) == (FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES));
     assert(!(horizon_file_map_access(GENERIC_READ) & FILE_WRITE_DATA));
     assert(horizon_file_map_access(DELETE | FILE_WRITE_DATA) == (DELETE | FILE_WRITE_DATA));
+    /* check_sharing, as wineserver decides it. Nothing open: anything goes. */
+    assert(!horizon_file_sharing_violation(0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                           FILE_GENERIC_WRITE, 0));
+    /* The Sims 2: read sharing reads only, then a write probe. */
+    assert(horizon_file_sharing_violation(FILE_GENERIC_READ, FILE_SHARE_READ,
+                                          horizon_file_map_access(GENERIC_WRITE | SYNCHRONIZE), FILE_SHARE_READ));
+    /* A second reader that shares reads is fine; one that refuses to share them is not. */
+    assert(!horizon_file_sharing_violation(FILE_GENERIC_READ, FILE_SHARE_READ, FILE_GENERIC_READ, FILE_SHARE_READ));
+    assert(horizon_file_sharing_violation(FILE_GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                          FILE_GENERIC_READ, 0));
+    /* Writers that share writes coexist; an attributes query ignores sharing. */
+    assert(!horizon_file_sharing_violation(FILE_GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                           FILE_GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE));
+    assert(!horizon_file_sharing_violation(FILE_GENERIC_WRITE, 0, FILE_READ_ATTRIBUTES | SYNCHRONIZE, 0));
+    /* DeleteFile on an open file needs FILE_SHARE_DELETE from it. */
+    assert(horizon_file_sharing_violation(FILE_GENERIC_READ, FILE_SHARE_READ, DELETE, FILE_SHARE_DELETE));
+    assert(!horizon_file_sharing_violation(FILE_GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                           DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE));
     assert((horizon_file_access_mode(access) & O_ACCMODE) == O_WRONLY);
     assert(!(horizon_file_access_mode(access) & O_APPEND));
     fd = open(path, horizon_file_access_mode(access) | O_TRUNC);
