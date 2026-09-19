@@ -678,61 +678,11 @@ static void save_program_settings( struct launcher *l, struct program *p )
     load_program_settings( l, p );
 }
 
-/* Give a game DXVK's d3d9.dll of its own.
- *
- * The runtime puts C:\dxvk on a game's DLL search path when its settings say
- * DXVK, so a copy is not what makes DXVK reachable; what it does is decide for
- * the game, since a program's own folder comes first in that search. A game
- * that has a d3d9.dll already keeps it, whoever put it there.
- * Returns 1 when the file was written, 0 when nothing was, and -1 on failure. */
-static int give_program_dxvk( struct launcher *l, struct program *p )
+static void enable_program_dxvk( struct launcher *l, struct program *p )
 {
-    char source[896], folder[768], target[776];
-    const char *base = launcher_dxvk_directory( p->machine );
-    char buffer[64 * 1024];
-    FILE *in, *out;
-    size_t chunk;
-    int failed = 0;
-
-    if (!base) return 0;
-    snprintf( folder, sizeof(folder), "%s", p->path );
-    parent_dir( folder );
-    if ((size_t)snprintf( target, sizeof(target), "%s/d3d9.dll", folder ) >= sizeof(target)) return -1;
-    if (file_exists( target )) return 0;
-    if ((size_t)snprintf( source, sizeof(source), "%s/drive_c/%s/d3d9.dll",
-                          l->options->runtime_dir, base ) >= sizeof(source)) return -1;
-    if (!(in = fopen( source, "rb" ))) return -1;
-    if (!(out = fopen( target, "wb" )))
-    {
-        fclose( in );
-        return -1;
-    }
-    while ((chunk = fread( buffer, 1, sizeof(buffer), in )))
-        if (fwrite( buffer, 1, chunk, out ) != chunk) { failed = 1; break; }
-    if (ferror( in ) || fclose( out ) || failed)
-    {
-        fclose( in );
-        remove( target );
-        return -1;
-    }
-    fclose( in );
-    /* What the game will load is what its settings should say it loads, so the
-     * version in its options is the one on the screen. */
+    if (!l->options->dxvk_on_add || !launcher_dxvk_directory( p->machine )) return;
     p->settings.dxvk = 1;
     save_program_settings( l, p );
-    return 1;
-}
-
-/* The copy a game is given when it joins the library, with what it came to said once. */
-static void give_program_dxvk_toast( struct launcher *l, struct program *p )
-{
-    if (!l->options->dxvk_on_add) return;
-    switch (give_program_dxvk( l, p ))
-    {
-    case 1: ui_toast( &l->ui, "DXVK's d3d9.dll copied into the game's folder", 2200 ); break;
-    case -1: ui_toast( &l->ui, "Could not copy DXVK's d3d9.dll into the game's folder", 2500 ); break;
-    default: break;
-    }
 }
 
 /***********************************************************************
@@ -1718,7 +1668,7 @@ static void draw_home( struct launcher *l )
 
 enum program_row
 {
-    ROW_START, ROW_FAVORITE, ROW_ARTWORK, ROW_LOCATE, ROW_TITLE, ROW_ARGS, ROW_VERBOSE, ROW_PROFILE, ROW_WINDOWS, ROW_D3D9, ROW_DXVK_VERSION, ROW_ADDRESS, ROW_OWN_CONTROLS, ROW_CONTROLS, ROW_BOX64,
+    ROW_START, ROW_FAVORITE, ROW_ARTWORK, ROW_LOCATE, ROW_TITLE, ROW_ARGS, ROW_VERBOSE, ROW_PROFILE, ROW_WINDOWS, ROW_D3D9, ROW_VKD3D_VERSION, ROW_DXVK_VERSION, ROW_ADDRESS, ROW_OWN_CONTROLS, ROW_CONTROLS, ROW_BOX64,
     ROW_HIDE, ROW_LIBRARY, PROGRAM_ROWS
 };
 
@@ -2016,6 +1966,7 @@ struct dxvk_progress_ui
     struct ui *ui;
     const struct dxvk_release *release;
     enum dxvk_progress_stage stage;
+    const char *name;
     Uint32 last_draw;
     int started;
 };
@@ -2037,18 +1988,28 @@ static void dxvk_install_progress( void *opaque, enum dxvk_progress_stage stage,
     case DXVK_PROGRESS_VERIFY: status = "Verifying download..."; current = total = 0; break;
     default: status = "Installing x86 and x64 files..."; current = total = 0; break;
     }
-    snprintf( title, sizeof(title), "Installing DXVK %s", progress->release->version );
+    snprintf( title, sizeof(title), "Installing %s %s", progress->name, progress->release->version );
     ui_progress_update( progress->ui, title, status, current, total );
     progress->stage = stage;
     progress->last_draw = now;
     progress->started = 1;
 }
 
-static int dxvk_release_menu( struct launcher *l, struct program *p, const struct ui_list *anchor )
+static int graphics_release_menu( struct launcher *l, struct program *p, const struct ui_list *anchor, int vkd3d )
 {
     static struct dxvk_release releases[DXVK_MAX_RELEASES];
     static struct ui_row rows[DXVK_MAX_RELEASES + 1];
     int refresh = 0;
+    const char *name = vkd3d ? "VKD3D" : "DXVK";
+    char *version = vkd3d ? p->settings.vkd3d_version : p->settings.dxvk_version;
+    enum dxvk_result (*catalog)( const char *, struct dxvk_release *, int, int *, int, int * ) =
+        vkd3d ? vkd3d_release_catalog : dxvk_release_catalog;
+    enum dxvk_result (*install)( const char *, const struct dxvk_release *, dxvk_progress_callback, void * ) =
+        vkd3d ? vkd3d_install_release : dxvk_install_release;
+    int (*installed_release)( const char *, unsigned short, const char * ) =
+        vkd3d ? vkd3d_release_installed : dxvk_release_installed;
+    int (*root_release)( const char *, unsigned short, char *, size_t ) =
+        vkd3d ? vkd3d_root_version : dxvk_root_version;
 
     for (;;)
     {
@@ -2057,32 +2018,33 @@ static int dxvk_release_menu( struct launcher *l, struct program *p, const struc
         int ids[DXVK_MAX_RELEASES + 1];
         int release_count = 0, count = 0, cached = 0, latest = -1, current = -1, chosen, i;
 
-        ui_toast( &l->ui, refresh ? "Refreshing DXVK releases..." : "Loading DXVK releases...", 15000 );
+        snprintf( message, sizeof(message), "%s %s releases...", refresh ? "Refreshing" : "Loading", name );
+        ui_toast( &l->ui, message, 15000 );
         ui_present( &l->ui );
-        result = dxvk_release_catalog( l->options->runtime_dir, releases, DXVK_MAX_RELEASES,
+        result = catalog( l->options->runtime_dir, releases, DXVK_MAX_RELEASES,
                                        &release_count, refresh, &cached );
         ui_toast( &l->ui, "", 0 );
         refresh = 0;
         if (result != DXVK_OK)
         {
-            ui_message( &l->ui, "DXVK releases", dxvk_result_message( result ) );
+            ui_message( &l->ui, name, dxvk_result_message( result ) );
             return 0;
         }
-        dxvk_root_version( l->options->runtime_dir, p->machine, root_version, sizeof(root_version) );
+        root_release( l->options->runtime_dir, p->machine, root_version, sizeof(root_version) );
         memset( rows, 0, sizeof(rows) );
         for (i = 0; i < release_count; i++)
         {
-            int installed = dxvk_release_installed( l->options->runtime_dir, p->machine, releases[i].version ) ||
+            int installed = installed_release( l->options->runtime_dir, p->machine, releases[i].version ) ||
                             (root_version[0] && !strcmp( root_version, releases[i].version ) &&
-                             dxvk_release_installed( l->options->runtime_dir, p->machine, "" ));
+                             installed_release( l->options->runtime_dir, p->machine, "" ));
             int index;
 
-            if (!launcher_dxvk_version_selectable( releases[i].version )) continue;
+            if (!vkd3d && !launcher_dxvk_version_selectable( releases[i].version )) continue;
             index = count++;
             ids[index] = i;
             if (latest < 0 && !releases[i].prerelease) latest = i;
-            if ((p->settings.dxvk_version[0] && !strcmp( p->settings.dxvk_version, releases[i].version )) ||
-                (!p->settings.dxvk_version[0] && root_version[0] && !strcmp( root_version, releases[i].version )))
+            if ((version[0] && !strcmp( version, releases[i].version )) ||
+                (!version[0] && root_version[0] && !strcmp( root_version, releases[i].version )))
                 current = index;
             snprintf( rows[index].label, sizeof(rows[index].label), "%s", releases[i].version );
             if (installed)
@@ -2115,33 +2077,34 @@ static int dxvk_release_menu( struct launcher *l, struct program *p, const struc
 
             if (releases[i].size)
                 snprintf( message, sizeof(message),
-                          "Download DXVK %s (%.1f MiB) from the official GitHub release and install its x86 and x64 DLLs?",
-                          releases[i].version, releases[i].size / 1048576.0 );
+                          "Download %s %s (%.1f MiB) from the official GitHub release and install its x86 and x64 DLLs?",
+                          name, releases[i].version, releases[i].size / 1048576.0 );
             else
                 snprintf( message, sizeof(message),
-                          "Download DXVK %s from the official GitHub release and install its x86 and x64 DLLs?",
-                          releases[i].version );
-            if (!ui_confirm( &l->ui, "Download DXVK", message, "Download" )) continue;
+                          "Download %s %s from the official GitHub release and install its x86 and x64 DLLs?",
+                          name, releases[i].version );
+            if (!ui_confirm( &l->ui, name, message, "Download" )) continue;
             memset( &progress, 0, sizeof(progress) );
             progress.ui = &l->ui;
+            progress.name = name;
             progress.release = releases + i;
             ui_progress_begin( &l->ui );
-            result = dxvk_install_release( l->options->runtime_dir, releases + i,
+            result = install( l->options->runtime_dir, releases + i,
                                            dxvk_install_progress, &progress );
             ui_progress_end( &l->ui );
             if (result != DXVK_OK)
             {
-                ui_message( &l->ui, "DXVK installation failed", dxvk_result_message( result ) );
+                ui_message( &l->ui, name, dxvk_result_message( result ) );
                 continue;
             }
         }
         if (root_version[0] && !strcmp( root_version, releases[i].version ) &&
-            dxvk_release_installed( l->options->runtime_dir, p->machine, "" ))
-            p->settings.dxvk_version[0] = 0;
-        else memcpy( p->settings.dxvk_version, releases[i].version, strlen( releases[i].version ) + 1 );
+            installed_release( l->options->runtime_dir, p->machine, "" ))
+            version[0] = 0;
+        else memcpy( version, releases[i].version, strlen( releases[i].version ) + 1 );
         p->settings.dxvk = 1;
         save_program_settings( l, p );
-        snprintf( message, sizeof(message), "DXVK %s selected", releases[i].version );
+        snprintf( message, sizeof(message), "%s %s selected", name, releases[i].version );
         ui_toast( &l->ui, message, 1800 );
         return 1;
     }
@@ -2310,8 +2273,10 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
         const char *base = file_name( p->path );
         int in_library = find_program( l, p->path ) >= 0;
         int x86 = p->machine == 0x014c, x64 = p->machine == 0x8664, dxvk_beside, dxvk_installed;
+        int vkd3d_installed = vkd3d_release_installed( l->options->runtime_dir, p->machine,
+                                                     p->settings.vkd3d_version );
         const char *dxvk_dir = launcher_dxvk_directory( p->machine );
-        char dxvk_root[32] = "";
+        char dxvk_root[32] = "", vkd3d_root[32] = "";
         enum ui_action action;
         struct ui_row *row;
 
@@ -2324,10 +2289,18 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
         {
             snprintf( path, sizeof(path), "%s/dxgi.dll", dir );
             dxvk_beside |= file_exists( path );
+            if (p->settings.dxvk)
+            {
+                snprintf( path, sizeof(path), "%s/d3d12.dll", dir );
+                dxvk_beside |= file_exists( path );
+                snprintf( path, sizeof(path), "%s/d3d12core.dll", dir );
+                dxvk_beside |= file_exists( path );
+            }
         }
         dxvk_installed = dxvk_dir && dxvk_release_installed( l->options->runtime_dir, p->machine,
                                                              p->settings.dxvk_version );
         dxvk_root_version( l->options->runtime_dir, p->machine, dxvk_root, sizeof(dxvk_root) );
+        vkd3d_root_version( l->options->runtime_dir, p->machine, vkd3d_root, sizeof(vkd3d_root) );
 
         count = 0;
 #define ADD_ROW(i, section, text, help_text) \
@@ -2380,14 +2353,25 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
         if (l->options->vulkan && (x86 || x64))
         {
-            ADD_ROW( ROW_D3D9, SECTION_GRAPHICS, x64 ? "Direct3D 9/10/11" : "Direct3D 9",
-                     "Wine uses its built-in Direct3D renderer. DXVK translates Direct3D through Vulkan. "
+            ADD_ROW( ROW_D3D9, SECTION_GRAPHICS, "Direct3D renderer",
+                      "Wine uses its built-in renderer. DXVK + VKD3D uses Vulkan for Direct3D 9/10/11/12. "
                      "Graphics DLLs next to the game have priority." );
             row->adjustable = 1;
             row->download = p->settings.dxvk && !dxvk_installed;
-            snprintf( row->value, sizeof(row->value), "%s%s%s", p->settings.dxvk ? "DXVK" : "Wine",
+            snprintf( row->value, sizeof(row->value), "%s%s%s",
+                      p->settings.dxvk ? "DXVK + VKD3D" : "Wine",
                       p->settings.dxvk && !dxvk_installed ? " (download required)" : "",
                       dxvk_beside ? " (app DLL first)" : "" );
+
+            ADD_ROW( ROW_VKD3D_VERSION, SECTION_GRAPHICS, "VKD3D version",
+                     "Choose an official VKD3D GitHub release." );
+            row->kind = UI_ROW_DROPDOWN;
+            row->download = !vkd3d_installed;
+            if (p->settings.vkd3d_version[0])
+                snprintf( row->value, sizeof(row->value), "%s", p->settings.vkd3d_version );
+            else if (vkd3d_root[0])
+                snprintf( row->value, sizeof(row->value), "Latest (%s)", vkd3d_root );
+            else snprintf( row->value, sizeof(row->value), "Latest" );
 
             ADD_ROW( ROW_DXVK_VERSION, SECTION_GRAPHICS, "DXVK version",
                      "Choose an official DXVK GitHub release." );
@@ -2550,19 +2534,25 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
         }
 
         case ROW_D3D9:
-            if (action == UI_ACTION_RESET || p->settings.dxvk) p->settings.dxvk = 0;
-            else if (dxvk_installed) p->settings.dxvk = 1;
-            else { dxvk_release_menu( l, p, &list ); break; }
+            if (action != UI_ACTION_RESET && !p->settings.dxvk && !dxvk_installed)
+            {
+                graphics_release_menu( l, p, &list, 0 );
+                break;
+            }
+            p->settings.dxvk = action == UI_ACTION_RESET ? 0 : !p->settings.dxvk;
             save_program_settings( l, p );
             break;
 
+        case ROW_VKD3D_VERSION:
         case ROW_DXVK_VERSION:
             if (action == UI_ACTION_RESET)
             {
-                p->settings.dxvk_version[0] = 0;
+                char *version = id == ROW_VKD3D_VERSION ? p->settings.vkd3d_version : p->settings.dxvk_version;
+                version[0] = 0;
                 save_program_settings( l, p );
             }
-            else if (action == UI_ACTION_CHOOSE) dxvk_release_menu( l, p, &list );
+            else if (action == UI_ACTION_CHOOSE)
+                graphics_release_menu( l, p, &list, id == ROW_VKD3D_VERSION );
             break;
 
         case ROW_ADDRESS:
@@ -2636,7 +2626,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
                 save_library( l );
                 ui_toast( ui, "Added to the library", 1500 );
                 p = &l->programs[index];
-                give_program_dxvk_toast( l, p );
+                enable_program_dxvk( l, p );
             }
             break;
         }
@@ -2729,6 +2719,8 @@ static const struct { const char *name, *value, *help; } credits[] =
       "https://github.com/ptitSeb/box64\nRuns x86 and x86-64 code through its interpreter and ARM64 dynarec." },
     { "DXVK", "Philip Rebohle, zlib",
       "https://github.com/doitsujin/dxvk\nDirect3D over Vulkan, for programs set to d3d=dxvk." },
+    { "VKD3D-Proton", "VKD3D-Proton contributors, LGPL-2.1",
+      "https://github.com/HansKristian-Work/vkd3d-proton\nDirect3D 12 over Vulkan." },
     { "Mesa", "Mesa3D, MIT",
       "https://mesa3d.org\nOpenGL through nvc0 and Vulkan through NVK on the Switch GPU." },
     { "mesa-switch", "danfromtico, NaGaa95 and others",
@@ -3089,8 +3081,7 @@ static void settings_menu( struct launcher *l )
         snprintf( rows[SET_DXVK_ON_ADD].value, sizeof(rows[0].value), "%s", on_off[!!l->options->dxvk_on_add] );
         rows[SET_DXVK_ON_ADD].kind = UI_ROW_SWITCH;
         rows[SET_DXVK_ON_ADD].on = !!l->options->dxvk_on_add;
-        rows[SET_DXVK_ON_ADD].help = "A game added to the library is given a copy of DXVK's d3d9.dll and set to "
-                                     "draw with it. A game that has one of its own keeps it.";
+        rows[SET_DXVK_ON_ADD].help = "New games use the bundled DXVK version until another version is selected.";
         snprintf( rows[SET_VERBOSE].label, sizeof(rows[0].label), "Verbose traces" );
         snprintf( rows[SET_VERBOSE].value, sizeof(rows[0].value), "%s", on_off[!!l->options->verbose] );
         rows[SET_VERBOSE].kind = UI_ROW_SWITCH;
@@ -3578,7 +3569,7 @@ static int add_game( struct launcher *l )
         l->program_count--;
         return -1;
     }
-    give_program_dxvk_toast( l, &l->programs[index] );
+    enable_program_dxvk( l, &l->programs[index] );
     launcher_log( "[LAUNCHER] Added %s to the library", path );
     ui_toast( &l->ui, "Game added to the library", 1800 );
     return index;

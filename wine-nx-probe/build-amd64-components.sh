@@ -4,8 +4,8 @@ root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 pe="${WINE_NX_PE_BUILD_DIR:-$root/wine-nx-probe/build-wine-amd64-pe}"
 build="${WINE_NX_BUILD_DIR:-$root/wine-nx-probe/build-switch-amd64}"
 jobs="${WINE_NX_JOBS:-8}"
-if [ "${WINE_NX_DXVK:-0}" = 1 ] && [ -z "${WINE_NX_MESA_SWITCH_DIR:-}" ]; then
-    echo "WINE_NX_DXVK=1 requires WINE_NX_MESA_SWITCH_DIR." >&2
+if { [ "${WINE_NX_DXVK:-0}" = 1 ] || [ "${WINE_NX_VKD3D:-0}" = 1 ]; } && [ -z "${WINE_NX_MESA_SWITCH_DIR:-}" ]; then
+    echo "DXVK/VKD3D require WINE_NX_MESA_SWITCH_DIR." >&2
     exit 1
 fi
 if [ -n "${WINE_NX_LLVM_MINGW:-}" ]; then
@@ -44,8 +44,12 @@ docker run --rm --network none --platform linux/arm64 -v "$root:/work" -w /work 
     '
 set -- --pe "$pe" --build "$build" --jobs "$jobs"
 if [ -n "${WINE_NX_MESA_SWITCH_DIR:-}" ]; then set -- "$@" --vulkan; fi
-if [ "${WINE_NX_DXVK:-0}" = 1 ]; then
+if [ "${WINE_NX_DXVK:-0}" = 1 ] || [ "${WINE_NX_VKD3D:-0}" = 1 ]; then
     python3 "$root/wine-nx-probe/tools/build-dxvk.py" --jobs "$jobs"
     set -- "$@" --dxvk "$root/wine-nx-probe/build-dxvk-amd64/payload"
+fi
+if [ "${WINE_NX_VKD3D:-0}" = 1 ]; then
+    python3 "$root/wine-nx-probe/tools/build-vkd3d.py" --jobs "$jobs"
+    set -- "$@" --vkd3d "$root/wine-nx-probe/build-vkd3d-amd64/payload"
 fi
 python3 "$root/wine-nx-probe/tools/package-amd64.py" "$@"

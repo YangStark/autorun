@@ -69,9 +69,8 @@ with **Settings -> System -> Make an Autorun forwarder** and start it from there
 2. In Autorun, press **+** -> **Add game** and choose the game's `.exe`.
 3. Press **A** to play.
 
-Adding a game puts a copy of DXVK's `d3d9.dll` in its folder, which is what
-draws Direct3D 9 games through the Switch's Vulkan driver. A game that already
-has one keeps it. To add games without it, turn off **Settings -> Give a new
+Adding a game enables DXVK, which draws Direct3D games through the Switch's
+Vulkan driver. To keep new games on WineD3D, turn off **Settings -> Give a new
 game DXVK**.
 
 **WarCraft III** needs a one-time setup, which Autorun includes: run

@@ -110,6 +110,28 @@ const char *dxvk_result_message( enum dxvk_result result )
     return "DXVK is unavailable in the host launcher test.";
 }
 
+enum dxvk_result vkd3d_release_catalog( const char *runtime_dir, struct dxvk_release *releases,
+                                       int max_releases, int *count, int refresh, int *cached )
+{
+    return dxvk_release_catalog( runtime_dir, releases, max_releases, count, refresh, cached );
+}
+
+enum dxvk_result vkd3d_install_release( const char *runtime_dir, const struct dxvk_release *release,
+                                       dxvk_progress_callback progress, void *opaque )
+{
+    return dxvk_install_release( runtime_dir, release, progress, opaque );
+}
+
+int vkd3d_release_installed( const char *runtime_dir, unsigned short machine, const char *version )
+{
+    return dxvk_release_installed( runtime_dir, machine, version );
+}
+
+int vkd3d_root_version( const char *runtime_dir, unsigned short machine, char *version, size_t size )
+{
+    return dxvk_root_version( runtime_dir, machine, version, size );
+}
+
 static int machine_of( const char *path, unsigned short *machine )
 {
     unsigned char header[0x40], nt[6];

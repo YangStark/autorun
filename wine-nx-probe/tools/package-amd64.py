@@ -13,6 +13,7 @@ import tempfile
 from zipfile import ZipFile, ZIP_DEFLATED
 
 from dxvk_payload import DLLS as DXVK_DLLS, validate_payload
+from vkd3d_payload import DLLS as VKD3D_DLLS, validate_payload as validate_vkd3d_payload
 
 probe = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
@@ -23,13 +24,17 @@ parser.add_argument('--no-build', action='store_true', help='Package existing DL
 parser.add_argument('--minimal', action='store_true', help='Only console smoke-test dependencies')
 parser.add_argument('--vulkan', action='store_true', help='Include Vulkan DLLs for a mesa-switch runtime')
 parser.add_argument('--dxvk', type=Path, help='AMD64 payload produced by tools/build-dxvk.py (requires --vulkan)')
+parser.add_argument('--vkd3d', type=Path, help='AMD64 payload produced by tools/build-vkd3d.py (requires --dxvk)')
 parser.add_argument('--interpreter-nro', type=Path, help='Include an interpreter-only diagnostic NRO')
 args = parser.parse_args()
 if args.vulkan and args.minimal:
     parser.error('--vulkan requires the full GUI package')
 if args.dxvk and not args.vulkan:
     parser.error('--dxvk requires --vulkan')
+if args.vkd3d and not args.dxvk:
+    parser.error('--vkd3d requires --dxvk for DXGI')
 dxvk_manifest = validate_payload(args.dxvk) if args.dxvk else None
+vkd3d_manifest = validate_vkd3d_payload(args.vkd3d) if args.vkd3d else None
 pe, build = args.pe.resolve(), args.build.resolve()
 env = os.environ.copy()
 if env.get('WINE_NX_LLVM_MINGW'):
@@ -51,6 +56,8 @@ if args.vulkan != bool(cache.get('WINE_NX_MESA_SWITCH_DIR')):
 nro = build / 'wine-nx-runtime.nro'
 if not nro.is_file() or nro.read_bytes()[16:20] != b'NRO0':
     parser.error('Missing or invalid wine-nx-runtime.nro')
+if args.vkd3d and b'[VKD3D] payload' not in nro.read_bytes():
+    parser.error('The NRO has no VKD3D launch support; rebuild it first')
 if args.interpreter_nro and (not args.interpreter_nro.is_file() or
                             args.interpreter_nro.read_bytes()[16:20] != b'NRO0'):
     parser.error('Invalid interpreter NRO')
@@ -225,11 +232,12 @@ def validate_external_imports(paths, modules):
 
 
 game_runtime = (
-    'dwmapi', 'msvcp140', 'normaliz', 'powrprof', 'vcruntime140', 'wldap32',
+    'cfgmgr32', 'dwmapi', 'msvcp140', 'normaliz', 'powrprof', 'vcruntime140', 'wldap32',
     'x3daudio1_7', 'xapofx1_5',
 )
 common = 'ntdll kernel32 kernelbase msvcrt ucrtbase advapi32 sechost'.split()
 dxvk_paths = [args.dxvk / name for name in DXVK_DLLS] if args.dxvk else []
+vkd3d_paths = [args.vkd3d / name for name in VKD3D_DLLS] if args.vkd3d else []
 if args.vulkan:
     common += ['vulkan-1', 'winevulkan']
 if not args.minimal:
@@ -244,6 +252,9 @@ if args.dxvk:
     native_seeds += ['d3d10', 'd3d10_1', 'd3dcompiler_43', 'd3dcompiler_47']
     native_seeds += sorted({import_host(name) for path in dxvk_paths for name, symbols in imports(path)
                             if module_name(name) not in DXVK_DLLS})
+if args.vkd3d:
+    native_seeds += sorted({import_host(name) for path in vkd3d_paths for name, symbols in imports(path)
+                            if module_name(name) not in DXVK_DLLS + VKD3D_DLLS})
 prebuild(native_seeds, 'aarch64')
 native = stage_closure(native_seeds, 'aarch64', 'system32')
 prebuild(common, 'i386')
@@ -320,6 +331,12 @@ if args.dxvk:
         (win64 / f'pe64-{name}.wine-nx.txt').write_text('d3d=dxvk\n')
     (destination / 'DarkSoulsII.wine-nx.txt').write_text('d3d=dxvk\n')
     shutil.copy2(probe / 'DXVK.md', stage / 'DXVK-README.md')
+if args.vkd3d:
+    destination = drive / 'vkd3d64'
+    destination.mkdir()
+    for path in vkd3d_paths:
+        shutil.copy2(path, destination / path.name)
+    shutil.copy2(args.vkd3d / 'vkd3d-manifest.json', destination / 'vkd3d-manifest.json')
 for test in ('smoke', 'functional', 'threads', 'lifecycle'):
     run(['i686-w64-mingw32-clang', '-Os', '-fno-builtin', '-nostdlib', '-Wl,--entry,_start@0',
          '-Wl,--image-base,0x10000000', '-Wl,--dynamicbase',
@@ -356,6 +373,11 @@ if args.dxvk:
     modules = {path.name: path for path in (drive / 'windows/system32').iterdir()}
     modules.update({path.name: path for path in dxvk_paths})
     validate_external_imports(dxvk_paths + sorted(win64.glob('pe64-dxvk-*.exe')), modules)
+if args.vkd3d:
+    for name in vkd3d_manifest['licenses']:
+        shutil.copy2(args.vkd3d / 'licenses' / name, licenses / name)
+    modules.update({path.name: path for path in vkd3d_paths})
+    validate_external_imports(vkd3d_paths, modules)
 
 for directory, modules in (('system32', native), ('syswow64', guest)):
     for name in modules:
@@ -398,16 +420,18 @@ manifest = {
     'wine': subprocess.check_output(['git', '-C', str(probe.parent), 'rev-parse', 'HEAD'], text=True).strip(),
     'hardware_verified': False,
     'features': {'amd64': True, 'dynarec': enabled('WINE_NX_BOX64_DYNAREC'),
-                 'vulkan': args.vulkan, 'dxvk': bool(args.dxvk),
+                 'vulkan': args.vulkan, 'dxvk': bool(args.dxvk), 'vkd3d': bool(args.vkd3d),
                  'interpreter_fallback': bool(args.interpreter_nro)},
     'mesa_switch': mesa_revision,
     'dxvk': dxvk_manifest,
+    'vkd3d': vkd3d_manifest,
     'validation': {'default': 'win64-tests/pe64-functional.exe',
                    'win64': ['pe64-smoke.exe'] + win64_tests},
     'files': {str(path.relative_to(stage)): hashlib.sha256(path.read_bytes()).hexdigest() for path in files},
 }
 (stage / 'build-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-archive = build / ('wine-nx-amd64-box64-mesa-dxvk.zip' if args.dxvk else
+archive = build / ('wine-nx-amd64-box64-mesa-dxvk-vkd3d.zip' if args.vkd3d else
+                   'wine-nx-amd64-box64-mesa-dxvk.zip' if args.dxvk else
                    'wine-nx-amd64-box64-mesa-vulkan.zip' if args.vulkan else 'wine-nx-amd64-box64.zip')
 with ZipFile(archive, 'w', ZIP_DEFLATED) as output:
     for path in sorted(stage.rglob('*')):
