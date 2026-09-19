@@ -226,15 +226,16 @@ static void test_warp_keeps_unsent_motion(void)
 }
 
 /* A program that took the mouse for itself: the server holds the cursor still
- * and tells the program the movement instead, and the driver follows the
- * cursor back after each poll. Returns the movement the program was told. */
+ * and tells the program the movement instead, and the driver puts the arrow
+ * back on the cursor after each poll. Returns the movement sent, which is the
+ * stick's own count and owes nothing to where the cursor is. */
 static double run_held_cursor_loop( int held_x, int stick_x, int seconds )
 {
     enum { CY = 360, FRAME_MS = 27, POLL_MS = 16 };
     struct pointer_cursor c = cursor_at( held_x, CY );
     unsigned long long last_poll = 0;
     double told = 0;
-    int t;
+    int t, dx, dy;
 
     for (t = 1; t <= seconds * 1000; t++)
     {
@@ -245,15 +246,11 @@ static double run_held_cursor_loop( int held_x, int stick_x, int seconds )
         }
         if (t % FRAME_MS == 0)
         {
-            int sent_x = (int)c.x;
-
             pointer_cursor_step( &c, stick_x, 0, (t - last_poll) * MS );
             last_poll = t;
-            sent_x = (int)c.x;
-            /* What the server makes of it, before the screen's edges. */
-            told += sent_x - held_x;
-            /* And the driver following the cursor, which did not move. */
-            pointer_cursor_warp( &c, sent_x, (int)c.y, held_x, (int)c.y );
+            pointer_cursor_take_motion( &c, &dx, &dy );
+            told += dx;
+            pointer_cursor_place( &c, held_x, CY );  /* the arrow follows the cursor */
         }
     }
     return told;
@@ -264,13 +261,18 @@ static void test_held_cursor_still_moves(void)
     /* Both ways, at the same rate: 1000 px/s for two seconds. */
     assert( fabs( run_held_cursor_loop( 640, 32767, 2 ) - 2000 ) < 60 );
     assert( fabs( run_held_cursor_loop( 640, -32767, 2 ) + 2000 ) < 60 );
-    /* Wherever the cursor happened to be when the program took the mouse, as
-     * long as a frame's worth of movement fits between it and the edge: the
-     * pointer is pulled back to it every frame and never comes to rest there.
-     * Held against the very edge, the movement into it is still lost -- the
-     * pointer has nowhere to go, and nothing here can tell it otherwise. */
-    assert( fabs( run_held_cursor_loop( 40, -32767, 2 ) + 2000 ) < 60 );
-    assert( fabs( run_held_cursor_loop( 1240, 32767, 2 ) - 2000 ) < 60 );
+    /* And wherever the cursor was when the program took the mouse, the corner
+     * of the screen included: Halo holds it at 0,0, and a view turning left
+     * from there is the whole of what the stick did, not nothing. */
+    assert( fabs( run_held_cursor_loop( 0, -32767, 2 ) + 2000 ) < 60 );
+    assert( fabs( run_held_cursor_loop( 1279, 32767, 2 ) - 2000 ) < 60 );
+    /* A slight tilt, well under a pixel a frame, still adds up. */
+    {
+        int slow = (int)(POINTER_CURSOR_DEAD_ZONE +
+                         (POINTER_CURSOR_STICK_MAX - POINTER_CURSOR_DEAD_ZONE) * 0.15);
+
+        assert( fabs( run_held_cursor_loop( 0, -slow, 4 ) + 90 ) < 4 );
+    }
 }
 
 int main(void)

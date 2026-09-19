@@ -41,6 +41,8 @@ extern int   wine_nx_pointer_take( int *x, int *y, unsigned int *buttons, unsign
                                    unsigned int *released );
 extern void  wine_nx_pointer_set_pos( int x, int y );
 extern void  wine_nx_pointer_follow( int x, int y );
+extern int   wine_nx_pointer_take_motion( int *dx, int *dy );
+extern int   wine_nx_pointer_take_placed( void );
 extern void  wine_nx_cursor_show( int visible );
 extern void  wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 extern int   wine_nx_runtime_verbose __attribute__((weak));
@@ -650,6 +652,7 @@ static BOOL wine_nx_send_keys(void)
     return TRUE;
 }
 
+/* A touch points at a place on the screen. */
 static void wine_nx_send_mouse( int x, int y, DWORD flags )
 {
     INPUT input = {0};
@@ -658,6 +661,20 @@ static void wine_nx_send_mouse( int x, int y, DWORD flags )
     input.mi.dx = x;
     input.mi.dy = y;
     input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | flags;
+    NtUserSendHardwareInput( 0, 0, &input, 0 );
+}
+
+/* The stick moves by an amount, which is what a mouse does: the cursor may be
+ * clipped to the screen or held still by a program that has taken the mouse
+ * for itself, and the movement still has to be told in full. */
+static void wine_nx_send_mouse_motion( int dx, int dy )
+{
+    INPUT input = {0};
+
+    input.type = INPUT_MOUSE;
+    input.mi.dx = dx;
+    input.mi.dy = dy;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE;
     NtUserSendHardwareInput( 0, 0, &input, 0 );
 }
 
@@ -714,8 +731,8 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
     static unsigned int last_buttons;
     unsigned int buttons, pressed, released;
     DWORD first, second;
-    BOOL moved, keys;
-    int x, y;
+    BOOL moved, keys, placed, stepped;
+    int x, y, dx, dy;
 
     (void)mask;
     wine_nx_fb_present();
@@ -723,18 +740,20 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
      * call, including those of the background thread. */
     wine_nx_pointer_poll( &x, &y, &buttons );
     moved = wine_nx_pointer_take( &x, &y, &buttons, &pressed, &released );
+    placed = wine_nx_pointer_take_placed();
+    stepped = wine_nx_pointer_take_motion( &dx, &dy );
     wine_nx_pointer_flags( last_buttons, buttons, pressed, released, &first, &second );
-    if (moved || first) wine_nx_send_mouse( x, y, (moved ? MOUSEEVENTF_MOVE : 0) | first );
+    if (placed || first) wine_nx_send_mouse( x, y, (placed ? MOUSEEVENTF_MOVE : 0) | first );
+    if (stepped) wine_nx_send_mouse_motion( dx, dy );
     if (second) wine_nx_send_mouse( x, y, second );
-    if (moved)
+    if (moved || placed || stepped)
     {
         POINT pos;
 
-        /* The cursor ends up where the server put it, which is not where the
-         * stick pushed once a program has taken the mouse for itself: it is
-         * told the movement and the cursor stays still. Follow it, keeping the
-         * motion Wine has not been handed, or the stick would come to rest
-         * against an edge and a view being turned would stop with it. */
+        /* The arrow belongs where the cursor is, which after movement is for
+         * the server to say: it clips the cursor to the screen, and holds it
+         * still for a program that has taken the mouse for itself. Nothing is
+         * lost by snapping to it, the movement having been sent already. */
         if (wine_nx_cursor_pos( &pos ) && (pos.x != x || pos.y != y))
         {
             static unsigned int followed;
@@ -744,8 +763,8 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
             {
                 char line[128];
 
-                snprintf( line, sizeof(line), "[NXINPUT] the cursor is at %d,%d where the stick asked for %d,%d",
-                          pos.x, pos.y, x, y );
+                snprintf( line, sizeof(line), "[NXINPUT] the cursor is at %d,%d, the stick moved %d,%d",
+                          pos.x, pos.y, dx, dy );
                 wine_nx_runtime_trace( line );
             }
             wine_nx_pointer_follow( pos.x, pos.y );

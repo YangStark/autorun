@@ -52,7 +52,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-209"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-210"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -436,6 +436,8 @@ static int wine_nx_pointer_ready;
 /* What the polls saw since the last wine_nx_pointer_take(). */
 static struct pointer_buttons wine_nx_pointer_buttons;
 static int wine_nx_pointer_moved;
+/* A touch points at a place, and the place is what Wine is given. */
+static int wine_nx_pointer_placed;
 /* The position Wine last had, from a take or the program's SetCursorPos. */
 static int wine_nx_pointer_sent_x = WINE_NX_FB_W / 2, wine_nx_pointer_sent_y = WINE_NX_FB_H / 2;
 
@@ -751,6 +753,7 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
 
         pointer_cursor_place( &wine_nx_pointer, touch.touches[0].x, touch.touches[0].y );
         moved = (int)wine_nx_pointer.x != old_x || (int)wine_nx_pointer.y != old_y;
+        wine_nx_pointer_placed |= moved;
         pressed |= WINE_NX_POINTER_LEFT;
     }
     else moved = gamepad ? 0 : pointer_cursor_step( &wine_nx_pointer, stick.x, stick.y,
@@ -809,6 +812,29 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
  * it changed, the buttons held now, and those pressed or released in between.
  * The display driver polls from a background thread, which has no TEB and
  * must not call into Wine, and delivers the input from a Wine thread. */
+/* The movement the stick has made since the last call, in whole pixels. */
+int wine_nx_pointer_take_motion( int *dx, int *dy )
+{
+    int any;
+
+    pthread_mutex_lock( &wine_nx_pointer_mutex );
+    any = pointer_cursor_take_motion( &wine_nx_pointer, dx, dy );
+    pthread_mutex_unlock( &wine_nx_pointer_mutex );
+    return any;
+}
+
+/* Whether a touch pointed at a place since the last call. */
+int wine_nx_pointer_take_placed( void )
+{
+    int placed;
+
+    pthread_mutex_lock( &wine_nx_pointer_mutex );
+    placed = wine_nx_pointer_placed;
+    wine_nx_pointer_placed = 0;
+    pthread_mutex_unlock( &wine_nx_pointer_mutex );
+    return placed;
+}
+
 int wine_nx_pointer_take( int *x, int *y, unsigned int *buttons, unsigned int *pressed, unsigned int *released )
 {
     struct pointer_buttons taken;
@@ -830,12 +856,11 @@ int wine_nx_pointer_take( int *x, int *y, unsigned int *buttons, unsigned int *p
 
 /* Follow a position set by the application (SetCursorPos), keeping the stick
  * motion Wine has not been handed yet (pointer_cursor_warp). */
-static void wine_nx_pointer_warp( int x, int y, int is_move )
+void wine_nx_pointer_set_pos( int x, int y )
 {
     pthread_mutex_lock( &wine_nx_pointer_mutex );
-    if (pointer_cursor_warp( &wine_nx_pointer, wine_nx_pointer_sent_x, wine_nx_pointer_sent_y, x, y ) &&
-        is_move)
-        wine_nx_pointer_moved = 1;
+    wine_nx_pointer_moved = pointer_cursor_warp( &wine_nx_pointer, wine_nx_pointer_sent_x,
+                                                 wine_nx_pointer_sent_y, x, y );
     wine_nx_pointer_sent_x = x;
     wine_nx_pointer_sent_y = y;
     x = (int)wine_nx_pointer.x;
@@ -844,20 +869,21 @@ static void wine_nx_pointer_warp( int x, int y, int is_move )
     wine_nx_cursor_move( x, y );
 }
 
-void wine_nx_pointer_set_pos( int x, int y )
-{
-    wine_nx_pointer_warp( x, y, 1 );
-}
-
 /* The cursor is where the server put it rather than where the stick pushed:
  * clipped to the screen, or held still for a program that took the mouse for
- * itself. Carry on from there, keeping the stick motion Wine has not been
- * handed -- but this is not movement of its own. Counting it as movement sends
- * it back again on the next poll, and the two pull against each other for as
- * long as the program holds the mouse. */
+ * itself. The arrow goes there, and nothing is lost by it -- the movement has
+ * been sent already, and what is left of it waits in the pointer's own count,
+ * not in where the arrow happens to be. */
 void wine_nx_pointer_follow( int x, int y )
 {
-    wine_nx_pointer_warp( x, y, 0 );
+    pthread_mutex_lock( &wine_nx_pointer_mutex );
+    pointer_cursor_place( &wine_nx_pointer, x, y );
+    wine_nx_pointer_sent_x = x;
+    wine_nx_pointer_sent_y = y;
+    x = (int)wine_nx_pointer.x;
+    y = (int)wine_nx_pointer.y;
+    pthread_mutex_unlock( &wine_nx_pointer_mutex );
+    wine_nx_cursor_move( x, y );
 }
 
 static int call_pe_entry_point( void *entry )

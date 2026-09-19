@@ -30,9 +30,24 @@
 struct pointer_cursor
 {
     double x, y;       /* sub-pixel position; the hot spot is the arrow tip */
+    double motion_x, motion_y; /* movement not yet handed over, sub-pixel */
     int width, height; /* screen size */
     uint32_t under[POINTER_CURSOR_W * POINTER_CURSOR_H];
 };
+
+/* The movement the stick has made since this was last asked, in whole pixels,
+ * keeping the rest for next time. A mouse reports what it did, not where it
+ * is: the screen's edges stop the cursor and a program turning a view still
+ * has to be told, and a program that has taken the mouse for itself holds the
+ * cursor still and is told nothing else. Returns nonzero when there is any. */
+static inline int pointer_cursor_take_motion( struct pointer_cursor *c, int *dx, int *dy )
+{
+    *dx = (int)c->motion_x;
+    *dy = (int)c->motion_y;
+    c->motion_x -= *dx;
+    c->motion_y -= *dy;
+    return *dx || *dy;
+}
 
 static inline void pointer_cursor_place( struct pointer_cursor *c, double x, double y )
 {
@@ -54,7 +69,11 @@ static inline int pointer_cursor_step( struct pointer_cursor *c, int stick_x, in
     tilt = (deflection - POINTER_CURSOR_DEAD_ZONE) / (POINTER_CURSOR_STICK_MAX - POINTER_CURSOR_DEAD_ZONE);
     if (tilt > 1) tilt = 1;
     distance = POINTER_CURSOR_SPEED * tilt * tilt * (double)elapsed_ns / 1e9;
-    pointer_cursor_place( c, c->x + dx / deflection * distance, c->y + dy / deflection * distance );
+    dx = dx / deflection * distance;
+    dy = dy / deflection * distance;
+    c->motion_x += dx;
+    c->motion_y += dy;
+    pointer_cursor_place( c, c->x + dx, c->y + dy );
     return (int)c->x != old_x || (int)c->y != old_y;
 }
 
