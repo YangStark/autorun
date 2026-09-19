@@ -660,6 +660,24 @@ static void wine_nx_send_mouse( int x, int y, DWORD flags )
     NtUserSendHardwareInput( 0, 0, &input, 0 );
 }
 
+/* Where the cursor really is. NtUserGetCursorPos is not it: without a recent
+ * change it asks the display driver, which is this one, and maps the answer
+ * through the thread's DPI. The stick works in the screen's own coordinates,
+ * which is what the desktop holds. */
+static BOOL wine_nx_cursor_pos( POINT *pos )
+{
+    struct object_lock lock = OBJECT_LOCK_INIT;
+    const desktop_shm_t *desktop_shm;
+    NTSTATUS status;
+
+    while ((status = get_shared_desktop( &lock, &desktop_shm )) == STATUS_PENDING)
+    {
+        pos->x = desktop_shm->cursor.x;
+        pos->y = desktop_shm->cursor.y;
+    }
+    return !status;
+}
+
 /* Whether to draw the arrow, from the cursor the program set and its show
  * count. Until a program sets a cursor there is none and the arrow is shown; a
  * program that later sets none, over a cursor it draws itself, hides it, and
@@ -716,8 +734,21 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
          * told the movement and the cursor stays still. Follow it, keeping the
          * motion Wine has not been handed, or the stick would come to rest
          * against an edge and a view being turned would stop with it. */
-        if (NtUserGetCursorPos( &pos ) && (pos.x != x || pos.y != y))
+        if (wine_nx_cursor_pos( &pos ) && (pos.x != x || pos.y != y))
+        {
+            static unsigned int followed;
+
+            /* Quiet once it is plainly working, loud enough to see that it is. */
+            if (followed++ < 8 && &wine_nx_runtime_trace)
+            {
+                char line[128];
+
+                snprintf( line, sizeof(line), "[NXINPUT] the cursor is at %d,%d where the stick asked for %d,%d",
+                          pos.x, pos.y, x, y );
+                wine_nx_runtime_trace( line );
+            }
             wine_nx_pointer_set_pos( pos.x, pos.y );
+        }
     }
     if (first) nxdrv_trace( "[NXINPUT] buttons=%x flags=%x,%x x=%d", buttons, first, second, x );
     else if (moved) nxdrv_trace_hot( "[NXINPUT] move x=%d y=%d buttons=%x", x, y, buttons, 0 );
