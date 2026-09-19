@@ -98,6 +98,8 @@ struct ui
     /* The mark the launcher puts in the corner, for the screens it does not
      * draw itself. Given header_status_data. */
     void (*footer_mark)( void *data );
+    void (*background_tick)( void *data );
+    void *background_data;
     /* Where the left of the clock and the battery came out, so that nothing a
      * screen draws on the right stands underneath them. */
     int status_left;
@@ -130,7 +132,8 @@ struct ui
     int running;
 
     char toast[160];
-    Uint32 toast_until;
+    Uint32 toast_since, toast_until;
+    int toast_notice;
 };
 
 int  ui_init( struct ui *ui, const void *font_data, size_t font_size, int animations );
@@ -198,6 +201,7 @@ void ui_footer( struct ui *ui, const struct ui_hint *hints, int count );
 void ui_hints_right( struct ui *ui, const struct ui_hint *hints, int count, int right, int y );
 void ui_fade( struct ui *ui );
 void ui_toast( struct ui *ui, const char *text, int milliseconds );
+void ui_notice( struct ui *ui, const char *text );
 void ui_draw_toast( struct ui *ui );
 /* Move the highlight toward target_y; returns where to draw it. */
 float ui_highlight( struct ui *ui, float target_y );

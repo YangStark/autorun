@@ -42,6 +42,8 @@
 #include "key_names.h"
 #include "launcher_settings.h"
 #include "launcher_ui.h"
+#include "launcher_update.h"
+#include "autorun_install.h"
 #include "steamgriddb.h"
 #include "dxvk_releases.h"
 #include "box64_options.h"
@@ -145,6 +147,7 @@ struct launcher
 {
     struct wine_nx_launcher_options *options;
     struct ui ui;
+    struct launcher_update *update;
 
     struct program programs[LAUNCHER_MAX_ENTRIES];
     int program_count;
@@ -2781,7 +2784,7 @@ enum settings_row
 {
     SET_HIDDEN, SET_HIDE_MISSING, SET_DXVK_ON_ADD, SET_VERBOSE, SET_PROFILE, SET_WINDOWS,
     SET_CONTROLS, SET_STEAMGRIDDB,
-    SET_REOPEN, SET_FORWARDER, SET_MAKE_32BIT, SET_MAKE_MAIN,
+    SET_UPDATE, SET_REOPEN, SET_FORWARDER, SET_MAKE_32BIT, SET_MAKE_MAIN,
     SET_CREDITS, SETTINGS_ROWS
 };
 
@@ -3204,6 +3207,7 @@ static void settings_menu( struct launcher *l )
             [SET_WINDOWS] = SET_SECTION_DEFAULTS, [SET_CONTROLS] = SET_SECTION_DEFAULTS,
             [SET_STEAMGRIDDB] = SET_SECTION_ARTWORK,
             [SET_REOPEN] = SET_SECTION_SYSTEM,
+            [SET_UPDATE] = SET_SECTION_SYSTEM,
             [SET_FORWARDER] = SET_SECTION_SYSTEM, [SET_MAKE_32BIT] = SET_SECTION_SYSTEM,
             [SET_MAKE_MAIN] = SET_SECTION_SYSTEM,
             [SET_CREDITS] = SET_SECTION_SYSTEM,
@@ -3259,6 +3263,11 @@ static void settings_menu( struct launcher *l )
                   launcher_kv_get( &l->look, "steamgriddb-key", path, sizeof(path) ) && path[0] ? "Configured" : "Not set" );
         rows[SET_STEAMGRIDDB].help = "Used to automatically download the community's highest-rated square, portrait and hero artwork.";
         rows[SET_STEAMGRIDDB].adjustable = 0;
+        snprintf( rows[SET_UPDATE].label, sizeof(rows[0].label), "Check for update" );
+        rows[SET_UPDATE].kind = UI_ROW_ACTION;
+        rows[SET_UPDATE].adjustable = 0;
+        rows[SET_UPDATE].disabled = !l->update;
+        rows[SET_UPDATE].help = "Official Autorun releases, changelog and installation. Games and settings are preserved.";
         snprintf( rows[SET_REOPEN].label, sizeof(rows[0].label), "Return here when a program ends" );
         snprintf( rows[SET_REOPEN].value, sizeof(rows[0].value), "%s", on_off[!!l->options->reopen_launcher] );
         rows[SET_REOPEN].kind = UI_ROW_SWITCH;
@@ -3325,6 +3334,10 @@ static void settings_menu( struct launcher *l )
         case SET_WINDOWS: l->options->framebuffer = !l->options->framebuffer; break;
         case SET_DXVK_ON_ADD: l->options->dxvk_on_add = !l->options->dxvk_on_add; break;
         case SET_REOPEN: l->options->reopen_launcher = !l->options->reopen_launcher; break;
+        case SET_UPDATE:
+            if (action == UI_ACTION_CHOOSE) launcher_update_open( l->update );
+            ui_start_screen( ui );
+            break;
         case SET_CONTROLS:
             if (action != UI_ACTION_CHOOSE) break;
             /* Written where the runtime looks first, whichever of the two the
@@ -4155,7 +4168,15 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
 
         if (!strcasecmp( p->path, target ) || !strcasecmp( p->dos, target )) l->history_selection = i;
     }
+    if (!autorun_install_finish( options->runtime_dir ))
+        ui_toast( &l->ui, "The update recovery files could not be cleared.", 5000 );
+    l->update = launcher_update_create( &l->ui, options->runtime_dir, options->schedule_restart );
+    l->ui.background_tick = launcher_update_tick;
+    l->ui.background_data = l->update;
     ret = run_library( l, target, target_size );
+    l->ui.background_tick = NULL;
+    launcher_update_destroy( l->update );
+    l->update = NULL;
     for (i = 0, added = 0, missing = 0; i < l->program_count; i++)
     {
         added += l->programs[i].icon_state == ICON_READY;

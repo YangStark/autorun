@@ -914,18 +914,50 @@ float ui_highlight( struct ui *ui, float target_y )
 
 void ui_toast( struct ui *ui, const char *text, int milliseconds )
 {
+    ui->toast_notice = 0;
     snprintf( ui->toast, sizeof(ui->toast), "%s", text );
-    ui->toast_until = SDL_GetTicks() + milliseconds;
+    ui->toast_since = SDL_GetTicks();
+    ui->toast_until = ui->toast_since + milliseconds;
 }
+
+void ui_notice( struct ui *ui, const char *text )
+{
+    ui_toast( ui, text, 4000 );
+    ui->toast_notice = 1;
+}
+
+static void ui_download_icon( struct ui *ui, int x, int y, SDL_Color color );
 
 void ui_draw_toast( struct ui *ui )
 {
     Uint32 now = SDL_GetTicks();
-    int w, h, alpha;
+    int w, h, alpha, y;
+    float open = 1.0f;
     SDL_Color card, text;
 
     if (!ui->toast[0] || now >= ui->toast_until) return;
-    alpha = ui->toast_until - now < 200 ? 255 * (ui->toast_until - now) / 200 : 255;
+    if (ui->animations)
+    {
+        open = clampf( (now - ui->toast_since) / 240.0f, 0, 1 );
+        if (ui->toast_until - now < 240) open = (ui->toast_until - now) / 240.0f;
+        open = open * open * (3 - 2 * open);
+    }
+    alpha = (int)(255 * open);
+    if (ui->toast_notice)
+    {
+        w = ui_text_width( ui, ui->small, ui->toast ) + 68;
+        h = 48;
+        int x = ui->width - w - 32;
+        y = UI_HEADER_HEIGHT + 14 - (int)(12 * (1 - open));
+        ui_rounded( ui, x + 2, y + 4, w, h, 14, (SDL_Color){0,0,0,80 * alpha / 255} );
+        ui_rounded( ui, x, y, w, h, 14, (SDL_Color){28,33,37,248 * alpha / 255} );
+        ui_outline( ui, x, y, w, h, 14, 1, (SDL_Color){218,228,235,50 * alpha / 255} );
+        ui_download_icon( ui, x + 16, y + 14, (SDL_Color){235,240,243,alpha} );
+        ui_text( ui, ui->small, x + 46, y + (h - TTF_FontHeight( ui->small )) / 2,
+                 ui->toast, (SDL_Color){235,240,243,alpha} );
+        return;
+    }
+    y = ui->height - 78 + (int)(18 * (1 - open));
     /* Between the list panel and the footer. */
     w = ui_text_width( ui, ui->small, ui->toast ) + 40;
     if (w > ui->width - 80) w = ui->width - 80;
@@ -935,8 +967,8 @@ void ui_draw_toast( struct ui *ui )
     if (ui->selection.r * 3 + ui->selection.g * 6 + ui->selection.b < 1600)
         text = (SDL_Color){ 255, 255, 255, alpha };
     else text = (SDL_Color){ 10, 14, 20, alpha };
-    ui_rounded( ui, (ui->width - w) / 2, ui->height - 78, w, h, h / 2, card );
-    ui_text_fit( ui, ui->small, (ui->width - w) / 2 + 20, ui->height - 78 + 6, w - 40, ui->toast, text, 0 );
+    ui_rounded( ui, (ui->width - w) / 2, y, w, h, h / 2, card );
+    ui_text_fit( ui, ui->small, (ui->width - w) / 2 + 20, y + 6, w - 40, ui->toast, text, 0 );
 }
 
 /***********************************************************************
@@ -999,6 +1031,7 @@ static void repeat_held( struct ui *ui )
 int ui_begin_frame( struct ui *ui )
 {
     if (!ui->running || !platform_running()) return ui->running = 0;
+    if (ui->background_tick) ui->background_tick( ui->background_data );
     if (ui->controller && !SDL_GameControllerGetAttached( ui->controller ))
     {
         SDL_GameControllerClose( ui->controller );
@@ -1187,12 +1220,12 @@ void (*ui_present_hook)( SDL_Renderer *renderer );
 
 void ui_present( struct ui *ui )
 {
-    ui_draw_toast( ui );
     if (ui->screen)
     {
         SDL_SetRenderTarget( ui->renderer, NULL );
         SDL_RenderCopy( ui->renderer, ui->screen, NULL, NULL );
     }
+    ui_draw_toast( ui );
     if (ui_present_hook) ui_present_hook( ui->renderer );
     SDL_RenderPresent( ui->renderer );
 }

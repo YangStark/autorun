@@ -23,6 +23,7 @@
 #include "unix_private.h"
 #include "horizon_private.h"
 #include "launcher.h"
+#include "autorun_install.h"
 #include "forwarder.h"
 #include "launcher_list.h"
 #include "launcher_settings.h"
@@ -2866,6 +2867,12 @@ static jmp_buf quit_jump;
 static int quit_jump_ready;
 static char own_nro[512];
 
+static int launcher_schedule_restart(void)
+{
+    return envHasNextLoad() && R_SUCCEEDED( envSetNextLoad( RUNTIME_DIR "/wine-nx-runtime.nro",
+                                                           RUNTIME_DIR "/wine-nx-runtime.nro" ) );
+}
+
 /* Called wherever a thread can leave off what it is doing. Never returns while
  * a quit is under way: the thread it is called on ends, or, for the one that
  * started the program, unwinds to main. */
@@ -3312,6 +3319,35 @@ int main( int argc, char **argv )
      * like one from the new one. */
     log_line( "[BUILD] %s from %s (address space %d bits)", WINE_NX_RUNTIME_BUILD, own_nro,
               runtime_address_space_bits() );
+    {
+        int recovered = autorun_install_recover( RUNTIME_DIR, strstr( own_nro, "/updates/previous.nro" ) != NULL );
+        if (recovered < 0)
+        {
+            wine_nx_console_quiet = 0;
+            PadState pad;
+            log_line( "[UPDATE] Recovery failed. Restore switch/wine/updates/previous.nro before starting a game. Press + to close." );
+            padConfigureInput( 1, HidNpadStyleSet_NpadStandard );
+            padInitializeDefault( &pad );
+            while (appletMainLoop())
+            {
+                padUpdate( &pad );
+                if (padGetButtonsDown( &pad ) & HidNpadButton_Plus) break;
+                consoleUpdate( NULL );
+                svcSleepThread( 16000000 );
+            }
+            consoleExit( NULL );
+            leave_cleanly();
+            return 0;
+        }
+        if (recovered == 2)
+        {
+            log_line( "[UPDATE] Restored the previous runtime; restarting" );
+            if (!launcher_schedule_restart()) log_line( "[UPDATE] Restart Autorun from the HOME menu" );
+            consoleExit( NULL );
+            leave_cleanly();
+            return 0;
+        }
+    }
     /* The launcher can access SteamGridDB before a game is selected. */
     log_memory_map( "start-up" );
     log_line( "[MAP] start-up: %d regions the loader already had lent", loader_lent_count );
@@ -3429,6 +3465,7 @@ int main( int argc, char **argv )
             .launch_title = launcher_launch_title,
             .title_installed = launcher_title_installed,
             .install_forwarder = launcher_install_forwarder,
+            .schedule_restart = envHasNextLoad() ? launcher_schedule_restart : NULL,
 #ifdef WINE_NX_MESA_SWITCH
             .vulkan = 1,
 #endif

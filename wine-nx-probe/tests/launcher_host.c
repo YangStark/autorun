@@ -26,6 +26,7 @@
 #include "launcher.h"
 #include "launcher_catalog.h"
 #include "launcher_ui.h"
+#include "launcher_update.h"
 #include "dxvk_releases.h"
 
 static char script[256][300];
@@ -34,6 +35,16 @@ static char prompt_text[512];
 static int prompt_set;
 static const char *font_path;
 static unsigned char *font_data;
+
+struct launcher_update *launcher_update_create( struct ui *ui, const char *root, int (*restart)(void) )
+{
+    (void)ui; (void)root; (void)restart;
+    return NULL;
+}
+void launcher_update_tick( void *update ) { (void)update; }
+void launcher_update_open( struct launcher_update *update ) { (void)update; }
+void launcher_update_destroy( struct launcher_update *update ) { (void)update; }
+int autorun_install_finish( const char *root ) { (void)root; return 1; }
 
 int launcher_platform_font( const void **data, size_t *size )
 {
