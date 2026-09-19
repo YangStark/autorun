@@ -8,8 +8,8 @@
  *   next to it (launcher_settings.h) and apply whenever it is started.
  * - Settings (X) holds the launcher's look (launcher.txt) and the global
  *   verbose.txt, profile.txt and framebuffer.txt.
- * - The file browser (-) starts a program anywhere on the card: C: is drive_c
- *   and Z: the card's root.
+ * - The file browser adds a program from the SD card or a mounted USB volume:
+ *   C: is drive_c, Z: the card's root and D: through H: are USB volumes.
  *
  * Icons are read and decoded on a worker thread and shown as they arrive.
  * When SDL cannot start, the text menu of launcher_console.c is shown instead.
@@ -2936,124 +2936,211 @@ static void join_path( char *out, size_t size, const char *dir, const char *name
     snprintf( out, size, "%s%s%s", dir, dir[strlen( dir ) - 1] == '/' ? "" : "/", name );
 }
 
-static int file_browser_pick( struct launcher *l, char *target, size_t size )
+static int directory_exists( const char *path )
 {
-    struct ui *ui = &l->ui;
-    char dir[512], came_from[256] = "", dos[512], path[512];
     struct stat st;
 
-    snprintf( dir, sizeof(dir), "%s", l->browse_dir );
-    if (stat( dir, &st ) || !S_ISDIR( st.st_mode )) snprintf( dir, sizeof(dir), "%s", LAUNCHER_DRIVE_C );
+    return !stat( path, &st ) && S_ISDIR( st.st_mode );
+}
+
+static int path_below( const char *path, const char *root )
+{
+    size_t length = strlen( root );
+
+    return !strncmp( path, root, length );
+}
+
+/* Choose the filesystem before showing any folders. The saved directory is
+ * kept within the chosen filesystem, but never skips this screen. */
+static int file_browser_storage( struct launcher *l, char *dir, size_t size )
+{
+    struct ui *ui = &l->ui;
+    static const char *const usb_paths[] = { "ums0:/", "ums1:/", "ums2:/", "ums3:/", "ums4:/" };
+    static const char *const usb_names[] = { "USB 1", "USB 2", "USB 3", "USB 4", "USB 5" };
+    struct wine_nx_launcher_usb_volume mounted[LAUNCHER_MAX_USB_VOLUMES];
+    int mounted_count, i;
 
     for (;;)
     {
         struct ui_list list = {0};
-        static const char *const volume_paths[] =
-        {
-            LAUNCHER_DRIVE_C, "sdmc:/", "ums0:/", "ums1:/", "ums2:/", "ums3:/", "ums4:/"
-        };
-        static const char *const volume_names[] =
-        {
-            "C: Wine", "Z: SD card", "D: USB 1", "E: USB 2", "F: USB 3", "G: USB 4", "H: USB 5"
-        };
-        enum { VOLUME_CAPACITY = sizeof(volume_paths) / sizeof(volume_paths[0]) };
-        const char *volumes[VOLUME_CAPACITY];
-        int count, has_up, volume_count = 0, rows, i, reload = 0;
+        struct ui_row rows[2] = {0};
+        enum ui_action action;
 
-        while (!read_dir( l, dir, &count ) && !is_root( dir )) parent_dir( dir );
-        snprintf( l->browse_dir, sizeof(l->browse_dir), "%s", dir );
-        has_up = !is_root( dir );
-        if (!launcher_dos_path( dir, dos, sizeof(dos) )) snprintf( dos, sizeof(dos), "%s", dir );
-
-        rows = 0;
-        if (has_up)
-        {
-            char parent[512], parent_dos[512];
-
-            snprintf( parent, sizeof(parent), "%s", dir );
-            parent_dir( parent );
-            memset( file_rows, 0, sizeof(file_rows[0]) );
-            snprintf( file_rows[0].label, sizeof(file_rows[0].label), "Up one folder" );
-            if (launcher_dos_path( parent, parent_dos, sizeof(parent_dos) ))
-                snprintf( file_rows[0].value, sizeof(file_rows[0].value), "%s", parent_dos );
-            rows = 1;
-        }
+        memset( mounted, 0, sizeof(mounted) );
+        if (l->options->list_usb)
+            mounted_count = l->options->list_usb( mounted, LAUNCHER_MAX_USB_VOLUMES );
         else
         {
-            for (i = 0; i < VOLUME_CAPACITY; i++)
-            {
-                if (stat( volume_paths[i], &st ) || !S_ISDIR( st.st_mode ) || !strcmp( volume_paths[i], dir )) continue;
-                memset( file_rows + rows, 0, sizeof(file_rows[0]) );
-                snprintf( file_rows[rows].label, sizeof(file_rows[rows].label), "%s", volume_names[i] );
-                snprintf( file_rows[rows].value, sizeof(file_rows[rows].value), "Storage" );
-                volumes[volume_count++] = volume_paths[i];
-                rows++;
-            }
+            mounted_count = 0;
+            for (i = 0; i < LAUNCHER_USB_DRIVES; i++)
+                if (directory_exists( usb_paths[i] ))
+                {
+                    snprintf( mounted[mounted_count].path, sizeof(mounted[mounted_count].path), "%s", usb_paths[i] );
+                    snprintf( mounted[mounted_count].label, sizeof(mounted[mounted_count].label), "%s", usb_names[i] );
+                    mounted[mounted_count++].drive = 'D' + i;
+                }
         }
-        for (i = 0; i < count; i++, rows++)
-        {
-            struct ui_row *row = file_rows + rows;
 
-            memset( row, 0, sizeof(*row) );
-            snprintf( row->label, sizeof(row->label), "%s", files[i].name );
-            if (files[i].is_dir) snprintf( row->value, sizeof(row->value), "Folder" );
-            else if (!files[i].supported)
-            {
-                snprintf( row->value, sizeof(row->value), "Cannot run here" );
-                row->disabled = 1;
-            }
-            else snprintf( row->value, sizeof(row->value), "%s", launcher_machine_name( files[i].machine ) );
-            if (came_from[0] && !strcasecmp( files[i].name, came_from )) list.selection = rows;
-        }
-        if (!rows)
+        snprintf( rows[0].label, sizeof(rows[0].label), "SD Card" );
+        snprintf( rows[0].value, sizeof(rows[0].value), "C: and Z:" );
+        snprintf( rows[1].label, sizeof(rows[1].label), "USB" );
+        if (mounted_count)
+            snprintf( rows[1].value, sizeof(rows[1].value), mounted_count == 1 ? "1 volume" : "%d volumes",
+                      mounted_count );
+        else
+            snprintf( rows[1].value, sizeof(rows[1].value), "Not connected" );
+
+        action = ui_list_run( ui, &list, "Add Game", "Choose storage", rows, 2, 0 );
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return 0;
+        if (action != UI_ACTION_CHOOSE) continue;
+        if (!list.selection)
         {
-            memset( file_rows, 0, sizeof(file_rows[0]) );
-            snprintf( file_rows[0].label, sizeof(file_rows[0].label), "No folders or programs here" );
-            file_rows[0].disabled = 1;
-            rows = 1;
+            if (path_below( l->browse_dir, "sdmc:/" ) && directory_exists( l->browse_dir ))
+                snprintf( dir, size, "%s", l->browse_dir );
+            else if (directory_exists( LAUNCHER_DRIVE_C ))
+                snprintf( dir, size, "%s", LAUNCHER_DRIVE_C );
+            else snprintf( dir, size, "sdmc:/" );
+            return 1;
         }
-        /* A folder opens on its first entry; going up returns to the folder left. */
-        if (!came_from[0] && has_up && rows > 1) list.selection = 1;
+        if (list.selection == 1 && !mounted_count)
+        {
+            ui_message( ui, "USB", "No mounted USB volume was found. Connect a drive, then try again." );
+            continue;
+        }
+        if (list.selection == 1 && mounted_count == 1)
+        {
+            if (path_below( l->browse_dir, mounted[0].path ) && directory_exists( l->browse_dir ))
+                snprintf( dir, size, "%s", l->browse_dir );
+            else snprintf( dir, size, "%s", mounted[0].path );
+            return 1;
+        }
+        if (list.selection == 1)
+        {
+            struct ui_list volumes = {0};
+            enum ui_action volume_action;
+
+            for (i = 0; i < mounted_count; i++)
+            {
+                memset( file_rows + i, 0, sizeof(file_rows[0]) );
+                snprintf( file_rows[i].label, sizeof(file_rows[i].label), "%s", mounted[i].label );
+                snprintf( file_rows[i].value, sizeof(file_rows[i].value), "%c:", mounted[i].drive );
+            }
+            volume_action = ui_list_run( ui, &volumes, "USB", "Choose a volume", file_rows,
+                                         mounted_count, 0 );
+            if (volume_action == UI_ACTION_QUIT) return 0;
+            if (volume_action == UI_ACTION_BACK) continue;
+            if (volume_action != UI_ACTION_CHOOSE) continue;
+            if (path_below( l->browse_dir, mounted[volumes.selection].path ) && directory_exists( l->browse_dir ))
+                snprintf( dir, size, "%s", l->browse_dir );
+            else snprintf( dir, size, "%s", mounted[volumes.selection].path );
+            return 1;
+        }
+    }
+}
+
+static int file_browser_pick( struct launcher *l, char *target, size_t size )
+{
+    struct ui *ui = &l->ui;
+    char dir[512], came_from[256] = "", dos[512], path[512];
+
+    for (;;)
+    {
+        int choose_storage = 0;
+
+        if (!file_browser_storage( l, dir, sizeof(dir) ))
+        {
+            save_look( l );
+            return 0;
+        }
         came_from[0] = 0;
-
-        while (!reload)
+        while (!choose_storage)
         {
-            enum ui_action action = ui_list_run( ui, &list, "Files", dos, file_rows, rows, 0 );
-            int index = list.selection - has_up - volume_count;
+            struct ui_list list = {0};
+            int count, has_up, readable, rows, i, reload = 0;
 
-            if (action == UI_ACTION_QUIT) return 0;
-            if (action == UI_ACTION_CHOOSE && !has_up && list.selection < volume_count)
+            while (!(readable = read_dir( l, dir, &count )) && !is_root( dir )) parent_dir( dir );
+            if (!readable)
             {
-                snprintf( dir, sizeof(dir), "%s", volumes[list.selection] );
-                reload = 1;
+                choose_storage = 1;
                 continue;
             }
-            if (action == UI_ACTION_BACK || (action == UI_ACTION_CHOOSE && index < 0))
+            snprintf( l->browse_dir, sizeof(l->browse_dir), "%s", dir );
+            has_up = !is_root( dir );
+            if (!launcher_dos_path( dir, dos, sizeof(dos) )) snprintf( dos, sizeof(dos), "%s", dir );
+
+            rows = 0;
+            if (has_up)
             {
-                if (!has_up)
+                char parent[512], parent_dos[512];
+
+                snprintf( parent, sizeof(parent), "%s", dir );
+                parent_dir( parent );
+                memset( file_rows, 0, sizeof(file_rows[0]) );
+                snprintf( file_rows[0].label, sizeof(file_rows[0].label), "Up one folder" );
+                if (launcher_dos_path( parent, parent_dos, sizeof(parent_dos) ))
+                    snprintf( file_rows[0].value, sizeof(file_rows[0].value), "%s", parent_dos );
+                rows = 1;
+            }
+            for (i = 0; i < count; i++, rows++)
+            {
+                struct ui_row *row = file_rows + rows;
+
+                memset( row, 0, sizeof(*row) );
+                snprintf( row->label, sizeof(row->label), "%s", files[i].name );
+                if (files[i].is_dir) snprintf( row->value, sizeof(row->value), "Folder" );
+                else if (!files[i].supported)
                 {
-                    save_look( l );
-                    return 0;
+                    snprintf( row->value, sizeof(row->value), "Cannot run here" );
+                    row->disabled = 1;
                 }
-                snprintf( came_from, sizeof(came_from), "%s", file_name( dir ) );
-                parent_dir( dir );
-                reload = 1;
-                break;
+                else snprintf( row->value, sizeof(row->value), "%s", launcher_machine_name( files[i].machine ) );
+                if (came_from[0] && !strcasecmp( files[i].name, came_from )) list.selection = rows;
             }
-            if (action != UI_ACTION_CHOOSE) continue;
-            if (index < 0 || index >= count) continue;
-            join_path( path, sizeof(path), dir, files[index].name );
-            launcher_log( "[LAUNCHER] Browser chose %s (%s)", path, files[index].is_dir ? "folder" : "program" );
-            if (files[index].is_dir)
+            if (!rows)
             {
-                snprintf( dir, sizeof(dir), "%s", path );
-                reload = 1;
+                memset( file_rows, 0, sizeof(file_rows[0]) );
+                snprintf( file_rows[0].label, sizeof(file_rows[0].label), "No folders or programs here" );
+                file_rows[0].disabled = 1;
+                rows = 1;
             }
-            else
+            /* A folder opens on its first entry; going up returns to the folder left. */
+            if (!came_from[0] && has_up && rows > 1) list.selection = 1;
+            came_from[0] = 0;
+
+            while (!reload)
             {
-                snprintf( target, size, "%s", path );
-                save_look( l );
-                return 1;
+                enum ui_action action = ui_list_run( ui, &list, "Files", dos, file_rows, rows, 0 );
+                int index = list.selection - has_up;
+
+                if (action == UI_ACTION_QUIT) return 0;
+                if (action == UI_ACTION_BACK || (action == UI_ACTION_CHOOSE && index < 0))
+                {
+                    if (!has_up)
+                    {
+                        choose_storage = 1;
+                        break;
+                    }
+                    snprintf( came_from, sizeof(came_from), "%s", file_name( dir ) );
+                    parent_dir( dir );
+                    reload = 1;
+                    break;
+                }
+                if (action != UI_ACTION_CHOOSE) continue;
+                if (index < 0 || index >= count) continue;
+                join_path( path, sizeof(path), dir, files[index].name );
+                launcher_log( "[LAUNCHER] Browser chose %s (%s)", path,
+                              files[index].is_dir ? "folder" : "program" );
+                if (files[index].is_dir)
+                {
+                    snprintf( dir, sizeof(dir), "%s", path );
+                    reload = 1;
+                }
+                else
+                {
+                    snprintf( target, size, "%s", path );
+                    save_look( l );
+                    return 1;
+                }
             }
         }
     }

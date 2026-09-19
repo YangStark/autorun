@@ -81,7 +81,8 @@ runtime; the full package now ships the Mesa 26 one.
   Vulkan memory in the driver's own mappings.
 - **Launcher.** An SDL2 launcher with a Home and a Library view, per-game
   options, a controls editor, SteamGridDB artwork, and forwarder installation
-  (`wine-nx-probe/source/launcher*.c`, `forwarder.c`).
+  (`wine-nx-probe/source/launcher*.c`, `forwarder.c`). Add Game begins with an
+  SD Card / USB picker; mounted USB volumes can then be browsed directly.
 - **Diagnostics.** A thread and core report, a sampling profiler, fatal fault
   reports that name the x86 instruction behind translated code, and a map of
   the address space when a program runs out of it.

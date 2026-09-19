@@ -9,11 +9,19 @@
 /* An application installed on the console. The launcher shows these so a
  * forwarder made with another address space can be chosen. */
 #define LAUNCHER_MAX_TITLES 96
+#define LAUNCHER_MAX_USB_VOLUMES 5
 
 struct wine_nx_launcher_title
 {
     unsigned long long id;
     char name[128];
+};
+
+struct wine_nx_launcher_usb_volume
+{
+    char path[40];
+    char label[128];
+    char drive;
 };
 
 struct wine_nx_launcher_options
@@ -26,6 +34,7 @@ struct wine_nx_launcher_options
     const char *build;
     /* 0 with the program's IMAGE_FILE_MACHINE_* when this runtime can start it. */
     int (*machine_of)( const char *path, unsigned short *machine );
+    int (*list_usb)( struct wine_nx_launcher_usb_volume *volumes, int max );
     int vulkan;                /* the runtime has Vulkan for DXVK */
     /* How wide an address space Horizon gave this process: 32 when the low 4 GB
      * is all of it, 36 or 39 when it reaches beyond, 0 when it could not be

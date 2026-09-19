@@ -78,6 +78,9 @@ extern const char *wine_nx_loader_last_open_path(void);
 extern NTSTATUS wine_nx_loader_last_open_status(void);
 extern const char *wine_nx_loader_last_export_diag(void);
 extern int wine_nx_sd_cache_install(void);
+#ifdef WINE_NX_USB_STORAGE
+extern int wine_nx_usb_list( struct wine_nx_launcher_usb_volume *volumes, int max );
+#endif
 
 static FILE *log_file;
 /* A second copy, kept from the moment a program starts. The next run of the
@@ -3368,6 +3371,9 @@ int main( int argc, char **argv )
             .emummc = runtime_on_emummc(),
             .build = WINE_NX_RUNTIME_BUILD,
             .machine_of = launcher_machine,
+#ifdef WINE_NX_USB_STORAGE
+            .list_usb = wine_nx_usb_list,
+#endif
             .address_space_bits = runtime_address_space_bits(),
         .reopen_launcher = runtime_reopen_launcher,
             .title_id = runtime_title_id(),
