@@ -610,20 +610,27 @@ struct horizon_fd_queue
 #define HORIZON_SET_THREAD_INFO_AFFINITY 0x04u
 #define HORIZON_SET_THREAD_INFO_ENTRYPOINT 0x10u
 #define HORIZON_IMAGE_FILE_MACHINE_ARM64 0xaa64
+#define HORIZON_IMAGE_FILE_MACHINE_AMD64 0x8664
 #define HORIZON_IMAGE_FILE_MACHINE_I386 0x014c
 static unsigned short horizon_process_machine = HORIZON_IMAGE_FILE_MACHINE_ARM64;
 unsigned int horizon_set_process_machine( unsigned short machine )
 {
-    if (machine != HORIZON_IMAGE_FILE_MACHINE_ARM64 && machine != HORIZON_IMAGE_FILE_MACHINE_I386)
+    if (machine != HORIZON_IMAGE_FILE_MACHINE_ARM64 &&
+        machine != HORIZON_IMAGE_FILE_MACHINE_AMD64 &&
+        machine != HORIZON_IMAGE_FILE_MACHINE_I386)
         return 0xc000007b; /* STATUS_INVALID_IMAGE_FORMAT */
     horizon_process_machine = machine;
     return 0;
 }
 
 #define HORIZON_IMAGE_NT_OPTIONAL_HDR64_MAGIC 0x20b
+#define HORIZON_IMAGE_FILE_RELOCS_STRIPPED 0x0001
 #define HORIZON_IMAGE_FILE_DLL 0x2000
-#define HORIZON_IMAGE_SCN_CNT_CODE 0x00000020
+#define HORIZON_IMAGE_SCN_MEM_EXECUTE 0x20000000
 #define HORIZON_IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE 0x0040
+#define HORIZON_IMAGE_DIRECTORY_ENTRY_BASERELOC 5
+#define HORIZON_IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG 10
+#define HORIZON_IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR 14
 #define HORIZON_IMAGE_FLAGS_IMAGE_DYNAMICALLY_RELOCATED 0x04
 #define HORIZON_IMAGE_FLAGS_IMAGE_MAPPED_FLAT 0x08
 #define HORIZON_SEC_IMAGE 0x01000000u
@@ -4356,15 +4363,71 @@ static unsigned long long horizon_get_le64( const unsigned char *ptr )
            ((unsigned long long)horizon_get_le32( ptr + 4 ) << 32);
 }
 
+static int horizon_pe_data_dir( const unsigned char *opt, unsigned int opt_size, BOOL pe32,
+                                unsigned int index, unsigned int *va, unsigned int *size )
+{
+    unsigned int count_offset = pe32 ? 92 : 108;
+    unsigned int dirs_offset = pe32 ? 96 : 112;
+
+    *va = *size = 0;
+    if (opt_size < count_offset + 4 || index >= horizon_get_le32( opt + count_offset ) ||
+        opt_size < dirs_offset + (index + 1) * 8)
+        return 0;
+    *va = horizon_get_le32( opt + dirs_offset + index * 8 );
+    *size = horizon_get_le32( opt + dirs_offset + index * 8 + 4 );
+    return *va && *size;
+}
+
+static size_t horizon_server_read_pe_dir( int fd, void *buffer, size_t buffer_size,
+                                          unsigned int va, unsigned int size,
+                                          unsigned int align_mask, const unsigned char *sections,
+                                          unsigned int section_count, unsigned long long file_size )
+{
+    unsigned int i;
+
+    if (!va || !size) return 0;
+    for (i = 0; i < section_count; i++)
+    {
+        const unsigned char *section = sections + i * 40;
+        unsigned int section_va = horizon_get_le32( section + 12 );
+        unsigned int virtual_size = horizon_get_le32( section + 8 );
+        unsigned int raw_size = horizon_get_le32( section + 16 );
+        unsigned int raw_offset = horizon_get_le32( section + 20 );
+        unsigned long long map_size, read_offset, read_size;
+
+        if (va < section_va || (virtual_size && va - section_va >= virtual_size)) continue;
+        map_size = virtual_size ? virtual_size : raw_size;
+        map_size = (map_size + align_mask) & ~(unsigned long long)align_mask;
+        if (!map_size || size >= map_size || va - section_va >= map_size - size) continue;
+
+        read_offset = (raw_offset & ~0x1ffu) + (unsigned long long)(va - section_va);
+        read_size = (unsigned long long)raw_size + (raw_offset & 0x1ffu);
+        read_size = (read_size + 0x1ff) & ~(unsigned long long)0x1ff;
+        if (read_size > map_size) read_size = map_size;
+        if (size < read_size) read_size = size;
+        if (buffer_size < read_size) read_size = buffer_size;
+        if (read_offset >= file_size) return 0;
+        if (read_size > file_size - read_offset) read_size = file_size - read_offset;
+        if (!read_size || horizon_server_read_exact_at( fd, read_offset, buffer, read_size )) return 0;
+        return read_size;
+    }
+    return 0;
+}
+
 static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe_image_info *info )
 {
-    unsigned char dos[64], nt[24];
+    static const char builtin_signature[] = "Wine builtin DLL";
+    static const char fakedll_signature[] = "Wine placeholder DLL";
+    unsigned char dos[64], mz_signature[32], nt[24], cfg[0xd0];
     unsigned char *headers = NULL;
     unsigned int status = HORIZON_STATUS_SUCCESS;
     unsigned int pe_offset, opt_size, section_count, headers_size;
     unsigned int size_of_image, section_alignment, size_of_headers, align_mask;
+    unsigned int reloc_va = 0, reloc_size = 0, cfg_va = 0, cfg_size = 0, clr_va = 0, clr_size = 0;
+    unsigned long long header_end;
     unsigned int i;
     unsigned short machine, characteristics, dll_charact;
+    BOOL pe32, has_relocs;
     struct stat st;
 
     memset( info, 0, sizeof(*info) );
@@ -4375,6 +4438,12 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     if ((status = horizon_server_read_exact_at( fd, 0, dos, sizeof(dos) )))
         return status;
     if (horizon_get_le16( dos ) != 0x5a4d) return HORIZON_STATUS_INVALID_IMAGE_FORMAT;
+    if (st.st_size >= sizeof(dos) + sizeof(mz_signature) &&
+        !horizon_server_read_exact_at( fd, sizeof(dos), mz_signature, sizeof(mz_signature) ))
+    {
+        info->wine_builtin = !memcmp( mz_signature, builtin_signature, sizeof(builtin_signature) );
+        info->wine_fakedll = !memcmp( mz_signature, fakedll_signature, sizeof(fakedll_signature) );
+    }
 
     pe_offset = horizon_get_le32( dos + 0x3c );
     if (pe_offset > (unsigned long long)st.st_size - sizeof(nt))
@@ -4389,8 +4458,7 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     opt_size = horizon_get_le16( nt + 20 );
     characteristics = horizon_get_le16( nt + 22 );
 
-    if (machine != HORIZON_IMAGE_FILE_MACHINE_ARM64 &&
-        !(machine == HORIZON_IMAGE_FILE_MACHINE_I386 && horizon_process_machine == machine))
+    if (machine != HORIZON_IMAGE_FILE_MACHINE_ARM64 && machine != horizon_process_machine)
         return HORIZON_STATUS_INVALID_IMAGE_FORMAT;
     if (!section_count || section_count > 128 || opt_size < (machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? 96 : 112))
         return HORIZON_STATUS_INVALID_IMAGE_FORMAT;
@@ -4406,11 +4474,19 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     status = horizon_server_read_exact_at( fd, pe_offset + sizeof(nt), headers, headers_size );
     if (status) goto done;
 
-    if (horizon_get_le16( headers ) != (machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? 0x10b : HORIZON_IMAGE_NT_OPTIONAL_HDR64_MAGIC))
+    pe32 = machine == HORIZON_IMAGE_FILE_MACHINE_I386;
+    if (horizon_get_le16( headers ) != (pe32 ? 0x10b : HORIZON_IMAGE_NT_OPTIONAL_HDR64_MAGIC))
     {
         status = HORIZON_STATUS_INVALID_IMAGE_FORMAT;
         goto done;
     }
+
+    horizon_pe_data_dir( headers, opt_size, pe32, HORIZON_IMAGE_DIRECTORY_ENTRY_BASERELOC,
+                         &reloc_va, &reloc_size );
+    horizon_pe_data_dir( headers, opt_size, pe32, HORIZON_IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG,
+                         &cfg_va, &cfg_size );
+    horizon_pe_data_dir( headers, opt_size, pe32, HORIZON_IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR,
+                         &clr_va, &clr_size );
 
     section_alignment = horizon_get_le32( headers + 32 );
     size_of_image = horizon_get_le32( headers + 56 );
@@ -4423,9 +4499,9 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
         goto done;
     }
 
-    info->base = machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? horizon_get_le32( headers + 28 ) : horizon_get_le64( headers + 24 );
-    info->stack_size = machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? horizon_get_le32( headers + 72 ) : horizon_get_le64( headers + 72 );
-    info->stack_commit = machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? horizon_get_le32( headers + 76 ) : horizon_get_le64( headers + 80 );
+    info->base = pe32 ? horizon_get_le32( headers + 28 ) : horizon_get_le64( headers + 24 );
+    info->stack_size = pe32 ? horizon_get_le32( headers + 72 ) : horizon_get_le64( headers + 72 );
+    info->stack_commit = pe32 ? horizon_get_le32( headers + 76 ) : horizon_get_le64( headers + 80 );
     info->entry_point = horizon_get_le32( headers + 16 );
     /* As wineserver's get_image_params (server/mapping.c) and Windows: the image
      * is mapped in whole units of its section alignment, at least a page. A
@@ -4435,6 +4511,12 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     align_mask = section_alignment - 1 > 0xfff ? section_alignment - 1 : 0xfff;
     info->map_size = (size_of_image + align_mask) & ~align_mask;
     if (info->map_size < size_of_image)
+    {
+        status = HORIZON_STATUS_INVALID_IMAGE_FORMAT;
+        goto done;
+    }
+    header_end = (unsigned long long)pe_offset + sizeof(nt) + headers_size;
+    if (header_end > info->map_size || header_end > 0xffffffffu)
     {
         status = HORIZON_STATUS_INVALID_IMAGE_FORMAT;
         goto done;
@@ -4449,17 +4531,23 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     info->image_charact = characteristics;
     info->dll_charact = dll_charact;
     info->machine = machine;
-    info->loader_flags = horizon_get_le32( headers + (machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? 88 : 104) );
-    info->header_size = size_of_headers;
+    info->contains_code = horizon_get_le32( headers + 4 ) || info->entry_point || (section_alignment & 0xfff);
+    info->loader_flags = clr_va && clr_size;
+    info->header_size = max( size_of_headers, (unsigned int)header_end );
     /* The headers are mapped up to the first section, as wineserver does. */
     info->header_map_size = info->map_size;
     info->file_size = st.st_size > 0xffffffffll ? 0xffffffffu : (unsigned int)st.st_size;
     info->checksum = horizon_get_le32( headers + 64 );
 
-    if (dll_charact & HORIZON_IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE)
-        info->image_flags |= HORIZON_IMAGE_FLAGS_IMAGE_DYNAMICALLY_RELOCATED;
     if (section_alignment & 0xfff)
         info->image_flags |= HORIZON_IMAGE_FLAGS_IMAGE_MAPPED_FLAT;
+
+    has_relocs = reloc_va && reloc_size && !(characteristics & HORIZON_IMAGE_FILE_RELOCS_STRIPPED);
+
+    if (!(section_alignment & 0xfff) &&
+        (dll_charact & HORIZON_IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) &&
+        (has_relocs || info->contains_code) && !(clr_va && clr_size))
+        info->image_flags |= HORIZON_IMAGE_FLAGS_IMAGE_DYNAMICALLY_RELOCATED;
 
     for (i = 0; i < section_count; i++)
     {
@@ -4467,8 +4555,22 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
 
         if (horizon_get_le32( section + 12 ) < info->header_map_size)
             info->header_map_size = horizon_get_le32( section + 12 );
-        if (horizon_get_le32( section + 36 ) & HORIZON_IMAGE_SCN_CNT_CODE)
-            info->contains_code = 1;
+        if (horizon_get_le32( section + 36 ) & HORIZON_IMAGE_SCN_MEM_EXECUTE) info->contains_code = 1;
+    }
+
+    memset( cfg, 0, sizeof(cfg) );
+    i = horizon_server_read_pe_dir( fd, cfg, sizeof(cfg), cfg_va, cfg_size, align_mask,
+                                    headers + opt_size, section_count, st.st_size );
+    if (i >= 4)
+    {
+        unsigned int chpe_offset = pe32 ? 0x7c : 0xc8;
+        unsigned int chpe_size = pe32 ? 4 : 8;
+        unsigned int declared_size = horizon_get_le32( cfg );
+
+        if (declared_size < i) i = declared_size;
+        if (i >= chpe_offset + chpe_size)
+            info->is_hybrid = pe32 ? !!horizon_get_le32( cfg + chpe_offset ) :
+                                     !!horizon_get_le64( cfg + chpe_offset );
     }
 
 done:
@@ -5525,8 +5627,9 @@ static int horizon_server_handle_init_first_thread( struct horizon_server_connec
 {
     const struct horizon_init_first_thread_request *request = (const void *)message;
     struct horizon_init_first_thread_reply reply;
-    unsigned short machines[] = { HORIZON_IMAGE_FILE_MACHINE_ARM64, HORIZON_IMAGE_FILE_MACHINE_I386 };
-    unsigned int machine_size = horizon_process_machine == HORIZON_IMAGE_FILE_MACHINE_I386 ? sizeof(machines) : sizeof(machines[0]);
+    unsigned short machines[] = { HORIZON_IMAGE_FILE_MACHINE_ARM64, horizon_process_machine };
+    unsigned int machine_size = horizon_process_machine == HORIZON_IMAGE_FILE_MACHINE_ARM64 ?
+                                sizeof(machines[0]) : sizeof(machines);
     unsigned int handle;
     int reply_fd, wait_fd;
 

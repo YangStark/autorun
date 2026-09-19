@@ -1,7 +1,8 @@
 /* A host stand-in for the Horizon kernel calls behind views of sections with no
- * file (horizon_memfile.h). mach_vm_remap shares pages between two addresses,
- * as svcMapProcessCodeMemory (an anchor) and svcMapProcessMemory (a view's
- * alias) do, and the stand-in checks what the kernel checks: an alias needs a
+ * file (horizon_memfile.h). mach_vm_remap on macOS and shared temporary-file
+ * mappings on Linux share pages between two addresses, as
+ * svcMapProcessCodeMemory (an anchor) and svcMapProcessMemory (a view's alias)
+ * do. The stand-in checks what the kernel checks: an alias needs a
  * live anchor under its source, removing one names the pages it mapped, and
  * a heap page is code-mapped at most once. An anchored source is made
  * inaccessible, as Horizon locks it, so code that touches it there crashes
@@ -9,11 +10,17 @@
  * which Horizon would allow and leave that view impossible to unmap. */
 #include <assert.h>
 #include <errno.h>
+#ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#else
+#include <fcntl.h>
+#include <stdlib.h>
+#endif
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #define HOST_PAGE ((size_t)getpagesize())
@@ -23,19 +30,50 @@
 
 #define HOST_MAX_ANCHORS 64
 #define HOST_MAX_ALIASED_PAGES 4096
+#ifndef __APPLE__
+#define HOST_MAX_ALLOCATIONS 64
+#endif
 
 struct host_anchor { void *addr; void *source; size_t size; int live; int placed; };
 struct host_alias { void *dst; void *src; };  /* a page */
+#ifndef __APPLE__
+struct host_allocation { void *addr; size_t size; int fd; int live; };
+#endif
 
 static struct host_anchor host_anchors[HOST_MAX_ANCHORS];
 static struct host_alias host_aliases[HOST_MAX_ALIASED_PAGES];
+#ifndef __APPLE__
+static struct host_allocation host_allocations[HOST_MAX_ALLOCATIONS];
+#endif
 static unsigned int host_alias_count;
 static int host_pages_live, host_anchor_calls, host_unanchor_calls;
 static int host_fail_anchor, host_fail_unanchor, host_fail_alias_countdown, host_fail_unalias;
 
 static void *host_alloc_pages( size_t size )
 {
+#ifdef __APPLE__
     void *ptr = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0 );
+#else
+    char path[] = "/tmp/wine-nx-memfile.XXXXXX";
+    unsigned int slot;
+    void *ptr;
+    int fd;
+
+    for (slot = 0; slot < HOST_MAX_ALLOCATIONS; slot++) if (!host_allocations[slot].live) break;
+    assert( slot < HOST_MAX_ALLOCATIONS );
+    if ((fd = mkstemp( path )) == -1) return NULL;
+    unlink( path );
+    if (ftruncate( fd, size ) ||
+        (ptr = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 )) == MAP_FAILED)
+    {
+        close( fd );
+        return NULL;
+    }
+    host_allocations[slot].addr = ptr;
+    host_allocations[slot].size = size;
+    host_allocations[slot].fd = fd;
+    host_allocations[slot].live = 1;
+#endif
 
     if (ptr == MAP_FAILED) return NULL;
     host_pages_live++;
@@ -44,7 +82,18 @@ static void *host_alloc_pages( size_t size )
 
 static void host_free_pages( void *ptr, size_t size )
 {
+#ifndef __APPLE__
+    unsigned int i;
+
+    for (i = 0; i < HOST_MAX_ALLOCATIONS; i++)
+        if (host_allocations[i].live && host_allocations[i].addr == ptr) break;
+    assert( i < HOST_MAX_ALLOCATIONS && host_allocations[i].size == size );
+#endif
     assert( !munmap( ptr, size ) );
+#ifndef __APPLE__
+    close( host_allocations[i].fd );
+    host_allocations[i].live = 0;
+#endif
     host_pages_live--;
 }
 
@@ -64,6 +113,7 @@ static void host_placeholder( void *addr, size_t size )
 
 static void *host_remap( void *dst, void *src, size_t size )
 {
+#ifdef __APPLE__
     mach_vm_address_t target = (mach_vm_address_t)(uintptr_t)dst;
     vm_prot_t cur, max;
     kern_return_t kr;
@@ -74,6 +124,48 @@ static void *host_remap( void *dst, void *src, size_t size )
                         &cur, &max, VM_INHERIT_NONE );
     assert( kr == KERN_SUCCESS );
     return (void *)(uintptr_t)target;
+#else
+    struct host_allocation *allocation = NULL;
+    unsigned int i;
+    off_t offset;
+    void *target;
+
+    for (i = 0; i < HOST_MAX_ALLOCATIONS; i++)
+        if (host_allocations[i].live && (char *)src >= (char *)host_allocations[i].addr &&
+            (char *)src + size <= (char *)host_allocations[i].addr + host_allocations[i].size)
+        {
+            allocation = &host_allocations[i];
+            offset = (char *)src - (char *)allocation->addr;
+            break;
+        }
+    if (!allocation)
+    {
+        for (i = 0; i < HOST_MAX_ANCHORS; i++)
+            if (host_anchors[i].live && (char *)src >= (char *)host_anchors[i].addr &&
+                (char *)src + size <= (char *)host_anchors[i].addr + host_anchors[i].size)
+            {
+                void *source = (char *)host_anchors[i].source +
+                               ((char *)src - (char *)host_anchors[i].addr);
+                unsigned int j;
+
+                for (j = 0; j < HOST_MAX_ALLOCATIONS; j++)
+                    if (host_allocations[j].live &&
+                        (char *)source >= (char *)host_allocations[j].addr &&
+                        (char *)source + size <= (char *)host_allocations[j].addr + host_allocations[j].size)
+                    {
+                        allocation = &host_allocations[j];
+                        offset = (char *)source - (char *)allocation->addr;
+                        break;
+                    }
+                break;
+            }
+    }
+    assert( allocation );
+    target = mmap( dst, size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | (dst ? MAP_FIXED : 0), allocation->fd, offset );
+    assert( target != MAP_FAILED && (!dst || target == dst) );
+    return target;
+#endif
 }
 
 static int host_ranges_overlap( const char *a, size_t a_size, const char *b, size_t b_size )

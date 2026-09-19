@@ -32,6 +32,18 @@ u32 __nx_exception_ignoredebug = 1;
 #define BASE 0x10000000u
 #define SIZE 0x10000u
 static volatile int native_faults;
+#if defined(WINE_NX_BOX64_DYNAREC) && !defined(__SWITCH__)
+static inline void set_x18( uint64_t value )
+{
+    __asm__ volatile("mov x18, %0" : : "r"(value) : "memory");
+}
+static inline uint64_t get_x18(void)
+{
+    uint64_t value;
+    __asm__ volatile("mov %0, x18" : "=r"(value));
+    return value;
+}
+#endif
 #ifdef __SWITCH__
 unsigned char __attribute__((aligned(16))) __nx_exception_stack[0x4000];
 u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
@@ -502,10 +514,19 @@ int main(void)
         ULONGLONG reads_before = wine_nx_box64_tsc_reads;
         ULONGLONG first, second;
         ULONG features;
+#if defined(WINE_NX_BOX64_DYNAREC) && !defined(__SWITCH__)
+        const uint64_t x18_sentinel = 0x18c0ffee98765432ULL;
+#endif
 
         memcpy( memory + 0x600, cpuid_program, sizeof(cpuid_program) );
         init_context( &context, BASE + 0x600, BASE + 0x6000 );
+#if defined(WINE_NX_BOX64_DYNAREC) && !defined(__SWITCH__)
+        set_x18( x18_sentinel );
+#endif
         assert( !wine_nx_box64_run( &context, 0, &f.gates, &host, &f, BASE + 0x8020, 100, &executed ) );
+#if defined(WINE_NX_BOX64_DYNAREC) && !defined(__SWITCH__)
+        assert( get_x18() == x18_sentinel );
+#endif
         assert( !memcmp( memory + 0x3070, "GenuineIntel", 12 ) );
         memcpy( &features, memory + 0x307c, 4 );
         assert( (features & 0x07808111) == 0x07808111 ); /* FPU TSC CX8 CMOV MMX FXSR SSE SSE2 */

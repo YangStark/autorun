@@ -360,11 +360,11 @@ static void init_box64_env(void)
 {
     /* Box64's own defaults for every option, then the CPU this backend
      * presents: nothing beyond SSE2 (dlls/winebox64/cpuid.h). */
-#define INTEGER(NAME, name, default, min, max, wine) box64env.name = default;
-#define INTEGER64(NAME, name, default, wine) box64env.name = default;
-#define BOOLEAN(NAME, name, default, wine) box64env.name = default;
-#define ADDRESS(NAME, name, wine)
-#define STRING(NAME, name, wine)
+#define INTEGER(NAME, name, default, min, max, wine, dynacache) box64env.name = default;
+#define INTEGER64(NAME, name, default, wine, dynacache) box64env.name = default;
+#define BOOLEAN(NAME, name, default, wine, dynacache) box64env.name = default;
+#define ADDRESS(NAME, name, wine, dynacache)
+#define STRING(NAME, name, wine, dynacache)
     ENVSUPER()
 #undef INTEGER
 #undef INTEGER64
@@ -374,6 +374,7 @@ static void init_box64_env(void)
     box64env.dynarec = 1;
     box64env.log = LOG_NONE;
     box64env.dynarec_log = LOG_NONE;
+    box64env.dynacache = 0;
     box64env.avx = 0;
     box64env.aes = 0;
     box64env.pclmulqdq = 0;
@@ -419,9 +420,9 @@ int wine_nx_box64_dynarec_init(void)
     return dynarec_ready;
 }
 
-void wine_nx_box64_dynarec_add_stop( uint32_t address )
+void wine_nx_box64_dynarec_add_stop( uintptr_t address )
 {
-    uintptr_t page = address & ~0xfffu;
+    uintptr_t page = address & ~(uintptr_t)0xfff;
     unsigned int i, count = __atomic_load_n( &stop_page_count, __ATOMIC_ACQUIRE );
 
     if (!address) return;
@@ -471,7 +472,10 @@ void wine_nx_box64_note_block_size( size_t size )
  * range. Unused table levels are skipped whole. */
 static inline uintptr_t next_table_boundary( uintptr_t pos, unsigned int shift )
 {
-    return (pos | (((uintptr_t)1 << shift) - 1)) + 1;
+    uintptr_t mask = ((uintptr_t)1 << shift) - 1;
+
+    if (pos > UINTPTR_MAX - mask) return UINTPTR_MAX;
+    return (pos | mask) + 1;
 }
 
 /* For [PROGRESS]: reports of changed guest memory, and lookups that found their
@@ -483,9 +487,9 @@ void wine_nx_box64_invalidate( uintptr_t addr, size_t size, int destroy )
 {
     uintptr_t end, pos;
 
-    if (!size || !dynarec_ready || addr > 0xffffffffu) return;
+    if (!size || !dynarec_ready) return;
     __atomic_add_fetch( &wine_nx_box64_invalidations, 1, __ATOMIC_RELAXED );
-    end = size > 0x100000000ull - addr ? 0x100000000ull : addr + size;
+    end = size > UINTPTR_MAX - addr ? UINTPTR_MAX : addr + size;
     size = end - addr;
     for (pos = addr > max_block_size ? addr - max_block_size : 0; pos < end;)
     {
@@ -902,19 +906,35 @@ uintptr_t getJumpAddress64( uintptr_t addr )
     return *jump_table_entry( addr, 0 );
 }
 
+dynablock_t *getDBBlock( uintptr_t addr, void **jblock )
+{
+    uintptr_t target = getJumpAddress64( addr );
+
+    if (jblock) *jblock = (void *)target;
+    return *(dynablock_t **)(target - sizeof(void *));
+}
+
 dynablock_t *getDB( uintptr_t addr )
 {
-    return *(dynablock_t **)(getJumpAddress64( addr ) - sizeof(void *));
+    return getDBBlock( addr, NULL );
 }
 
 int getNeedTest( uintptr_t addr )
 {
-    const uintptr_t target = getJumpAddress64( addr );
-    dynablock_t *block = *(dynablock_t **)(target - sizeof(void *));
+    void *target;
+    dynablock_t *block = getDBBlock( addr, &target );
 
-    if (!block || target == (uintptr_t)block->block) return 0;
+    if (!block || target != block->jmpnext) return 0;
     __atomic_add_fetch( &wine_nx_box64_marked_lookups, 1, __ATOMIC_RELAXED );
     return 1;
+}
+
+dynablock_t *getDBnoTest( uintptr_t addr )
+{
+    void *target;
+    dynablock_t *block = getDBBlock( addr, &target );
+
+    return block && target != block->jmpnext ? block : NULL;
 }
 
 void *customMalloc( size_t size ) { return malloc( size ); }
@@ -928,16 +948,17 @@ void *customMemAligned32( size_t align, size_t size ) { return memalign( align, 
 void customFree( void *ptr ) { free( ptr ); }
 void customFree32( void *ptr ) { free( ptr ); }
 
-/* Guest addresses are 32-bit. The gate pages hold INT3 sentinels the dynarec
- * would skip over; reporting them non-executable hands them to the
- * interpreter, whose hook ends the run. */
+/* The gate pages hold INT3 sentinels the dynarec would skip over; reporting
+ * them non-executable hands them to the interpreter, whose hook ends the run. */
 uint32_t getProtection( uintptr_t addr )
 {
+    extern uint32_t wine_nx_box64_guest_protection( uintptr_t address );
     unsigned int i, count = __atomic_load_n( &stop_page_count, __ATOMIC_ACQUIRE );
+    uint32_t protection = wine_nx_box64_guest_protection( addr );
 
-    if (addr > 0xffffffffu) return 0;
-    for (i = 0; i < count; i++) if ((addr & ~0xfffu) == stop_pages[i]) return 0;
-    return PROT_READ | PROT_EXEC;
+    if (!(protection & PROT_EXEC)) return protection;
+    for (i = 0; i < count; i++) if ((addr & ~(uintptr_t)0xfff) == stop_pages[i]) return 0;
+    return protection;
 }
 
 uint32_t getProtection_fast( uintptr_t addr ) { return getProtection( addr ); }
@@ -1046,7 +1067,7 @@ int IsNativeCall( uintptr_t addr, int is32bits, uintptr_t *calladdress, uint16_t
     return 0;
 }
 const char *GetBridgeName( void *ptr ) { (void)ptr; return NULL; }
-const char *GetNativeName( void *ptr ) { (void)ptr; return NULL; }
+const char *GetNativeName( void *ptr, int lib ) { (void)ptr; (void)lib; return NULL; }
 void *GetNativeFnc( uintptr_t fnc ) { (void)fnc; return NULL; }
 int isSimpleWrapper( wrapper_t wrapper ) { (void)wrapper; return 0; }
 int isRetX87Wrapper( wrapper_t wrapper ) { (void)wrapper; return 0; }

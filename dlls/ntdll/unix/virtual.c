@@ -426,6 +426,10 @@ struct range_entry
 
 static struct range_entry *free_ranges;
 static struct range_entry *free_ranges_end;
+#ifdef __SWITCH__
+static struct range_entry horizon_free_range_exclusions[2];
+static unsigned int horizon_free_range_exclusion_count;
+#endif
 
 
 static inline BOOL is_beyond_limit( const void *addr, size_t size, const void *limit )
@@ -1431,6 +1435,58 @@ static void free_ranges_insert_view( struct file_view *view )
     VIRTUAL_DEBUG_DUMP_RANGES();
 }
 
+#ifdef __SWITCH__
+static void free_ranges_exclude( void *base, size_t size )
+{
+    void *range_base = ROUND_ADDR( base, granularity_mask );
+    void *range_end = ROUND_ADDR( (char *)base + size + granularity_mask, granularity_mask );
+    struct range_entry *range = free_ranges_lower_bound( range_base );
+
+    if (range != free_ranges_end && range->end <= range_base) range++;
+    while (range != free_ranges_end && range->base < range_end)
+    {
+        if (range->base < range_base && range->end > range_end)
+        {
+            struct range_entry *next = range + 1;
+
+            memmove( next + 1, next, (free_ranges_end - next) * sizeof(*next) );
+            free_ranges_end++;
+            assert( (char *)free_ranges_end - (char *)free_ranges <= view_block_size );
+            next->base = range_end;
+            next->end = range->end;
+            range->end = range_base;
+            break;
+        }
+        if (range->base < range_base)
+        {
+            range->end = range_base;
+            range++;
+        }
+        else if (range->end > range_end)
+        {
+            range->base = range_end;
+            break;
+        }
+        else
+        {
+            memmove( range, range + 1, (free_ranges_end - range - 1) * sizeof(*range) );
+            free_ranges_end--;
+        }
+    }
+    assert( free_ranges_end - free_ranges > 0 );
+}
+
+static void free_ranges_restore_exclusions(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < horizon_free_range_exclusion_count; i++)
+        free_ranges_exclude( horizon_free_range_exclusions[i].base,
+                             (char *)horizon_free_range_exclusions[i].end -
+                             (char *)horizon_free_range_exclusions[i].base );
+}
+#endif
+
 /***********************************************************************
  *           free_ranges_remove_view
  *
@@ -1505,6 +1561,9 @@ static void free_ranges_remove_view( struct file_view *view )
         range->base = view_base;
         range->end = view_end;
     }
+#ifdef __SWITCH__
+    free_ranges_restore_exclusions();
+#endif
     VIRTUAL_DEBUG_DUMP_RANGES();
 }
 
@@ -3367,7 +3426,13 @@ static void *get_host_addr_space_limit(void)
 static void alloc_arm64ec_map(void)
 {
     unsigned int status;
-    SIZE_T size = ((ULONG_PTR)address_space_limit + page_size) >> (page_shift + 3);  /* one bit per page */
+    ULONG_PTR limit = (ULONG_PTR)address_space_limit;
+    SIZE_T size;
+
+#ifdef __SWITCH__
+    limit = min( limit, (ULONG_PTR)host_addr_space_limit );
+#endif
+    size = (limit + page_size) >> (page_shift + 3);  /* one bit per page */
 
     size = ROUND_SIZE( 0, size, host_page_mask );
     status = map_view( &arm64ec_view, NULL, size, MEM_TOP_DOWN, VPROT_READ | VPROT_COMMITTED, 0, 0, 0 );
@@ -4484,31 +4549,42 @@ void virtual_init(void)
 #ifdef __SWITCH__
     {
         /* The kernel's heap and alias regions lie inside the address space but
-         * are not Wine's: the kernel refuses mappings there while a Horizon
-         * reservation accepts them, so a TEB or stack reserved over libnx's heap
-         * shares its pages with malloc. On a 32-bit address space they sit below
-         * 4 GiB among Wine's own allocations. System views keep the free-area
-         * search from offering them. A view costs a byte per page and a table
-         * per 4 GiB, so only the part below 4 GiB is covered; in the 39-bit
-         * layout the regions lie far above it and nothing changes. */
+         * are not Wine's. Keep low regions as system views so memory queries
+         * report them reserved. Exclude high regions only from the free-range
+         * search, since protection bytes for those large regions are wasteful. */
         void *starts[2];
         size_t sizes[2];
         struct file_view *view;
-        char *top = (char *)min( host_addr_space_limit, (void *)limit_4g );
         int i, count = horizon_get_kernel_regions( starts, sizes, 2 );
 
         for (i = 0; i < count; i++)
         {
             char *start = max( (char *)starts[i], (char *)address_space_start );
-            char *end = min( (char *)starts[i] + sizes[i], top );
+            char *end = min( (char *)starts[i] + sizes[i], (char *)host_addr_space_limit );
+            char *low_end;
 
             start = (char *)((UINT_PTR)start & ~page_mask);
             end = (char *)(((UINT_PTR)end + page_mask) & ~page_mask);
             if (start >= end) continue;
-            if (create_view( &view, start, end - start, VPROT_SYSTEM ))
-                horizon_trace( "[VA] could not keep Wine out of %p-%p", start, end );
-            else
-                horizon_trace( "[VA] kept Wine out of %p-%p", start, end );
+
+            low_end = min( end, (char *)limit_4g );
+            if (start < low_end)
+            {
+                if (create_view( &view, start, low_end - start, VPROT_SYSTEM ))
+                    horizon_trace( "[VA] could not keep Wine out of %p-%p", start, low_end );
+                else
+                    horizon_trace( "[VA] kept Wine out of %p-%p", start, low_end );
+            }
+            if (end > (char *)limit_4g)
+            {
+                char *high_start = max( start, (char *)limit_4g );
+
+                assert( horizon_free_range_exclusion_count < ARRAY_SIZE(horizon_free_range_exclusions) );
+                horizon_free_range_exclusions[horizon_free_range_exclusion_count].base = high_start;
+                horizon_free_range_exclusions[horizon_free_range_exclusion_count++].end = end;
+                free_ranges_exclude( high_start, end - high_start );
+                horizon_trace( "[VA] excluded kernel region %p-%p from free ranges", high_start, end );
+            }
         }
     }
 #endif

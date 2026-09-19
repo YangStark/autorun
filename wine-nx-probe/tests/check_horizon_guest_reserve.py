@@ -88,11 +88,17 @@ for name in ('reserved_area', 'range_entry', 'alloc_area'):
     fixture += re.search(r'^struct ' + name + r'\n\{.*?^\};', source, re.M | re.S)[0] + '\n'
 fixture += r'''
 /* virtual_init excludes the kernel heap before making reservations. */
-static struct range_entry free_ranges[] = {{(void *)0x10000, (void *)0x75000000},
-                                         {(void *)0xf5000000, (void *)0x100000000ull},
-                                         {(void *)0x100000000ull, (void *)0x8000000000ull}};
+static struct range_entry free_ranges[16] = {{(void *)0x10000, (void *)0x75000000},
+                                            {(void *)0xf5000000, (void *)0x100000000ull},
+                                            {(void *)0x100000000ull, (void *)0x8000000000ull}};
 static struct range_entry *free_ranges_end = free_ranges + 2;
+static struct range_entry horizon_free_range_exclusions[2];
+static unsigned int horizon_free_range_exclusion_count;
+#define view_block_size sizeof(free_ranges)
 '''
+fixture += block('static struct range_entry *free_ranges_lower_bound(')
+fixture += block('static void free_ranges_exclude(')
+fixture += block('static void free_ranges_restore_exclusions(')
 # The window left for native thread stacks, from the real source.
 fixture += re.search(r'^#define HORIZON_NATIVE_STACKS .*$', source, re.M)[0] + '\n'
 # The window the runtime hands horizon.c for its own placements.
@@ -140,6 +146,27 @@ int main(void)
 {
     struct alloc_area a = {.size = 60032u * 1024, .align_mask = 0xffff};
     void *ptr;
+    /* A released neighboring view may merge free ranges across a sparse
+     * kernel exclusion. Restore both partial sides of the permanent hole. */
+    horizon_free_range_exclusions[0] = (struct range_entry){(void *)0x100000, (void *)0x300000};
+    horizon_free_range_exclusion_count = 1;
+    free_ranges[0] = (struct range_entry){0, (void *)0x180000};
+    free_ranges[1] = (struct range_entry){(void *)0x200000, (void *)0x500000};
+    free_ranges_end = free_ranges + 2;
+    free_ranges_restore_exclusions();
+    assert(free_ranges_end == free_ranges + 2);
+    assert(free_ranges[0].base == 0 && free_ranges[0].end == (void *)0x100000);
+    assert(free_ranges[1].base == (void *)0x300000 && free_ranges[1].end == (void *)0x500000);
+    free_ranges[0] = (struct range_entry){0, (void *)0x500000};
+    free_ranges_end = free_ranges + 1;
+    free_ranges_restore_exclusions();
+    assert(free_ranges_end == free_ranges + 2);
+    assert(free_ranges[0].end == (void *)0x100000 && free_ranges[1].base == (void *)0x300000);
+    horizon_free_range_exclusion_count = 0;
+    free_ranges[0] = (struct range_entry){(void *)0x10000, (void *)0x75000000};
+    free_ranges[1] = (struct range_entry){(void *)0xf5000000, (void *)0x100000000ull};
+    free_ranges[2] = (struct range_entry){(void *)0x100000000ull, (void *)0x8000000000ull};
+    free_ranges_end = free_ranges + 2;
     /* Model an existing native executable and the kernel heap. Neither may
      * be overwritten by the early reservations. */
     native[native_count++] = (struct native_map){0x10000000, 0x11000000};
