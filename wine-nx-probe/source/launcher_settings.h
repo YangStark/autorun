@@ -178,6 +178,7 @@ struct launcher_settings
     int profile;      /* the sampling profiler */
     int framebuffer;  /* 1: windows go to the framebuffer, 0: through the compositor */
     int dxvk;         /* architecture-specific DXVK payload */
+    char dxvk_version[32]; /* empty: the bundled latest release */
     /* Whether the program's own keys apply over the shared ones: -1 they do
      * when it has a file of them, which is what a card written before this
      * setting existed means; 0 Autorun's keys alone, the file kept for when it
@@ -193,6 +194,28 @@ static inline const char *launcher_dxvk_directory( unsigned short machine )
     if (machine == 0x014c) return "dxvk";
     if (machine == 0x8664) return "dxvk64";
     return NULL;
+}
+
+static inline int launcher_dxvk_version_valid( const char *version )
+{
+    const unsigned char *p = (const unsigned char *)version;
+
+    if (!p || !isalnum( *p )) return 0;
+    for (; *p; p++)
+        if (!isalnum( *p ) && *p != '.' && *p != '-' && *p != '_') return 0;
+    return p - (const unsigned char *)version < 32 && isalnum( p[-1] );
+}
+
+static inline int launcher_dxvk_version_directory( unsigned short machine, const char *version,
+                                                   char *out, size_t size )
+{
+    const char *base = launcher_dxvk_directory( machine );
+    int length;
+
+    if (!base || !out || !size || (version && version[0] && !launcher_dxvk_version_valid( version ))) return 0;
+    if (version && version[0]) length = snprintf( out, size, "%s\\versions\\%s", base, version );
+    else length = snprintf( out, size, "%s", base );
+    return length >= 0 && (size_t)length < size;
 }
 
 static inline int launcher_settings_path( const char *exe_path, char *out, size_t size )
@@ -217,7 +240,7 @@ static inline int launcher_setting_state( const struct launcher_kv *kv, const ch
 
 static inline void launcher_settings_read( const struct launcher_kv *kv, struct launcher_settings *settings )
 {
-    char value[16];
+    char value[64];
 
     if (!launcher_kv_get( kv, "title", settings->title, sizeof(settings->title) )) settings->title[0] = 0;
     settings->hidden = launcher_setting_state( kv, "hidden" ) == 1;
@@ -232,6 +255,9 @@ static inline void launcher_settings_read( const struct launcher_kv *kv, struct 
     if (!launcher_kv_get( kv, "d3d", value, sizeof(value) ) &&
         !launcher_kv_get( kv, "d3d9", value, sizeof(value) )) value[0] = 0;
     settings->dxvk = !strcasecmp( value, "dxvk" );
+    settings->dxvk_version[0] = 0;
+    if (launcher_kv_get( kv, "dxvk-version", value, sizeof(value) ) && launcher_dxvk_version_valid( value ))
+        memcpy( settings->dxvk_version, value, strlen( value ) + 1 );
     settings->own_controls = launcher_setting_state( kv, "own-controls" );
     settings->address_space = -1;
     if (launcher_kv_get( kv, "address-space", value, sizeof(value) ))
@@ -254,6 +280,7 @@ static inline int launcher_settings_write( struct launcher_kv *kv, const struct 
                                            settings->framebuffer ? "framebuffer" : "compositor" ) &&
            launcher_kv_set( kv, "d3d9", NULL ) &&
            launcher_kv_set( kv, "d3d", settings->dxvk ? "dxvk" : NULL ) &&
+           launcher_kv_set( kv, "dxvk-version", settings->dxvk_version[0] ? settings->dxvk_version : NULL ) &&
            launcher_kv_set( kv, "own-controls", states[settings->own_controls + 1] ) &&
            launcher_kv_set( kv, "address-space", settings->address_space < 0 ? NULL :
                                                  settings->address_space ? "32-bit" : "any" );

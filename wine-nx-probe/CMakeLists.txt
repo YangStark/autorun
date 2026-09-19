@@ -609,6 +609,7 @@ add_executable(wine-nx-runtime
     source/launcher_svg.c
     source/launcher_ui.c
     source/steamgriddb.c
+    source/dxvk_releases.c
     source/runtime_platform.c
     source/sd_cache.c
     source/wow64_box64_bridge.c
@@ -847,7 +848,7 @@ endif()
 # functions come through eglGetProcAddress, so it works over either Mesa.
 find_library(SWITCH_SDL2 SDL2 HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_SDL2_TTF SDL2_ttf HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
-set_source_files_properties(source/launcher.c source/launcher_catalog.c source/launcher_ui.c source/steamgriddb.c PROPERTIES
+set_source_files_properties(source/launcher.c source/launcher_catalog.c source/launcher_ui.c source/steamgriddb.c source/dxvk_releases.c PROPERTIES
     INCLUDE_DIRECTORIES "$ENV{DEVKITPRO}/portlibs/switch/include/SDL2"
     COMPILE_DEFINITIONS _REENTRANT)
 # The mark in the corner is only there in the build that generates it.

@@ -88,12 +88,22 @@ static void test_settings( const char *dir )
     load_text( &kv, "d3d=wine\nd3d9=dxvk\n" );
     launcher_settings_read( &kv, &settings );
     assert( settings.dxvk == 0 );
-    load_text( &kv, "d3d=DXVK\n" );
+    load_text( &kv, "d3d=DXVK\ndxvk-version=2.7.1\n" );
     launcher_settings_read( &kv, &settings );
-    assert( settings.dxvk == 1 );
+    assert( settings.dxvk == 1 && !strcmp( settings.dxvk_version, "2.7.1" ) );
+    load_text( &kv, "d3d=DXVK\ndxvk-version=../../bad\n" );
+    launcher_settings_read( &kv, &settings );
+    assert( settings.dxvk == 1 && !settings.dxvk_version[0] );
+    assert( launcher_dxvk_version_valid( "3.1.1" ) && launcher_dxvk_version_valid( "2.0-rc1" ) );
+    assert( !launcher_dxvk_version_valid( "" ) && !launcher_dxvk_version_valid( "../3.1" ) &&
+            !launcher_dxvk_version_valid( "3.1/other" ) );
     assert( !strcmp( launcher_dxvk_directory( 0x014c ), "dxvk" ) );
     assert( !strcmp( launcher_dxvk_directory( 0x8664 ), "dxvk64" ) );
     assert( !launcher_dxvk_directory( 0xaa64 ) && !launcher_dxvk_directory( 0 ) );
+    assert( launcher_dxvk_version_directory( 0x8664, "2.7.1", path, sizeof(path) ) &&
+            !strcmp( path, "dxvk64\\versions\\2.7.1" ) );
+    assert( launcher_dxvk_version_directory( 0x014c, "", path, sizeof(path) ) && !strcmp( path, "dxvk" ) );
+    assert( !launcher_dxvk_version_directory( 0x8664, "../bad", path, sizeof(path) ) );
 
     snprintf( path, sizeof(path), "%s/game.wine-nx.txt", dir );
     load_text( &kv, "# written by hand\n" );
@@ -105,12 +115,13 @@ static void test_settings( const char *dir )
     settings.profile = 1;
     settings.framebuffer = 0;
     settings.dxvk = 1;
+    strcpy( settings.dxvk_version, "2.7.1" );
     assert( launcher_settings_write( &kv, &settings ) && launcher_kv_save( &kv, path ) );
     assert( launcher_kv_load( &kv, path ) );
-    assert( !strcmp( kv.text, "# written by hand\ntitle=Need for Speed\nhidden=1\nprofile=1\nwindows=compositor\nd3d=dxvk\n" ) );
+    assert( !strcmp( kv.text, "# written by hand\ntitle=Need for Speed\nhidden=1\nprofile=1\nwindows=compositor\nd3d=dxvk\ndxvk-version=2.7.1\n" ) );
     launcher_settings_read( &kv, &back );
     assert( !strcmp( back.title, settings.title ) && back.hidden == 1 && back.verbose == -1 && back.profile == 1 );
-    assert( back.framebuffer == 0 && back.dxvk == 1 );
+    assert( back.framebuffer == 0 && back.dxvk == 1 && !strcmp( back.dxvk_version, "2.7.1" ) );
 
     /* Back to the global settings: only the comment stays; without it the file goes. */
     memset( &settings, 0, sizeof(settings) );

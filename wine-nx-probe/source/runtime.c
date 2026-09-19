@@ -31,6 +31,7 @@
 #include "compositor.h"
 #include "std_stream_lines.h"
 #include "thread_profile.h"
+#include "dxvk_releases.h"
 
 /* The sampler finds an x86 context through these without Wine's headers. */
 C_ASSERT( FIELD_OFFSET( TEB, TlsSlots[WOW64_TLS_CPURESERVED] ) == NX_PROF_TEB_CPU_AREA );
@@ -406,6 +407,7 @@ int wine_nx_runtime_verbose;
  * containing 1, which the launcher's X toggles like Y does verbose.txt. */
 static int runtime_profile;
 static int runtime_dxvk;
+static char runtime_dxvk_version[32];
 
 /* libdrm_nouveau's switch for CPU-cacheable pinned GPU memory, cleared by
  * sdmc:/switch/wine/gl-uncached.txt containing 1. */
@@ -1625,20 +1627,32 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     size_t chars, size, i;
     WCHAR *cursor;
     const char *cmdline_str;
-    const char *dxvk_dir = launcher_dxvk_directory( main_image_info.Machine );
+    char dxvk_dir[96];
+    int dxvk_path = launcher_dxvk_version_directory( main_image_info.Machine, runtime_dxvk_version,
+                                                     dxvk_dir, sizeof(dxvk_dir) );
 
     if (!target_to_dos_path( target, dos_path, dos_path_size )) return NULL;
     dos_dirname( dos_path, current_dir, sizeof(current_dir) );
     snprintf( nt_path, sizeof(nt_path), "\\??\\%s", dos_path );
     /* Keep native DXVK DLLs separate for each guest architecture. */
-    if (runtime_dxvk && dxvk_dir)
+    if (runtime_dxvk && dxvk_path &&
+        dxvk_release_installed( RUNTIME_DIR, main_image_info.Machine, runtime_dxvk_version ))
     {
         snprintf( dll_path, sizeof(dll_path), "%s;C:\\%s;C:\\windows\\system32;C:\\windows;C:\\",
                   current_dir, dxvk_dir );
-        log_line( "[DXVK] %s payload C:\\%s; application-local DLLs take priority",
-                  main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64 ? "AMD64" : "x86", dxvk_dir );
+        if (runtime_dxvk_version[0])
+            log_line( "[DXVK] %s payload C:\\%s (version %s); application-local DLLs take priority",
+                      main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64 ? "AMD64" : "x86", dxvk_dir,
+                      runtime_dxvk_version );
+        else
+            log_line( "[DXVK] %s bundled payload C:\\%s; application-local DLLs take priority",
+                      main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64 ? "AMD64" : "x86", dxvk_dir );
     }
-    else snprintf( dll_path, sizeof(dll_path), "%s;C:\\windows\\system32;C:\\windows;C:\\", current_dir );
+    else
+    {
+        if (runtime_dxvk) log_line( "[DXVK] selected payload is not installed; using Wine Direct3D" );
+        snprintf( dll_path, sizeof(dll_path), "%s;C:\\windows\\system32;C:\\windows;C:\\", current_dir );
+    }
     /* The current directory ends in a backslash, as RtlSetCurrentDirectory_U
      * stores it; relative paths are appended to it directly. */
     if ((chars = strlen( current_dir )) && current_dir[chars - 1] != '\\' && chars + 1 < sizeof(current_dir))
@@ -3443,6 +3457,8 @@ int main( int argc, char **argv )
         struct launcher_kv kv;
         char settings_path[520];
 
+        runtime_dxvk = 0;
+        runtime_dxvk_version[0] = 0;
         if (target[1] != ':' && launcher_settings_path( target, settings_path, sizeof(settings_path) ) &&
             launcher_kv_load( &kv, settings_path ) && kv.size)
         {
@@ -3452,6 +3468,7 @@ int main( int argc, char **argv )
             if (settings.framebuffer >= 0) wine_nx_compositor_mode = !settings.framebuffer;
 #ifdef WINE_NX_MESA_SWITCH
             runtime_dxvk = settings.dxvk;
+            memcpy( runtime_dxvk_version, settings.dxvk_version, sizeof(runtime_dxvk_version) );
 #endif
             log_line( "[SETTINGS] %s: verbose %s, profiler %s, windows %s, Direct3D %s", settings_path,
                       settings.verbose < 0 ? "global" : settings.verbose ? "on" : "off",

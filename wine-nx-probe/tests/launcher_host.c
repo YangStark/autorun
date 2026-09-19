@@ -26,6 +26,7 @@
 #include "launcher.h"
 #include "launcher_catalog.h"
 #include "launcher_ui.h"
+#include "dxvk_releases.h"
 
 static char script[256][300];
 static int script_count, script_pos, wait_frames, frames;
@@ -73,6 +74,40 @@ int launcher_platform_status( int *hour, int *minute, int *battery, int *chargin
 void wine_nx_runtime_trace( const char *msg )
 {
     printf( "%s\n", msg );
+}
+
+enum dxvk_result dxvk_release_catalog( const char *runtime_dir, struct dxvk_release *releases,
+                                       int max_releases, int *count, int refresh, int *cached )
+{
+    (void)runtime_dir; (void)releases; (void)max_releases; (void)refresh; (void)cached;
+    *count = 0;
+    return DXVK_NOT_FOUND;
+}
+
+enum dxvk_result dxvk_install_release( const char *runtime_dir, const struct dxvk_release *release,
+                                       dxvk_progress_callback progress, void *opaque )
+{
+    (void)runtime_dir; (void)release; (void)progress; (void)opaque;
+    return DXVK_IO_ERROR;
+}
+
+int dxvk_release_installed( const char *runtime_dir, unsigned short machine, const char *version )
+{
+    (void)runtime_dir; (void)machine; (void)version;
+    return 0;
+}
+
+int dxvk_root_version( const char *runtime_dir, unsigned short machine, char *version, size_t size )
+{
+    (void)runtime_dir; (void)machine;
+    if (size) version[0] = 0;
+    return 0;
+}
+
+const char *dxvk_result_message( enum dxvk_result result )
+{
+    (void)result;
+    return "DXVK is unavailable in the host launcher test.";
 }
 
 static int machine_of( const char *path, unsigned short *machine )

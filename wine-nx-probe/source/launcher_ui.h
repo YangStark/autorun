@@ -211,6 +211,10 @@ int  ui_confirm( struct ui *ui, const char *title, const char *text, const char 
 int  ui_ask( struct ui *ui, const char *title, const char *text, const struct ui_hint *hints, int count );
 /* A short list inside a modal. Returns the item chosen, or -1 for the way out. */
 int  ui_menu( struct ui *ui, const char *title, const char *const *items, int count, int selection );
+void ui_progress_begin( struct ui *ui );
+void ui_progress_update( struct ui *ui, const char *title, const char *status,
+                         unsigned long long current, unsigned long long total );
+void ui_progress_end( struct ui *ui );
 
 /* A list of settings rows. ui_list_run draws it and handles input until the
  * user acts on a row, then returns the action for the row at list->selection;
@@ -226,6 +230,7 @@ struct ui_row
     int disabled;
     int adjustable;     /* Left and Right change the value */
     int destructive;
+    int download;
     const char *help;   /* the line under the label, and what X shows */
     unsigned char kind; /* enum ui_row_kind, for ui_settings_run */
     unsigned char on;   /* UI_ROW_SWITCH: which way it is set */
