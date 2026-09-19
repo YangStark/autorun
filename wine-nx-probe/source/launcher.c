@@ -183,7 +183,7 @@ struct launcher
     int status, clock_hour, clock_minute, battery, charging;
 
     struct launcher_kv look;
-    int top_row, show_hidden;
+    int top_row, show_hidden, hide_missing;
     char browse_dir[512];
 
     SDL_Thread *thread;
@@ -620,7 +620,7 @@ static void rebuild_visible( struct launcher *l, int keep_index )
     {
         const struct program *p = &l->programs[i];
 
-        if (p->removed || (p->settings.hidden && !l->show_hidden) ||
+        if (p->removed || (l->hide_missing && p->missing) || (p->settings.hidden && !l->show_hidden) ||
             (l->favorites_only && !p->favorite) || !contains_case( p->title, l->search )) continue;
         l->visible[l->visible_count++] = i;
     }
@@ -650,7 +650,8 @@ static void rebuild_history( struct launcher *l, int keep_index )
     {
         const struct program *p = &l->programs[i];
 
-        if (p->removed || !p->launched_order || (p->settings.hidden && !l->show_hidden)) continue;
+        if (p->removed || !p->launched_order || (l->hide_missing && p->missing) ||
+            (p->settings.hidden && !l->show_hidden)) continue;
         l->history[l->history_count++] = i;
     }
     sort_launcher = l;
@@ -2778,7 +2779,8 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
 enum settings_row
 {
-    SET_HIDDEN, SET_DXVK_ON_ADD, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_CONTROLS, SET_STEAMGRIDDB,
+    SET_HIDDEN, SET_HIDE_MISSING, SET_DXVK_ON_ADD, SET_VERBOSE, SET_PROFILE, SET_WINDOWS,
+    SET_CONTROLS, SET_STEAMGRIDDB,
     SET_REOPEN, SET_FORWARDER, SET_MAKE_32BIT, SET_MAKE_MAIN,
     SET_CREDITS, SETTINGS_ROWS
 };
@@ -2844,6 +2846,7 @@ static void save_look( struct launcher *l )
     launcher_kv_set( &l->look, "columns", NULL );
     launcher_kv_set( &l->look, "rows", NULL );
     launcher_kv_set( &l->look, "show-hidden", l->show_hidden ? "1" : "0" );
+    launcher_kv_set( &l->look, "hide-missing", l->hide_missing ? "1" : NULL );
     launcher_kv_set( &l->look, "browse", l->browse_dir );
     runtime_file( l, "launcher.txt", path, sizeof(path) );
     launcher_kv_save( &l->look, path );
@@ -3194,7 +3197,9 @@ static void settings_menu( struct launcher *l )
         int i;
         static const unsigned char row_section[SETTINGS_ROWS] =
         {
-            [SET_HIDDEN] = SET_SECTION_LIBRARY, [SET_DXVK_ON_ADD] = SET_SECTION_LIBRARY,
+            [SET_HIDDEN] = SET_SECTION_LIBRARY,
+            [SET_HIDE_MISSING] = SET_SECTION_LIBRARY,
+            [SET_DXVK_ON_ADD] = SET_SECTION_LIBRARY,
             [SET_VERBOSE] = SET_SECTION_DEFAULTS, [SET_PROFILE] = SET_SECTION_DEFAULTS,
             [SET_WINDOWS] = SET_SECTION_DEFAULTS, [SET_CONTROLS] = SET_SECTION_DEFAULTS,
             [SET_STEAMGRIDDB] = SET_SECTION_ARTWORK,
@@ -3216,6 +3221,11 @@ static void settings_menu( struct launcher *l )
         rows[SET_HIDDEN].help = "Programs hidden from a game's own settings are listed again.";
         rows[SET_HIDDEN].kind = UI_ROW_SWITCH;
         rows[SET_HIDDEN].on = l->show_hidden;
+        snprintf( rows[SET_HIDE_MISSING].label, sizeof(rows[0].label), "Hide missing programs" );
+        snprintf( rows[SET_HIDE_MISSING].value, sizeof(rows[0].value), "%s", on_off[l->hide_missing] );
+        rows[SET_HIDE_MISSING].help = "Hide unavailable games. USB games return when the drive reconnects.";
+        rows[SET_HIDE_MISSING].kind = UI_ROW_SWITCH;
+        rows[SET_HIDE_MISSING].on = l->hide_missing;
         snprintf( rows[SET_DXVK_ON_ADD].label, sizeof(rows[0].label), "Give a new game DXVK" );
         snprintf( rows[SET_DXVK_ON_ADD].value, sizeof(rows[0].value), "%s", on_off[!!l->options->dxvk_on_add] );
         rows[SET_DXVK_ON_ADD].kind = UI_ROW_SWITCH;
@@ -3307,6 +3317,7 @@ static void settings_menu( struct launcher *l )
         switch (i)
         {
         case SET_HIDDEN: l->show_hidden = !l->show_hidden; break;
+        case SET_HIDE_MISSING: l->hide_missing = !l->hide_missing; break;
         /* The runtime keeps these: it owns the settings file and writes every
          * one of them at once when the launcher closes. */
         case SET_VERBOSE: l->options->verbose = !l->options->verbose; break;
@@ -4061,6 +4072,7 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
     runtime_file( l, "launcher.txt", path, sizeof(path) );
     launcher_kv_load( &l->look, path );
     l->show_hidden = launcher_kv_get_int( &l->look, "show-hidden", 0 ) == 1;
+    l->hide_missing = launcher_kv_get_int( &l->look, "hide-missing", 0 ) == 1;
     if (!launcher_kv_get( &l->look, "browse", l->browse_dir, sizeof(l->browse_dir) ) || !l->browse_dir[0])
         snprintf( l->browse_dir, sizeof(l->browse_dir), "%s", LAUNCHER_DRIVE_C );
 
