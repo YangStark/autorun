@@ -16,9 +16,13 @@
  *   one for a pack that is not would send the game to a folder with nothing in
  *   it. The base game and the last expansion also carry Game Registry, which
  *   is where the game looks for the rest.
- * - 1.0\language, the number the batch file asks for. language.txt beside this
- *   program holds it, and without one it is 1, English (United States); the
- *   numbers are in the readme.
+ * - 1.0\language, the number the batch file asks for, and the locale the same
+ *   number stands for under Software\Maxis\The Sims 2 Legacy. The release's
+ *   own anadius.cfg sets its language to "invalid" so that the game reads that
+ *   second key instead, and asks for it by name: without it the game says
+ *   "open: Invalid handle" and stops before it starts. language.txt beside this
+ *   program holds the number, and without one it is 1, English (United States);
+ *   the numbers are in the readme.
  * - vidc.VP60 and vidc.VP61 under Drivers32, which is what the release's
  *   vp6.reg holds. Not for the game's own movies, which are Maxis' own format
  *   and want no codec, but for the video it writes: it records gameplay
@@ -86,7 +90,8 @@ static void report( const char *label, const WCHAR *name, const char *result, DW
     buffer[n++] = '0';
     buffer[n++] = 'x';
     for (i = 0; i < 8; i++) buffer[n++] = hex[(value >> (28 - i * 4)) & 15];
-    buffer[n++] = '\n';
+    /* No newline: the log makes a line of each call, and anything that is not
+     * plain ASCII reaches it as a question mark. */
     str.Buffer = buffer;
     str.Length = (USHORT)(n * sizeof(WCHAR));
     str.MaximumLength = str.Length;
@@ -272,10 +277,32 @@ void __stdcall start(void)
     ok &= set_string( collection, L"DisplayName", L"The Sims 2 Legacy" );
     ok &= set_string( collection, L"EPsInstalled", eps_installed );
 
-    at = 0;
-    wide_append( path, &at, MAX_PATH * 2, collection );
-    wide_append( path, &at, MAX_PATH * 2, L"\\1.0" );
-    ok &= set_dword( path, L"language", chosen_language( setup_folder ) );
+    {
+        /* The number the batch file asks for, and the locale it stands for:
+         * the game takes one and the release's launcher emulation the other,
+         * and they have to agree. */
+        static const struct { DWORD number; const WCHAR *locale; } locales[] =
+        {
+            {  1, L"en_US" }, {  2, L"fr_FR" }, {  3, L"de_DE" }, {  4, L"it_IT" },
+            {  5, L"es_ES" }, {  6, L"sv_SE" }, {  7, L"fi_FI" }, {  8, L"nl_NL" },
+            {  9, L"da_DK" }, { 10, L"pt_BR" }, { 11, L"cs_CZ" }, { 13, L"en_GB" },
+            { 14, L"ja_JP" }, { 15, L"ko_KR" }, { 16, L"ru_RU" }, { 17, L"zh_CN" },
+            { 18, L"zh_TW" }, { 20, L"pl_PL" }, { 21, L"th_TH" }, { 22, L"no_NO" },
+            { 23, L"pt_PT" }, { 24, L"hu_HU" },
+        };
+        DWORD language = chosen_language( setup_folder );
+        const WCHAR *locale = L"en_US";
+        unsigned int n;
+
+        for (n = 0; n < sizeof(locales) / sizeof(locales[0]); n++)
+            if (locales[n].number == language) locale = locales[n].locale;
+
+        at = 0;
+        wide_append( path, &at, MAX_PATH * 2, collection );
+        wide_append( path, &at, MAX_PATH * 2, L"\\1.0" );
+        ok &= set_dword( path, L"language", language );
+        ok &= set_string( L"Software\\Maxis\\The Sims 2 Legacy", L"Locale", locale );
+    }
 
     for (i = 0; i < sizeof(packs) / sizeof(packs[0]); i++)
     {

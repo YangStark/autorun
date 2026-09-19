@@ -175,6 +175,11 @@ copy __Installer\\customcomponent\\vp6\\vp6vfw.dll into C:\\windows\\syswow64 on
 the card if you want either. The setup registers it under both the names Video
 for Windows opens it by, whether or not the file is there.
 
+The language number does two things: the game reads it, and so does the
+release's own launcher emulation, which anadius.cfg points at a key of its own
+by setting its language to "invalid". The setup writes both. Getting only the
+first is how the game comes up saying "open: Invalid handle" and stops.
+
 For a language other than English, put its number in language.txt beside
 sims2-setup.exe before running it:
 

@@ -34,6 +34,17 @@ assert 'if (!i || i + 1 == sizeof(packs) / sizeof(packs[0]))' in source
 # A pack that is not there gets no key, rather than one pointing at nothing.
 assert 'if (!folder_exists( folder ))' in source and 'continue;' in source
 
+# The release's own anadius.cfg sets its language to "invalid" so the game reads
+# the locale from a key of its own, and every number the setup takes has to have
+# one: without it the game says "open: Invalid handle" and stops.
+locales = re.findall(r'\{\s*(\d+), L"([a-z]{2}_[A-Z]{2})"\s*\}', source)
+assert len(locales) == 22, len(locales)
+numbers = [int(n) for n, _ in locales]
+assert numbers == sorted(numbers) and len(set(numbers)) == 22
+assert 12 not in numbers and 19 not in numbers      # the two the release skips
+assert dict((int(n), l) for n, l in locales)[23] == 'pt_PT'
+assert 'Software\\\\Maxis\\\\The Sims 2 Legacy' in source and 'L"Locale"' in source
+
 # The game sits beside the setup, not inside it and not at the root of the
 # drive: looking one folder too far up found C: and skipped every pack.
 assert source.count('holds_the_game( game )') == 3

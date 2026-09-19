@@ -69,7 +69,8 @@ static void report( const char *label, const WCHAR *name, const char *result, DW
     buffer[n++] = '0';
     buffer[n++] = 'x';
     for (i = 0; i < 8; i++) buffer[n++] = hex[(value >> (28 - i * 4)) & 15];
-    buffer[n++] = '\n';
+    /* No newline: the log makes a line of each call, and anything that is not
+     * plain ASCII reaches it as a question mark. */
     str.Buffer = buffer;
     str.Length = n * sizeof(WCHAR);
     str.MaximumLength = str.Length;
