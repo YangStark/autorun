@@ -32,6 +32,12 @@
 #include "std_stream_lines.h"
 #include "thread_profile.h"
 #include "dxvk_releases.h"
+#ifdef WINE_NX_MESA_SWITCH
+#include "graphics_config.h"
+#endif
+#ifdef WINE_NX_LSFG
+#include "lsfg_config.h"
+#endif
 
 /* The sampler finds an x86 context through these without Wine's headers. */
 C_ASSERT( FIELD_OFFSET( TEB, TlsSlots[WOW64_TLS_CPURESERVED] ) == NX_PROF_TEB_CPU_AREA );
@@ -407,6 +413,7 @@ int wine_nx_runtime_verbose;
  * containing 1, which the launcher's X toggles like Y does verbose.txt. */
 static int runtime_profile;
 static int runtime_dxvk;
+static int runtime_dxvk_hud;
 static char runtime_vkd3d_version[32];
 static char runtime_dxvk_version[32];
 
@@ -1588,6 +1595,8 @@ static void put_process_string( WCHAR **cursor, UNICODE_STRING *string, const ch
  * its shader cache (LOCALAPPDATA); its directories are made at start-up. */
 static const char runtime_environment[] =
     "APPDATA=C:\\users\\wine\\AppData\\Roaming\0"
+    "DXVK_CONFIG_FILE=C:\\users\\wine\\AppData\\Local\\Autorun\\dxvk.conf\0"
+    "DXVK_HUD=0\0"
     "HOMEDRIVE=C:\0"
     "HOMEPATH=\\users\\wine\0"
     "LOCALAPPDATA=C:\\users\\wine\\AppData\\Local\0"
@@ -1598,8 +1607,8 @@ static const char runtime_environment[] =
     "TMP=C:\\windows\\temp\0"
     "USERNAME=wine\0"
     "USERPROFILE=C:\\users\\wine\0"
-    "WINE_D3D_CONFIG=cs_spin_count=64,explicit_buffer_flush=1\0"
-    "windir=C:\\windows\0";
+    "windir=C:\\windows\0"
+    "WINE_D3D_CONFIG=cs_spin_count=64,explicit_buffer_flush=1\0";
 
 /* Horizon has no console device: the standard handles are files next to the
  * runtime, copied into this log when the process exits. */
@@ -1627,7 +1636,7 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     char cmdline[1024], args_buf[896], args_path[512];
     size_t chars, size, i;
     WCHAR *cursor;
-    const char *cmdline_str;
+    const char *cmdline_str, *dxvk_hud = launcher_hud_values[runtime_dxvk_hud];
     char dxvk_dir[96], vkd3d_dir[96], vkd3d_path[104] = "", graphics_path[208] = "";
     int dxvk_path = launcher_dxvk_version_directory( main_image_info.Machine, runtime_dxvk_version,
                                                      dxvk_dir, sizeof(dxvk_dir) );
@@ -1722,7 +1731,7 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     chars += strlen( cmdline_str ) + 1;
     chars += strlen( dos_path ) + 1;
     chars += strlen( nt_path ) + 1;
-    chars += sizeof(runtime_environment) + strlen( graphics_path );
+    chars += sizeof(runtime_environment) + strlen( graphics_path ) + strlen( dxvk_hud ) - 1;
     size = sizeof(*params) + chars * sizeof(WCHAR);
 
     if (!(params = calloc( 1, size ))) return NULL;
@@ -1748,6 +1757,12 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     {
         const char *value = entry;
 
+        if (!runtime_dxvk && !strncmp( entry, "DXVK_", 5 )) continue;
+        if (!strncmp( entry, "DXVK_HUD=", 9 ))
+        {
+            for (i = 0; i < 9; i++) *cursor++ = (unsigned char)*value++;
+            value = dxvk_hud;
+        }
         if (!strncmp( entry, "PATH=", 5 ))
         {
             for (i = 0; i < 5; i++) *cursor++ = (unsigned char)*value++;
@@ -3479,6 +3494,13 @@ int main( int argc, char **argv )
         char settings_path[520];
 
         runtime_dxvk = 0;
+        runtime_dxvk_hud = 0;
+#ifdef WINE_NX_MESA_SWITCH
+        wine_nx_graphics_configure( 0, 1 );
+#endif
+#ifdef WINE_NX_LSFG
+        wine_nx_lsfg_configure( 0, 1, 1 );
+#endif
         runtime_vkd3d_version[0] = 0;
         runtime_dxvk_version[0] = 0;
         if (target[1] != ':' &&
@@ -3491,8 +3513,30 @@ int main( int argc, char **argv )
             if (settings.framebuffer >= 0) wine_nx_compositor_mode = !settings.framebuffer;
 #ifdef WINE_NX_MESA_SWITCH
             runtime_dxvk = settings.dxvk;
+            runtime_dxvk_hud = settings.dxvk_hud;
+            wine_nx_graphics_configure( launcher_frame_limits[settings.frame_limit], settings.vsync );
+#ifdef WINE_NX_LSFG
+            wine_nx_lsfg_configure( settings.lsfg_enabled, settings.lsfg_performance, settings.lsfg_flow );
+#endif
             memcpy( runtime_vkd3d_version, settings.vkd3d_version, sizeof(runtime_vkd3d_version) );
             memcpy( runtime_dxvk_version, settings.dxvk_version, sizeof(runtime_dxvk_version) );
+            if (runtime_dxvk)
+            {
+                struct launcher_kv graphics;
+
+                mkdir( WINE_USER_DIR "/AppData/Local/Autorun", 0777 );
+                if (!launcher_dxvk_config( &settings, graphics.text, sizeof(graphics.text) ))
+                    return return_to_launcher();
+                graphics.size = strlen( graphics.text );
+                if (!launcher_kv_save( &graphics, WINE_USER_DIR "/AppData/Local/Autorun/dxvk.conf" ))
+                {
+                    log_line( "[DXVK] could not write graphics settings" );
+                    return return_to_launcher();
+                }
+                log_line( "[DXVK] HUD %s, frame limit %s, VSync %s",
+                          launcher_hud_labels[settings.dxvk_hud], launcher_frame_limit_labels[settings.frame_limit],
+                          settings.vsync ? "on" : "off" );
+            }
 #endif
             log_line( "[SETTINGS] %s: verbose %s, profiler %s, windows %s, Direct3D %s", settings_path,
                       settings.verbose < 0 ? "global" : settings.verbose ? "on" : "off",

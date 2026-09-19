@@ -58,6 +58,11 @@ if not nro.is_file() or nro.read_bytes()[16:20] != b'NRO0':
     parser.error('Missing or invalid wine-nx-runtime.nro')
 if args.vkd3d and b'[VKD3D] payload' not in nro.read_bytes():
     parser.error('The NRO has no VKD3D launch support; rebuild it first')
+lsfg_revision = None
+if enabled('WINE_NX_LSFG') and args.vulkan:
+    lsfg_revision = (probe / 'lsfg/revision.txt').read_text().strip()
+    if b'[LSFG]' not in nro.read_bytes():
+        parser.error('The NRO has no LSFG-VK support; rebuild it first')
 if args.interpreter_nro and (not args.interpreter_nro.is_file() or
                             args.interpreter_nro.read_bytes()[16:20] != b'NRO0'):
     parser.error('Invalid interpreter NRO')
@@ -363,6 +368,10 @@ if args.vulkan:
 shutil.copy2(probe / 'AMD64.md', stage / 'AMD64-README.md')
 licenses = stage / 'licenses'
 licenses.mkdir()
+if lsfg_revision:
+    shutil.copy2(probe / 'vendor/lsfg-vk/LICENSE.md', licenses / 'LSFG-VK-GPL-3.0.txt')
+    shutil.copy2(probe / 'lsfg/README.md', stage / 'LSFG-README.md')
+    (stage / 'lsfg').mkdir()
 for source, name in ((probe.parent / 'COPYING.LIB', 'Wine-LGPL-2.1.txt'),
                      (probe / 'vendor/box64/LICENSE', 'Box64-MIT.txt'),
                      (probe.parent / 'dlls/winebox64ec/LICENSE.FEX', 'FEX-MIT.txt')):
@@ -421,10 +430,15 @@ manifest = {
     'hardware_verified': False,
     'features': {'amd64': True, 'dynarec': enabled('WINE_NX_BOX64_DYNAREC'),
                  'vulkan': args.vulkan, 'dxvk': bool(args.dxvk), 'vkd3d': bool(args.vkd3d),
+                 'lsfg': bool(lsfg_revision),
                  'interpreter_fallback': bool(args.interpreter_nro)},
     'mesa_switch': mesa_revision,
     'dxvk': dxvk_manifest,
     'vkd3d': vkd3d_manifest,
+    'lsfg': {'repository': 'https://git.lsfg-vk.dev/lsfg-vk-archive.git',
+             'revision': lsfg_revision,
+             'patch_sha256': hashlib.sha256((probe / 'lsfg/horizon.patch').read_bytes()).hexdigest()}
+            if lsfg_revision else None,
     'validation': {'default': 'win64-tests/pe64-functional.exe',
                    'win64': ['pe64-smoke.exe'] + win64_tests},
     'files': {str(path.relative_to(stage)): hashlib.sha256(path.read_bytes()).hexdigest() for path in files},

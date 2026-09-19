@@ -86,7 +86,7 @@ struct ui
     SDL_Texture *glyphs[16];
 
     int animations;
-    SDL_Color background, text, dim, value, selection, panel, card, focus, danger;
+    SDL_Color background, text, dim, value, selection, panel, card, focus, success, danger;
 
     struct ui_text_entry cache[UI_TEXT_CACHE];
     unsigned int cache_use;
@@ -220,8 +220,9 @@ void ui_progress_end( struct ui *ui );
  * user acts on a row, then returns the action for the row at list->selection;
  * the caller changes what it must and calls it again. */
 /* How a settings row draws what it carries on the right: an arrow into a screen
- * of its own, a value the row itself changes, or a switch. */
-enum ui_row_kind { UI_ROW_ACTION, UI_ROW_VALUE, UI_ROW_SWITCH, UI_ROW_DROPDOWN };
+ * of its own, a value the row itself changes, a switch, or read-only status. */
+enum ui_row_kind { UI_ROW_ACTION, UI_ROW_VALUE, UI_ROW_SWITCH, UI_ROW_DROPDOWN, UI_ROW_INFO };
+enum ui_value_tone { UI_VALUE_NORMAL, UI_VALUE_SUCCESS, UI_VALUE_DANGER };
 
 struct ui_row
 {
@@ -233,6 +234,7 @@ struct ui_row
     int download;
     const char *help;   /* the line under the label, and what X shows */
     unsigned char kind; /* enum ui_row_kind, for ui_settings_run */
+    unsigned char value_tone;
     unsigned char on;   /* UI_ROW_SWITCH: which way it is set */
     unsigned char group;/* which section it belongs to */
 };

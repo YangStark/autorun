@@ -822,28 +822,51 @@ static int backend_release_installed( const struct release_backend *backend, con
     return payload_path( backend, runtime_dir, machine, version, path, sizeof(path) ) && validate_payload( backend, path, machine, version );
 }
 
+static int manifest_version( const char *path, const char *name, char *version, size_t size )
+{
+    char *text;
+    const char *begin, *end, *object, *object_end, *cursor;
+    FILE *file;
+    long length;
+    int valid = 0;
+
+    if (!(file = fopen( path, "rb" ))) return 0;
+    if (fseek( file, 0, SEEK_END ) || (length = ftell( file )) <= 0 || length > 4 * 1024 * 1024 ||
+        fseek( file, 0, SEEK_SET ) || !(text = malloc( (size_t)length + 1 )))
+    {
+        fclose( file );
+        return 0;
+    }
+    if (fread( text, 1, (size_t)length, file ) != (size_t)length) goto done;
+    text[length] = 0;
+    begin = text;
+    end = text + length;
+    object = begin;
+    object_end = end;
+    if (name)
+    {
+        if (!(cursor = json_field( begin, end, name )) || *cursor != '{' ||
+            !next_object( &cursor, end, &object, &object_end )) goto done;
+    }
+    valid = json_string( json_field( object, object_end, "version" ), object_end, version, size ) &&
+            launcher_dxvk_version_valid( version );
+done:
+    fclose( file );
+    free( text );
+    return valid;
+}
+
 static int backend_root_version( const struct release_backend *backend, const char *runtime_dir, unsigned short machine, char *version, size_t size )
 {
-    char root[896], path[920], text[2048];
-    const char *field, *colon, *start, *end;
-    FILE *file;
-    size_t read, length;
+    char root[896], path[920];
 
     if (!version || !size || !payload_path( backend, runtime_dir, machine, "", root, sizeof(root) ) ||
-        (size_t)snprintf( path, sizeof(path), "%s/%s-manifest.json", root, backend->id ) >= sizeof(path) ||
-        !(file = fopen( path, "rb" ))) return 0;
-    read = fread( text, 1, sizeof(text) - 1, file );
-    fclose( file );
-    text[read] = 0;
-    if (!(field = strstr( text, "\"version\"" )) || !(colon = strchr( field + 9, ':' )) ||
-        !(start = strchr( colon + 1, '"' ))) return 0;
-    start++;
-    if (!(end = strchr( start, '"' ))) return 0;
-    length = end - start;
-    if (!length || length >= size || length >= 32) return 0;
-    memcpy( version, start, length );
-    version[length] = 0;
-    return launcher_dxvk_version_valid( version );
+        (size_t)snprintf( path, sizeof(path), "%s/%s-manifest.json", root, backend->id ) >= sizeof(path)) return 0;
+    version[0] = 0;
+    if (manifest_version( path, NULL, version, size )) return 1;
+    if (!validate_payload( backend, root, machine, "" ) ||
+        (size_t)snprintf( path, sizeof(path), "%s/build-manifest.json", runtime_dir ) >= sizeof(path)) return 0;
+    return manifest_version( path, backend->id, version, size );
 }
 
 const char *dxvk_result_message( enum dxvk_result result )

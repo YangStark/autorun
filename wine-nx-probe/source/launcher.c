@@ -1668,7 +1668,10 @@ static void draw_home( struct launcher *l )
 
 enum program_row
 {
-    ROW_START, ROW_FAVORITE, ROW_ARTWORK, ROW_LOCATE, ROW_TITLE, ROW_ARGS, ROW_VERBOSE, ROW_PROFILE, ROW_WINDOWS, ROW_D3D9, ROW_VKD3D_VERSION, ROW_DXVK_VERSION, ROW_ADDRESS, ROW_OWN_CONTROLS, ROW_CONTROLS, ROW_BOX64,
+    ROW_START, ROW_FAVORITE, ROW_ARTWORK, ROW_LOCATE, ROW_TITLE, ROW_ARGS, ROW_VERBOSE, ROW_PROFILE,
+    ROW_WINDOWS, ROW_D3D9, ROW_VKD3D_VERSION, ROW_DXVK_VERSION, ROW_DXVK_HUD, ROW_FRAME_LIMIT, ROW_VSYNC,
+    ROW_LSFG, ROW_LSFG_DLL, ROW_LSFG_PERFORMANCE, ROW_LSFG_FLOW,
+    ROW_ADDRESS, ROW_OWN_CONTROLS, ROW_CONTROLS, ROW_BOX64,
     ROW_HIDE, ROW_LIBRARY, PROGRAM_ROWS
 };
 
@@ -2254,11 +2257,24 @@ static void box64_options_menu( struct launcher *l, struct program *p )
 
 /* Returns 1 when the program is to be started. */
 /* The sections of Game Settings, in the order they stand in the list. */
-enum program_section { SECTION_GENERAL, SECTION_GRAPHICS, SECTION_DIAGNOSTICS, SECTION_LIBRARY };
+enum program_section
+{
+    SECTION_GENERAL,
+    SECTION_GRAPHICS,
+#ifdef WINE_NX_LSFG
+    SECTION_FRAME_GENERATION,
+#endif
+    SECTION_DIAGNOSTICS,
+    SECTION_LIBRARY
+};
 
 static int program_menu( struct launcher *l, struct program *p, char *target, size_t size )
 {
-    static const char *const sections[] = { "General", "Graphics", "Diagnostics", "Library" };
+    static const char *const sections[] = { "General", "Graphics",
+#ifdef WINE_NX_LSFG
+                                            "Frame Generation",
+#endif
+                                            "Diagnostics", "Library" };
     /* Kept between openings, so a game returns to the section it was left in. */
     static int section;
     struct ui_row rows[PROGRAM_ROWS];
@@ -2275,6 +2291,9 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
         int x86 = p->machine == 0x014c, x64 = p->machine == 0x8664, dxvk_beside, dxvk_installed;
         int vkd3d_installed = vkd3d_release_installed( l->options->runtime_dir, p->machine,
                                                      p->settings.vkd3d_version );
+#ifdef WINE_NX_LSFG
+        int lsfg_installed;
+#endif
         const char *dxvk_dir = launcher_dxvk_directory( p->machine );
         char dxvk_root[32] = "", vkd3d_root[32] = "";
         enum ui_action action;
@@ -2370,7 +2389,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
             if (p->settings.vkd3d_version[0])
                 snprintf( row->value, sizeof(row->value), "%s", p->settings.vkd3d_version );
             else if (vkd3d_root[0])
-                snprintf( row->value, sizeof(row->value), "Latest (%s)", vkd3d_root );
+                snprintf( row->value, sizeof(row->value), "%s", vkd3d_root );
             else snprintf( row->value, sizeof(row->value), "Latest" );
 
             ADD_ROW( ROW_DXVK_VERSION, SECTION_GRAPHICS, "DXVK version",
@@ -2382,7 +2401,69 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
             else if (dxvk_root[0])
                 snprintf( row->value, sizeof(row->value), "Latest (%s)", dxvk_root );
             else snprintf( row->value, sizeof(row->value), "Latest" );
+            ADD_ROW( ROW_DXVK_HUD, SECTION_GRAPHICS, "DXVK HUD",
+                     "FPS shows only the frame rate. Compact shows the DirectX version, FPS and frame times. "
+                     "Full also shows the DXVK version, GPU, video memory and shader compiler activity. "
+                     "The DXVK HUD does not cover VKD3D's D3D12 rendering." );
+            row->kind = UI_ROW_DROPDOWN;
+            snprintf( row->value, sizeof(row->value), "%s", launcher_hud_labels[p->settings.dxvk_hud] );
+
+            ADD_ROW( ROW_FRAME_LIMIT, SECTION_GRAPHICS, "Frame rate limit",
+                     "Limits real game frames in Vulkan, DXVK and VKD3D. Off adds no cap. "
+                     "VSync and the game's own limit still apply." );
+            row->kind = UI_ROW_DROPDOWN;
+            snprintf( row->value, sizeof(row->value), "%s", launcher_frame_limit_labels[p->settings.frame_limit] );
+
+            ADD_ROW( ROW_VSYNC, SECTION_GRAPHICS, "VSync",
+                     "Synchronizes Vulkan, DXVK and VKD3D presentation to the display. LSFG-VK always uses synchronized presentation." );
+            row->kind = UI_ROW_SWITCH;
+            row->on = p->settings.vsync;
+            snprintf( row->value, sizeof(row->value), "%s", p->settings.vsync ? "Enabled" : "Disabled" );
         }
+
+#ifdef WINE_NX_LSFG
+        runtime_file( l, "lsfg/Lossless.dll", path, sizeof(path) );
+        lsfg_installed = file_exists( path );
+        if (!lsfg_installed) p->settings.lsfg_enabled = 0;
+        ADD_ROW( ROW_LSFG, SECTION_FRAME_GENERATION, "LSFG-VK (2x)",
+                 "Generates one frame between each pair of game frames for Vulkan, DXVK and VKD3D only. "
+                 "Output follows the physical display resolution and uses synchronized presentation regardless of "
+                 "the VSync setting." );
+        row->kind = UI_ROW_SWITCH;
+        row->disabled = !lsfg_installed;
+        row->on = p->settings.lsfg_enabled;
+        snprintf( row->value, sizeof(row->value), "%s",
+                  !lsfg_installed ? "Unavailable" : p->settings.lsfg_enabled ? "Enabled" : "Disabled" );
+
+        ADD_ROW( ROW_LSFG_DLL, SECTION_FRAME_GENERATION, "Lossless.dll",
+                 "Copy Lossless.dll to sdmc:/switch/wine/lsfg/Lossless.dll." );
+        row->kind = UI_ROW_INFO;
+        row->disabled = 1;
+        if (lsfg_installed)
+        {
+            snprintf( row->value, sizeof(row->value), "Installed" );
+            row->value_tone = UI_VALUE_SUCCESS;
+        }
+        else
+        {
+            snprintf( row->value, sizeof(row->value), "Not found" );
+            row->value_tone = UI_VALUE_DANGER;
+        }
+
+        ADD_ROW( ROW_LSFG_PERFORMANCE, SECTION_FRAME_GENERATION, "Performance Mode",
+                 "Uses LSFG's performance path. Disable it for the quality path, which costs more GPU time." );
+        row->kind = UI_ROW_SWITCH;
+        row->on = p->settings.lsfg_performance;
+        snprintf( row->value, sizeof(row->value), "%s",
+                  p->settings.lsfg_performance ? "Enabled" : "Disabled" );
+
+        ADD_ROW( ROW_LSFG_FLOW, SECTION_FRAME_GENERATION, "Motion Resolution",
+                 "Resolution used to estimate motion. Lower values reduce GPU work and memory use; generated output "
+                 "still follows the physical display resolution." );
+        row->kind = UI_ROW_DROPDOWN;
+        snprintf( row->value, sizeof(row->value), "%s",
+                  launcher_lsfg_flow_labels[p->settings.lsfg_flow] );
+#endif
 
         {
             enum launcher_address_space needs = launcher_program_address_space( p->path );
@@ -2554,6 +2635,64 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
             else if (action == UI_ACTION_CHOOSE)
                 graphics_release_menu( l, p, &list, id == ROW_VKD3D_VERSION );
             break;
+
+        case ROW_DXVK_HUD:
+        case ROW_FRAME_LIMIT:
+        {
+            int *value = id == ROW_DXVK_HUD ? &p->settings.dxvk_hud : &p->settings.frame_limit;
+            const char *const *labels = id == ROW_DXVK_HUD ? launcher_hud_labels : launcher_frame_limit_labels;
+            int choices = id == ROW_DXVK_HUD ? LAUNCHER_HUD_COUNT : LAUNCHER_FRAME_LIMIT_COUNT;
+            struct ui_row items[LAUNCHER_FRAME_LIMIT_COUNT] = {0};
+
+            if (action == UI_ACTION_RESET) *value = 0;
+            else if (action == UI_ACTION_CHOOSE)
+            {
+                for (i = 0; i < choices; i++)
+                    snprintf( items[i].label, sizeof(items[i].label), "%s", labels[i] );
+                int selected = ui_settings_dropdown( ui, &list, items, choices, *value );
+                if (selected < 0) break;
+                *value = selected;
+            }
+            else break;
+            save_program_settings( l, p );
+            break;
+        }
+
+        case ROW_VSYNC:
+        {
+            p->settings.vsync = action == UI_ACTION_RESET ? 1 : !p->settings.vsync;
+            save_program_settings( l, p );
+            break;
+        }
+
+#ifdef WINE_NX_LSFG
+        case ROW_LSFG:
+        case ROW_LSFG_PERFORMANCE:
+        {
+            int *value = id == ROW_LSFG ? &p->settings.lsfg_enabled : &p->settings.lsfg_performance;
+
+            *value = action == UI_ACTION_RESET ? id == ROW_LSFG_PERFORMANCE : !*value;
+            save_program_settings( l, p );
+            break;
+        }
+
+        case ROW_LSFG_FLOW:
+            if (action == UI_ACTION_RESET) p->settings.lsfg_flow = 1;
+            else if (action == UI_ACTION_CHOOSE)
+            {
+                struct ui_row items[3] = {0};
+                int selected;
+
+                for (i = 0; i < 3; i++)
+                    snprintf( items[i].label, sizeof(items[i].label), "%s", launcher_lsfg_flow_labels[i] );
+                selected = ui_settings_dropdown( ui, &list, items, 3, p->settings.lsfg_flow );
+                if (selected < 0) break;
+                p->settings.lsfg_flow = selected;
+            }
+            else break;
+            save_program_settings( l, p );
+            break;
+#endif
 
         case ROW_ADDRESS:
             /* Auto, then what the two answers are, so either can be forced. */

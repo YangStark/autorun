@@ -59,15 +59,13 @@ struct FrameSlot {
 
 class Presentation {
 public:
-    Presentation(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
-                 VkQueue queue, uint32_t family, VkSwapchainKHR swapchain, VkExtent2D extent)
+    Presentation(std::unique_ptr<lsfgvk::backend::Instance> instance, VkDevice device,
+                 VkSwapchainKHR swapchain, VkExtent2D extent)
         : swapchain(swapchain), extent(extent),
-          backend(lsfgvk::backend::BorrowedDevice{
-              instance, physical, device, family, queue, vkGetInstanceProcAddr, cache_path},
-              shader_path, false),
-          context(backend.openLocalContext(extent.width, extent.height,
-                                           false, 1.0f / flow_scale, performance, 1)),
-          vk(backend.vulkan())
+          backend(std::move(instance)),
+          context(backend->openLocalContext(extent.width, extent.height,
+                                            false, 1.0f / flow_scale, performance, 1)),
+          vk(backend->vulkan())
     {
         uint32_t count{};
         auto result = vk.df().GetSwapchainImagesKHR(device, swapchain, &count, nullptr);
@@ -101,7 +99,7 @@ public:
         auto& slot = slots.at(frame_index % slots.size());
         slot.wait(vk);
         const size_t source_index = frame_index & 1;
-        const VkImage source = backend.sourceImage(context, source_index);
+        const VkImage source = backend->sourceImage(context, source_index);
         std::vector<VkSemaphore> waits;
         if (info.waitSemaphoreCount)
             waits.assign(info.pWaitSemaphores, info.pWaitSemaphores + info.waitSemaphoreCount);
@@ -110,10 +108,10 @@ public:
         slot.frame.memoryBarrier(vk);
         capture(slot.frame, images[index], source, frame_index != 0);
         if (!frame_index)
-            capture(slot.frame, images[index], backend.sourceImage(context, 1), false);
-        backend.recordFrame(context, slot.frame);
+            capture(slot.frame, images[index], backend->sourceImage(context, 1), false);
+        backend->recordFrame(context, slot.frame);
         if (!warmup)
-            output(slot.frame, backend.destinationImage(context, 0), images[index],
+            output(slot.frame, backend->destinationImage(context, 0), images[index],
                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_SHADER_WRITE_BIT);
         slot.frame.end(vk);
         VkSemaphore signal = presented[index].handle();
@@ -147,11 +145,6 @@ public:
                             {signal}, VK_NULL_HANDLE, 0, slot.restore_done.handle());
         slot.restore_pending = true;
         VkResult result = show(info, index, signal, false);
-        if (result >= VK_SUCCESS && !generated_logged)
-        {
-            trace("first interpolated frame presented");
-            generated_logged = true;
-        }
         if (result == VK_SUCCESS && (generated == VK_SUBOPTIMAL_KHR || acquired == VK_SUBOPTIMAL_KHR))
             result = VK_SUBOPTIMAL_KHR;
         return result;
@@ -202,7 +195,7 @@ private:
 
     VkSwapchainKHR swapchain;
     VkExtent2D extent;
-    lsfgvk::backend::Instance backend;
+    std::unique_ptr<lsfgvk::backend::Instance> backend;
     lsfgvk::backend::Context& context;
     const vk::Vulkan& vk;
     std::vector<VkImage> images;
@@ -210,7 +203,6 @@ private:
     std::vector<FrameSlot> slots;
     uint64_t frame_index{};
     unsigned int warmup{2};
-    bool generated_logged{};
 };
 }
 
@@ -268,11 +260,17 @@ extern "C" int wine_nx_lsfg_prepare_swapchain(VkInstance instance, VkPhysicalDev
         trace("disabled for this swapchain: motion resolution must be at least 64x64");
         return 0;
     }
-    if (info->imageArrayLayers != 1 || info->flags ||
+    const VkSwapchainCreateFlagsKHR supported_flags = VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR;
+    if (info->imageArrayLayers != 1 || (info->flags & ~supported_flags) ||
         info->imageColorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR ||
         (info->imageFormat != VK_FORMAT_B8G8R8A8_UNORM && info->imageFormat != VK_FORMAT_R8G8B8A8_UNORM))
     {
-        trace("disabled for this swapchain: only SDR RGBA8/BGRA8 UNORM is supported");
+        char message[192];
+        std::snprintf(message, sizeof(message),
+                      "disabled for this swapchain: layers=%u flags=0x%x format=%d color-space=%d",
+                      info->imageArrayLayers, static_cast<unsigned int>(info->flags),
+                      info->imageFormat, info->imageColorSpace);
+        trace(message);
         return 0;
     }
     auto caps_fn = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
@@ -306,7 +304,7 @@ extern "C" wine_nx_lsfg *wine_nx_lsfg_create(VkInstance instance, VkPhysicalDevi
                                             const VkSwapchainCreateInfoKHR *info)
 {
     try {
-        return new wine_nx_lsfg{instance, physical, device, swapchain, info->imageExtent, {}, false};
+        return new wine_nx_lsfg{instance, physical, device, swapchain, info->imageExtent};
     } catch (const std::exception& e) {
         trace(e.what());
         return nullptr;
@@ -345,9 +343,12 @@ extern "C" int wine_nx_lsfg_present(wine_nx_lsfg *state, VkQueue queue, unsigned
             const VkQueueFlags flags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
             if (family >= props.size() || (props[family].queueFlags & flags) != flags)
                 throw std::runtime_error("presentation queue must support graphics and compute");
-            trace("compiling frame-generation pipelines");
+            auto backend = std::make_unique<lsfgvk::backend::Instance>(
+                lsfgvk::backend::BorrowedDevice{state->instance, state->physical, state->device,
+                    family, queue, vkGetInstanceProcAddr, cache_path},
+                shader_path, false);
             state->presentation = std::make_unique<Presentation>(
-                state->instance, state->physical, state->device, queue, family, state->swapchain, state->extent);
+                std::move(backend), state->device, state->swapchain, state->extent);
             char message[160];
             std::snprintf(message, sizeof(message), "2x active, %ux%u, motion %.1f%%, %s",
                           state->extent.width, state->extent.height, flow_scale * 100,
