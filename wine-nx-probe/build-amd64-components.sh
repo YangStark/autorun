@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+pe="${WINE_NX_PE_BUILD_DIR:-$root/wine-nx-probe/build-wine-amd64-pe}"
+build="${WINE_NX_BUILD_DIR:-$root/wine-nx-probe/build-switch-amd64}"
+jobs="${WINE_NX_JOBS:-8}"
+if [ -n "${WINE_NX_LLVM_MINGW:-}" ]; then
+    export PATH="$WINE_NX_LLVM_MINGW/bin:$PATH"
+fi
+for tool in arm64ec-w64-mingw32-clang aarch64-w64-mingw32-clang i686-w64-mingw32-clang x86_64-w64-mingw32-clang x86_64-w64-mingw32-windres llvm-readobj; do
+    command -v "$tool" >/dev/null || { echo "Missing $tool; set WINE_NX_LLVM_MINGW." >&2; exit 1; }
+done
+mkdir -p "$pe" "$build"
+pe="$(CDPATH= cd -- "$pe" && pwd)"
+build="$(CDPATH= cd -- "$build" && pwd)"
+case "$pe" in "$root"/*) ;; *) echo "PE build must be inside the Wine checkout." >&2; exit 1;; esac
+case "$build" in "$root"/*) ;; *) echo "Switch build must be inside the Wine checkout." >&2; exit 1;; esac
+(
+    cd "$pe"
+    "$root/configure" --enable-archs=aarch64,arm64ec,i386 \
+        --enable-winebox64=aarch64 --enable-winebox64ec=arm64ec \
+        --disable-tests --without-x --without-freetype --without-alsa --without-pulse \
+        --without-dbus --without-fontconfig --without-udev --without-usb \
+        --without-gstreamer --without-vulkan
+    make -j"$jobs" include/all
+)
+sh "$root/wine-nx-probe/tools/bootstrap-box64-core.sh"
+docker run --rm --network none --platform linux/arm64 -v "$root:/work" -w /work \
+    -e NX_PE="/work/${pe#"$root/"}" -e NX_BUILD="/work/${build#"$root/"}" \
+    -e NX_JOBS="$jobs" -e NX_DYNAREC="${WINE_NX_BOX64_DYNAREC:-ON}" \
+    -e NX_MESA="${WINE_NX_MESA_SWITCH_DIR:-}" \
+    "${WINE_NX_DEVKIT_IMAGE:-devkitpro/devkita64}" sh -ec '
+    cmake -S wine-nx-probe -B "$NX_BUILD" -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE=/work/wine-nx-probe/cmake/switch-devkitA64.cmake \
+        -DWINE_NX_PE_BUILD_DIR="$NX_PE" -DWINE_NX_AMD64=ON \
+        -DWINE_NX_BOX64_INTERPRETER=ON -DWINE_NX_BOX64_DYNAREC="$NX_DYNAREC" \
+        -DWINE_NX_MESA_SWITCH_DIR="$NX_MESA" -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$NX_BUILD" --target wine-nx-runtime-nro -j "$NX_JOBS"
+    '
+set -- --pe "$pe" --build "$build" --jobs "$jobs"
+if [ -n "${WINE_NX_MESA_SWITCH_DIR:-}" ]; then set -- "$@" --vulkan; fi
+python3 "$root/wine-nx-probe/tools/package-amd64.py" "$@"

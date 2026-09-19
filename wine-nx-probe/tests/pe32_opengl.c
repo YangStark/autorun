@@ -7,8 +7,7 @@
 #include <winternl.h>
 #include <GL/gl.h>
 
-__declspec(dllimport) NTSTATUS NTAPI NtDisplayString( const UNICODE_STRING *str );
-__declspec(dllimport) NTSTATUS NTAPI NtTerminateProcess( HANDLE process, NTSTATUS status );
+#include "pe_test_io.h"
 
 static void report_text( const char *label, const char *text )
 {
@@ -28,25 +27,30 @@ static void report_text( const char *label, const char *text )
     str.Buffer = buffer;
     str.Length = n * sizeof(WCHAR);
     str.MaximumLength = str.Length;
-    NtDisplayString( &str );
+    pe_test_display_string( &str );
 }
 
-static void report( const char *label, DWORD value )
+static void report( const char *label, ULONG_PTR value )
 {
     static const char hex[] = "0123456789abcdef";
-    char text[11];
+    char text[2 + sizeof(value) * 2 + 1];
     unsigned int i;
 
     text[0] = '0';
     text[1] = 'x';
-    for (i = 0; i < 8; i++) text[2 + i] = hex[(value >> (28 - i * 4)) & 15];
-    text[10] = 0;
+    for (i = 0; i < sizeof(value) * 2; i++)
+        text[2 + i] = hex[(value >> ((sizeof(value) * 2 - 1 - i) * 4)) & 15];
+    text[2 + sizeof(value) * 2] = 0;
     report_text( label, text );
 }
 
 void __stdcall start(void)
 {
+#ifdef _WIN64
+    static const WCHAR class_name[] = L"pe64-opengl";
+#else
     static const WCHAR class_name[] = L"pe32-opengl";
+#endif
     PIXELFORMATDESCRIPTOR pfd = {
         .nSize = sizeof(pfd), .nVersion = 1,
         .dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
@@ -131,6 +135,6 @@ done:
     if (dc) ReleaseDC( window, dc );
     if (window) DestroyWindow( window );
     report( failure ? "FAIL" : "PASS API; verify red, green then blue", failure );
-    NtTerminateProcess( (HANDLE)-1, failure ? 0x300 | failure : 42 );
+    pe_test_terminate( failure ? 0x300 | failure : 42 );
     for (;;) {}
 }

@@ -12,8 +12,7 @@
 #include <windows.h>
 #include <winternl.h>
 
-__declspec(dllimport) NTSTATUS NTAPI NtDisplayString( const UNICODE_STRING *str );
-__declspec(dllimport) NTSTATUS NTAPI NtTerminateProcess( HANDLE process, NTSTATUS status );
+#include "pe_test_io.h"
 
 #define WINDOW 0x10000
 #define SECTION_SIZE (16 << 20)
@@ -52,7 +51,7 @@ static void report_text( const char *label, const char *text )
     str.Buffer = buffer;
     str.Length = n * sizeof(WCHAR);
     str.MaximumLength = str.Length;
-    NtDisplayString( &str );
+    pe_test_display_string( &str );
 }
 
 static void report( const char *label, DWORD value )
@@ -311,5 +310,5 @@ done:
     if (section) CloseHandle( section );
     if (failure) report( "FAIL step", failure );
     else report_text( "PASS", NULL );
-    NtTerminateProcess( GetCurrentProcess(), failure ? failure : 42 );
+    pe_test_terminate( failure ? failure : 42 );
 }

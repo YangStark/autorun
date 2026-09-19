@@ -2232,25 +2232,58 @@ static NTSTATUS runtime_start_wow64( void *module, void *entry,
 #endif
 
 #ifdef WINE_NX_AMD64
+static NTSTATUS runtime_create_registry_path( const char *path, HANDLE *key )
+{
+    WCHAR key_name[256];
+    UNICODE_STRING name = {0};
+    OBJECT_ATTRIBUTES attr;
+    HANDLE next;
+    NTSTATUS status;
+    size_t i, length = strlen( path );
+
+    *key = NULL;
+    if (!length || path[0] != '\\') return STATUS_OBJECT_PATH_SYNTAX_BAD;
+    if (length >= ARRAY_SIZE(key_name)) return STATUS_NAME_TOO_LONG;
+    for (i = 0; i <= length; i++) key_name[i] = (unsigned char)path[i];
+    name.Buffer = key_name;
+    name.MaximumLength = sizeof(key_name);
+
+    for (i = 1; i <= length; i++)
+    {
+        WCHAR end = key_name[i];
+
+        if (end && end != '\\') continue;
+        key_name[i] = 0;
+        name.Length = i * sizeof(WCHAR);
+        InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, NULL, NULL );
+        status = NtCreateKey( &next, KEY_CREATE_SUB_KEY | KEY_SET_VALUE, &attr, 0, NULL,
+                              REG_OPTION_VOLATILE, NULL );
+        key_name[i] = end;
+        if (status) return status;
+        if (!end)
+        {
+            *key = next;
+            return STATUS_SUCCESS;
+        }
+        NtClose( next );
+    }
+    return STATUS_OBJECT_PATH_SYNTAX_BAD;
+}
+
 static NTSTATUS runtime_prepare_arm64ec(void)
 {
     static const char key_path[] = "\\Registry\\Machine\\Software\\Microsoft\\Wow64\\amd64";
     static const WCHAR cpu_name[] = {'w','i','n','e','b','o','x','6','4','e','c','.','d','l','l',0};
-    WCHAR key_name[sizeof(key_path)];
-    UNICODE_STRING name = { sizeof(key_name) - sizeof(WCHAR), sizeof(key_name), key_name };
     UNICODE_STRING value = {0};
-    OBJECT_ATTRIBUTES attr;
     HMODULE ntdll = NULL;
     HANDLE key;
     SIZE_T size;
     NTSTATUS status;
-    unsigned int i;
     TEB *teb = NtCurrentTeb();
     extern NTSTATUS wine_nx_prepare_arm64ec_ntdll( HMODULE );
 
-    for (i = 0; i < sizeof(key_path); i++) key_name[i] = key_path[i];
-    InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, NULL, NULL );
-    status = NtCreateKey( &key, KEY_SET_VALUE, &attr, 0, NULL, REG_OPTION_VOLATILE, NULL );
+    status = runtime_create_registry_path( key_path, &key );
+    log_line( "[AMD64] CPU registry status=%08x", status );
     if (status) return status;
     status = NtSetValueKey( key, &value, 0, REG_SZ, cpu_name, sizeof(cpu_name) );
     NtClose( key );

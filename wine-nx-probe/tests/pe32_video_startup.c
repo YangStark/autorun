@@ -4,8 +4,7 @@
 #include <windows.h>
 #include <winternl.h>
 
-__declspec(dllimport) NTSTATUS NTAPI NtDisplayString( const UNICODE_STRING *str );
-__declspec(dllimport) NTSTATUS NTAPI NtTerminateProcess( HANDLE process, NTSTATUS status );
+#include "pe_test_io.h"
 
 static void report( const WCHAR *message, ULONG_PTR value )
 {
@@ -25,7 +24,7 @@ static void report( const WCHAR *message, ULONG_PTR value )
     str.Buffer = text;
     str.Length = n * sizeof(WCHAR);
     str.MaximumLength = (n + 1) * sizeof(WCHAR);
-    NtDisplayString( &str );
+    pe_test_display_string( &str );
 }
 
 static LRESULT WINAPI test_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
@@ -59,7 +58,7 @@ void __stdcall start(void)
     {
         error = GetLastError();
         report( L"application LoadIconW error", error );
-        NtTerminateProcess( (HANDLE)-1, 0x201 );
+        pe_test_terminate( 0x201 );
     }
 
     report( L"before system LoadCursorW", 32512 );
@@ -69,7 +68,7 @@ void __stdcall start(void)
     {
         error = GetLastError();
         report( L"system LoadCursorW error", error );
-        NtTerminateProcess( (HANDLE)-1, 0x202 );
+        pe_test_terminate( 0x202 );
     }
 
     cls.style = CS_OWNDC;
@@ -85,7 +84,7 @@ void __stdcall start(void)
     {
         error = GetLastError();
         report( L"RegisterClassW error", error );
-        NtTerminateProcess( (HANDLE)-1, 0x203 );
+        pe_test_terminate( 0x203 );
     }
 
     report( L"before CreateWindowExW", 0 );
@@ -97,7 +96,7 @@ void __stdcall start(void)
     {
         error = GetLastError();
         report( L"CreateWindowExW error", error );
-        NtTerminateProcess( (HANDLE)-1, 0x204 );
+        pe_test_terminate( 0x204 );
     }
 
     report( L"before ShowWindow", 0 );
@@ -107,6 +106,6 @@ void __stdcall start(void)
     DestroyWindow( window );
     UnregisterClassW( cls.lpszClassName, instance );
     report( L"PASS ALL", 42 );
-    NtTerminateProcess( (HANDLE)-1, 42 );
+    pe_test_terminate( 42 );
     for (;;) {}
 }

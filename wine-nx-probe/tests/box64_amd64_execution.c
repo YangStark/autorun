@@ -297,6 +297,14 @@ static void test_mmx_context( struct fixture *fixture )
     init_context( &context, BASE + 0xa80 );
     memset( context.FltSave.FloatRegisters, 0xa5, sizeof(context.FltSave.FloatRegisters) );
     assert( run( fixture, &context, 0 ) == STATUS_SUCCESS );
+#ifndef WINE_NX_BOX64_DYNAREC
+    timeout[0] = timeout[1] = 0x90;
+    put_code( fixture, 0xc00, timeout, 2 );
+    context.Rip = BASE + 0xc00;
+    assert( wine_nx_box64_run_amd64( &context, BASE + 0x6000, &fixture->state, &host, fixture,
+                                     0, 1, NULL ) == STATUS_TIMEOUT );
+    assert( context.Rip == BASE + 0xc01 );
+#endif
     context.Rip = BASE + 0xb00;
     assert( run( fixture, &context, 0 ) == STATUS_SUCCESS );
     memcpy( &output, fixture->memory + 0x7220, sizeof(output) );

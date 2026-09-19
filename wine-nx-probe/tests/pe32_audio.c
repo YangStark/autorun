@@ -4,8 +4,7 @@
 #include <mmsystem.h>
 #include <winternl.h>
 
-__declspec(dllimport) NTSTATUS NTAPI NtDisplayString( const UNICODE_STRING *str );
-__declspec(dllimport) NTSTATUS NTAPI NtTerminateProcess( HANDLE process, NTSTATUS status );
+#include "pe_test_io.h"
 
 static short samples[48000 * 2];
 
@@ -24,7 +23,7 @@ static void report( const char *label, DWORD value )
     str.Buffer = text;
     str.Length = n * sizeof(WCHAR);
     str.MaximumLength = str.Length;
-    NtDisplayString( &str );
+    pe_test_display_string( &str );
 }
 
 void __stdcall start(void)
@@ -98,6 +97,6 @@ cleanup:
     CloseHandle( event );
 done:
     report( failure ? "FAIL" : "PASS API; verify left then right tone", failure );
-    NtTerminateProcess( (HANDLE)-1, failure ? 0x300 | failure : 42 );
+    pe_test_terminate( failure ? 0x300 | failure : 42 );
     for (;;) {}
 }
