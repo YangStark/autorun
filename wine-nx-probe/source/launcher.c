@@ -952,7 +952,7 @@ struct grid
 };
 
 static void draw_shell( struct launcher *l, int home );
-static void draw_footprint( struct launcher *l );
+static void draw_footprint( struct launcher *l, int with_address_space );
 static void draw_backdrop( struct launcher *l, int current );
 static void draw_cover( struct ui *ui, const struct program *p, SDL_Rect rect, int radius, int brightness,
                         int alpha );
@@ -1324,14 +1324,15 @@ static void draw_shell( struct launcher *l, int home )
     draw_symbol( l, SYMBOL_SETTINGS, right, SHELL_Y,
                  l->zone == ZONE_HEADER && l->header_focus == SHELL_SETTINGS ? 255 : 190 );
     l->shell_hits[SHELL_SETTINGS] = (SDL_Rect){ right - SHELL_GAP / 2, 0, width + SHELL_GAP, UI_HEADER_HEIGHT };
-    if (home) draw_footprint( l );
+    if (home) draw_footprint( l, 1 );
 }
 
 /* The mark, and beside it the address space when it is the low one -- which is
  * the only one worth saying, because it is the only one that changes what can
- * be started. Home and the settings keep it; the library is covers, and one
- * more thing in the corner is one too many. */
-static void draw_footprint( struct launcher *l )
+ * be started. It belongs on the home screen, where there is room for it and
+ * nothing else to read; the settings show the mark alone, and the library is
+ * covers, where one more thing in the corner is one too many. */
+static void draw_footprint( struct launcher *l, int with_address_space )
 {
     struct ui *ui = &l->ui;
     const int line = HOME_HINT_Y - 12;
@@ -1349,7 +1350,7 @@ static void draw_footprint( struct launcher *l )
         SDL_RenderCopy( ui->renderer, l->logo, NULL, &rect );
         x += rect.w + 12;
     }
-    if (l->options->address_space_bits != 32) return;
+    if (!with_address_space || l->options->address_space_bits != 32) return;
     ui_text( ui, ui->small, x, line - TTF_FontHeight( ui->small ) / 2,
              "Running 32-bit address space", ui->dim );
 }
@@ -1357,7 +1358,7 @@ static void draw_footprint( struct launcher *l )
 /* What the settings screens ask for through the ui. */
 static void footer_mark( void *data )
 {
-    draw_footprint( data );
+    draw_footprint( data, 0 );
 }
 
 static SDL_Rect cover_crop( const struct program *p, int width, int height )
@@ -2068,11 +2069,12 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
             row->kind = UI_ROW_SWITCH;
             row->on = own;
 
-            ADD_ROW( ROW_CONTROLS, SECTION_DIAGNOSTICS, "Edit controls",
-                     own ? "The keys this program's controls send, over the ones everything else sends."
-                         : "Autorun's controls apply; turn this program's own on to change them." );
-            row->disabled = !own;
-            snprintf( row->value, sizeof(row->value), "%s", has_own ? "Set" : "Default" );
+            if (own)
+            {
+                ADD_ROW( ROW_CONTROLS, SECTION_DIAGNOSTICS, "Edit controls",
+                         "The keys this program's controls send, over the ones everything else sends." );
+                snprintf( row->value, sizeof(row->value), "%s", has_own ? "Set" : "Default" );
+            }
         }
 
         if (x86)
@@ -2731,6 +2733,10 @@ static void settings_menu( struct launcher *l )
         snprintf( rows[SET_CONTROLS].value, sizeof(rows[0].value), "%s",
                   shared_keys( l, path, sizeof(path) ) ? "Set" : "Default" );
         rows[SET_CONTROLS].help = "The keys every program's controls send, unless the program has its own.";
+        /* A row that opens a screen, not one that is changed where it stands:
+         * left and right have nothing to do here and A must go in. */
+        rows[SET_CONTROLS].adjustable = 0;
+        rows[SET_CONTROLS].kind = UI_ROW_ACTION;
         snprintf( rows[SET_STEAMGRIDDB].label, sizeof(rows[0].label), "SteamGridDB API key" );
         snprintf( rows[SET_STEAMGRIDDB].value, sizeof(rows[0].value), "%s",
                   launcher_kv_get( &l->look, "steamgriddb-key", path, sizeof(path) ) && path[0] ? "Configured" : "Not set" );
