@@ -172,8 +172,15 @@ docker run --rm --platform linux/arm64 -v "$PWD:/work" -w /work devkitpro/devkit
         -DWINE_NX_BOX64_DYNAREC=ON -DCMAKE_BUILD_TYPE=Release \
         -DWINE_NX_MESA_SWITCH_DIR=/work/wine-nx-probe/build-mesa-switch/install/opt/devkitpro/portlibs/switch/lib
     cmake --build wine-nx-probe/build-switch-wow64-mesa-switch --target wine-nx-runtime-nro'
+python3 wine-nx-probe/tools/package-autorun.py    # both halves below, merged: autorun-NNN.zip
+```
+
+`package-autorun.py` is what a card wants. The halves can also be run on their
+own:
+
+```sh
 python3 wine-nx-probe/tools/package-wow64-full.py # the whole SD-card payload as one zip
-python3 wine-nx-probe/tools/package-wow64-dxvk.py # the Mesa 26 runtime, Vulkan and DXVK, over the full payload
+python3 wine-nx-probe/tools/package-wow64-dxvk.py # the Mesa 26 runtime, Vulkan and DXVK, over that payload
 ```
 
 The AMD64 component and package flow is documented in
