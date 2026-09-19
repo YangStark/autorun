@@ -19,6 +19,7 @@ struct fixture
 {
     unsigned char *memory;
     BOOL native[SIZE / 0x1000];
+    struct wine_nx_amd64_state state;
 };
 
 static NTSTATUS read_guest( void *opaque, ULONG_PTR address, void *buffer, SIZE_T size )
@@ -69,7 +70,7 @@ static void init_context( AMD64_CONTEXT *context, ULONG_PTR rip )
 static NTSTATUS run( struct fixture *fixture, AMD64_CONTEXT *context, ULONG_PTR completion )
 {
     ULONGLONG executed = 0;
-    return wine_nx_box64_run_amd64( context, BASE + 0x6000, &host, fixture,
+    return wine_nx_box64_run_amd64( context, BASE + 0x6000, &fixture->state, &host, fixture,
                                     completion, 10000, &executed );
 }
 
@@ -262,6 +263,67 @@ static void test_x87_context( struct fixture *fixture )
     assert( output == input && context.FltSave.TagWord == 0 );
 }
 
+static void test_mmx_context( struct fixture *fixture )
+{
+    const uint64_t left = UINT64_C(0x1020304050607080);
+    const uint64_t right = UINT64_C(0x0102030405060708);
+    unsigned char load[64], add[64], *cursor;
+#ifndef WINE_NX_BOX64_DYNAREC
+    unsigned char timeout[64];
+#endif
+    AMD64_CONTEXT context;
+    uint64_t output, native_output;
+    int32_t disp;
+
+    memcpy( fixture->memory + 0x7200, &left, sizeof(left) );
+    memcpy( fixture->memory + 0x7210, &right, sizeof(right) );
+
+    cursor = load;
+    emit8( &cursor, 0x0f ); emit8( &cursor, 0x6f ); emit8( &cursor, 0x05 );
+    disp = (BASE + 0x7200) - (BASE + 0xa80 + 7); emit32( &cursor, disp );
+    emit8( &cursor, 0x0f ); emit8( &cursor, 0x6f ); emit8( &cursor, 0x0d );
+    disp = (BASE + 0x7210) - (BASE + 0xa80 + 14); emit32( &cursor, disp );
+    jump_native( &cursor );
+    put_code( fixture, 0xa80, load, cursor - load );
+
+    cursor = add;
+    emit8( &cursor, 0x0f ); emit8( &cursor, 0xd4 ); emit8( &cursor, 0xc1 );
+    emit8( &cursor, 0x0f ); emit8( &cursor, 0x7f ); emit8( &cursor, 0x05 );
+    disp = (BASE + 0x7220) - (BASE + 0xb00 + 10); emit32( &cursor, disp );
+    emit8( &cursor, 0x0f ); emit8( &cursor, 0x77 );
+    jump_native( &cursor );
+    put_code( fixture, 0xb00, add, cursor - add );
+
+    init_context( &context, BASE + 0xa80 );
+    memset( context.FltSave.FloatRegisters, 0xa5, sizeof(context.FltSave.FloatRegisters) );
+    assert( run( fixture, &context, 0 ) == STATUS_SUCCESS );
+    context.Rip = BASE + 0xb00;
+    assert( run( fixture, &context, 0 ) == STATUS_SUCCESS );
+    memcpy( &output, fixture->memory + 0x7220, sizeof(output) );
+    native_output = output;
+#ifndef WINE_NX_BOX64_DYNAREC
+    cursor = timeout;
+    emit8( &cursor, 0x0f ); emit8( &cursor, 0x6f ); emit8( &cursor, 0x05 );
+    disp = (BASE + 0x7200) - (BASE + 0xb80 + 7); emit32( &cursor, disp );
+    emit8( &cursor, 0x0f ); emit8( &cursor, 0x6f ); emit8( &cursor, 0x0d );
+    disp = (BASE + 0x7210) - (BASE + 0xb80 + 14); emit32( &cursor, disp );
+    emit8( &cursor, 0x0f ); emit8( &cursor, 0xd4 ); emit8( &cursor, 0xc1 );
+    emit8( &cursor, 0x0f ); emit8( &cursor, 0x7f ); emit8( &cursor, 0x05 );
+    disp = (BASE + 0x7230) - (BASE + 0xb80 + 24); emit32( &cursor, disp );
+    jump_native( &cursor );
+    put_code( fixture, 0xb80, timeout, cursor - timeout );
+    init_context( &context, BASE + 0xb80 );
+    memset( context.FltSave.FloatRegisters, 0x5a, sizeof(context.FltSave.FloatRegisters) );
+    assert( wine_nx_box64_run_amd64( &context, BASE + 0x6000, &fixture->state, &host, fixture,
+                                     0, 2, NULL ) == STATUS_TIMEOUT );
+    assert( context.Rip == BASE + 0xb80 + 14 );
+    assert( run( fixture, &context, 0 ) == STATUS_SUCCESS );
+    memcpy( &output, fixture->memory + 0x7230, sizeof(output) );
+    assert( output == left + right );
+#endif
+    assert( native_output == left + right );
+}
+
 static void test_unsupported( struct fixture *fixture )
 {
     static const unsigned char avx[] = {0xc5, 0xf8, 0x77};
@@ -273,7 +335,7 @@ static void test_unsupported( struct fixture *fixture )
     assert( context.Rip == BASE + 0x900 );
     init_context( &context, BASE + 0x900 );
     context.ContextFlags |= CONTEXT_AMD64_XSTATE;
-    assert( wine_nx_box64_run_amd64( &context, BASE + 0x6000, &host, fixture,
+    assert( wine_nx_box64_run_amd64( &context, BASE + 0x6000, &fixture->state, &host, fixture,
                                      0, 100, NULL ) == STATUS_NOT_SUPPORTED );
 }
 
@@ -320,6 +382,7 @@ int main(void)
     test_cpuid_and_stops( &fixture );
     test_syscall_state( &fixture );
     test_x87_context( &fixture );
+    test_mmx_context( &fixture );
     test_unsupported( &fixture );
 #ifdef WINE_NX_BOX64_DYNAREC
     test_high_invalidation( &fixture );

@@ -7,6 +7,10 @@
 
 static void test_names(void)
 {
+    assert( !strcmp( launcher_machine_name( 0x8664 ), "x64" ) );
+    assert( !strcmp( launcher_machine_name( 0x014c ), "x86" ) );
+    assert( !strcmp( launcher_machine_name( 0xaa64 ), "ARM64" ) );
+    assert( !strcmp( launcher_machine_name( 0 ), "Unknown" ) );
     assert( launcher_is_exe( "notepad.exe" ) && launcher_is_exe( "7ZR.EXE" ) && launcher_is_exe( "a.Exe" ) );
     assert( !launcher_is_exe( ".exe" ) && !launcher_is_exe( "._notepad.exe" ) );  /* macOS resource forks */
     assert( !launcher_is_exe( "notepad.exe.txt" ) && !launcher_is_exe( "readme" ) && !launcher_is_exe( "x.dll" ) );

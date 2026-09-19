@@ -2245,6 +2245,44 @@ static void redirect_ntdll_functions( HMODULE module )
 #undef REDIRECT
 }
 
+#ifdef __SWITCH__
+NTSTATUS wine_nx_prepare_arm64ec_ntdll( HMODULE module )
+{
+    static const char *names[] =
+    {
+        "DbgUiRemoteBreakin", "KiRaiseUserExceptionDispatcher", "KiUserExceptionDispatcher",
+        "KiUserApcDispatcher", "KiUserCallbackDispatcher", "KiUserEmulationDispatcher",
+        "LdrInitializeThunk", "LdrSystemDllInitBlock", "RtlUserThreadStart", "__wine_ctrl_routine",
+        "__wine_syscall_dispatcher", "__wine_unix_call_dispatcher",
+        "__wine_unix_call_dispatcher_arm64ec", "__wine_unixlib_handle", "wine_nx_user_shared_data"
+    };
+    const IMAGE_LOAD_CONFIG_DIRECTORY *cfg;
+    const IMAGE_EXPORT_DIRECTORY *exports;
+    struct _KUSER_SHARED_DATA **shared;
+    ULONG size;
+    unsigned int i;
+
+    if (!is_arm64ec()) return STATUS_INVALID_PARAMETER;
+    cfg = get_module_data_dir( module, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &size );
+    if (!cfg || min( size, cfg->Size ) < offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer ) +
+                                       sizeof(cfg->CHPEMetadataPointer) || !cfg->CHPEMetadataPointer)
+        return STATUS_INVALID_IMAGE_FORMAT;
+    exports = get_module_data_dir( module, IMAGE_DIRECTORY_ENTRY_EXPORT, NULL );
+    if (!exports) return STATUS_INVALID_IMAGE_FORMAT;
+    for (i = 0; i < ARRAY_SIZE(names); i++)
+        if (!find_named_export( module, exports, names[i] )) return STATUS_PROCEDURE_NOT_FOUND;
+
+    load_ntdll_functions( module );
+    redirect_ntdll_functions( module );
+    shared = (void *)find_named_export( module, exports, "wine_nx_user_shared_data" );
+    *shared = user_shared_data;
+    if (!peb->EcCodeBitMap || !is_ec_code( (ULONG_PTR)pLdrInitializeThunk ) ||
+        !is_ec_code( (ULONG_PTR)pRtlUserThreadStart ) || !is_ec_code( (ULONG_PTR)pKiUserEmulationDispatcher ))
+        return STATUS_INVALID_IMAGE_FORMAT;
+    return STATUS_SUCCESS;
+}
+#endif
+
 
 /***********************************************************************
  *           load_ntdll

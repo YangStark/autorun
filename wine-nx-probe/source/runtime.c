@@ -55,7 +55,9 @@ u32 __nx_exception_ignoredebug = 1;
 #define CONFIG_DIR  RUNTIME_DIR "/config"
 #define CONFIG_FILE CONFIG_DIR "/settings.json"
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
-#ifdef WINE_NX_BOX64_DYNAREC
+#ifdef WINE_NX_AMD64
+#define WINE_NX_RUNTIME_BUILD "nx-amd64-box64-3"
+#elif defined(WINE_NX_BOX64_DYNAREC)
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-218"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
@@ -1454,7 +1456,7 @@ static unsigned int close_handle_object( HANDLE handle )
     return status;
 }
 
-static unsigned int runtime_init_process_done(void)
+static unsigned int runtime_init_process_done( BOOL *suspend )
 {
     unsigned int status;
 
@@ -1463,6 +1465,7 @@ static unsigned int runtime_init_process_done(void)
         req->teb = wine_server_client_ptr( NtCurrentTeb() );
         req->peb = wine_server_client_ptr( NtCurrentTeb()->Peb );
         status = wine_server_call( req );
+        if (suspend) *suspend = !status && reply->suspend;
     }
     SERVER_END_REQ;
 
@@ -1615,10 +1618,10 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     if (!target_to_dos_path( target, dos_path, dos_path_size )) return NULL;
     dos_dirname( dos_path, current_dir, sizeof(current_dir) );
     snprintf( nt_path, sizeof(nt_path), "\\??\\%s", dos_path );
-    /* DXVK's d3d9.dll in C:\dxvk comes before Wine's in system32; one next to
-     * the program still comes first. */
+    /* Keep native DXVK DLLs separate for each guest architecture. */
     snprintf( dll_path, sizeof(dll_path), "%s;%sC:\\windows\\system32;C:\\windows;C:\\",
-              current_dir, runtime_d3d9_dxvk ? "C:\\dxvk;" : "" );
+              current_dir, !runtime_d3d9_dxvk ? "" :
+              main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64 ? "C:\\dxvk64;" : "C:\\dxvk;" );
     /* The current directory ends in a backslash, as RtlSetCurrentDirectory_U
      * stores it; relative paths are appended to it directly. */
     if ((chars = strlen( current_dir )) && current_dir[chars - 1] != '\\' && chars + 1 < sizeof(current_dir))
@@ -1779,6 +1782,7 @@ static unsigned int map_pe_image( const char *path, void **module, SIZE_T *view_
     {
         status = NtMapViewOfSection( section, NtCurrentProcess(), module, 0, 0, NULL,
                                      view_size, ViewShare, 0, PAGE_EXECUTE_READ );
+        if (status == STATUS_IMAGE_NOT_AT_BASE) status = STATUS_SUCCESS;
         close_handle_object( section );
     }
     close_handle_object( file );
@@ -2109,6 +2113,9 @@ static NTSTATUS runtime_target_machine( const char *path, USHORT *machine )
 #ifdef WINE_NX_BOX64_INTERPRETER
             || (nt.file.Machine == IMAGE_FILE_MACHINE_I386 && nt.magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
 #endif
+#ifdef WINE_NX_AMD64
+            || (nt.file.Machine == IMAGE_FILE_MACHINE_AMD64 && nt.magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+#endif
            ) { *machine = nt.file.Machine; status = STATUS_SUCCESS; }
     }
     fclose( file );
@@ -2220,6 +2227,45 @@ static NTSTATUS runtime_start_wow64( void *module, void *entry,
         call_pe_entry_point( initialize );
         return STATUS_UNSUCCESSFUL;
     }
+    return STATUS_SUCCESS;
+}
+#endif
+
+#ifdef WINE_NX_AMD64
+static NTSTATUS runtime_prepare_arm64ec(void)
+{
+    static const char key_path[] = "\\Registry\\Machine\\Software\\Microsoft\\Wow64\\amd64";
+    static const WCHAR cpu_name[] = {'w','i','n','e','b','o','x','6','4','e','c','.','d','l','l',0};
+    WCHAR key_name[sizeof(key_path)];
+    UNICODE_STRING name = { sizeof(key_name) - sizeof(WCHAR), sizeof(key_name), key_name };
+    UNICODE_STRING value = {0};
+    OBJECT_ATTRIBUTES attr;
+    HMODULE ntdll = NULL;
+    HANDLE key;
+    SIZE_T size;
+    NTSTATUS status;
+    unsigned int i;
+    TEB *teb = NtCurrentTeb();
+    extern NTSTATUS wine_nx_prepare_arm64ec_ntdll( HMODULE );
+
+    for (i = 0; i < sizeof(key_path); i++) key_name[i] = key_path[i];
+    InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, NULL, NULL );
+    status = NtCreateKey( &key, KEY_SET_VALUE, &attr, 0, NULL, REG_OPTION_VOLATILE, NULL );
+    if (status) return status;
+    status = NtSetValueKey( key, &value, 0, REG_SZ, cpu_name, sizeof(cpu_name) );
+    NtClose( key );
+    if (status) return status;
+
+    wine_nx_load_apiset_dll();
+    status = map_pe_image( WINE_SYSTEM_DIR "/ntdll.dll", (void **)&ntdll, &size );
+    if (!status) status = virtual_relocate_module( ntdll );
+    if (!status) status = wine_nx_prepare_arm64ec_ntdll( ntdll );
+    log_line( "[AMD64] ARM64EC ntdll=%p status=%08x", ntdll, status );
+    if (status) return status;
+    status = init_thread_stack( teb, 0, main_image_info.MaximumStackSize, main_image_info.CommittedStackSize );
+    if (status) return status;
+    log_line( "[AMD64] loader ready: TEB=%p stack=%p CPU area=%p", teb, teb->Tib.StackBase,
+              teb->ChpeV2CpuAreaInfo );
     return STATUS_SUCCESS;
 }
 #endif
@@ -3337,7 +3383,7 @@ int main( int argc, char **argv )
                       settings.profile < 0 ? "global" : settings.profile ? "on" : "off",
                       settings.framebuffer < 0 ? "global" : settings.framebuffer ? "framebuffer" : "compositor",
 #ifdef WINE_NX_MESA_SWITCH
-                      settings.dxvk ? "DXVK from C:\\dxvk" : "Wine" );
+                      settings.dxvk ? "DXVK" : "Wine" );
 #else
                       settings.dxvk ? "Wine (DXVK needs the Vulkan runtime)" : "Wine" );
 #endif
@@ -3367,6 +3413,19 @@ int main( int argc, char **argv )
         park_forever();
     }
     main_image_info.Machine = target_machine;
+#ifdef WINE_NX_AMD64
+    if (target_machine == IMAGE_FILE_MACHINE_AMD64)
+    {
+        void *start, *end;
+
+        horizon_get_address_space_limits( &start, &end );
+        if ((ULONG_PTR)end < 0x8000000000ULL)
+        {
+            log_line( "[FAIL] AMD64 requires the 39-bit forwarder; current address space %p-%p", start, end );
+            park_forever();
+        }
+    }
+#endif
     wine_nx_runtime_platform_init();
     log_line( "[INIT] Wine paths/unix bridge ready" );
     virtual_init();
@@ -3421,11 +3480,16 @@ int main( int argc, char **argv )
 
     server_init_process();
     log_line( "[INIT] server process initialized" );
-    status = runtime_init_process_done();
-    if (status)
+#ifdef WINE_NX_AMD64
+    if (target_machine != IMAGE_FILE_MACHINE_AMD64)
+#endif
     {
-        log_line( "[FAIL] init_process_done status=%08x", status );
-        park_forever();
+        status = runtime_init_process_done( NULL );
+        if (status)
+        {
+            log_line( "[FAIL] init_process_done status=%08x", status );
+            park_forever();
+        }
     }
 
     status = map_pe_image( target, &module, &view_size );
@@ -3446,6 +3510,24 @@ int main( int argc, char **argv )
         runtime_init_peb_process( teb, module, params );
         log_line( "[PEB] image=%s nt=\\??\\%s", dos_path, dos_path );
 
+#ifdef WINE_NX_AMD64
+        if (target_machine == IMAGE_FILE_MACHINE_AMD64)
+        {
+            BOOL suspend = FALSE;
+            extern void wine_nx_start_arm64ec_thread( PRTL_THREAD_START_ROUTINE, void *, BOOL, TEB * );
+
+            status = runtime_prepare_arm64ec();
+            if (!status) status = runtime_init_process_done( &suspend );
+            log_line( "[AMD64] startup status=%08x", status );
+            if (!status && autorun)
+            {
+                svcSetThreadPriority( CUR_THREAD_HANDLE, 0x3b );
+                wine_nx_thread_register( 'w', HandleToULong( teb->ClientId.UniqueThread ), teb );
+                wine_nx_start_arm64ec_thread( (PRTL_THREAD_START_ROUTINE)entry, teb->Peb, suspend, teb );
+            }
+            park_forever();
+        }
+#endif
 #ifdef WINE_NX_BOX64_INTERPRETER
         if (target_machine == IMAGE_FILE_MACHINE_I386)
         {

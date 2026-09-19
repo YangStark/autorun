@@ -871,6 +871,7 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
 }
 
 NTSTATUS wine_nx_box64_run_amd64( AMD64_CONTEXT *context, ULONG_PTR gs_base,
+                                 struct wine_nx_amd64_state *state,
                                  const struct wine_nx_amd64_host *host, void *opaque,
                                  ULONG_PTR completion, ULONGLONG budget, ULONGLONG *executed )
 {
@@ -886,7 +887,8 @@ NTSTATUS wine_nx_box64_run_amd64( AMD64_CONTEXT *context, ULONG_PTR gs_base,
 #endif
 
     if (executed) *executed = 0;
-    if (!context || !host || !host->read || !host->is_native || !host->address_limit || !budget ||
+    if (!context || !state || !host || !host->read || !host->is_native ||
+        !host->address_limit || !budget ||
         gs_base >= host->address_limit || (completion && completion >= host->address_limit))
         return STATUS_INVALID_PARAMETER;
     for (slot = 0; slot < NX_CACHED_ENGINES && cached_engine_busy[slot]; slot++) continue;
@@ -913,6 +915,7 @@ NTSTATUS wine_nx_box64_run_amd64( AMD64_CONTEXT *context, ULONG_PTR gs_base,
     if (completion) wine_nx_box64_invalidate( completion, 1, 1 );
 #endif
     status = import_context_amd64( engine, context );
+    memcpy( engine->emu.mmx, state->mmx, sizeof(state->mmx) );
     if (!status)
     {
 #ifdef WINE_NX_BOX64_DYNAREC
@@ -944,6 +947,7 @@ NTSTATUS wine_nx_box64_run_amd64( AMD64_CONTEXT *context, ULONG_PTR gs_base,
         }
         fesetenv( &native_fenv );
         status = export_context_amd64( engine, context );
+        memcpy( state->mmx, engine->emu.mmx, sizeof(state->mmx) );
         if (engine->status) status = engine->status;
     }
     if (executed) *executed = engine->executed;

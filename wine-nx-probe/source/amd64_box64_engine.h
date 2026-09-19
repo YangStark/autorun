@@ -11,8 +11,14 @@ struct wine_nx_amd64_host
     ULONG_PTR address_limit;
 };
 
+struct wine_nx_amd64_state
+{
+    ULONGLONG mmx[8];
+};
+
 NTSTATUS wine_nx_box64_run_amd64( AMD64_CONTEXT *context, ULONG_PTR gs_base,
-                                const struct wine_nx_amd64_host *host, void *opaque,
-                                ULONG_PTR completion, ULONGLONG budget, ULONGLONG *executed );
+                                 struct wine_nx_amd64_state *state,
+                                 const struct wine_nx_amd64_host *host, void *opaque,
+                                 ULONG_PTR completion, ULONGLONG budget, ULONGLONG *executed );
 
 #endif

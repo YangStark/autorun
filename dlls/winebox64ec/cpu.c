@@ -10,6 +10,7 @@
  */
 
 #include <stdarg.h>
+#include <string.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -33,6 +34,8 @@ C_ASSERT( offsetof(CHPE_V2_CPU_AREA_INFO, InSimulation) == 0x00 );
 C_ASSERT( offsetof(CHPE_V2_CPU_AREA_INFO, EmulatorStackBase) == 0x08 );
 C_ASSERT( offsetof(CHPE_V2_CPU_AREA_INFO, ContextAmd64) == 0x18 );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, ContextFlags) == 0x030 );
+C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, AMD64_MxCsr_copy) == 0x034 );
+C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, AMD64_SegCs) == 0x038 );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, AMD64_EFlags) == 0x044 );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, X8) == 0x078 );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, X0) == 0x080 );
@@ -51,6 +54,9 @@ C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, X20) == 0x0e0 );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, X21) == 0x0e8 );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, X22) == 0x0f0 );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, Pc) == 0x0f8 );
+C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, AMD64_ControlWord) == 0x100 );
+C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, AMD64_MxCsr) == 0x118 );
+C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, AMD64_MxCsr_Mask) == 0x11c );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, V) == 0x1a0 );
 C_ASSERT( sizeof(ARM64EC_NT_CONTEXT) == 0x4d0 );
 
@@ -71,8 +77,8 @@ static ULONG fpcsr_to_mxcsr( ULONG fpcr, ULONG fpsr )
     if (!(fpcr & 0x00000400)) ret |= 0x0400;
     if (!(fpcr & 0x00000800)) ret |= 0x0800;
     if (!(fpcr & 0x00001000)) ret |= 0x1000;
-    if (fpcr & 0x08000000) ret |= 0x2000;
-    if (fpcr & 0x04000000) ret |= 0x4000;
+    if (fpcr & 0x00800000) ret |= 0x2000;
+    if (fpcr & 0x00400000) ret |= 0x4000;
     if (fpcr & 0x01000000) ret |= 0x8000;
     return ret;
 }
@@ -94,8 +100,8 @@ static ULONGLONG mxcsr_to_fpcsr( ULONG mxcsr )
     if (!(mxcsr & 0x0400)) fpcr |= 0x00000400;
     if (!(mxcsr & 0x0800)) fpcr |= 0x00000800;
     if (!(mxcsr & 0x1000)) fpcr |= 0x00001000;
-    if (mxcsr & 0x2000) fpcr |= 0x08000000;
-    if (mxcsr & 0x4000) fpcr |= 0x04000000;
+    if (mxcsr & 0x2000) fpcr |= 0x00800000;
+    if (mxcsr & 0x4000) fpcr |= 0x00400000;
     if (mxcsr & 0x8000) fpcr |= 0x01000000;
     return fpcr | ((ULONGLONG)fpsr << 32);
 }
@@ -237,6 +243,21 @@ NTSTATUS WINAPI ProcessInit(void)
     return STATUS_SUCCESS;
 }
 
+static void initialize_thread_context( ARM64EC_NT_CONTEXT *context )
+{
+    if (context->ContextFlags) return;
+    memset( context, 0, sizeof(*context) );
+    context->ContextFlags = CONTEXT_AMD64_FULL | CONTEXT_AMD64_SEGMENTS;
+    context->AMD64_SegCs = 0x33;
+    context->AMD64_SegDs = context->AMD64_SegEs = context->AMD64_SegGs =
+        context->AMD64_SegSs = 0x2b;
+    context->AMD64_SegFs = 0x53;
+    context->AMD64_EFlags = 0x202;
+    context->AMD64_MxCsr = context->AMD64_MxCsr_copy = 0x1f80;
+    context->AMD64_MxCsr_Mask = 0xffff;
+    context->AMD64_ControlWord = 0x27f;
+}
+
 NTSTATUS WINAPI ThreadInit(void)
 {
     struct winebox64ec_thread_params params = {0};
@@ -244,6 +265,7 @@ NTSTATUS WINAPI ThreadInit(void)
     NTSTATUS status;
 
     if (area->EmulatorData[0]) return STATUS_SUCCESS;
+    initialize_thread_context( area->ContextAmd64 );
     params.version = WINEBOX64EC_ABI_VERSION;
     params.size = sizeof(params);
     params.cpu_area = (ULONG_PTR)area;

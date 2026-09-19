@@ -461,6 +461,61 @@ static NTSTATUS nx_get_capture_buffer(void *args)
 static NTSTATUS nx_release_capture_buffer(void *args)
 { ((struct release_capture_buffer_params *)args)->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE; return STATUS_SUCCESS; }
 
+static NTSTATUS nx_midi_get_driver(void *args) { *(WCHAR *)args = 0; return STATUS_SUCCESS; }
+static NTSTATUS nx_midi_init(void *args)
+{
+    struct midi_init_params *p = args;
+    *p->err = 0;
+    return STATUS_SUCCESS;
+}
+static NTSTATUS nx_midi_release(void *args) { (void)args; return STATUS_SUCCESS; }
+static void nx_midi_message_result(UINT msg, UINT *err, struct notify_context *notify, UINT get_num_devs)
+{
+    *err = msg == get_num_devs ? 0 : MMSYSERR_BADDEVICEID;
+    if (notify) notify->send_notify = FALSE;
+}
+static NTSTATUS nx_midi_out_message(void *args)
+{
+    struct midi_out_message_params *p = args;
+    nx_midi_message_result(p->msg, p->err, p->notify, MODM_GETNUMDEVS);
+    return STATUS_SUCCESS;
+}
+static NTSTATUS nx_midi_in_message(void *args)
+{
+    struct midi_in_message_params *p = args;
+    nx_midi_message_result(p->msg, p->err, p->notify, MIDM_GETNUMDEVS);
+    return STATUS_SUCCESS;
+}
+static NTSTATUS nx_midi_wait(void *args)
+{
+    struct midi_notify_wait_params *p = args;
+    *p->quit = TRUE;
+    if (p->notify) p->notify->send_notify = FALSE;
+    return STATUS_SUCCESS;
+}
+static NTSTATUS nx_aux_message(void *args)
+{
+    struct aux_message_params *p = args;
+    *p->err = p->msg == AUXDM_GETNUMDEVS || p->msg == DRVM_INIT || p->msg == DRVM_EXIT ?
+              0 : MMSYSERR_BADDEVICEID;
+    return STATUS_SUCCESS;
+}
+
+const unixlib_entry_t wine_nx_audio_unix_funcs[] =
+{
+    nx_process_attach, nx_not_implemented, nx_main_loop, nx_get_endpoint_ids,
+    nx_create_stream, nx_release_stream, nx_start, nx_stop, nx_reset, nx_timer_loop,
+    nx_get_render_buffer, nx_release_render_buffer, nx_get_capture_buffer,
+    nx_release_capture_buffer, nx_is_format_supported, nx_not_implemented,
+    nx_get_mix_format, nx_get_device_period, nx_get_buffer_size, nx_get_latency,
+    nx_get_current_padding, nx_get_next_packet_size, nx_get_frequency, nx_get_position,
+    nx_set_volumes, nx_set_event_handle, nx_not_implemented, nx_test_connect, nx_is_started,
+    nx_get_prop_value, nx_midi_get_driver, nx_midi_init, nx_midi_release,
+    nx_midi_out_message, nx_midi_in_message, nx_midi_wait, nx_aux_message
+};
+C_ASSERT(ARRAY_SIZE(wine_nx_audio_unix_funcs) == funcs_count);
+const unsigned int wine_nx_audio_unix_count = ARRAY_SIZE(wine_nx_audio_unix_funcs);
+
 /* WoW64 thunks adapted from dlls/wineoss.drv/oss.c, LGPL-2.1-or-later,
  * Copyright 2021 Jacek Caban; 2021-2022 Huw Davies. */
 typedef UINT PTR32;
@@ -891,12 +946,10 @@ static NTSTATUS nx_wow64_get_prop_value(void *args)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS nx_midi_get_driver(void *args) { *(WCHAR *)args = 0; return STATUS_SUCCESS; }
 /* MIDI/aux enumeration must report zero devices, not leave output fields
  * untouched when winmm probes the selected driver. */
 static NTSTATUS nx_wow64_midi_init(void *args)
 { *(UINT *)ULongToPtr(*(PTR32 *)args) = 0; return STATUS_SUCCESS; }
-static NTSTATUS nx_midi_release(void *args) { (void)args; return STATUS_SUCCESS; }
 static NTSTATUS nx_wow64_midi_message(void *args)
 {
     struct { UINT dev, msg; PTR32 user, p1, p2, err, notify; } *p = args;

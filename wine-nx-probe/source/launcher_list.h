@@ -9,9 +9,18 @@
 #include <stddef.h>
 #include <string.h>
 #include <strings.h>
-
 #include <stdio.h>
 
+static inline const char *launcher_machine_name( unsigned short machine )
+{
+    switch (machine)
+    {
+    case 0x014c: return "x86";
+    case 0x8664: return "x64";
+    case 0xaa64: return "ARM64";
+    default: return "Unknown";
+    }
+}
 #define LAUNCHER_MAX_ENTRIES 256
 #define LAUNCHER_DRIVE_C "sdmc:/switch/wine/drive_c"
 

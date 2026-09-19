@@ -66,7 +66,7 @@ static void launcher_draw( const char *build, int count, int selected, int first
     }
     for (i = first; i < count && i < first + LAUNCHER_ROWS; i++)
     {
-        const char *arch = launcher_entries[i].machine == 0x014c ? "x86" : "ARM64";
+        const char *arch = launcher_machine_name( launcher_entries[i].machine );
 
         if (i == selected)
             printf( CONSOLE_GREEN " > %-68.68s %5s\n" CONSOLE_RESET, launcher_entries[i].dos, arch );

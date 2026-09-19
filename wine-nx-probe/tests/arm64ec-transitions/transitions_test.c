@@ -42,6 +42,13 @@ static uint64_t load64( const void *base, unsigned int offset )
     return value;
 }
 
+static uint16_t load16( const void *base, unsigned int offset )
+{
+    uint16_t value;
+    memcpy( &value, (const unsigned char *)base + offset, sizeof(value) );
+    return value;
+}
+
 static void store64( void *base, unsigned int offset, uint64_t value )
 {
     memcpy( (unsigned char *)base + offset, &value, sizeof(value) );
@@ -71,6 +78,7 @@ void winebox64ec_run_context_returning( void *area, unsigned int entry_kind )
             for (j = 0; j < 16; ++j) capture_ok &= ctx[0x1a0 + i * 16 + j] == input_vec[i][j];
     }
     else capture_ok = entry_kind == (mode == MODE_ENTRY ? 2u : 1u);
+    capture_ok &= load16( ctx, 0x038 ) == 0x33;
 
     for (i = 0; i < 15; ++i) store64( ctx, context_gpr_offsets[i], output_gpr[i] );
     memcpy( ctx + 0x1a0, output_vec, sizeof(output_vec) );
@@ -101,6 +109,7 @@ static void initialize(void)
     store64( fake_peb, 0x368, (uint64_t)ec_bitmap );
     store64( cpu_area, 0x08, (uint64_t)(emulator_stack + sizeof(emulator_stack)) );
     store64( cpu_area, 0x18, (uint64_t)context );
+    context[0x038] = 0x33;
     x64_return_instr = &ret_sentinel;
     for (i = 0; i < 15; ++i)
     {

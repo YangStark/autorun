@@ -2974,7 +2974,7 @@ static int file_browser_pick( struct launcher *l, char *target, size_t size )
                 snprintf( row->value, sizeof(row->value), "Cannot run here" );
                 row->disabled = 1;
             }
-            else snprintf( row->value, sizeof(row->value), "%s", files[i].machine == 0x014c ? "x86" : "ARM64" );
+            else snprintf( row->value, sizeof(row->value), "%s", launcher_machine_name( files[i].machine ) );
             if (came_from[0] && !strcasecmp( files[i].name, came_from )) list.selection = rows;
         }
         if (!rows)

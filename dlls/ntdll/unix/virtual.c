@@ -1056,8 +1056,16 @@ extern const unixlib_entry_t wine_nx_ws2_32_unix_funcs[];
 extern const unixlib_entry_t wine_nx_crypt32_unix_funcs[];
 extern const unixlib_entry_t wine_nx_win32u_unix_funcs[];
 extern const unixlib_entry_t wine_nx_opengl32_unix_funcs[];
+extern const unixlib_entry_t wine_nx_audio_unix_funcs[];
+extern const unixlib_entry_t wine_nx_xinput_unix_funcs[];
+#ifdef WINE_NX_MESA_SWITCH
+extern const unixlib_entry_t wine_nx_winevulkan_unix_funcs[];
+#endif
 #ifdef WINE_NX_BOX64_INTERPRETER
 extern const unixlib_entry_t wine_nx_winebox64_unix_funcs[];
+#endif
+#ifdef WINE_NX_AMD64
+extern const unixlib_entry_t wine_nx_winebox64ec_unix_funcs[];
 #endif
 
 static const struct
@@ -1069,10 +1077,19 @@ static const struct
 #ifdef WINE_NX_BOX64_INTERPRETER
     { {'w','i','n','e','b','o','x','6','4','.','d','l','l',0}, wine_nx_winebox64_unix_funcs },
 #endif
+#ifdef WINE_NX_AMD64
+    { {'w','i','n','e','b','o','x','6','4','e','c','.','d','l','l',0}, wine_nx_winebox64ec_unix_funcs },
+#endif
     { {'w','s','2','_','3','2','.','d','l','l',0}, wine_nx_ws2_32_unix_funcs },
     { {'c','r','y','p','t','3','2','.','d','l','l',0}, wine_nx_crypt32_unix_funcs },
     { {'w','i','n','3','2','u','.','d','l','l',0}, wine_nx_win32u_unix_funcs },
     { {'o','p','e','n','g','l','3','2','.','d','l','l',0}, wine_nx_opengl32_unix_funcs },
+    { {'w','i','n','e','n','x','a','u','d','i','o','.','d','r','v',0}, wine_nx_audio_unix_funcs },
+    { {'x','i','n','p','u','t','1','_','3','.','d','l','l',0}, wine_nx_xinput_unix_funcs },
+    { {'x','i','n','p','u','t','1','_','4','.','d','l','l',0}, wine_nx_xinput_unix_funcs },
+#ifdef WINE_NX_MESA_SWITCH
+    { {'w','i','n','e','v','u','l','k','a','n','.','d','l','l',0}, wine_nx_winevulkan_unix_funcs },
+#endif
 };
 
 /* Tables for 32-bit DLLs under WoW64 (see ws2_32_unix_stub.c). Those modules
@@ -4464,6 +4481,17 @@ static void horizon_reserve_guest_address_space(void)
 }
 #endif
 
+
+#ifdef __SWITCH__
+static void cap_horizon_arm64ec_address_space(void)
+{
+    if (!is_arm64ec()) return;
+    address_space_limit = min( address_space_limit, host_addr_space_limit );
+    user_space_limit = min( user_space_limit, host_addr_space_limit );
+    working_set_limit = min( working_set_limit, host_addr_space_limit );
+}
+#endif
+
 /***********************************************************************
  *           virtual_init
  */
@@ -4496,6 +4524,7 @@ void virtual_init(void)
 #ifdef _WIN64
 #ifdef __SWITCH__
     horizon_get_address_space_limits( &address_space_start, &host_addr_space_limit );
+    cap_horizon_arm64ec_address_space();
 #else
     host_addr_space_limit = get_host_addr_space_limit();
 #endif
