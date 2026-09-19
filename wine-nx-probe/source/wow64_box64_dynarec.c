@@ -319,6 +319,7 @@ static const struct { const char *name; int *value; int min, max; } nx_box64_opt
     { "BOX64_DYNAREC_NATIVEFLAGS", &box64env.dynarec_nativeflags, 0, 1 },
     { "BOX64_DYNAREC_PAUSE", &box64env.dynarec_pause, 0, 3 },
     { "BOX64_DYNAREC_SAFEFLAGS", &box64env.dynarec_safeflags, 0, 2 },
+    { "BOX64_DYNAREC_SEP", &box64env.dynarec_sep, 0, 2 },
     { "BOX64_DYNAREC_STRONGMEM", &box64env.dynarec_strongmem, 0, 3 },
     { "BOX64_DYNAREC_WEAKBARRIER", &box64env.dynarec_weakbarrier, 0, 2 },
     { "BOX64_DYNAREC_X87DOUBLE", &box64env.dynarec_x87double, 0, 2 },
@@ -387,6 +388,11 @@ static void init_box64_env(void)
      * trap they cause is wine_nx_box64_callret_trap. Level 1 has no guard and
      * would return into a stale translation. */
     box64env.dynarec_callret = 2;
+    /* SEP: the return site after each CALL is an entry point of its block. A
+     * call into native code leaves the engine, which comes back at that site;
+     * without the entry, the rest of the block is translated again for every
+     * such call. Level 1 covers file-mapped memory only, which is not reported. */
+    box64env.dynarec_sep = 2;
     box64env.dynarec_wait = 1; /* tracked lock ownership for translation faults */
     /* A division by zero raises EXCEPTION_INT_DIVIDE_BY_ZERO, which programs
      * catch, instead of the 0 ARM64's UDIV gives: one compare next to a slow

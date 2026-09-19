@@ -24,6 +24,8 @@
 #include "../winebox64/cpuid.h"
 #include "unixlib.h"
 
+NTSYSAPI void *WINAPI RtlPcToFileHeader( void *, void ** );
+
 static ULONGLONG process_opaque;
 void *x64_return_instr;
 
@@ -200,6 +202,7 @@ NTSTATUS WINAPI ProcessInit(void)
 {
     struct winebox64ec_query_params query = {0};
     struct winebox64ec_process_params process = {0};
+    HMODULE module = NULL;
     void *ret_page = NULL;
     SIZE_T size = 0x1000;
     ULONG old_protect;
@@ -231,6 +234,8 @@ NTSTATUS WINAPI ProcessInit(void)
     process.version = WINEBOX64EC_ABI_VERSION;
     process.size = sizeof(process);
     process.peb = (ULONG_PTR)NtCurrentTeb()->Peb;
+    RtlPcToFileHeader( ProcessInit, (void **)&module );
+    if (module) process.dispatch_ret = (ULONG_PTR)RtlFindExportedRoutineByName( module, "RetToEntryThunk" );
     status = WINE_UNIX_CALL( winebox64ec_process_init, &process );
     if (status || !process.process)
     {

@@ -28,6 +28,7 @@ fixture = rf'''
 typedef NTSTATUS (*unixlib_entry_t)( void *args );
 #define __NTDLL_UNIX_HORIZON_PRIVATE_H
 void horizon_get_address_space_limits( void **start, void **limit );
+void *wine_nx_arm64ec_dispatch_ret;
 
 static _Thread_local TEB *active_teb;
 static TEB *mock_current_teb(void) {{ return active_teb; }}
@@ -173,7 +174,8 @@ static void mark_native( ULONG_PTR address, BOOL value )
 static void test_abi_and_process(void)
 {{
     struct winebox64ec_query_params query = {{ .version = WINEBOX64EC_ABI_VERSION, .size = sizeof(query) }};
-    struct winebox64ec_process_params init = {{ .version = WINEBOX64EC_ABI_VERSION, .size = sizeof(init) }};
+    struct winebox64ec_process_params init = {{ .version = WINEBOX64EC_ABI_VERSION, .size = sizeof(init),
+                                                .dispatch_ret = 0x100003000ull }};
 
     assert( query_abi( &query ) == STATUS_SUCCESS );
     assert( query.capabilities == WINEBOX64EC_CAP_SSE2 );
@@ -204,8 +206,11 @@ static void test_abi_and_process(void)
     peb.EcCodeBitMap = NULL;
     assert( init_process( &init ) == STATUS_INVALID_PARAMETER );
     peb.EcCodeBitMap = native_bitmap;
+    assert( init_process( &init ) == STATUS_INVALID_ADDRESS );
+    mark_native( init.dispatch_ret, TRUE );
     assert( init_process( &init ) == STATUS_SUCCESS );
     assert( init.process && process.address_limit == 0x8000000000ull );
+    assert( wine_nx_arm64ec_dispatch_ret == (void *)(uintptr_t)init.dispatch_ret );
 }}
 
 static void test_thread_and_context(void)

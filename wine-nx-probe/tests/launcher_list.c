@@ -81,7 +81,7 @@ static void test_scrolling(void)
 
 static void test_dos_paths(void)
 {
-    char dos[32];
+    char dos[32], long_dos[64];
 
     assert( launcher_dos_path( "sdmc:/switch/wine/drive_c/openttd/openttd.exe", dos, sizeof(dos) ) );
     assert( !strcmp( dos, "C:\\openttd\\openttd.exe" ) );
@@ -95,6 +95,13 @@ static void test_dos_paths(void)
     assert( launcher_dos_path( "sdmc:/", dos, sizeof(dos) ) && !strcmp( dos, "Z:\\" ) );
     assert( launcher_dos_path( "sdmc:", dos, sizeof(dos) ) && !strcmp( dos, "Z:\\" ) );
     assert( !launcher_dos_path( "romfs:/x.exe", dos, sizeof(dos) ) && !launcher_dos_path( "sdmcx:/a", dos, sizeof(dos) ) );
+    assert( !launcher_dos_path( "ums0:/Wine/Dark Souls II/Game/DarkSoulsII.exe", dos, sizeof(dos) ) );
+    assert( launcher_dos_path( "ums0:/Wine/Dark Souls II/Game/DarkSoulsII.exe", long_dos, sizeof(long_dos) ) &&
+            !strcmp( long_dos, "D:\\Wine\\Dark Souls II\\Game\\DarkSoulsII.exe" ) );
+    assert( launcher_dos_path( "ums4:/", dos, sizeof(dos) ) && !strcmp( dos, "H:\\" ) );
+    assert( launcher_dos_path( "ums1:", dos, sizeof(dos) ) && !strcmp( dos, "E:\\" ) );
+    assert( !launcher_dos_path( "ums5:/x.exe", dos, sizeof(dos) ) && !launcher_dos_path( "ums10:/x.exe", dos, sizeof(dos) ) );
+    assert( !launcher_dos_path( "umsx:/x.exe", dos, sizeof(dos) ) && !launcher_dos_path( "ums0x/x.exe", dos, sizeof(dos) ) );
     assert( !launcher_dos_path( "sdmc:/a/very/long/path/that/does/not/fit.exe", dos, sizeof(dos) ) );
 }
 

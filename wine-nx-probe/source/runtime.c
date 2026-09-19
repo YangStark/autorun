@@ -50,6 +50,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define WINE_ROOT "sdmc:/switch/wine"
 #define WINE_DRIVE_C WINE_ROOT "/drive_c"
 #define WINE_SYSTEM_DIR WINE_DRIVE_C "/windows/system32"
+#define WINE_USER_DIR WINE_DRIVE_C "/users/wine"
 #define RUNTIME_DIR WINE_ROOT
 /* Everything a person sets, in one place. */
 #define CONFIG_DIR  RUNTIME_DIR "/config"
@@ -1538,8 +1539,9 @@ static int target_to_dos_path( const char *target, char *dos_path, size_t size )
         return 1;
     }
 
-    /* A file on the card: C: is drive_c and Z: the card's root, as file.c maps them. */
-    if (!strncmp( target, "sdmc:", 5 )) return launcher_dos_path( target, dos_path, size );
+    /* A file on the card or a USB drive, as file.c maps them. */
+    if (!strncmp( target, "sdmc:", 5 ) || !strncmp( target, "ums", 3 ))
+        return launcher_dos_path( target, dos_path, size );
     ret = snprintf( dos_path, size, "C:\\%s", path_basename( target ) );
 
     if (ret <= 0 || (size_t)ret >= size) return 0;
@@ -1577,13 +1579,21 @@ static void put_process_string( WCHAR **cursor, UNICODE_STRING *string, const ch
 }
 
 /* Minimal environment (sorted, NUL-separated; the literal's own terminator
- * ends the block). Console programs and Wine's DLLs look these up. */
+ * ends the block). Console programs and Wine's DLLs look these up. The user
+ * profile is where programs keep saves and settings, and where DXVK keeps
+ * its shader cache (LOCALAPPDATA); its directories are made at start-up. */
 static const char runtime_environment[] =
+    "APPDATA=C:\\users\\wine\\AppData\\Roaming\0"
+    "HOMEDRIVE=C:\0"
+    "HOMEPATH=\\users\\wine\0"
+    "LOCALAPPDATA=C:\\users\\wine\\AppData\\Local\0"
     "PATH=C:\\windows\\system32;C:\\windows\0"
     "SystemDrive=C:\0"
     "SystemRoot=C:\\windows\0"
     "TEMP=C:\\windows\\temp\0"
     "TMP=C:\\windows\\temp\0"
+    "USERNAME=wine\0"
+    "USERPROFILE=C:\\users\\wine\0"
     "WINE_D3D_CONFIG=cs_spin_count=64,explicit_buffer_flush=1\0"
     "windir=C:\\windows\0";
 
@@ -2256,8 +2266,10 @@ static NTSTATUS runtime_create_registry_path( const char *path, HANDLE *key )
         key_name[i] = 0;
         name.Length = i * sizeof(WCHAR);
         InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, NULL, NULL );
+        /* Persistent, like the key on Windows: a volatile parent created here
+         * would refuse every non-volatile key later made below Software\Microsoft. */
         status = NtCreateKey( &next, KEY_CREATE_SUB_KEY | KEY_SET_VALUE, &attr, 0, NULL,
-                              REG_OPTION_VOLATILE, NULL );
+                              REG_OPTION_NON_VOLATILE, NULL );
         key_name[i] = end;
         if (status) return status;
         if (!end)
@@ -3224,6 +3236,12 @@ int main( int argc, char **argv )
     mkdir( WINE_DRIVE_C "/windows", 0777 );
     mkdir( WINE_DRIVE_C "/windows/temp", 0777 );
     mkdir( WINE_SYSTEM_DIR, 0777 );
+    mkdir( WINE_DRIVE_C "/users", 0777 );
+    mkdir( WINE_USER_DIR, 0777 );
+    mkdir( WINE_USER_DIR "/AppData", 0777 );
+    mkdir( WINE_USER_DIR "/AppData/Local", 0777 );
+    mkdir( WINE_USER_DIR "/AppData/Roaming", 0777 );
+    mkdir( WINE_USER_DIR "/Documents", 0777 );
     log_file = fopen( RUNTIME_DIR "/wine-nx-runtime.log", "w" );
     if (log_file)
     {
@@ -3247,6 +3265,13 @@ int main( int argc, char **argv )
     wine_nx_runtime_network_init();
     log_lent_memory( "the network" );
 
+#ifdef WINE_NX_USB_STORAGE
+    {
+        extern void wine_nx_usb_start(void);
+
+        wine_nx_usb_start();
+    }
+#endif
     mkdir( CONFIG_DIR, 0777 );
     wine_nx_config_load( &runtime_config, CONFIG_FILE );
     autorun = config_bool( "run-the-chosen-program", 0, "run-entry.txt", 0 );
@@ -3295,6 +3320,13 @@ int main( int argc, char **argv )
             wine_nx_vulkan_probe();
             log_lent_memory( "the Vulkan probe" );
         }
+    }
+#endif
+#ifdef WINE_NX_USB_STORAGE
+    {
+        extern void wine_nx_usb_wait(void);
+
+        wine_nx_usb_wait();
     }
 #endif
     /* A launcher in another forwarder sent this game here, because it needs the

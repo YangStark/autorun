@@ -84,7 +84,8 @@ static NTSTATUS init_process( void *args )
     struct winebox64ec_process_params *p = args;
     void *start, *end;
 
-    if (!p || p->version != WINEBOX64EC_ABI_VERSION || p->size != sizeof(*p) || p->flags)
+    if (!p || p->version != WINEBOX64EC_ABI_VERSION || p->size != sizeof(*p) || p->flags ||
+        !p->dispatch_ret)
         return STATUS_INVALID_PARAMETER;
     p->process = 0;
     if (p->peb != (ULONG_PTR)NtCurrentTeb()->Peb) return STATUS_INVALID_PARAMETER;
@@ -93,6 +94,9 @@ static NTSTATUS init_process( void *args )
     process.peb = (PEB *)(ULONG_PTR)p->peb;
     process.address_limit = min( (ULONG_PTR)end, (ULONG_PTR)0x8000000000ull );
     if (!process.peb->EcCodeBitMap) return STATUS_INVALID_PARAMETER;
+    if (p->dispatch_ret >= process.address_limit || !is_native( NULL, p->dispatch_ret ))
+        return STATUS_INVALID_ADDRESS;
+    wine_nx_arm64ec_dispatch_ret = (void *)(ULONG_PTR)p->dispatch_ret;
     p->process = (ULONG_PTR)&process;
     return STATUS_SUCCESS;
 }

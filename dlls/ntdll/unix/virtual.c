@@ -5700,6 +5700,38 @@ static NTSTATUS grow_thread_stack( char *page, struct thread_stack_info *stack_i
 }
 
 
+#ifdef __SWITCH__
+/* Writable executable memory stays executable until a write faults. A long
+ * sequential write, such as a file read into a PAGE_EXECUTE_READWRITE buffer,
+ * then takes a fault per page, so a fault on the page after the previous
+ * window makes a doubling window writable. virtual_mutex must be held. */
+static size_t exec_write_fault_size( char *page, BYTE vprot )
+{
+    static char *next_page;
+    static size_t window;
+    struct file_view *view = find_view( page, 0 );
+    size_t count;
+    char *end;
+
+    if (!view || (view->protect & VPROT_WRITEWATCH) || !is_vprot_exec_write( vprot ))
+    {
+        next_page = NULL;
+        return host_page_size;
+    }
+    window = page == next_page ? min( window * 2, 256 ) : 1;
+    end = (char *)view->base + view->size;
+    for (count = 1; count < window && page + count * host_page_size < end; count++)
+    {
+        BYTE next = get_host_page_vprot( page + count * host_page_size );
+
+        if (!(next & VPROT_COMMITTED) || !(next & VPROT_WRITEWATCH) || !is_vprot_exec_write( next )) break;
+    }
+    next_page = page + count * host_page_size;
+    return count * host_page_size;
+}
+#endif
+
+
 /***********************************************************************
  *           virtual_handle_fault
  */
@@ -5746,8 +5778,13 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
             }
             else
             {
-                set_page_vprot_bits( page, host_page_size, 0, VPROT_WRITEWATCH );
-                mprotect_range( page, host_page_size, 0, 0 );
+#ifdef __SWITCH__
+                size_t size = exec_write_fault_size( page, vprot );
+#else
+                size_t size = host_page_size;
+#endif
+                set_page_vprot_bits( page, size, 0, VPROT_WRITEWATCH );
+                mprotect_range( page, size, 0, 0 );
             }
         }
         /* ignore fault if page is writable now */
@@ -8212,7 +8249,16 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
 {
     unsigned int status;
 
-    if (virtual_check_buffer_for_read( buffer, size ))
+    if (!virtual_check_buffer_for_read( buffer, size ))
+    {
+        status = STATUS_PARTIAL_COPY;
+        size = 0;
+    }
+    else if (process == GetCurrentProcess())
+    {
+        if ((status = virtual_uninterrupted_write_memory( addr, buffer, size ))) size = 0;
+    }
+    else
     {
         SERVER_START_REQ( write_process_memory )
         {
@@ -8223,11 +8269,6 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
             size = reply->written;
         }
         SERVER_END_REQ;
-    }
-    else
-    {
-        status = STATUS_PARTIAL_COPY;
-        size = 0;
     }
     if (bytes_written) *bytes_written = size;
     return status;

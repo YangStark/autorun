@@ -372,6 +372,44 @@ static void test_high_invalidation( struct fixture *fixture )
     init_context( &context, BASE + 0xa00 );
     assert( run( fixture, &context, 0 ) == STATUS_SUCCESS && context.Rax == 2 );
 }
+
+extern uint64_t wine_nx_box64_dynarec_bytes;
+
+/* A call into native code leaves the engine, which comes back at the return
+ * site. That site must be an entry point of the block made for the call, or
+ * the rest of the block is translated again for every such call. */
+static void test_native_return_sites( struct fixture *fixture )
+{
+    unsigned char code[512], *cursor = code;
+    AMD64_CONTEXT context;
+    uint64_t before, first, all;
+    unsigned int i, calls = 24;
+    int32_t disp;
+
+    for (i = 0; i < calls; i++)
+    {
+        emit8( &cursor, 0xe8 );
+        disp = (NATIVE + 0x100) - (BASE + 0xd00 + (cursor - code) + 4);
+        emit32( &cursor, disp );
+        emit8( &cursor, 0x48 ); emit8( &cursor, 0x83 ); emit8( &cursor, 0xc3 ); emit8( &cursor, 0x01 );
+    }
+    jump_native( &cursor );
+    put_code( fixture, 0xd00, code, cursor - code );
+    init_context( &context, BASE + 0xd00 );
+    before = wine_nx_box64_dynarec_bytes;
+    assert( run( fixture, &context, 0 ) == STATUS_SUCCESS );
+    first = wine_nx_box64_dynarec_bytes - before;
+    for (i = 0; i < calls; i++)
+    {
+        assert( context.Rip == NATIVE + 0x100 && context.Rsp == STACK - 8 );
+        memcpy( &context.Rip, fixture->memory + (context.Rsp - BASE), sizeof(context.Rip) );
+        context.Rsp += sizeof(uint64_t);
+        assert( run( fixture, &context, 0 ) == STATUS_SUCCESS );
+    }
+    assert( context.Rip == NATIVE && context.Rbx == calls );
+    all = wine_nx_box64_dynarec_bytes - before;
+    assert( all < 2 * first + 4096 );
+}
 #endif
 
 int main(void)
@@ -394,6 +432,7 @@ int main(void)
     test_unsupported( &fixture );
 #ifdef WINE_NX_BOX64_DYNAREC
     test_high_invalidation( &fixture );
+    test_native_return_sites( &fixture );
 #endif
     assert( !munmap( fixture.memory, SIZE ) );
     puts( "box64 amd64 execution: ok" );

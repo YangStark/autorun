@@ -25,6 +25,7 @@ case "$build" in "$root"/*) ;; *) echo "Switch build must be inside the Wine che
     make -j"$jobs" include/all
 )
 sh "$root/wine-nx-probe/tools/bootstrap-box64-core.sh"
+sh "$root/wine-nx-probe/tools/bootstrap-libusbhsfs.sh"
 docker run --rm --network none --platform linux/arm64 -v "$root:/work" -w /work \
     -e NX_PE="/work/${pe#"$root/"}" -e NX_BUILD="/work/${build#"$root/"}" \
     -e NX_JOBS="$jobs" -e NX_DYNAREC="${WINE_NX_BOX64_DYNAREC:-ON}" \
@@ -34,7 +35,7 @@ docker run --rm --network none --platform linux/arm64 -v "$root:/work" -w /work 
         -DCMAKE_TOOLCHAIN_FILE=/work/wine-nx-probe/cmake/switch-devkitA64.cmake \
         -DWINE_NX_PE_BUILD_DIR="$NX_PE" -DWINE_NX_AMD64=ON \
         -DWINE_NX_BOX64_INTERPRETER=ON -DWINE_NX_BOX64_DYNAREC="$NX_DYNAREC" \
-        -DWINE_NX_MESA_SWITCH_DIR="$NX_MESA" -DCMAKE_BUILD_TYPE=Release
+        -DWINE_NX_MESA_SWITCH_DIR="$NX_MESA" -DWINE_NX_USB_STORAGE=ON -DCMAKE_BUILD_TYPE=Release
     cmake --build "$NX_BUILD" --target wine-nx-runtime-nro -j "$NX_JOBS"
     '
 set -- --pe "$pe" --build "$build" --jobs "$jobs"

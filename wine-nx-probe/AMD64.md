@@ -75,7 +75,10 @@ creation/join. Expected result: `RESULT PASS` in
 
 The full package also includes these native x64 programs in
 `C:\win64-tests`: functional, threads, lifecycle, messages, timers,
-video-startup, section, audio, OpenGL, D3D9, and Vulkan when Mesa is enabled.
+video-startup, section, wasapi, audio, OpenGL, D3D9, and Vulkan when Mesa is
+enabled. The wasapi test performs waveOutOpen's steps through mmdevapi
+directly, from a message-only window on a second apartment, and reports
+each result before the audio test uses winmm.
 The default target is `pe64-functional.exe`. Run them in that order; successful
 tests print `PASS` and exit with `0x2a`. OpenGL, D3D9, and Vulkan show red,
 green, then blue as their hardware check. The Vulkan test also validates NVK
@@ -86,6 +89,16 @@ If the archive includes `wine-nx-runtime-interpreter.nro`, keep a copy of the
 normal NRO, then replace `wine-nx-runtime.nro` with that file to repeat a
 failing test without the dynarec. It uses the same DLL payload and still needs
 the 39-bit forwarder for AMD64.
+
+## USB drives
+
+FAT32 and exFAT USB drives mount at startup through libusbhsfs, with the same
+UASP transport and BOT fallback as Cemu-nx. The first five volumes are `D:` to
+`H:` in Wine, and the launcher lists programs found in each volume's `Wine`
+folder, two folder levels deep: `Wine\Game\Game.exe` or
+`Wine\Game\Bin\Game.exe`. Use exFAT for games with files over 4 GiB, which
+FAT32 cannot hold. NTFS and ext4 are not supported. Plug the drive in before
+starting Wine-NX, and close the running program before unplugging it.
 
 ## Host regression checks
 

@@ -264,6 +264,9 @@ void __stdcall start(void)
     report( "BEGIN clipboard", 0 ); result = test_clipboard();
     report( result ? "FAIL clipboard" : "PASS clipboard", result ); if (result) mask |= 512;
 
+    DestroyWindow( a_window );
+    CloseHandle( thread );
+    CloseHandle( b_ready );
     report( mask ? "FAIL combined mask" : "PASS ALL", mask );
     pe_test_terminate( mask ? 0x100 | mask : 42 );
     for (;;) {}

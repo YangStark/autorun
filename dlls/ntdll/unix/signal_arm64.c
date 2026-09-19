@@ -501,6 +501,7 @@ void *wine_nx_current_teb(void)
 unsigned int wine_nx_syscalls;
 /* Calls per system call id (table << 12 | function), for the runtime's [PROGRESS] line. */
 unsigned int wine_nx_syscall_counts[0x2000];
+void *wine_nx_arm64ec_dispatch_ret;
 
 NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
                                     ULONG_PTR x0, ULONG_PTR x1,
@@ -685,7 +686,22 @@ __asm__(
     "    ldp q14, q15, [x29, #192]\n"
     "    ldp q6, q7, [x29, #224]\n"
     "    ldp x29, x30, [sp], #256\n"
-    "    ret\n"
+    "    lsr x16, x30, #39\n"
+    "    cbnz x16, 1f\n"
+    "    ldr x16, [x18, #0x60]\n"
+    "    ldr x16, [x16, #0x368]\n"
+    "    cbz x16, 2f\n"
+    "    lsr x17, x30, #18\n"
+    "    ldr x16, [x16, x17, lsl #3]\n"
+    "    lsr x17, x30, #12\n"
+    "    lsr x16, x16, x17\n"
+    "    tbnz x16, #0, 2f\n"
+    "1:\n"
+    "    adrp x16, wine_nx_arm64ec_dispatch_ret\n"
+    "    ldr x16, [x16, :lo12:wine_nx_arm64ec_dispatch_ret]\n"
+    "    cbz x16, 2f\n"
+    "    br x16\n"
+    "2:  ret\n"
     ".size __wine_syscall_dispatcher, . - __wine_syscall_dispatcher\n"
 );
 

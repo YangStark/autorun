@@ -5,7 +5,7 @@
 /* This interface crosses the PE/Unix boundary.  Keep every address and opaque
  * token as an explicit 64-bit integer: ARM64EC pointer spelling must not make
  * the layout depend on which side includes this file. */
-#define WINEBOX64EC_ABI_VERSION 1
+#define WINEBOX64EC_ABI_VERSION 2
 
 enum winebox64ec_calls
 {
@@ -63,6 +63,7 @@ struct winebox64ec_process_params
     ULONGLONG process;                 /* out: native process opaque */
     ULONGLONG peb;
     ULONGLONG flags;
+    ULONGLONG dispatch_ret;
 };
 
 struct winebox64ec_thread_params
@@ -129,7 +130,7 @@ struct winebox64ec_term_params
 };
 
 C_ASSERT( sizeof(struct winebox64ec_query_params) == 16 );
-C_ASSERT( sizeof(struct winebox64ec_process_params) == 32 );
+C_ASSERT( sizeof(struct winebox64ec_process_params) == 40 );
 C_ASSERT( sizeof(struct winebox64ec_thread_params) == 40 );
 C_ASSERT( sizeof(struct winebox64ec_run_params) == 72 );
 C_ASSERT( sizeof(struct winebox64ec_notify_params) == 56 );

@@ -198,7 +198,7 @@ struct launcher
 
 static struct launcher launcher;
 static struct file_entry files[MAX_FILES];
-static struct ui_row file_rows[MAX_FILES + 1];
+static struct ui_row file_rows[MAX_FILES + 8];
 
 extern int wine_nx_launcher_console_run( const char *drive_c, const char *runtime_dir, const char *build,
                                          int (*machine_of)( const char *path, unsigned short *machine ),
@@ -2942,7 +2942,16 @@ static int file_browser_pick( struct launcher *l, char *target, size_t size )
     for (;;)
     {
         struct ui_list list = {0};
-        int count, has_up, rows, i, reload = 0;
+        static const char *const volume_paths[] =
+        {
+            LAUNCHER_DRIVE_C, "sdmc:/", "ums0:/", "ums1:/", "ums2:/", "ums3:/", "ums4:/"
+        };
+        static const char *const volume_names[] =
+        {
+            "C: Wine", "Z: SD card", "D: USB 1", "E: USB 2", "F: USB 3", "G: USB 4", "H: USB 5"
+        };
+        const char *volumes[ARRAY_SIZE(volume_paths)];
+        int count, has_up, volume_count = 0, rows, i, reload = 0;
 
         while (!read_dir( l, dir, &count ) && !is_root( dir )) parent_dir( dir );
         snprintf( l->browse_dir, sizeof(l->browse_dir), "%s", dir );
@@ -2961,6 +2970,18 @@ static int file_browser_pick( struct launcher *l, char *target, size_t size )
             if (launcher_dos_path( parent, parent_dos, sizeof(parent_dos) ))
                 snprintf( file_rows[0].value, sizeof(file_rows[0].value), "%s", parent_dos );
             rows = 1;
+        }
+        else
+        {
+            for (i = 0; i < ARRAY_SIZE(volume_paths); i++)
+            {
+                if (stat( volume_paths[i], &st ) || !S_ISDIR( st.st_mode ) || !strcmp( volume_paths[i], dir )) continue;
+                memset( file_rows + rows, 0, sizeof(file_rows[0]) );
+                snprintf( file_rows[rows].label, sizeof(file_rows[rows].label), "%s", volume_names[i] );
+                snprintf( file_rows[rows].value, sizeof(file_rows[rows].value), "Storage" );
+                volumes[volume_count++] = volume_paths[i];
+                rows++;
+            }
         }
         for (i = 0; i < count; i++, rows++)
         {
@@ -2991,9 +3012,15 @@ static int file_browser_pick( struct launcher *l, char *target, size_t size )
         while (!reload)
         {
             enum ui_action action = ui_list_run( ui, &list, "Files", dos, file_rows, rows, 0 );
-            int index = list.selection - has_up;
+            int index = list.selection - has_up - volume_count;
 
             if (action == UI_ACTION_QUIT) return 0;
+            if (action == UI_ACTION_CHOOSE && !has_up && list.selection < volume_count)
+            {
+                snprintf( dir, sizeof(dir), "%s", volumes[list.selection] );
+                reload = 1;
+                continue;
+            }
             if (action == UI_ACTION_BACK || (action == UI_ACTION_CHOOSE && index < 0))
             {
                 if (!has_up)
@@ -3006,7 +3033,8 @@ static int file_browser_pick( struct launcher *l, char *target, size_t size )
                 reload = 1;
                 break;
             }
-            if (action != UI_ACTION_CHOOSE || index >= count) continue;
+            if (action != UI_ACTION_CHOOSE) continue;
+            if (index < 0 || index >= count) continue;
             join_path( path, sizeof(path), dir, files[index].name );
             launcher_log( "[LAUNCHER] Browser chose %s (%s)", path, files[index].is_dir ? "folder" : "program" );
             if (files[index].is_dir)

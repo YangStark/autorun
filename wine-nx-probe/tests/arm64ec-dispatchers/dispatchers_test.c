@@ -13,7 +13,10 @@ unsigned int input_syscall_id;
 uint64_t unix_inputs[3];
 uint64_t observed_state[4];
 unsigned int syscall_x9_returned, unix_lr_returned;
-unsigned char stale_teb[16], authoritative_teb[16];
+unsigned int dispatch_ret_called;
+unsigned char stale_teb[16], authoritative_teb[0x68], fake_peb[0x370];
+uint64_t native_bitmap[32];
+void *wine_nx_arm64ec_dispatch_ret;
 
 static uint64_t recorded_args[8], recorded_stack_args[8], recorded_stack_ptr;
 static uint64_t recorded_unix[3];
@@ -23,6 +26,7 @@ static unsigned int failures;
 extern void invoke_syscall_dispatcher(void);
 extern void invoke_unix_dispatcher(void);
 extern void syscall_return_target(void);
+extern void syscall_dispatch_ret(void);
 extern void clobber_vectors(void);
 
 int32_t wine_nx_do_syscall( uint64_t *stack_args,
@@ -63,8 +67,11 @@ static void report( const char *name, int passed )
 
 static void initialize(void)
 {
+    uint64_t peb = (uint64_t)fake_peb, bitmap = (uint64_t)native_bitmap;
     unsigned int i, j;
 
+    memcpy( authoritative_teb + 0x60, &peb, sizeof(peb) );
+    memcpy( fake_peb + 0x368, &bitmap, sizeof(bitmap) );
     for (i = 0; i < 11; ++i)
         input_nonvolatile[i] = 0x1900000000000000ull + i * 0x0102030405060708ull;
     for (i = 0; i < 10; ++i)
@@ -86,11 +93,13 @@ static void clear_results(void)
     memset( observed_vec, 0, sizeof(observed_vec) );
     memset( observed_state, 0, sizeof(observed_state) );
     syscall_x9_returned = unix_lr_returned = 0;
+    dispatch_ret_called = 0;
 }
 
-static void test_syscall(void)
+static void run_syscall(void)
 {
     clear_results();
+    wine_nx_arm64ec_dispatch_ret = syscall_dispatch_ret;
     invoke_syscall_dispatcher();
     if (memcmp( recorded_args, input_args, sizeof(input_args) ) || recorded_syscall_id != input_syscall_id)
         printf( "INFO syscall a0=%#llx/%#llx a7=%#llx/%#llx id=%#x/%#x\n",
@@ -101,8 +110,6 @@ static void test_syscall(void)
             recorded_syscall_id == input_syscall_id );
     report( "syscall-stack-args", recorded_stack_ptr == saved_host[0] - 128 &&
             !memcmp( recorded_stack_args, input_stack_args, sizeof(input_stack_args) ) );
-    report( "syscall-status-x9-lr", observed_state[0] == SYSCALL_STATUS && syscall_x9_returned &&
-            observed_state[3] == (uint64_t)&syscall_return_target );
     report( "syscall-nonvolatile-gpr", !memcmp( observed_nonvolatile, input_nonvolatile,
                                                  sizeof(input_nonvolatile) ) );
     report( "syscall-q6-q15", !memcmp( observed_vec, input_vec, sizeof(input_vec) ) );
@@ -110,9 +117,24 @@ static void test_syscall(void)
             observed_state[2] == saved_host[0] - 128 );
 }
 
+static void test_syscall(void)
+{
+    uint64_t target = (uint64_t)&syscall_return_target;
+
+    run_syscall();
+    report( "syscall-guest-return", observed_state[0] == SYSCALL_STATUS && syscall_x9_returned &&
+            dispatch_ret_called && observed_state[3] == target );
+
+    native_bitmap[target >> 18] |= 1ull << ((target >> 12) & 63);
+    run_syscall();
+    report( "syscall-native-return", observed_state[0] == SYSCALL_STATUS && syscall_x9_returned &&
+            !dispatch_ret_called && observed_state[3] == target );
+}
+
 static void test_unix(void)
 {
     clear_results();
+    wine_nx_arm64ec_dispatch_ret = NULL;
     invoke_unix_dispatcher();
     report( "unix-call-args", !memcmp( recorded_unix, unix_inputs, sizeof(unix_inputs) ) );
     report( "unix-status-lr", observed_state[0] == UNIX_STATUS && unix_lr_returned );

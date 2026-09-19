@@ -47,6 +47,7 @@
 # include <sys/statvfs.h>
 #endif
 #ifdef __SWITCH__
+# include <sys/iosupport.h>
 # include <sys/statvfs.h>
 #endif
 #ifdef HAVE_SYS_SYSCALL_H
@@ -4195,9 +4196,16 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
     if (prefix_len == 2 && prefix[1] == ':')
     {
         const char *drive_root = NULL;
+        char usb_root[] = "ums0:";
 
         if (prefix[0] == 'c') drive_root = "sdmc:/switch/wine/drive_c";
         else if (prefix[0] == 'z') drive_root = "sdmc:";
+        else if (prefix[0] >= 'd' && prefix[0] <= 'h')
+        {
+            /* USB volumes as the runtime mounts them: D: is ums0:, E: is ums1:. */
+            usb_root[3] = '0' + prefix[0] - 'd';
+            if (FindDevice( usb_root ) >= 0) drive_root = usb_root;
+        }
 
         if (drive_root)
         {

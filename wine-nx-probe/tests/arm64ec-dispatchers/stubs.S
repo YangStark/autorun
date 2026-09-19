@@ -97,6 +97,13 @@ syscall_return_target:
     str w17, [x16, :lo12:syscall_x9_returned]
     b capture_return
 
+.global syscall_dispatch_ret
+syscall_dispatch_ret:
+    adrp x16, dispatch_ret_called
+    mov w17, #1
+    str w17, [x16, :lo12:dispatch_ret_called]
+    br x30
+
 .global unix_return_target
 unix_return_target:
     b capture_return

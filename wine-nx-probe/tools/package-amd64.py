@@ -175,7 +175,8 @@ if not args.minimal:
     common += ('user32 win32u gdi32 imm32 ole32 oleaut32 combase coml2 rpcrt4 shell32 '
                'comdlg32 comctl32 shlwapi shcore version ws2_32 winmm mmdevapi avrt '
                'dsound opengl32 wined3d d3d9 d3d11 dxgi dinput8 xinput1_3 xinput1_4 '
-               'xinput9_1_0 dbghelp windowscodecs').split()
+               'xinput9_1_0 dbghelp windowscodecs '
+               'd3dx9_38 d3dx9_43 winhttp oleacc wsock32 psapi').split()
 native_seeds = common + ['winebox64', 'winebox64ec', 'wow64', 'wow64win', 'apisetschema']
 prebuild(native_seeds, 'aarch64')
 native = stage_closure(native_seeds, 'aarch64', 'system32')
@@ -223,6 +224,7 @@ if not args.minimal:
                       '-luser32', '-lkernel32', '-lntdll'])
     win64_tests.append(output.name)
     build_pe64('section', 'pe32_section.c', ('kernel32', 'ntdll'))
+    build_pe64('wasapi', 'pe32_wasapi.c', ('ole32', 'user32', 'kernel32', 'ntdll'))
     build_pe64('audio', 'pe32_audio.c', ('winmm', 'kernel32', 'ntdll'))
     build_pe64('opengl', 'pe32_opengl.c', ('opengl32', 'gdi32', 'user32', 'kernel32', 'ntdll'))
     build_pe64('d3d9', 'pe32_d3d9.c', ('d3d9', 'gdi32', 'user32', 'kernel32', 'ntdll'))

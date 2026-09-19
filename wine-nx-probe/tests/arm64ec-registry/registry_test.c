@@ -34,7 +34,7 @@ typedef struct
 #define KEY_SET_VALUE 0x0002
 #define KEY_CREATE_SUB_KEY 0x0004
 #define OBJ_CASE_INSENSITIVE 0x0040
-#define REG_OPTION_VOLATILE 0x0001
+#define REG_OPTION_NON_VOLATILE 0x0000
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define InitializeObjectAttributes(p,n,a,r,s) do { \
     (p)->Length = sizeof(*(p)); \
@@ -80,7 +80,7 @@ static NTSTATUS NtCreateKey( HANDLE *key, ACCESS_MASK access, const OBJECT_ATTRI
         return STATUS_OBJECT_NAME_NOT_FOUND;
     if (current > existing) return STATUS_OBJECT_NAME_NOT_FOUND;
     if (current == existing) existing++;
-    if (access != (KEY_CREATE_SUB_KEY | KEY_SET_VALUE) || options != REG_OPTION_VOLATILE ||
+    if (access != (KEY_CREATE_SUB_KEY | KEY_SET_VALUE) || options != REG_OPTION_NON_VOLATILE ||
         attr->Attributes != OBJ_CASE_INSENSITIVE || attr->RootDirectory)
         return STATUS_ACCESS_DENIED;
     *key = (HANDLE)(uintptr_t)(current + 1);
