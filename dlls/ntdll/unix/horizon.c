@@ -9125,17 +9125,23 @@ static int horizon_server_handle_get_desktop_window( struct horizon_server_conne
 
 /* A program that cannot open one of its own files usually says so in its own
  * words -- Halo reports that one of its files is missing or corrupted -- and
- * never says which, so the log names the ones it asked for and did not get.
+ * never says which, so the log names the ones it asked for and did not get,
+ * with how it asked and what Horizon's open() said: The Sims 2 opens each of
+ * its packages to read, then to write only to see whether it may, and
+ * Horizon refused one of those as an invalid argument.
  * The loader probes for a DLL in every directory of its search path, so the
  * ones below the Wine tree are its search and not a program's own file. */
-static void horizon_report_missing_file( const char *path, unsigned int status )
+static void horizon_report_missing_file( const char *path, unsigned int status,
+                                         const struct horizon_create_file_request *request, int error )
 {
     static LONG reported;
-    char message[384];
+    char message[448];
 
     if (strstr( path, "/windows/" ) || strstr( path, "/Windows/" )) return;
     if (__atomic_add_fetch( &reported, 1, __ATOMIC_RELAXED ) > 64) return;
-    snprintf( message, sizeof(message), "[FS] %s could not be opened: status %08x", path, status );
+    snprintf( message, sizeof(message), "[FS] %s could not be opened: status %08x "
+              "(access %08x, sharing %x, disposition %d, options %08x, errno %d)",
+              path, status, request->access, request->sharing, request->create, request->options, error );
     wine_nx_runtime_trace( message );
 }
 
@@ -9153,6 +9159,7 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
     int flags;
     int is_dir = 0;
     int fd = -1;
+    int open_error = 0;
 
     memset( &reply, 0, sizeof(reply) );
     /* DELETE_ON_CLOSE requires DELETE access, not merely a writable fd. */
@@ -9199,6 +9206,7 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
             int open_errno = errno;
             DIR *dir;
 
+            open_error = open_errno;
             /* libnx cannot open() a directory, but NT opens an existing one
              * without FILE_DIRECTORY_FILE (CreateFileW with backup semantics). */
             if (open_errno != EEXIST && (dir = opendir( filename )))
@@ -9234,7 +9242,8 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
     }
 
     if (fd != -1) close( fd );
-    if (reply.header.error && filename) horizon_report_missing_file( filename, reply.header.error );
+    if (reply.header.error && filename)
+        horizon_report_missing_file( filename, reply.header.error, request, open_error );
     if (is_dir)
         horizon_trace( "[HZDIR] create path=%s handle=%08x err=%08x\n",
                        filename ? filename : "<null>", reply.handle, reply.header.error );
