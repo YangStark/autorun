@@ -280,6 +280,4 @@ References that shaped the port without being part of the build:
 
 ## More
 
-- [WoW64 CPU interface](wow64-box64-interface.md)
-- [x86 memory layout on Horizon](horizon-x86-memory.md)
 - [Build-by-build notes](../wine-nx-probe/README.md)
