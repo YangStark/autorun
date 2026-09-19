@@ -843,6 +843,10 @@ if(WINE_NX_MESA_SWITCH_DIR)
         "${CMAKE_CURRENT_SOURCE_DIR}/../dlls/winevulkan"
     )
     target_sources(wine-nx-runtime PRIVATE $<TARGET_OBJECTS:wine-winevulkan-unix-real>)
+    option(WINE_NX_LSFG "Enable the GPL LSFG-VK frame-generation backend" ON)
+    if(WINE_NX_LSFG)
+        include(cmake/LsfgVk.cmake)
+    endif()
 endif()
 # The launcher (source/launcher.c) draws with SDL2 and SDL2_ttf; SDL's GL
 # functions come through eglGetProcAddress, so it works over either Mesa.

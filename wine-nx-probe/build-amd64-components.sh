@@ -30,6 +30,9 @@ case "$build" in "$root"/*) ;; *) echo "Switch build must be inside the Wine che
 )
 sh "$root/wine-nx-probe/tools/bootstrap-box64-core.sh"
 sh "$root/wine-nx-probe/tools/bootstrap-libusbhsfs.sh"
+if [ -n "${WINE_NX_MESA_SWITCH_DIR:-}" ]; then
+    sh "$root/wine-nx-probe/tools/bootstrap-lsfg-vk.sh"
+fi
 docker run --rm --network none --platform linux/arm64 -v "$root:/work" -w /work \
     -e NX_PE="/work/${pe#"$root/"}" -e NX_BUILD="/work/${build#"$root/"}" \
     -e NX_JOBS="$jobs" -e NX_DYNAREC="${WINE_NX_BOX64_DYNAREC:-ON}" \
