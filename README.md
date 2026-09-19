@@ -75,6 +75,21 @@ with **Settings -> System -> Make an Autorun forwarder** and start it from there
 `C:\WarCraft III Setup\war3-setup.exe` once before playing. Its folder has a
 `README.txt` with the details.
 
+### Settings a game expects to already have
+
+Some games read a settings file that their own installer or launcher normally
+writes, and refuse to start without it. Autorun ships those files, in the same
+place Windows keeps them: `switch/wine/drive_c/users/wine/Documents` on the
+card, which a game sees as its Documents folder.
+
+**Fallout: New Vegas** is one. With no settings of its own it decides it does
+not know the graphics card, hands itself over to `FalloutNVLauncher.exe` and
+closes. The included
+`My Games\FalloutNV\FalloutPrefs.ini` names the Switch's GPU and asks for 720p,
+so the game starts instead. Leave it where it is. The game rewrites that file
+once you change its options in game, so if you edit it yourself keep the
+`sD3DDevice` line under `[Display]`.
+
 ### Games that need the 32-bit forwarder
 
 A few older games only work when loaded at fixed low memory addresses - Need for
