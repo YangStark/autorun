@@ -10,6 +10,11 @@
  * which must still start at its entry point with its parameter. And a window
  * procedure's result, which SendMessage returns after a callback.
  *
+ * Last, faults in the program's own code, which must reach its handlers: The
+ * Sims 2 reads address 0 in a __try to see that they do. A read and a write of
+ * address 0 and a division by zero, each caught by a vectored handler that
+ * sees the registers as the faulting instruction left them and steps past it.
+ *
  * The result goes in a message box, which the runtime log records, and in
  * apc-test.txt beside the program.
  */
@@ -90,6 +95,27 @@ static DWORD WINAPI started( void *param )
     return 0x51;
 }
 
+static volatile LONG faults;
+static DWORD fault_code[3], fault_kind[3], fault_address[3], fault_ebx[3];
+
+static LONG CALLBACK catch_fault( EXCEPTION_POINTERS *ptrs )
+{
+    EXCEPTION_RECORD *rec = ptrs->ExceptionRecord;
+    LONG n = faults;
+
+    if (n >= 3 || (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION &&
+                   rec->ExceptionCode != EXCEPTION_INT_DIVIDE_BY_ZERO))
+        return EXCEPTION_CONTINUE_SEARCH;
+    fault_code[n] = rec->ExceptionCode;
+    fault_kind[n] = rec->NumberParameters >= 2 ? (DWORD)rec->ExceptionInformation[0] : 0xff;
+    fault_address[n] = rec->NumberParameters >= 2 ? (DWORD)rec->ExceptionInformation[1] : 0xff;
+    fault_ebx[n] = ptrs->ContextRecord->Ebx;
+    /* Past the instruction: 5 bytes for the moves, 2 for the division. */
+    ptrs->ContextRecord->Eip += rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ? 5 : 2;
+    faults = n + 1;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
 static LRESULT CALLBACK answer_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
 {
     if (msg == WM_USER + 7) return 0x1234;
@@ -98,7 +124,7 @@ static LRESULT CALLBACK answer_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
 
 int WINAPI WinMain( HINSTANCE instance, HINSTANCE prev, LPSTR cmdline, int show )
 {
-    char path[MAX_PATH], plain[192], overlapped[192], apc[96], thread[128], callback[64], report[1024];
+    char path[MAX_PATH], plain[192], overlapped[192], apc[96], thread[128], callback[64], seh[160], report[1280];
     OSVERSIONINFOA version = { sizeof(version) };
     DWORD sleep_ret;
     int rounds = 0;
@@ -145,9 +171,29 @@ int WINAPI WinMain( HINSTANCE instance, HINSTANCE prev, LPSTR cmdline, int show 
         if (hwnd) DestroyWindow( hwnd );
     }
 
+    /* Faults in the program's own code, caught by its own handler. */
+    {
+        void *handler = AddVectoredExceptionHandler( 1, catch_fault );
+
+        __asm__ __volatile__( "movl $0x1234, %%ebx\n\t"
+                              ".byte 0xa0, 0, 0, 0, 0\n\t"      /* mov al, [0] */
+                              "movl $0x5678, %%ebx\n\t"
+                              ".byte 0xa2, 0, 0, 0, 0\n\t"      /* mov [0], al */
+                              "movl $0x9abc, %%ebx\n\t"
+                              "xorl %%edx, %%edx\n\t"
+                              "xorl %%ecx, %%ecx\n\t"
+                              "movl $1, %%eax\n\t"
+                              "divl %%ecx\n\t"                   /* 2 bytes: f7 f1 */
+                              ::: "eax", "ebx", "ecx", "edx", "memory" );
+        RemoveVectoredExceptionHandler( handler );
+        snprintf( seh, sizeof(seh), "faults=%ld read=%lx/%lu/%lx/%lx write=%lx/%lu/%lx/%lx div=%lx/%lx",
+                  faults, fault_code[0], fault_kind[0], fault_address[0], fault_ebx[0],
+                  fault_code[1], fault_kind[1], fault_address[1], fault_ebx[1], fault_code[2], fault_ebx[2] );
+    }
+
     snprintf( report, sizeof(report),
-              "platform=%lu | plain: %s | overlapped: %s | QueueUserAPC: %s | suspended thread: %s | %s",
-              version.dwPlatformId, plain, overlapped, apc, thread, callback );
+              "platform=%lu | plain: %s | overlapped: %s | QueueUserAPC: %s | suspended thread: %s | %s | %s",
+              version.dwPlatformId, plain, overlapped, apc, thread, callback, seh );
 
     if ((file = fopen( "apc-test.txt", "w" )))
     {

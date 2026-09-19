@@ -22,9 +22,16 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
 /* Called only for unresolved native memory faults. Returns FALSE for a native
  * address or an inactive interpreter; during block compilation it returns to
  * Box64's interpreter fallback. For a 32-bit address during Run it exits
- * the active run with STATUS_ACCESS_VIOLATION. Horizon calls this after libnx
- * has returned from the kernel exception, Linux test hosts from a signal
- * handler. The context is diagnostic: partial instruction effects may remain,
- * so restarting a faulted guest or delivering resumable x86 SEH is unsupported. */
-BOOL wine_nx_box64_handle_fault( ULONG_PTR address );
+ * the active run with STATUS_ACCESS_VIOLATION and the context of the faulting
+ * instruction, which WoW64 raises into the guest's own handlers: in
+ * translated code its registers come from the native ones (x, x0-x30 as the
+ * fault left them, and the native pc), as Box64's signal handler takes them.
+ * access is 0 for a read, 1 for a write. Horizon calls this after libnx has
+ * returned from the kernel exception, Linux test hosts from a signal handler. */
+BOOL wine_nx_box64_handle_fault( ULONG_PTR address, ULONG access, ULONG_PTR pc,
+                                 const unsigned long long *x );
+
+/* What the last STATUS_ACCESS_VIOLATION of this thread's run was about: the
+ * address, and 0 read, 1 write or 8 execute. */
+void wine_nx_box64_last_fault( ULONG *address, ULONG *access );
 #endif

@@ -2,7 +2,7 @@
 #ifndef WINEBOX64_UNIXLIB_H
 #define WINEBOX64_UNIXLIB_H
 #include "../../wine-nx-probe/source/wow64_box64_bridge.h"
-#define WINEBOX64_ABI_VERSION 3
+#define WINEBOX64_ABI_VERSION 4
 
 enum winebox64_run_operation { winebox64_query_abi, winebox64_execute };
 
@@ -16,6 +16,10 @@ struct winebox64_run_params
     struct wine_nx_wow64_gates gates;
     ULONGLONG budget;
     ULONGLONG executed;
+    /* An access violation the run stopped at: the address, and 0 read,
+     * 1 write or 8 execute, for the exception raised into the guest. */
+    ULONG fault_address;
+    ULONG fault_access;
 };
 struct winebox64_unix_params
 {
@@ -41,7 +45,7 @@ enum winebox64_calls { winebox64_run, winebox64_call_unix, winebox64_invalidate 
 /* Both sides are native ARM64. Keep the version first so an older native
  * table can reject a new layout before accessing any changed fields. */
 C_ASSERT( offsetof(struct winebox64_run_params, context) == 16 );
-C_ASSERT( sizeof(struct winebox64_run_params) == 48 );
+C_ASSERT( sizeof(struct winebox64_run_params) == 56 );
 C_ASSERT( sizeof(struct winebox64_unix_params) == 24 );
 C_ASSERT( sizeof(struct winebox64_invalidate_params) == 32 );
 #endif

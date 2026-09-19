@@ -94,6 +94,13 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *ctx, ULONG fs_base,
     return STATUS_TIMEOUT;
 }
 
+/* What the engine says the access violation was about. */
+void wine_nx_box64_last_fault( ULONG *address, ULONG *access )
+{
+    *address = 0x1234;
+    *access = 1;
+}
+
 static unsigned int invalidations;
 static uintptr_t invalidated_address;
 static size_t invalidated_size;
@@ -161,8 +168,11 @@ int main(void)
     for (unsigned int i = 0; i < 800; ++i) assert( run( &p ) == STATUS_TIMEOUT );
     assert( read_calls == 768 && trace_calls == 1536 );
     wine_nx_runtime_verbose = 0;
+    assert( !p.fault_address && !p.fault_access );
     run_status = STATUS_ACCESS_VIOLATION;
     assert( run( &p ) == STATUS_ACCESS_VIOLATION );
+    /* The access violation's address and kind reach BTCpuSimulate, which raises it. */
+    assert( p.fault_address == 0x1234 && p.fault_access == 1 );
     assert( error_calls == 1 && trace_calls == 1536 && read_calls == 769 );
     assert( fault_calls == 2 && fault_registers == 1 );
     /* A readable stack row followed by an inaccessible row stops safely. */

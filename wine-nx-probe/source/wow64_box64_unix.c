@@ -161,6 +161,9 @@ static NTSTATUS run_guest( void *args )
 #endif
         NTSTATUS status = wine_nx_box64_run( p->context, p->fs_base, &p->gates, &host, NULL,
                                             0, p->budget, &p->executed );
+
+        p->fault_address = p->fault_access = 0;
+        if (status == STATUS_ACCESS_VIOLATION) wine_nx_box64_last_fault( &p->fault_address, &p->fault_access );
 #ifdef __SWITCH__
         if (trace < 768 && p->context)
         {
@@ -170,13 +173,23 @@ static NTSTATUS run_guest( void *args )
                       (unsigned)p->context->Esp, (unsigned)p->context->Eax );
             wine_nx_runtime_trace( message );
         }
+        /* A guest exception goes to the program's own handlers now (winebox64's
+         * BTCpuSimulate), and a program may cause them on purpose: the first
+         * sixteen are described. */
         if (status && status != STATUS_TIMEOUT)
         {
-            snprintf( message, sizeof(message), "[BOX64] status=%08x EIP=%08x EAX=%08x instructions=%llu",
-                      (unsigned)status, p->context ? (unsigned)p->context->Eip : 0,
-                      p->context ? (unsigned)p->context->Eax : 0, (unsigned long long)p->executed );
-            wine_nx_runtime_trace( message );
-            trace_fault_context( p->context );
+            static LONG described;
+
+            if (__atomic_add_fetch( &described, 1, __ATOMIC_RELAXED ) <= 16)
+            {
+                snprintf( message, sizeof(message), "[BOX64] status=%08x EIP=%08x EAX=%08x instructions=%llu"
+                          " fault=%08x access=%u",
+                          (unsigned)status, p->context ? (unsigned)p->context->Eip : 0,
+                          p->context ? (unsigned)p->context->Eax : 0, (unsigned long long)p->executed,
+                          (unsigned)p->fault_address, (unsigned)p->fault_access );
+                wine_nx_runtime_trace( message );
+                trace_fault_context( p->context );
+            }
         }
 #endif
         return status;

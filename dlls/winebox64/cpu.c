@@ -5,6 +5,7 @@
 #include "rtlsupportapi.h"
 
 extern NTSTATUS WINAPI Wow64SystemServiceEx( UINT number, UINT *args );
+extern NTSTATUS WINAPI Wow64RaiseException( int code, EXCEPTION_RECORD *rec );
 static struct wine_nx_wow64_gates gates;
 
 static void DECLSPEC_NORETURN fail( NTSTATUS status )
@@ -190,6 +191,44 @@ static BOOL context_replaced( void *opaque )
     cpu->Flags &= ~WOW64_CPURESERVED_FLAG_RESET_STATE;
     return replaced;
 }
+/* An exception the guest caused -- an access violation, a division by zero,
+ * INT3, an invalid opcode -- goes to its own handlers, as wow64's
+ * cpu_simulate_handler sends a backend's fault there: the context is the
+ * faulting instruction's, and Wow64RaiseException builds the frame
+ * KiUserExceptionDispatcher runs from. Programs rely on this: The Sims 2 reads
+ * address 0 in a __try to see that its handlers work. */
+static BOOL raise_guest_exception( NTSTATUS status, const struct winebox64_run_params *params )
+{
+    EXCEPTION_RECORD rec = { 0 };
+
+    switch (status)
+    {
+    case STATUS_ACCESS_VIOLATION:
+        rec.ExceptionCode = STATUS_ACCESS_VIOLATION;
+        rec.ExceptionAddress = ULongToPtr( params->context->Eip );
+        rec.NumberParameters = 2;
+        rec.ExceptionInformation[0] = params->fault_access;
+        rec.ExceptionInformation[1] = params->fault_address;
+        Wow64RaiseException( -1, &rec );
+        return TRUE;
+    case STATUS_INTEGER_DIVIDE_BY_ZERO:
+        Wow64RaiseException( 0x00, &rec );
+        return TRUE;
+    case STATUS_BREAKPOINT:
+        /* The engine stops on the INT3, where Windows reports it, rather
+         * than past it as Wow64RaiseException( 3 ) expects. */
+        rec.ExceptionCode = STATUS_BREAKPOINT;
+        rec.ExceptionAddress = ULongToPtr( params->context->Eip );
+        rec.NumberParameters = 1;
+        Wow64RaiseException( -1, &rec );
+        return TRUE;
+    case STATUS_ILLEGAL_INSTRUCTION:
+        Wow64RaiseException( 0x06, &rec );
+        return TRUE;
+    }
+    return FALSE;
+}
+
 void WINAPI BTCpuSimulate(void)
 {
     static const struct wine_nx_wow64_host host = { read_guest, syscall_guest, unix_guest, context_replaced };
@@ -208,6 +247,7 @@ void WINAPI BTCpuSimulate(void)
         cpu->Flags &= ~WOW64_CPURESERVED_FLAG_RESET_STATE;
         status = WINE_UNIX_CALL( winebox64_run, &params );
         if (status == STATUS_TIMEOUT) continue;
+        if (raise_guest_exception( status, &params )) continue;
         if (status) fail( status );
         status = wine_nx_wow64_dispatch_gate( params.context, &gates, &host, NULL );
         if (status) fail( status );

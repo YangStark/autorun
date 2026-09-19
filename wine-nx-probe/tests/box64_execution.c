@@ -41,8 +41,14 @@ void __libnx_exception_handler( ThreadExceptionDump *ctx )
     unsigned int exception_class = ctx->esr >> 26;
     if ((exception_class == 0x24 || exception_class == 0x25) && !(ctx->esr & (1u << 10)))
     {
+        unsigned long long x[31];
+        unsigned int i;
+
+        for (i = 0; i < 29; i++) x[i] = ctx->cpu_gprs[i].x;
+        x[29] = ctx->fp.x;
+        x[30] = ctx->lr.x;
         ++native_faults;
-        wine_nx_box64_handle_fault( ctx->far.x );
+        wine_nx_box64_handle_fault( ctx->far.x, (ctx->esr >> 6) & 1, ctx->pc.x, x );
     }
     printf( "Unexpected native exception esr=%#x pc=%#llx far=%#llx\n", ctx->esr,
             (unsigned long long)ctx->pc.x, (unsigned long long)ctx->far.x );
@@ -81,9 +87,14 @@ static int protect_fault_page( BOOL accessible )
 #else
 static void operand_fault_handler( int signal, siginfo_t *info, void *context )
 {
-    (void)context;
+    ucontext_t *uc = context;
+    unsigned long long x[31];
+    unsigned int i;
+
+    for (i = 0; i < 31; i++) x[i] = uc->uc_mcontext.regs[i];
     ++native_faults;
-    wine_nx_box64_handle_fault( (ULONG_PTR)info->si_addr );
+    /* The access kind is Horizon's to read from ESR; the host passes a read. */
+    wine_nx_box64_handle_fault( (ULONG_PTR)info->si_addr, 0, uc->uc_mcontext.pc, x );
     _Exit( 128 + signal ); /* Never consume a fault outside an active guest run. */
 }
 
@@ -677,8 +688,11 @@ int main(void)
     }
 #endif
 #endif
-    /* A unix call that replaces the whole context (NtContinue from a callback):
-     * the run goes on from the new context, keeping its Eax. */
+    /* A unix call that replaces the whole context -- wow64 puts the program's
+     * context back after a callback: the run goes on from that context with
+     * the call's result in Eax, as wow64cpu's unix_call_32to64 stores it. A
+     * context that keeps its own Eax comes back through NtContinue, which
+     * returns it (check_wow64_box64_bridge). */
     {
         const struct wine_nx_wow64_host replacing_host = {read_guest, native_call, native_unix_call, replaced_once};
         unsigned int calls_before = f.calls;
@@ -688,12 +702,20 @@ int main(void)
         assert( !wine_nx_box64_run( &context, BASE + 0x3000, &f.gates, &replacing_host, &f,
                                    BASE + 0x8020, 100, &executed ) );
         assert( !replace_context_once && f.calls == calls_before + 1 );
-        assert( context.Eip == BASE + 0x8020 && context.Esp == BASE + 0x6000 && context.Eax == 0x1234 );
+        assert( context.Eip == BASE + 0x8020 && context.Esp == BASE + 0x6000 );
+        assert( context.Eax == (ULONG)STATUS_INVALID_HANDLE );
     }
 
-    /* Instruction-fetch failures are reported without dereferencing the PC. */
+    /* Instruction-fetch failures are reported without dereferencing the PC,
+     * as an execute fault at the address fetched. */
     init_context( &context, BASE - 1, BASE + 0x6000 );
     assert( wine_nx_box64_run( &context, 0, &f.gates, &host, &f, 0, 10, &executed ) == STATUS_ACCESS_VIOLATION );
+    {
+        ULONG address, access;
+
+        wine_nx_box64_last_fault( &address, &access );
+        assert( address == BASE - 1 && access == 8 );
+    }
 
     /* Compilation may inspect a path the guest never takes. The conditional
      * jump skips prefixes ending at an inaccessible page; a compiler fault
@@ -728,7 +750,7 @@ int main(void)
             {0xf0,0x01,0x05,0,0xf0,0,0x10},  /* lock add [protected], eax */
         };
         unsigned int i;
-        assert( !wine_nx_box64_handle_fault( BASE + SIZE - 0x1000 ) );
+        assert( !wine_nx_box64_handle_fault( BASE + SIZE - 0x1000, 0, 0, NULL ) );
         for (i = 0; i < sizeof(fault_programs) / sizeof(fault_programs[0]); ++i)
         {
             put_code( memory, 0x200, fault_programs[i], sizeof(fault_programs[i]) );
@@ -737,6 +759,31 @@ int main(void)
                                        &executed ) == STATUS_ACCESS_VIOLATION );
             assert( COUNT_IS(executed, 1) && context.Eip == BASE + 0x200 );
         }
+    }
+    /* A fault after other instructions of the same block, as The Sims 2's
+     * SEH probe: the guest's handlers see the faulting instruction and the
+     * registers as the instructions before it left them. */
+    {
+        static const unsigned char probe[] = {
+            0xbb,0x34,0x12,0,0,              /* mov ebx,0x1234 */
+            0xb9,0x78,0x56,0,0,              /* mov ecx,0x5678 */
+            0x01,0xcb,                       /* add ebx,ecx */
+            0xa1,0,0xf0,0,0x10,              /* mov eax,[protected] */
+        };
+        ULONG address, access;
+
+        put_code( memory, 0x200, probe, sizeof(probe) );
+        init_context( &context, BASE + 0x200, BASE + 0x6000 );
+        context.Eax = 0x55;
+        assert( wine_nx_box64_run( &context, 0, &f.gates, &host, &f, 0, 10,
+                                   &executed ) == STATUS_ACCESS_VIOLATION );
+        printf( "fault after a block: eip=%08x ebx=%08x ecx=%08x eax=%08x esp=%08x\n", (unsigned)context.Eip,
+                (unsigned)context.Ebx, (unsigned)context.Ecx, (unsigned)context.Eax, (unsigned)context.Esp );
+        assert( context.Eip == BASE + 0x20c );
+        assert( context.Ebx == 0x68ac && context.Ecx == 0x5678 && context.Eax == 0x55 );
+        assert( context.Esp == BASE + 0x6000 );
+        wine_nx_box64_last_fault( &address, &access );
+        assert( address == BASE + SIZE - 0x1000 && access == 0 );
     }
     /* Valid opcode, inaccessible immediate: the raw decoder also unwinds. */
     memory[SIZE - 0x1001] = 0xb8;
@@ -747,9 +794,9 @@ int main(void)
 #ifdef WINE_NX_BOX64_DYNAREC
     /* The inaccessible immediate faults in compilation, then in the fallback
      * interpreter. Only that second fault is a guest access violation. */
-    assert( native_faults == faults_before_operands + 6 );
+    assert( native_faults == faults_before_operands + 7 );
 #else
-    assert( native_faults == faults_before_operands + 5 );
+    assert( native_faults == faults_before_operands + 6 );
 #endif
     assert( !protect_fault_page( TRUE ) );
     {

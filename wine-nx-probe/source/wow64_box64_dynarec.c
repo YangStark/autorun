@@ -387,6 +387,10 @@ static void init_box64_env(void)
      * would return into a stale translation. */
     box64env.dynarec_callret = 2;
     box64env.dynarec_wait = 1; /* tracked lock ownership for translation faults */
+    /* A division by zero raises EXCEPTION_INT_DIVIDE_BY_ZERO, which programs
+     * catch, instead of the 0 ARM64's UDIV gives: one compare next to a slow
+     * division. The interpreter always checks. */
+    box64env.dynarec_div0 = 1;
     apply_box64_options();
 }
 
