@@ -20,10 +20,12 @@
  *   program holds it, and without one it is 1, English (United States); the
  *   numbers are in the readme.
  * - vidc.VP60 and vidc.VP61 under Drivers32, which is what the release's
- *   vp6.reg holds: the game's movies are VP6, a codec nobody else has to give
- *   away, and Video for Windows finds it by those two names. The DLL itself is
- *   the release's to copy, and the readme says from where; registering a codec
- *   that is not there costs nothing, since a movie is all that wants it.
+ *   vp6.reg holds. Not for the game's own movies, which are Maxis' own format
+ *   and want no codec, but for the video it writes: it records gameplay
+ *   through Video for Windows, which finds a codec by those two names, and
+ *   reads a custom video made as a VP6 AVI the same way. The DLL is the
+ *   release's to copy, nobody else having it to give away, and registering a
+ *   codec that is not there costs nothing.
  *
  * Each step is reported to wine-nx-runtime.log as a [SIMS2 SETUP] line; the
  * exit code is 0 when every step worked. Running it again is harmless. */

@@ -163,11 +163,17 @@ did in wine-nx-runtime.log as [SIMS2 SETUP] lines. Running it again is harmless.
 The game is then C:\\The Sims 2\\EP9\\TSBin\\Sims2EP9.exe, which is the one
 executable the collection has; it relocates, so it needs no forwarder.
 
-The movies are VP6, a codec that is the release's to supply and nobody else's to
-give away: copy __Installer\\customcomponent\\vp6\\vp6vfw.dll into
-C:\\windows\\syswow64 on the card. The setup registers it under both the names
-Video for Windows opens it by, whether or not it is there; without it the game
-runs and its movies do not.
+The game's own movies -- the intro, the EA logo, what plays on a television --
+are .movie files in Maxis' own format, which the game reads itself: they need no
+codec and nothing registered.
+
+VP6 is for the video the game writes rather than the video it reads. It records
+gameplay through Video for Windows (AVIStreamWrite and ICSeqCompressFrame are
+what Sims2EP9.exe imports), and a custom video made as a VP6 AVI is read the
+same way. The codec is the release's to supply and nobody else's to give away:
+copy __Installer\\customcomponent\\vp6\\vp6vfw.dll into C:\\windows\\syswow64 on
+the card if you want either. The setup registers it under both the names Video
+for Windows opens it by, whether or not the file is there.
 
 For a language other than English, put its number in language.txt beside
 sims2-setup.exe before running it:
