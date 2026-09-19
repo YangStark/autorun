@@ -22,8 +22,8 @@ Verified on hardware:
 | Wine Notepad (x86) | Menus, dialogs, fonts and the controller cursor work. |
 | OpenTTD 15.3 (x86) | Runs at up to 60 fps with OpenGL, with sound effects. |
 | Quake III Arena (Quake3e, x86) | The demo runs at about 37 fps at 1280x720 with OpenGL. |
-| WarCraft III (x86) | In game at 24–34 fps with its OpenGL renderer, menus at about 50 fps; the intro movie plays through DirectShow. |
-| Need for Speed Underground 2 | In game with sound and the controller (NFSU-XtendedInput). With wined3d, races run at roughly 20–45 fps at default detail with the CPU overclocked. With DXVK, races load and run. |
+| WarCraft III (x86) | In game at 24-34 fps with its OpenGL renderer, menus at about 50 fps; the intro movie plays through DirectShow. |
+| Need for Speed Underground 2 | In game with sound and the controller (NFSU-XtendedInput). With wined3d, races run at roughly 20-45 fps at default detail with the CPU overclocked. With DXVK, races load and run. |
 | Halo: Combat Evolved | Plays at about 30 fps under a 32-bit (no alias) forwarder. |
 | Left 4 Dead 2 | Reaches the main menu. |
 | Direct3D 9 test | Draws and reads every frame back: about 55 fps through wined3d, 58 fps through DXVK. |
