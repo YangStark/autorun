@@ -2,10 +2,14 @@
 """Exercise the AMD64 package dependency closure without running packaging."""
 import ast
 import functools
+import json
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
+import shutil
 import tempfile
 from types import SimpleNamespace
+from zipfile import ZipFile
 
 
 root = Path(__file__).resolve().parents[2]
@@ -13,6 +17,13 @@ package = root / 'wine-nx-probe/tools/package-amd64.py'
 selected = {'module_name', 'apiset', 'import_host', 'coff_blocks', 'imports', 'forwarders',
             'stage_closure', 'validate_external_imports'}
 tree = ast.parse(package.read_text(), filename=str(package))
+game_runtime = next(ast.literal_eval(node.value) for node in tree.body
+                    if isinstance(node, ast.Assign) and
+                    any(isinstance(target, ast.Name) and target.id == 'game_runtime' for target in node.targets))
+assert set(game_runtime) == {
+    'dwmapi', 'msvcp140', 'normaliz', 'powrprof', 'vcruntime140', 'wldap32',
+    'x3daudio1_7', 'xapofx1_5',
+}
 helpers = ast.Module(body=[node for node in tree.body
                            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in selected],
                      type_ignores=[])
@@ -282,3 +293,41 @@ with tempfile.TemporaryDirectory(prefix='wine-nx-package-dxvk-') as temp:
 
 print('PASS: DXVK normal/delayed imports, API sets, ordinal and ARM64EC forwarded exports; '
       'missing symbols/modules and forwarder cycles are rejected')
+
+autorun = root / 'wine-nx-probe/tools/package-autorun.py'
+autorun_tree = ast.parse(autorun.read_text(), filename=str(autorun))
+merge = next(node for node in autorun_tree.body
+             if isinstance(node, ast.FunctionDef) and node.name == 'merge_amd64')
+helpers = ast.Module(body=[merge], type_ignores=[])
+ast.fix_missing_locations(helpers)
+autorun_namespace = {
+    'PurePosixPath': PurePosixPath,
+    'ZipFile': ZipFile,
+    'json': json,
+    're': re,
+    'shutil': shutil,
+}
+exec(compile(helpers, str(autorun), 'exec'), autorun_namespace)
+
+with tempfile.TemporaryDirectory(prefix='autorun-amd64-merge-') as temp:
+    temp = Path(temp)
+    stage = temp / 'stage'
+    runtime = stage / 'switch/wine'
+    runtime.mkdir(parents=True)
+    for name in ('run-entry.txt', 'target.txt', 'vulkan-probe.txt'):
+        (runtime / name).write_text('keep\n')
+    archive = temp / 'amd64.zip'
+    manifest = {'features': {name: True for name in
+                ('amd64', 'dynarec', 'vulkan', 'dxvk', 'vkd3d', 'lsfg')}}
+    with ZipFile(archive, 'w') as z:
+        z.writestr('switch/wine/build-manifest.json', json.dumps(manifest))
+        z.writestr('switch/wine/wine-nx-runtime.nro', b'NRO0 nx-amd64-box64-3\0')
+        z.writestr('switch/wine/drive_c/windows/system32/winebox64ec.dll', b'cpu')
+        z.writestr('switch/wine/drive_c/dxvk64/dxgi.dll', b'dxvk')
+        z.writestr('switch/wine/drive_c/vkd3d64/d3d12.dll', b'vkd3d')
+    assert autorun_namespace['merge_amd64'](archive, stage) == '3'
+    assert (runtime / 'drive_c/dxvk64/dxgi.dll').read_bytes() == b'dxvk'
+    for name in ('run-entry.txt', 'target.txt', 'vulkan-probe.txt'):
+        assert (runtime / name).read_text() == 'keep\n'
+
+print('PASS: the Autorun package merges the complete AMD64 graphics runtime without replacing package settings')

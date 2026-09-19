@@ -224,6 +224,10 @@ def validate_external_imports(paths, modules):
                     raise ValueError(f'{path.name}: {error}') from error
 
 
+game_runtime = (
+    'dwmapi', 'msvcp140', 'normaliz', 'powrprof', 'vcruntime140', 'wldap32',
+    'x3daudio1_7', 'xapofx1_5',
+)
 common = 'ntdll kernel32 kernelbase msvcrt ucrtbase advapi32 sechost'.split()
 dxvk_paths = [args.dxvk / name for name in DXVK_DLLS] if args.dxvk else []
 if args.vulkan:
@@ -234,6 +238,7 @@ if not args.minimal:
                'dsound opengl32 wined3d d3d9 d3d11 dxgi dinput8 xinput1_3 xinput1_4 '
                'xinput9_1_0 dbghelp windowscodecs '
                'd3dx9_38 d3dx9_43 winhttp oleacc wsock32 psapi').split()
+    common += game_runtime
 native_seeds = common + ['winebox64', 'winebox64ec', 'wow64', 'wow64win', 'apisetschema']
 if args.dxvk:
     native_seeds += ['d3d10', 'd3d10_1', 'd3dcompiler_43', 'd3dcompiler_47']
