@@ -139,10 +139,31 @@ assert 'Arch: i386\n' in readobj('--file-headers', apc_test)
 
 # The launcher lists every program in drive_c; target.txt only preselects one.
 (stage / 'target.txt').write_text('sdmc:/switch/wine/drive_c/WarCraft III Setup/war3-setup.exe\n')
-(stage / 'run-entry.txt').write_text('1\n')
+# Everything a person sets, in one file, where a dozen loose toggles were.
+config = stage / 'config'
+config.mkdir(parents=True, exist_ok=True)
+(config / 'settings.json').write_text('''{
+  "run-the-chosen-program": true,
+  "verbose-log": false,
+  "profiler": false,
+  "core-balancing": true,
+  "display-devices": true,
+  "windows-through-opengl": true,
+  "vulkan-probe": false,
+  "reopen-the-launcher-on-exit": false,
+  "hand-the-process-back-anyway": false,
+  "gl-pinned-buffers-cached": true,
+  "gl-clean-before-submit": true,
+  "gl-clean-test": false
+}
+''')
+for gone in ('run-entry.txt', 'verbose.txt', 'profile.txt', 'framebuffer.txt', 'no-balance.txt',
+             'no-display-devices.txt', 'vulkan-probe.txt', 'reload-launcher.txt', 'loader-anyway.txt',
+             'gl-uncached.txt', 'gl-noclean.txt', 'gl-clean-test.txt'):
+    (stage / gone).unlink(missing_ok=True)
 # The controller stands in for a keyboard; this lists what each control sends
 # and how to change it, with every line commented out so the defaults hold.
-(stage / 'keys.txt').write_text('''# Keys the controller sends, one NAME=code line each, where code is a Windows
+(config / 'keys.txt').write_text('''# Keys the controller sends, one NAME=code line each, where code is a Windows
 # virtual-key code in decimal or 0x form. Remove the # to change one. A and B
 # are not here: they stay the left and right mouse buttons.
 #
@@ -231,6 +252,17 @@ whole screen while it draws; the windows come back when it stops. The log shows
 "[INIT] windows shown by the OpenGL compositor" and "[NXCOMP]" lines. If windows
 do not show or look wrong, put a file switch/wine/framebuffer.txt containing 1
 on the SD card to go back to the framebuffer.
+
+Settings: switch/wine/config/settings.json holds every one of them, and
+config/keys.txt the keys the controller sends. Both are set from the launcher --
+Settings, Defaults, Controls for the keys everything sends, and a program's own
+Controls row for the keys it alone sends -- so neither has to be written by
+hand; left and right change a control, A opens the whole list of keys, Y puts
+one back to its default. A card written by an earlier
+build has them loose beside the launcher -- verbose.txt, framebuffer.txt,
+no-balance.txt and the rest -- and the first run moves each into settings.json
+and takes the file away, saying so in the log. A setting a newer build added is
+kept when an older one writes the file back.
 
 wine-nx-runtime.log holds the run. Its [PROGRESS] lines report OpenGL frames,
 the time in eglSwapBuffers and in opengl32 calls, the megabytes Wine copies for

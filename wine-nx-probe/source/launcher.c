@@ -39,6 +39,7 @@
 #include "launcher_icons.h"
 #include "launcher_list.h"
 #include "launcher_pe.h"
+#include "key_names.h"
 #include "launcher_settings.h"
 #include "launcher_ui.h"
 #include "steamgriddb.h"
@@ -304,6 +305,20 @@ static int file_exists( const char *path )
 static void runtime_file( const struct launcher *l, const char *name, char *out, size_t size )
 {
     snprintf( out, size, "%s/%s", l->options->runtime_dir, name );
+}
+
+/* The key map everything shares. It lives in the config folder; a card written
+ * by an earlier build has it beside the launcher, and the runtime reads that
+ * one too. Returns whether either is there, with the path of the one to show. */
+static void controls_screen( struct launcher *l, const char *path, const char *under_path,
+                             const char *title );
+
+static int shared_keys( const struct launcher *l, char *out, size_t size )
+{
+    runtime_file( l, "config/keys.txt", out, size );
+    if (file_exists( out )) return 1;
+    runtime_file( l, "keys.txt", out, size );
+    return file_exists( out );
 }
 
 /* Nonzero when the line reached the card, which the handoff in start_program
@@ -2041,15 +2056,12 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
         }
 
         ADD_ROW( ROW_CONTROLS, SECTION_DIAGNOSTICS, "Controls",
-                 "Keys the controller presses: NAME.keys.txt next to the program, applied over the "
-                 "shared keys.txt, one NAME=code line each." );
+                 "The keys this program's controls send, over the ones everything else sends." );
         if (launcher_keys_path( p->path, path, sizeof(path) ) && file_exists( path ))
-            snprintf( row->value, sizeof(row->value), "%s", file_name( path ) );
+            snprintf( row->value, sizeof(row->value), "Its own" );
         else
-        {
-            runtime_file( l, "keys.txt", path, sizeof(path) );
-            snprintf( row->value, sizeof(row->value), "%s", file_exists( path ) ? "keys.txt" : "Default" );
-        }
+            snprintf( row->value, sizeof(row->value), "%s",
+                      shared_keys( l, path, sizeof(path) ) ? "Shared" : "Default" );
 
         if (x86)
         {
@@ -2177,11 +2189,15 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
         case ROW_CONTROLS:
             if (action != UI_ACTION_CHOOSE) break;
-            if (!launcher_keys_path( p->path, path, sizeof(path) ) || !file_exists( path ))
-                runtime_file( l, "keys.txt", path, sizeof(path) );
-            show_file( l, "Controls", path,
-                       "No keys.txt: the controller uses the default keys. Put NAME=code lines in "
-                       "NAME.keys.txt next to the program to change them." );
+            if (launcher_keys_path( p->path, path, sizeof(path) ))
+            {
+                char under[512];
+
+                /* What this program alone sends, over what everything does. */
+                shared_keys( l, under, sizeof(under) );
+                controls_screen( l, path, under, "Controls" );
+                ui_start_screen( &l->ui );
+            }
             break;
 
         case ROW_BOX64:
@@ -2237,8 +2253,8 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
 enum settings_row
 {
-    SET_HIDDEN, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_STEAMGRIDDB,
-    SET_FORWARDER, SET_MAKE_32BIT, SET_MAKE_MAIN,
+    SET_HIDDEN, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_CONTROLS, SET_STEAMGRIDDB,
+    SET_REOPEN, SET_FORWARDER, SET_MAKE_32BIT, SET_MAKE_MAIN,
     SET_CREDITS, SETTINGS_ROWS
 };
 
@@ -2353,6 +2369,148 @@ static const struct { const char *name, *value, *help; } credits[] =
 };
 #define CREDIT_COUNT (sizeof(credits) / sizeof(credits[0]))
 
+/* The keys a controller sends, as a screen rather than a file to be written by
+ * hand. One row for each control, the key it sends beside it; left and right
+ * step through the keys, A opens the whole list, and Y puts a control back to
+ * what it sends with no line of its own.
+ *
+ * What is written is the same keys.txt the runtime has always read -- a
+ * NAME=code line for each control that differs -- so a file written here can
+ * still be edited on a computer, and one edited there opens here. */
+static unsigned short control_key( const struct launcher_kv *keys, const struct launcher_kv *under,
+                                   int control )
+{
+    const char *name = wine_nx_controls[control].name;
+    char value[64];
+
+    if (launcher_kv_get( keys, name, value, sizeof(value) ) && value[0])
+        return (unsigned short)strtoul( value, NULL, 0 );
+    /* A program's own keys are applied over the shared ones, so a control the
+     * program says nothing about shows what the shared file gives it. */
+    if (under && launcher_kv_get( under, name, value, sizeof(value) ) && value[0])
+        return (unsigned short)strtoul( value, NULL, 0 );
+    return wine_nx_controls[control].sends;
+}
+
+static void set_control_key( struct launcher_kv *keys, int control, int code )
+{
+    char value[32];
+
+    /* Back to the default is the line taken away, not a line saying the
+     * default: a later build that changes what a control sends should reach a
+     * controller nobody has touched. */
+    if (code < 0) launcher_kv_set( keys, wine_nx_controls[control].name, NULL );
+    else
+    {
+        snprintf( value, sizeof(value), "0x%02x", code );
+        launcher_kv_set( keys, wine_nx_controls[control].name, value );
+    }
+}
+
+/* The whole list of keys, starting on the one the control sends now. Returns
+ * the code chosen, or -1 for the way out. */
+static int key_screen( struct launcher *l, const char *control_label, unsigned short current )
+{
+    static struct ui_row rows[WINE_NX_KEY_NAME_COUNT];
+    struct ui_list list = {0};
+    char title[128];
+    int i, at = wine_nx_key_index( current );
+
+    memset( rows, 0, sizeof(rows) );
+    for (i = 0; i < WINE_NX_KEY_NAME_COUNT; i++)
+    {
+        snprintf( rows[i].label, sizeof(rows[i].label), "%s", wine_nx_key_names[i].name );
+        if (wine_nx_key_names[i].code)
+            snprintf( rows[i].value, sizeof(rows[i].value), "0x%02x", wine_nx_key_names[i].code );
+    }
+    snprintf( title, sizeof(title), "%s sends", control_label );
+    list.selection = at > 0 ? at : 0;
+    for (;;)
+    {
+        enum ui_action action = ui_list_run( &l->ui, &list, title, "Controls", rows,
+                                             WINE_NX_KEY_NAME_COUNT, 0 );
+
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return -1;
+        if (action == UI_ACTION_CHOOSE) return wine_nx_key_names[list.selection].code;
+    }
+}
+
+static void controls_screen( struct launcher *l, const char *path, const char *under_path,
+                             const char *title )
+{
+    struct ui_row rows[WINE_NX_CONTROL_COUNT];
+    struct launcher_kv keys, under;
+    struct ui_list list = {0};
+    int changed = 0, i;
+
+    if (under_path) launcher_kv_load( &under, under_path );
+    if (!launcher_kv_load( &keys, path ))
+    {
+        ui_message( &l->ui, "Controls", "That file is too large to open here; edit it on a computer." );
+        ui_start_screen( &l->ui );
+        return;
+    }
+    for (;;)
+    {
+        enum ui_action action;
+        char label[64];
+        unsigned short code;
+
+        memset( rows, 0, sizeof(rows) );
+        for (i = 0; i < WINE_NX_CONTROL_COUNT; i++)
+        {
+            snprintf( rows[i].label, sizeof(rows[i].label), "%s", wine_nx_controls[i].label );
+            snprintf( rows[i].value, sizeof(rows[i].value), "%s",
+                      wine_nx_key_label( i, control_key( &keys, under_path ? &under : NULL, i ),
+                                         label, sizeof(label) ) );
+            rows[i].adjustable = 1;
+            rows[i].kind = UI_ROW_VALUE;
+        }
+        rows[0].help = "A and B are the mouse buttons until they are given a key of their own.";
+        rows[16].help = "The left stick steers with the d-pad until it is given keys of its own.";
+        action = ui_list_run( &l->ui, &list, title, "Controls", rows, WINE_NX_CONTROL_COUNT, 1 );
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) break;
+        i = list.selection;
+        code = control_key( &keys, under_path ? &under : NULL, i );
+        switch (action)
+        {
+        case UI_ACTION_CHOOSE:
+        {
+            int picked = key_screen( l, wine_nx_controls[i].label, code );
+
+            ui_start_screen( &l->ui );
+            if (picked >= 0 && picked != code) { set_control_key( &keys, i, picked ); changed = 1; }
+            break;
+        }
+        case UI_ACTION_LEFT:
+        case UI_ACTION_RIGHT:
+        {
+            int at = wine_nx_key_index( code );
+
+            /* A code the list does not name steps from the start rather than
+             * nowhere, so a hand-written file can be changed here too. */
+            if (at < 0) at = 0;
+            else at += action == UI_ACTION_RIGHT ? 1 : -1;
+            if (at < 0) at = WINE_NX_KEY_NAME_COUNT - 1;
+            if (at >= WINE_NX_KEY_NAME_COUNT) at = 0;
+            set_control_key( &keys, i, wine_nx_key_names[at].code );
+            changed = 1;
+            break;
+        }
+        case UI_ACTION_RESET:
+            set_control_key( &keys, i, -1 );
+            changed = 1;
+            break;
+        default: break;
+        }
+    }
+    if (changed && !launcher_kv_save( &keys, path ))
+    {
+        ui_message( &l->ui, "Controls", "The keys could not be saved to the card." );
+        ui_start_screen( &l->ui );
+    }
+}
+
 static void credits_screen( struct launcher *l )
 {
     struct ui_row rows[CREDIT_COUNT];
@@ -2400,8 +2558,9 @@ static void settings_menu( struct launcher *l )
         {
             [SET_HIDDEN] = SET_SECTION_LIBRARY,
             [SET_VERBOSE] = SET_SECTION_DEFAULTS, [SET_PROFILE] = SET_SECTION_DEFAULTS,
-            [SET_WINDOWS] = SET_SECTION_DEFAULTS,
+            [SET_WINDOWS] = SET_SECTION_DEFAULTS, [SET_CONTROLS] = SET_SECTION_DEFAULTS,
             [SET_STEAMGRIDDB] = SET_SECTION_ARTWORK,
+            [SET_REOPEN] = SET_SECTION_SYSTEM,
             [SET_FORWARDER] = SET_SECTION_SYSTEM, [SET_MAKE_32BIT] = SET_SECTION_SYSTEM,
             [SET_MAKE_MAIN] = SET_SECTION_SYSTEM,
             [SET_CREDITS] = SET_SECTION_SYSTEM,
@@ -2423,22 +2582,32 @@ static void settings_menu( struct launcher *l )
         snprintf( rows[SET_VERBOSE].value, sizeof(rows[0].value), "%s", on_off[!!l->options->verbose] );
         rows[SET_VERBOSE].kind = UI_ROW_SWITCH;
         rows[SET_VERBOSE].on = !!l->options->verbose;
-        rows[SET_VERBOSE].help = "verbose.txt: Wine's traces go to wine-nx-runtime.log for every program without its own setting.";
+        rows[SET_VERBOSE].help = "Wine's traces go to wine-nx-runtime.log for every program without its own setting.";
         snprintf( rows[SET_PROFILE].label, sizeof(rows[0].label), "Profiler" );
         snprintf( rows[SET_PROFILE].value, sizeof(rows[0].value), "%s", on_off[!!l->options->profile] );
         rows[SET_PROFILE].kind = UI_ROW_SWITCH;
         rows[SET_PROFILE].on = !!l->options->profile;
-        rows[SET_PROFILE].help = "profile.txt: [PROF] lines with where each thread spends its time.";
+        rows[SET_PROFILE].help = "[PROF] lines with where each thread spends its time.";
         snprintf( rows[SET_WINDOWS].label, sizeof(rows[0].label), "Windows shown by" );
         snprintf( rows[SET_WINDOWS].value, sizeof(rows[0].value), "%s",
                   l->options->framebuffer ? "Framebuffer" : "Compositor" );
-        rows[SET_WINDOWS].help = "framebuffer.txt: the framebuffer copies window pixels straight to the screen, "
+        rows[SET_WINDOWS].help = "The framebuffer copies window pixels straight to the screen, "
                                  "for when the OpenGL compositor misbehaves.";
+        snprintf( rows[SET_CONTROLS].label, sizeof(rows[0].label), "Controls" );
+        snprintf( rows[SET_CONTROLS].value, sizeof(rows[0].value), "%s",
+                  shared_keys( l, path, sizeof(path) ) ? "Set" : "Default" );
+        rows[SET_CONTROLS].help = "The keys every program's controls send, unless the program has its own.";
         snprintf( rows[SET_STEAMGRIDDB].label, sizeof(rows[0].label), "SteamGridDB API key" );
         snprintf( rows[SET_STEAMGRIDDB].value, sizeof(rows[0].value), "%s",
                   launcher_kv_get( &l->look, "steamgriddb-key", path, sizeof(path) ) && path[0] ? "Configured" : "Not set" );
         rows[SET_STEAMGRIDDB].help = "Used to automatically download the community's highest-rated square, portrait and hero artwork.";
         rows[SET_STEAMGRIDDB].adjustable = 0;
+        snprintf( rows[SET_REOPEN].label, sizeof(rows[0].label), "Return here when a program ends" );
+        snprintf( rows[SET_REOPEN].value, sizeof(rows[0].value), "%s", on_off[!!l->options->reopen_launcher] );
+        rows[SET_REOPEN].kind = UI_ROW_SWITCH;
+        rows[SET_REOPEN].on = !!l->options->reopen_launcher;
+        rows[SET_REOPEN].help = "Autorun starts itself again instead of closing to the HOME menu. "
+                                "A forwarder made by sphaira cannot do it and stops the console.";
         snprintf( rows[SET_FORWARDER].label, sizeof(rows[0].label), "32-bit forwarder" );
         {
             char name[128];
@@ -2491,20 +2660,19 @@ static void settings_menu( struct launcher *l )
         switch (i)
         {
         case SET_HIDDEN: l->show_hidden = !l->show_hidden; break;
-        case SET_VERBOSE:
-            l->options->verbose = !l->options->verbose;
-            runtime_file( l, "verbose.txt", path, sizeof(path) );
-            write_line( path, l->options->verbose ? "1" : "0" );
-            break;
-        case SET_PROFILE:
-            l->options->profile = !l->options->profile;
-            runtime_file( l, "profile.txt", path, sizeof(path) );
-            write_line( path, l->options->profile ? "1" : "0" );
-            break;
-        case SET_WINDOWS:
-            l->options->framebuffer = !l->options->framebuffer;
-            runtime_file( l, "framebuffer.txt", path, sizeof(path) );
-            write_line( path, l->options->framebuffer ? "1" : "0" );
+        /* The runtime keeps these: it owns the settings file and writes every
+         * one of them at once when the launcher closes. */
+        case SET_VERBOSE: l->options->verbose = !l->options->verbose; break;
+        case SET_PROFILE: l->options->profile = !l->options->profile; break;
+        case SET_WINDOWS: l->options->framebuffer = !l->options->framebuffer; break;
+        case SET_REOPEN: l->options->reopen_launcher = !l->options->reopen_launcher; break;
+        case SET_CONTROLS:
+            if (action != UI_ACTION_CHOOSE) break;
+            /* Written where the runtime looks first, whichever of the two the
+             * card has now. */
+            runtime_file( l, "config/keys.txt", path, sizeof(path) );
+            controls_screen( l, path, NULL, "Controls" );
+            ui_start_screen( ui );
             break;
         case SET_STEAMGRIDDB:
         {

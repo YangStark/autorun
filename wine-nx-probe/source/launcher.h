@@ -18,7 +18,7 @@ struct wine_nx_launcher_title
 
 struct wine_nx_launcher_options
 {
-    const char *runtime_dir;   /* sdmc:/switch/wine: target.txt, args.txt, verbose.txt... */
+    const char *runtime_dir;   /* sdmc:/switch/wine: target.txt, args.txt, config/settings.json... */
     const char *nro_path;      /* this program's own NRO, which a forwarder starts */
     /* Which of the two system memories the console booted from: 1 an emuMMC,
      * 0 the real one, -1 when Atmosphere did not say. */
@@ -45,10 +45,12 @@ struct wine_nx_launcher_options
     /* Build a forwarder for this program and install it. bits is 32 or 36;
      * returns 0, leaving step pointing at what failed otherwise. */
     unsigned int (*install_forwarder)( int bits, const char *name, unsigned long long *id, const char **step );
-    /* The global settings on entry, as the user left them on return. */
+    /* The global settings on entry, as the user left them on return. The
+     * runtime keeps them; the launcher only says what they became. */
     int verbose;
     int profile;
     int framebuffer;
+    int reopen_launcher;  /* come back here when a program ends, rather than to the menu */
 };
 
 /* Show the launcher. Returns 1 with the chosen program's path in target, or 0

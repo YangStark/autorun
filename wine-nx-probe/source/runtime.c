@@ -26,6 +26,7 @@
 #include "forwarder.h"
 #include "launcher_list.h"
 #include "launcher_settings.h"
+#include "config_json.h"
 #include "pointer_cursor.h"
 #include "compositor.h"
 #include "std_stream_lines.h"
@@ -50,9 +51,12 @@ u32 __nx_exception_ignoredebug = 1;
 #define WINE_DRIVE_C WINE_ROOT "/drive_c"
 #define WINE_SYSTEM_DIR WINE_DRIVE_C "/windows/system32"
 #define RUNTIME_DIR WINE_ROOT
+/* Everything a person sets, in one place. */
+#define CONFIG_DIR  RUNTIME_DIR "/config"
+#define CONFIG_FILE CONFIG_DIR "/settings.json"
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-211"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-212"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -1249,6 +1253,39 @@ static int read_bool_file( const char *path )
     if (!read_first_line( path, line, sizeof(line) )) return 0;
     return !strcmp( line, "1" ) || !strcasecmp( line, "true" ) ||
            !strcasecmp( line, "yes" ) || !strcasecmp( line, "run" );
+}
+
+static struct wine_nx_config runtime_config;
+static int runtime_config_moved;  /* a setting was found in the file it used to be */
+/* Read at the start, wanted on the way out, when the card may be busy. */
+static int runtime_loader_anyway, runtime_reopen_launcher;
+
+/* A setting, with the file it used to be for a card written by an earlier
+ * build. The file is read only when the settings file has nothing to say, and
+ * what it said is written into the settings file and the file itself taken
+ * away: a card is moved over once and is tidy afterwards. A name here says
+ * what it turns on, where half the files said what they turned off, so `flip`
+ * marks the ones whose answer is the other way round. */
+static int config_bool( const char *key, int fallback, const char *was, int flip )
+{
+    char path[512];
+
+    if (wine_nx_config_find( &runtime_config, key ) >= 0)
+        return wine_nx_config_bool( &runtime_config, key, fallback );
+    snprintf( path, sizeof(path), "%s/%s", RUNTIME_DIR, was );
+    if (!access( path, F_OK ))
+    {
+        int value = read_bool_file( path );
+
+        if (flip) value = !value;
+        wine_nx_config_set_bool( &runtime_config, key, value );
+        runtime_config_moved = 1;
+        remove( path );
+        log_line( "[CONFIG] %s moved into settings.json as %s: %s", was, key, value ? "true" : "false" );
+        return value;
+    }
+    wine_nx_config_set_bool( &runtime_config, key, fallback );
+    return fallback;
 }
 
 /* switch/wine/keys.txt: one NAME=code line for each control whose key should
@@ -2773,7 +2810,7 @@ static int return_to_launcher( void )
          * reason enough not to go that way, and the log says which. With
          * switch/wine/loader-anyway.txt the loader is handed the process as it
          * is, to find out what it will still take. */
-        if (mine && !read_bool_file( RUNTIME_DIR "/loader-anyway.txt" ))
+        if (mine && !runtime_loader_anyway)
         {
             log_step( "pages are still lent out; the loader must not take the process back" );
             log_memory_map( "exit" );
@@ -2795,7 +2832,7 @@ static int return_to_launcher( void )
      * Otherwise: close the application the way the HOME menu does, through
      * libnx's applet exit. The console goes back to the menu with no error, and
      * the launcher is one press away. */
-    if (!still_lent && read_bool_file( RUNTIME_DIR "/reload-launcher.txt" ) &&
+    if (!still_lent && runtime_reopen_launcher &&
         envHasNextLoad() && own_nro[0] && R_SUCCEEDED( envSetNextLoad( own_nro, own_nro ) ))
     {
         log_step( "starting this program again for the launcher" );
@@ -3011,37 +3048,46 @@ int main( int argc, char **argv )
     wine_nx_runtime_network_init();
     log_lent_memory( "the network" );
 
-    autorun = read_bool_file( RUNTIME_DIR "/run-entry.txt" );
-    wine_nx_runtime_verbose = read_bool_file( RUNTIME_DIR "/verbose.txt" );
-    /* Pinned GPU buffers are CPU-cacheable unless gl-uncached.txt asks for the
-     * old mapping, which is there to compare the two. */
-    if (&wine_nx_nouveau_pin_cached && read_bool_file( RUNTIME_DIR "/gl-uncached.txt" ))
+    mkdir( CONFIG_DIR, 0777 );
+    wine_nx_config_load( &runtime_config, CONFIG_FILE );
+    autorun = config_bool( "run-the-chosen-program", 0, "run-entry.txt", 0 );
+    wine_nx_runtime_verbose = config_bool( "verbose-log", 0, "verbose.txt", 0 );
+    /* Pinned GPU buffers are CPU-cacheable unless asked for the old mapping,
+     * which is there to compare the two. */
+    if (&wine_nx_nouveau_pin_cached && !config_bool( "gl-pinned-buffers-cached", 1, "gl-uncached.txt", 1 ))
         wine_nx_nouveau_pin_cached = 0;
-    if (&wine_nx_nouveau_skip_clean && read_bool_file( RUNTIME_DIR "/gl-noclean.txt" ))
+    if (&wine_nx_nouveau_skip_clean && !config_bool( "gl-clean-before-submit", 1, "gl-noclean.txt", 1 ))
         wine_nx_nouveau_skip_clean = 1;
-    else if (&wine_nx_nouveau_skip_clean && read_bool_file( RUNTIME_DIR "/gl-clean-test.txt" ))
+    else if (&wine_nx_nouveau_skip_clean && config_bool( "gl-clean-test", 0, "gl-clean-test.txt", 0 ))
         clean_alternates = 1;
     if (&wine_nx_nouveau_pin_cached && &wine_nx_nouveau_skip_clean)
-        log_line( "[INIT] pinned GPU buffers %s, cache clean before submissions %s (gl-uncached.txt, gl-noclean.txt, gl-clean-test.txt)",
+        log_line( "[INIT] pinned GPU buffers %s, cache clean before submissions %s",
                   wine_nx_nouveau_pin_cached ? "cacheable" : "uncached",
                   wine_nx_nouveau_skip_clean ? "off" : clean_alternates ? "alternating from 60 s, 30 s off/30 s on" : "on" );
-    if (read_bool_file( RUNTIME_DIR "/no-balance.txt" )) wine_nx_balance_enabled = 0;
-    log_line( "[INIT] core balancing %s (no-balance.txt)", wine_nx_balance_enabled ? "on" : "off" );
-    runtime_profile = read_bool_file( RUNTIME_DIR "/profile.txt" );
+    if (!config_bool( "core-balancing", 1, "no-balance.txt", 1 )) wine_nx_balance_enabled = 0;
+    log_line( "[INIT] core balancing %s", wine_nx_balance_enabled ? "on" : "off" );
+    runtime_profile = config_bool( "profiler", 0, "profile.txt", 0 );
+    /* The key map keeps a file of its own: it is a line for each control, with
+     * room for the comments that say what the codes mean. */
+    read_key_map( CONFIG_DIR "/keys.txt" );
     read_key_map( RUNTIME_DIR "/keys.txt" );
-    if (read_bool_file( RUNTIME_DIR "/no-display-devices.txt" )) wine_nx_display_devices = 0;
-    log_line( "[INIT] display devices %s (no-display-devices.txt)",
-              wine_nx_display_devices ? "registered" : "off" );
-    if (read_bool_file( RUNTIME_DIR "/framebuffer.txt" )) wine_nx_compositor_mode = 0;
-    log_line( "[INIT] windows shown by %s (framebuffer.txt)",
+    if (!config_bool( "display-devices", 1, "no-display-devices.txt", 1 )) wine_nx_display_devices = 0;
+    log_line( "[INIT] display devices %s", wine_nx_display_devices ? "registered" : "off" );
+    if (!config_bool( "windows-through-opengl", 1, "framebuffer.txt", 1 )) wine_nx_compositor_mode = 0;
+    log_line( "[INIT] windows shown by %s",
               wine_nx_compositor_mode ? "the OpenGL compositor" : "the framebuffer" );
+    /* Both are wanted on the way out, when the card is a poor thing to ask. */
+    runtime_loader_anyway = config_bool( "hand-the-process-back-anyway", 0, "loader-anyway.txt", 0 );
+    runtime_reopen_launcher = config_bool( "reopen-the-launcher-on-exit", 0, "reload-launcher.txt", 0 );
+    if (runtime_config_moved && wine_nx_config_save( &runtime_config, CONFIG_FILE ))
+        log_line( "[CONFIG] settings written to %s", CONFIG_FILE );
 #ifdef WINE_NX_MESA_SWITCH
     /* This runtime links mesa-switch (build-mesa-switch.sh); vulkan-probe.txt
      * reports what its NVK offers, for Vulkan and DXVK (vulkan_probe.c). */
     {
-        int vulkan_probe = read_bool_file( RUNTIME_DIR "/vulkan-probe.txt" );
+        int vulkan_probe = config_bool( "vulkan-probe", 0, "vulkan-probe.txt", 0 );
 
-        log_line( "[INIT] Mesa from mesa-switch: OpenGL through nvc0, Vulkan through NVK; Vulkan probe %s (vulkan-probe.txt)",
+        log_line( "[INIT] Mesa from mesa-switch: OpenGL through nvc0, Vulkan through NVK; Vulkan probe %s",
                   vulkan_probe ? "on" : "off" );
         if (vulkan_probe)
         {
@@ -3088,6 +3134,7 @@ int main( int argc, char **argv )
             .build = WINE_NX_RUNTIME_BUILD,
             .machine_of = launcher_machine,
             .address_space_bits = runtime_address_space_bits(),
+        .reopen_launcher = runtime_reopen_launcher,
             .title_id = runtime_title_id(),
             .list_titles = launcher_titles,
             .launch_title = launcher_launch_title,
@@ -3127,6 +3174,14 @@ int main( int argc, char **argv )
         wine_nx_runtime_verbose = options.verbose;
         runtime_profile = options.profile;
         wine_nx_compositor_mode = !options.framebuffer;
+        /* The launcher changes settings; keeping them is the runtime's, which
+         * owns the file and knows every other setting in it. */
+        wine_nx_config_set_bool( &runtime_config, "verbose-log", options.verbose );
+        wine_nx_config_set_bool( &runtime_config, "profiler", options.profile );
+        wine_nx_config_set_bool( &runtime_config, "windows-through-opengl", !options.framebuffer );
+        wine_nx_config_set_bool( &runtime_config, "reopen-the-launcher-on-exit", options.reopen_launcher );
+        runtime_reopen_launcher = options.reopen_launcher;
+        wine_nx_config_save( &runtime_config, CONFIG_FILE );
         if (!chosen)
         {
             log_line( "[LAUNCHER] closed without starting a program" );
