@@ -185,6 +185,21 @@ for gone in ('run-entry.txt', 'verbose.txt', 'profile.txt', 'framebuffer.txt', '
 # LDOWN=0      and works its menus with another. Unset, it sends what the d-pad
 # LLEFT=0      does.
 # LRIGHT=0
+# RUP=0x26     the right stick, when it is set to send keys rather than move
+# RDOWN=0x28   the mouse
+# RLEFT=0x25
+# RRIGHT=0x27
+# TUP=0x26     a finger dragged across the screen, likewise
+# TDOWN=0x28
+# TLEFT=0x25
+# TRIGHT=0x27
+#
+# And what each of the four that can point does, which is mouse or keys:
+#
+# LSTICK=keys
+# RSTICK=mouse
+# DPAD=keys
+# TOUCH=mouse
 ''')
 (stage / f'BUILD-{marker}-README.txt').write_text(f'''Wine-NX build {marker}: the whole SD-card payload.
 Copy the switch folder to the SD card, merging folders; it replaces the runtime
@@ -258,7 +273,12 @@ config/keys.txt the keys the controller sends. Both are set from the launcher --
 Settings, Defaults, Controls for the keys everything sends, and a program's own
 Controls row for the keys it alone sends -- so neither has to be written by
 hand; left and right change a control, A opens the whole list of keys, Y puts
-one back to its default. A card written by an earlier
+one back to its default. The left stick, the right stick, the d-pad and a
+finger dragged across the screen each move the mouse or send four keys, which
+the same screen sets: a game played with the mouse wants both sticks on it, one
+played with the keyboard wants the keys it walks with. A program uses Autorun's
+controls until its own are turned on in its settings, and turning them off again
+keeps the keys that were set. A card written by an earlier
 build has them loose beside the launcher -- verbose.txt, framebuffer.txt,
 no-balance.txt and the rest -- and the first run moves each into settings.json
 and takes the file away, saying so in the log. A setting a newer build added is

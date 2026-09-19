@@ -15,8 +15,19 @@ runtime = (root / 'wine-nx-probe/source/runtime.c').read_text()
 # The runtime's own list of control names, which keys.txt is written against.
 names = runtime[runtime.index('wine_nx_pad_key_names[WINE_NX_KEY_COUNT] ='):]
 names = re.findall(r'"([A-Z]+)"', names[:names.index('};')])
-shown = re.findall(r'\{\s*"([A-Z]+)",\s*"', header)
+shown = re.findall(r'\{\s*"([A-Z]+)",\s*"[^"]*",\s*"', header)   # the controls, not the devices
 assert sorted(names) == sorted(shown), (sorted(set(names) ^ set(shown)))
+
+# The three that point, by the names the runtime reads them under, and the four
+# keys of each where the table says they are.
+devices = re.findall(r'\{\s*"([A-Z]+)",\s*"[^"]*",\s*(\d+),', header)
+runtime_devices = re.findall(r'wine_nx_device_names\[WINE_NX_DEVICE_COUNT\] =\s*\{([^}]*)\}', runtime)
+assert [d[0] for d in devices] == re.findall(r'"([A-Z]+)"', runtime_devices[0])
+for name, first in devices:
+    first = int(first)
+    prefix = {'LSTICK': 'L', 'RSTICK': 'R', 'TOUCH': 'T', 'DPAD': ''}[name]
+    for i, way in enumerate(('UP', 'DOWN', 'LEFT', 'RIGHT')):
+        assert shown[first + i] == prefix + way, (name, shown[first + i])
 
 # And what each sends with no line of its own is what the runtime starts with.
 defaults = runtime[runtime.index('unsigned short wine_nx_pad_keys[WINE_NX_KEY_COUNT] ='):]

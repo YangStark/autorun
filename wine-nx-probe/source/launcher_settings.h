@@ -178,6 +178,11 @@ struct launcher_settings
     int profile;      /* the sampling profiler */
     int framebuffer;  /* 1: windows go to the framebuffer, 0: through the compositor */
     int dxvk;         /* 1: Direct3D 9 from C:\dxvk\d3d9.dll, 0: Wine's */
+    /* Whether the program's own keys apply over the shared ones: -1 they do
+     * when it has a file of them, which is what a card written before this
+     * setting existed means; 0 Autorun's keys alone, the file kept for when it
+     * is turned on again. */
+    int own_controls;
     /* What the program needs of the address space (launcher_catalog.h):
      * -1 read it from the program itself, 0 any, 1 the low 4 GB. */
     int address_space;
@@ -218,6 +223,7 @@ static inline void launcher_settings_read( const struct launcher_kv *kv, struct 
         else if (!strcasecmp( value, "compositor" )) settings->framebuffer = 0;
     }
     settings->dxvk = launcher_kv_get( kv, "d3d9", value, sizeof(value) ) && !strcasecmp( value, "dxvk" );
+    settings->own_controls = launcher_setting_state( kv, "own-controls" );
     settings->address_space = -1;
     if (launcher_kv_get( kv, "address-space", value, sizeof(value) ))
     {
@@ -238,6 +244,7 @@ static inline int launcher_settings_write( struct launcher_kv *kv, const struct 
            launcher_kv_set( kv, "windows", settings->framebuffer < 0 ? NULL :
                                            settings->framebuffer ? "framebuffer" : "compositor" ) &&
            launcher_kv_set( kv, "d3d9", settings->dxvk ? "dxvk" : NULL ) &&
+           launcher_kv_set( kv, "own-controls", states[settings->own_controls + 1] ) &&
            launcher_kv_set( kv, "address-space", settings->address_space < 0 ? NULL :
                                                  settings->address_space ? "32-bit" : "any" );
 }

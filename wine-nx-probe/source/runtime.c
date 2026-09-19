@@ -442,6 +442,10 @@ static struct pointer_buttons wine_nx_pointer_buttons;
 static int wine_nx_pointer_moved;
 /* A touch points at a place, and the place is what Wine is given. */
 static int wine_nx_pointer_placed;
+/* A finger sending keys: where it went down, and how far it has gone since.
+ * Half a centimetre of a 1280-pixel screen, so that a tap is not a direction. */
+#define WINE_NX_TOUCH_STEP 40
+static int wine_nx_touch_held, wine_nx_touch_x, wine_nx_touch_y, wine_nx_touch_dx, wine_nx_touch_dy;
 /* The position Wine last had, from a take or the program's SetCursorPos. */
 static int wine_nx_pointer_sent_x = WINE_NX_FB_W / 2, wine_nx_pointer_sent_y = WINE_NX_FB_H / 2;
 
@@ -685,17 +689,33 @@ enum
     WINE_NX_KEY_X, WINE_NX_KEY_Y, WINE_NX_KEY_L, WINE_NX_KEY_R,
     WINE_NX_KEY_ZL, WINE_NX_KEY_ZR, WINE_NX_KEY_PLUS, WINE_NX_KEY_MINUS,
     WINE_NX_KEY_STICKL, WINE_NX_KEY_STICKR, WINE_NX_KEY_A, WINE_NX_KEY_B,
-    /* The left stick on its own, for a game that walks with one set of keys
-     * and works its menus with another. Unset, it sends what the d-pad does. */
+    /* Each of the three things that point, for a game that walks with one set
+     * of keys and works its menus with another. The left stick sends what the
+     * d-pad does until it is given keys of its own. */
     WINE_NX_KEY_LUP, WINE_NX_KEY_LDOWN, WINE_NX_KEY_LLEFT, WINE_NX_KEY_LRIGHT,
+    WINE_NX_KEY_RUP, WINE_NX_KEY_RDOWN, WINE_NX_KEY_RLEFT, WINE_NX_KEY_RRIGHT,
+    WINE_NX_KEY_TUP, WINE_NX_KEY_TDOWN, WINE_NX_KEY_TLEFT, WINE_NX_KEY_TRIGHT,
     WINE_NX_KEY_COUNT
 };
+
+/* What each of them does: move the mouse, or send its four keys. */
+enum { WINE_NX_DEVICE_LEFT, WINE_NX_DEVICE_RIGHT, WINE_NX_DEVICE_DPAD, WINE_NX_DEVICE_TOUCH,
+       WINE_NX_DEVICE_COUNT };
+#define WINE_NX_POINTS  0   /* moves the mouse */
+#define WINE_NX_PRESSES 1   /* sends its four keys */
+static const char *const wine_nx_device_names[WINE_NX_DEVICE_COUNT] =
+    { "LSTICK", "RSTICK", "DPAD", "TOUCH" };
+/* The left stick and the d-pad have always sent keys; the others have pointed. */
+static unsigned char wine_nx_device_mode[WINE_NX_DEVICE_COUNT] =
+    { WINE_NX_PRESSES, WINE_NX_POINTS, WINE_NX_PRESSES, WINE_NX_POINTS };
 
 static const char *const wine_nx_pad_key_names[WINE_NX_KEY_COUNT] =
 {
     "UP", "DOWN", "LEFT", "RIGHT", "X", "Y", "L", "R",
     "ZL", "ZR", "PLUS", "MINUS", "STICKL", "STICKR", "A", "B",
-    "LUP", "LDOWN", "LLEFT", "LRIGHT"
+    "LUP", "LDOWN", "LLEFT", "LRIGHT",
+    "RUP", "RDOWN", "RLEFT", "RRIGHT",
+    "TUP", "TDOWN", "TLEFT", "TRIGHT"
 };
 
 /* Defaults that suit a game: the d-pad and left stick steer, the triggers
@@ -711,6 +731,8 @@ unsigned short wine_nx_pad_keys[WINE_NX_KEY_COUNT] =
     0x11, 0x12,              /* stick presses: control, alt */
     0, 0,                    /* A and B: none, so they click */
     0, 0, 0, 0,              /* the left stick: none, so it steers with the d-pad */
+    0x26, 0x28, 0x25, 0x27,  /* the right stick, were it to send keys: arrows */
+    0x26, 0x28, 0x25, 0x27,  /* and a finger dragged across the screen */
 };
 
 /* Which of those controls are held, read by the display driver's ProcessEvents
@@ -757,17 +779,62 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
      * clicks or cursor come from it meanwhile. The touchscreen still points. */
     xinput_poll = wine_nx_xinput_last_poll;
     gamepad = xinput_poll && (xinput_poll >= now || armTicksToNs( now - xinput_poll ) < 1000000000ull);
+    moved = 0;
     if (hidGetTouchScreenStates( &touch, 1 ) && touch.count > 0)
     {
-        int old_x = (int)wine_nx_pointer.x, old_y = (int)wine_nx_pointer.y;
+        if (wine_nx_device_mode[WINE_NX_DEVICE_TOUCH] == WINE_NX_POINTS)
+        {
+            int old_x = (int)wine_nx_pointer.x, old_y = (int)wine_nx_pointer.y;
 
-        pointer_cursor_place( &wine_nx_pointer, touch.touches[0].x, touch.touches[0].y );
-        moved = (int)wine_nx_pointer.x != old_x || (int)wine_nx_pointer.y != old_y;
-        wine_nx_pointer_placed |= moved;
-        pressed |= WINE_NX_POINTER_LEFT;
+            pointer_cursor_place( &wine_nx_pointer, touch.touches[0].x, touch.touches[0].y );
+            moved = (int)wine_nx_pointer.x != old_x || (int)wine_nx_pointer.y != old_y;
+            wine_nx_pointer_placed |= moved;
+            pressed |= WINE_NX_POINTER_LEFT;
+        }
+        else
+        {
+            /* Sending keys: which way the finger has gone from where it went
+             * down, far enough that a tap is not a direction. */
+            if (!wine_nx_touch_held)
+            {
+                wine_nx_touch_x = touch.touches[0].x;
+                wine_nx_touch_y = touch.touches[0].y;
+            }
+            wine_nx_touch_dx = (int)touch.touches[0].x - wine_nx_touch_x;
+            wine_nx_touch_dy = (int)touch.touches[0].y - wine_nx_touch_y;
+            wine_nx_touch_held = 1;
+        }
     }
-    else moved = gamepad ? 0 : pointer_cursor_step( &wine_nx_pointer, stick.x, stick.y,
-                                                    armTicksToNs( now - wine_nx_pointer_tick ) );
+    else
+    {
+        wine_nx_touch_held = wine_nx_touch_dx = wine_nx_touch_dy = 0;
+        if (wine_nx_device_mode[WINE_NX_DEVICE_RIGHT] == WINE_NX_POINTS)
+            moved = gamepad ? 0 : pointer_cursor_step( &wine_nx_pointer, stick.x, stick.y,
+                                                       armTicksToNs( now - wine_nx_pointer_tick ) );
+    }
+    /* The left stick points as well when it is set to, so a game played with
+     * the mouse alone has both of them for it. */
+    if (!gamepad && wine_nx_device_mode[WINE_NX_DEVICE_LEFT] == WINE_NX_POINTS)
+    {
+        HidAnalogStickState left = padGetStickPos( &wine_nx_pad, 0 );
+
+        moved |= pointer_cursor_step( &wine_nx_pointer, left.x, left.y,
+                                      armTicksToNs( now - wine_nx_pointer_tick ) );
+    }
+    /* And the d-pad, which has no tilt to speak of: a direction held is the
+     * stick pushed the whole way. */
+    if (!gamepad && wine_nx_device_mode[WINE_NX_DEVICE_DPAD] == WINE_NX_POINTS)
+    {
+        int dpad_x = 0, dpad_y = 0;
+
+        if (held & HidNpadButton_Left) dpad_x -= POINTER_CURSOR_STICK_MAX;
+        if (held & HidNpadButton_Right) dpad_x += POINTER_CURSOR_STICK_MAX;
+        if (held & HidNpadButton_Down) dpad_y -= POINTER_CURSOR_STICK_MAX;
+        if (held & HidNpadButton_Up) dpad_y += POINTER_CURSOR_STICK_MAX;
+        if (dpad_x || dpad_y)
+            moved |= pointer_cursor_step( &wine_nx_pointer, dpad_x, dpad_y,
+                                          armTicksToNs( now - wine_nx_pointer_tick ) );
+    }
     wine_nx_pointer_tick = now;
     if (!gamepad && (held & HidNpadButton_A) && !wine_nx_pad_keys[WINE_NX_KEY_A]) pressed |= WINE_NX_POINTER_LEFT;
     if (!gamepad && (held & HidNpadButton_B) && !wine_nx_pad_keys[WINE_NX_KEY_B]) pressed |= WINE_NX_POINTER_RIGHT;
@@ -781,6 +848,7 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
             { HidNpadButton_ZL, WINE_NX_KEY_ZL }, { HidNpadButton_ZR, WINE_NX_KEY_ZR },
             { HidNpadButton_Plus, WINE_NX_KEY_PLUS }, { HidNpadButton_Minus, WINE_NX_KEY_MINUS },
             { HidNpadButton_StickL, WINE_NX_KEY_STICKL }, { HidNpadButton_StickR, WINE_NX_KEY_STICKR },
+            /* The d-pad's four are left out when it is moving the mouse. */
             { HidNpadButton_Up, WINE_NX_KEY_UP }, { HidNpadButton_Down, WINE_NX_KEY_DOWN },
             { HidNpadButton_Left, WINE_NX_KEY_LEFT }, { HidNpadButton_Right, WINE_NX_KEY_RIGHT },
             { HidNpadButton_A, WINE_NX_KEY_A }, { HidNpadButton_B, WINE_NX_KEY_B },  /* sent only if given a key */
@@ -788,14 +856,37 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
         unsigned int keys = 0, i;
 
         for (i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
+        {
+            if (wine_nx_device_mode[WINE_NX_DEVICE_DPAD] == WINE_NX_POINTS &&
+                buttons[i].key >= WINE_NX_KEY_UP && buttons[i].key <= WINE_NX_KEY_RIGHT)
+                continue;
             if (held & buttons[i].button) keys |= 1u << buttons[i].key;
+        }
         /* The left stick steers with the d-pad unless it was given keys of
          * its own: Halo walks with w, a, s and d and works its menus with the
          * arrows, and one controller has to do both. */
-        if (steer.y >  12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LUP] ? WINE_NX_KEY_LUP : WINE_NX_KEY_UP);
-        if (steer.y < -12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LDOWN] ? WINE_NX_KEY_LDOWN : WINE_NX_KEY_DOWN);
-        if (steer.x < -12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LLEFT] ? WINE_NX_KEY_LLEFT : WINE_NX_KEY_LEFT);
-        if (steer.x >  12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LRIGHT] ? WINE_NX_KEY_LRIGHT : WINE_NX_KEY_RIGHT);
+        if (wine_nx_device_mode[WINE_NX_DEVICE_LEFT] == WINE_NX_PRESSES)
+        {
+            if (steer.y >  12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LUP] ? WINE_NX_KEY_LUP : WINE_NX_KEY_UP);
+            if (steer.y < -12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LDOWN] ? WINE_NX_KEY_LDOWN : WINE_NX_KEY_DOWN);
+            if (steer.x < -12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LLEFT] ? WINE_NX_KEY_LLEFT : WINE_NX_KEY_LEFT);
+            if (steer.x >  12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LRIGHT] ? WINE_NX_KEY_LRIGHT : WINE_NX_KEY_RIGHT);
+        }
+        if (wine_nx_device_mode[WINE_NX_DEVICE_RIGHT] == WINE_NX_PRESSES)
+        {
+            if (stick.y >  12000) keys |= 1u << WINE_NX_KEY_RUP;
+            if (stick.y < -12000) keys |= 1u << WINE_NX_KEY_RDOWN;
+            if (stick.x < -12000) keys |= 1u << WINE_NX_KEY_RLEFT;
+            if (stick.x >  12000) keys |= 1u << WINE_NX_KEY_RRIGHT;
+        }
+        /* A finger held away from where it went down, by more than a tap. */
+        if (wine_nx_touch_held)
+        {
+            if (wine_nx_touch_dy < -WINE_NX_TOUCH_STEP) keys |= 1u << WINE_NX_KEY_TUP;
+            if (wine_nx_touch_dy >  WINE_NX_TOUCH_STEP) keys |= 1u << WINE_NX_KEY_TDOWN;
+            if (wine_nx_touch_dx < -WINE_NX_TOUCH_STEP) keys |= 1u << WINE_NX_KEY_TLEFT;
+            if (wine_nx_touch_dx >  WINE_NX_TOUCH_STEP) keys |= 1u << WINE_NX_KEY_TRIGHT;
+        }
         if (gamepad) keys = 0;
         __atomic_store_n( &wine_nx_pad_key_state, keys, __ATOMIC_RELAXED );
     }
@@ -1320,6 +1411,22 @@ static void read_key_map( const char *path )
         value = equals + 1;
         while (*name == ' ') name++;
         while (*value == ' ') value++;
+        /* The three that point say what they do rather than which key they
+         * are: LSTICK=mouse, RSTICK=keys. */
+        for (i = 0; i < WINE_NX_DEVICE_COUNT; i++)
+            if (!strcasecmp( name, wine_nx_device_names[i] ))
+            {
+                if (!strcasecmp( value, "mouse" )) wine_nx_device_mode[i] = WINE_NX_POINTS;
+                else if (!strcasecmp( value, "keys" )) wine_nx_device_mode[i] = WINE_NX_PRESSES;
+                else
+                {
+                    log_line( "[NXINPUT] %s: %s is mouse or keys, not '%s'", path, name, value );
+                    break;
+                }
+                changed++;
+                break;
+            }
+        if (i < WINE_NX_DEVICE_COUNT) continue;
         for (i = 0; i < WINE_NX_KEY_COUNT; i++)
             if (!strcasecmp( name, wine_nx_pad_key_names[i] ))
             {
@@ -1521,12 +1628,25 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
      * Format expected: "<argv[0]> <args...>" — a full Win32 command line.
      * If present, use it verbatim as CommandLine so curl etc. see args via
      * GetCommandLineA/W. Otherwise fall back to the dos_path alone. */
-    /* A program's own controls, over keys.txt: SPEED2.EXE reads SPEED2.keys.txt. */
+    /* A program's own controls, over the shared ones: SPEED2.EXE reads
+     * SPEED2.keys.txt, unless its settings say to use Autorun's alone. The
+     * file is left where it is either way, so turning it back on brings back
+     * the keys that were set rather than the defaults. */
     {
-        char keys_path[512];
+        char keys_path[512], settings_path[520];
+        struct launcher_settings settings;
+        struct launcher_kv kv;
+        int own = -1;
 
-        if (target[1] != ':' && launcher_keys_path( target, keys_path, sizeof(keys_path) ))
+        if (target[1] != ':' && launcher_settings_path( target, settings_path, sizeof(settings_path) ) &&
+            launcher_kv_load( &kv, settings_path ) && kv.size)
+        {
+            launcher_settings_read( &kv, &settings );
+            own = settings.own_controls;
+        }
+        if (own != 0 && target[1] != ':' && launcher_keys_path( target, keys_path, sizeof(keys_path) ))
             read_key_map( keys_path );
+        else if (own == 0) log_line( "[NXINPUT] %s: Autorun's controls, not its own", target );
     }
     /* Its own Box64 options, read when its first x86 code runs: SPEED2.box64.txt. */
     {

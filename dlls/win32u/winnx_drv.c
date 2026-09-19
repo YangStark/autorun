@@ -619,7 +619,7 @@ static void wine_nx_pointer_flags( unsigned int last, unsigned int held, unsigne
  * the virtual-key code of each in wine_nx_pad_keys (wine-nx-probe/source/
  * runtime.c, overridable through switch/wine/keys.txt and a program's own
  * NAME.keys.txt). */
-#define WINE_NX_PAD_KEY_COUNT 20
+#define WINE_NX_PAD_KEY_COUNT 28
 extern unsigned int wine_nx_pad_key_state __attribute__((weak));
 extern unsigned short wine_nx_pad_keys[] __attribute__((weak));
 

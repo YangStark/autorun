@@ -45,9 +45,43 @@ static const struct wine_nx_control wine_nx_controls[] =
     { "LDOWN",  "Left stick down",   "What the d-pad sends", 0x00 },
     { "LLEFT",  "Left stick left",   "What the d-pad sends", 0x00 },
     { "LRIGHT", "Left stick right",  "What the d-pad sends", 0x00 },
+    { "RUP",    "Right stick up",     "Nothing",             0x26 },
+    { "RDOWN",  "Right stick down",   "Nothing",             0x28 },
+    { "RLEFT",  "Right stick left",   "Nothing",             0x25 },
+    { "RRIGHT", "Right stick right",  "Nothing",             0x27 },
+    { "TUP",    "Finger up",          "Nothing",             0x26 },
+    { "TDOWN",  "Finger down",        "Nothing",             0x28 },
+    { "TLEFT",  "Finger left",        "Nothing",             0x25 },
+    { "TRIGHT", "Finger right",       "Nothing",             0x27 },
 };
 
 #define WINE_NX_CONTROL_COUNT ((int)(sizeof(wine_nx_controls) / sizeof(wine_nx_controls[0])))
+
+/* The three things that point. Each either moves the mouse or sends the four
+ * keys of its own, which is what keys.txt says with LSTICK=mouse or RSTICK=keys.
+ * `first` is where its four are in the list above. */
+struct wine_nx_device
+{
+    const char *name;    /* as keys.txt spells it */
+    const char *label;   /* as the screen says it */
+    int first;           /* its Up control */
+    int follows_dpad;    /* its keys unset means the d-pad's, as the left stick's do */
+    int points;          /* what it does with no line of its own */
+};
+
+static const struct wine_nx_device wine_nx_devices[] =
+{
+    { "LSTICK", "Left stick",  16, 1, 0 },
+    { "RSTICK", "Right stick", 20, 0, 1 },
+    { "DPAD",   "D-pad",       12, 0, 0 },
+    { "TOUCH",  "Finger drag", 24, 0, 1 },
+};
+
+#define WINE_NX_DEVICE_COUNT_UI ((int)(sizeof(wine_nx_devices) / sizeof(wine_nx_devices[0])))
+
+/* Up, down, left, right, for the two sets of keys worth a name of their own. */
+static const unsigned short wine_nx_preset_arrows[4] = { 0x26, 0x28, 0x25, 0x27 };
+static const unsigned short wine_nx_preset_wasd[4]   = { 0x57, 0x53, 0x41, 0x44 };
 
 struct wine_nx_key_name
 {

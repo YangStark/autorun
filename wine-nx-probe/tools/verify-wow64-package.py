@@ -4,6 +4,7 @@ from pathlib import Path
 import hashlib
 import re
 import subprocess
+import json
 import sys
 
 root = Path(__file__).resolve().parents[2]
@@ -181,6 +182,17 @@ for name, data, _ in tree_module.TREE:
     assert (stage / "drive_c" / name).read_bytes() == data, f"7zr tree file differs: {name}"
 assert not (stage / "drive_c/wine-nx-tree.7z").exists(), "Staging an archive would replace the one 7zr made on the Switch"
 assert not (stage / "drive_c/7zr-out").exists(), "7zr x must create its output folders itself"
-assert (stage / "run-entry.txt").read_text().strip() == "1"
+# One settings file, where a dozen loose toggles were, and the keys beside it.
+# The stages this one is built from are earlier steps and still carry the files.
+if (stage / "config/settings.json").exists():
+    settings = json.loads((stage / "config/settings.json").read_text())
+    assert settings["run-the-chosen-program"] is True
+    assert settings["windows-through-opengl"] is True and settings["core-balancing"] is True
+    assert (stage / "config/keys.txt").exists()
+    for gone in ("run-entry.txt", "verbose.txt", "profile.txt", "framebuffer.txt", "no-balance.txt",
+                 "keys.txt"):
+        assert not (stage / gone).exists(), f"{gone} is a setting now, not a file"
+else:
+    assert (stage / "run-entry.txt").read_text().strip() == "1"
 assert (stage / "share/wine/nls/locale.nls").exists()
 print("WoW64 package: architectures, dependency closure, CPU exports, relocatable PE32, NRO and launch files passed")

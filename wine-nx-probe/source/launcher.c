@@ -1626,7 +1626,7 @@ static void draw_home( struct launcher *l )
 
 enum program_row
 {
-    ROW_START, ROW_FAVORITE, ROW_ARTWORK, ROW_LOCATE, ROW_TITLE, ROW_ARGS, ROW_VERBOSE, ROW_PROFILE, ROW_WINDOWS, ROW_D3D9, ROW_ADDRESS, ROW_CONTROLS, ROW_BOX64,
+    ROW_START, ROW_FAVORITE, ROW_ARTWORK, ROW_LOCATE, ROW_TITLE, ROW_ARGS, ROW_VERBOSE, ROW_PROFILE, ROW_WINDOWS, ROW_D3D9, ROW_ADDRESS, ROW_OWN_CONTROLS, ROW_CONTROLS, ROW_BOX64,
     ROW_HIDE, ROW_LIBRARY, PROGRAM_ROWS
 };
 
@@ -2055,13 +2055,25 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
                            needs == LAUNCHER_ADDRESS_ANY ? "any" : "unread" );
         }
 
-        ADD_ROW( ROW_CONTROLS, SECTION_DIAGNOSTICS, "Controls",
-                 "The keys this program's controls send, over the ones everything else sends." );
-        if (launcher_keys_path( p->path, path, sizeof(path) ) && file_exists( path ))
-            snprintf( row->value, sizeof(row->value), "Its own" );
-        else
-            snprintf( row->value, sizeof(row->value), "%s",
-                      shared_keys( l, path, sizeof(path) ) ? "Shared" : "Default" );
+        {
+            int has_own = launcher_keys_path( p->path, path, sizeof(path) ) && file_exists( path );
+            /* Not set means its own when it has any, which is what a card
+             * written before this setting existed means. */
+            int own = p->settings.own_controls < 0 ? has_own : p->settings.own_controls;
+
+            ADD_ROW( ROW_OWN_CONTROLS, SECTION_DIAGNOSTICS, "Controls",
+                     "Autorun's controls, or this program's own over them. Turning them off keeps "
+                     "the keys that were set, for when they are wanted again." );
+            snprintf( row->value, sizeof(row->value), "%s", own ? "Its own" : "Autorun's" );
+            row->kind = UI_ROW_SWITCH;
+            row->on = own;
+
+            ADD_ROW( ROW_CONTROLS, SECTION_DIAGNOSTICS, "Edit controls",
+                     own ? "The keys this program's controls send, over the ones everything else sends."
+                         : "Autorun's controls apply; turn this program's own on to change them." );
+            row->disabled = !own;
+            snprintf( row->value, sizeof(row->value), "%s", has_own ? "Set" : "Default" );
+        }
 
         if (x86)
         {
@@ -2186,6 +2198,17 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
                                         next_state( p->settings.address_space, action == UI_ACTION_LEFT ? -1 : 1 );
             save_program_settings( l, p );
             break;
+
+        case ROW_OWN_CONTROLS:
+        {
+            int has_own = launcher_keys_path( p->path, path, sizeof(path) ) && file_exists( path );
+
+            if (action == UI_ACTION_RESET) p->settings.own_controls = -1;
+            else p->settings.own_controls = !(p->settings.own_controls < 0 ? has_own :
+                                              p->settings.own_controls);
+            save_program_settings( l, p );
+            break;
+        }
 
         case ROW_CONTROLS:
             if (action != UI_ACTION_CHOOSE) break;
@@ -2407,6 +2430,74 @@ static void set_control_key( struct launcher_kv *keys, int control, int code )
     }
 }
 
+/* What one of the three that point is set to do. The keys file says it in
+ * words -- LSTICK=mouse -- because it is not a key. */
+enum device_choice { DEVICE_MOUSE, DEVICE_DPAD, DEVICE_ARROWS, DEVICE_WASD, DEVICE_CUSTOM };
+
+static const char *const device_choice_names[] =
+    { "Mouse", "Same as d-pad", "Arrow keys", "W A S D", "Its own keys" };
+
+static int device_points( const struct launcher_kv *keys, const struct launcher_kv *under, int device )
+{
+    const char *name = wine_nx_devices[device].name;
+    char value[32];
+
+    if (launcher_kv_get( keys, name, value, sizeof(value) ) && value[0])
+        return strcasecmp( value, "keys" ) == 0 ? 0 : 1;
+    if (under && launcher_kv_get( under, name, value, sizeof(value) ) && value[0])
+        return strcasecmp( value, "keys" ) == 0 ? 0 : 1;
+    return wine_nx_devices[device].points;
+}
+
+static enum device_choice device_choice( const struct launcher_kv *keys, const struct launcher_kv *under,
+                                         int device )
+{
+    const struct wine_nx_device *d = &wine_nx_devices[device];
+    unsigned short code[4];
+    int i, unset = 1;
+
+    if (device_points( keys, under, device )) return DEVICE_MOUSE;
+    for (i = 0; i < 4; i++)
+    {
+        code[i] = control_key( keys, under, d->first + i );
+        if (code[i]) unset = 0;
+    }
+    if (unset && d->follows_dpad) return DEVICE_DPAD;
+    if (!memcmp( code, wine_nx_preset_arrows, sizeof(code) )) return DEVICE_ARROWS;
+    if (!memcmp( code, wine_nx_preset_wasd, sizeof(code) )) return DEVICE_WASD;
+    return DEVICE_CUSTOM;
+}
+
+static void set_device_choice( struct launcher_kv *keys, int device, enum device_choice choice )
+{
+    const struct wine_nx_device *d = &wine_nx_devices[device];
+    const unsigned short *preset = choice == DEVICE_WASD ? wine_nx_preset_wasd : wine_nx_preset_arrows;
+    int i;
+
+    launcher_kv_set( keys, d->name, choice == DEVICE_MOUSE ? "mouse" : "keys" );
+    if (choice == DEVICE_MOUSE || choice == DEVICE_CUSTOM) return;
+    for (i = 0; i < 4; i++)
+        set_control_key( keys, d->first + i, choice == DEVICE_DPAD ? -1 : preset[i] );
+}
+
+/* Round the choices for this one, leaving out those it does not have. */
+static enum device_choice next_device_choice( int device, enum device_choice from, int forward )
+{
+    int at = from == DEVICE_CUSTOM ? DEVICE_CUSTOM : from;
+
+    for (;;)
+    {
+        at += forward ? 1 : -1;
+        if (at < 0) at = DEVICE_CUSTOM;
+        if (at > DEVICE_CUSTOM) at = DEVICE_MOUSE;
+        /* Its own keys is where a file written by hand puts it, not somewhere
+         * to step into; the d-pad is the left stick's alone. */
+        if (at == DEVICE_CUSTOM) continue;
+        if (at == DEVICE_DPAD && !wine_nx_devices[device].follows_dpad) continue;
+        return (enum device_choice)at;
+    }
+}
+
 /* The whole list of keys, starting on the one the control sends now. Returns
  * the code chosen, or -1 for the way out. */
 static int key_screen( struct launcher *l, const char *control_label, unsigned short current )
@@ -2438,7 +2529,7 @@ static int key_screen( struct launcher *l, const char *control_label, unsigned s
 static void controls_screen( struct launcher *l, const char *path, const char *under_path,
                              const char *title )
 {
-    struct ui_row rows[WINE_NX_CONTROL_COUNT];
+    struct ui_row rows[WINE_NX_DEVICE_COUNT_UI + WINE_NX_CONTROL_COUNT];
     struct launcher_kv keys, under;
     struct ui_list list = {0};
     int changed = 0, i;
@@ -2452,26 +2543,69 @@ static void controls_screen( struct launcher *l, const char *path, const char *u
     }
     for (;;)
     {
+        const struct launcher_kv *base = under_path ? &under : NULL;
         enum ui_action action;
         char label[64];
         unsigned short code;
+        int device;
 
         memset( rows, 0, sizeof(rows) );
+        for (device = 0; device < WINE_NX_DEVICE_COUNT_UI; device++)
+        {
+            snprintf( rows[device].label, sizeof(rows[0].label), "%s", wine_nx_devices[device].label );
+            snprintf( rows[device].value, sizeof(rows[0].value), "%s",
+                      device_choice_names[device_choice( &keys, base, device )] );
+            rows[device].adjustable = 1;
+            rows[device].kind = UI_ROW_VALUE;
+            rows[device].help = "Move the mouse, or send four keys. A game played with the mouse "
+                                "wants both sticks on it; one played with the keyboard wants the "
+                                "keys it walks with.";
+        }
         for (i = 0; i < WINE_NX_CONTROL_COUNT; i++)
         {
-            snprintf( rows[i].label, sizeof(rows[i].label), "%s", wine_nx_controls[i].label );
-            snprintf( rows[i].value, sizeof(rows[i].value), "%s",
-                      wine_nx_key_label( i, control_key( &keys, under_path ? &under : NULL, i ),
-                                         label, sizeof(label) ) );
-            rows[i].adjustable = 1;
-            rows[i].kind = UI_ROW_VALUE;
+            struct ui_row *row = &rows[WINE_NX_DEVICE_COUNT_UI + i];
+
+            snprintf( row->label, sizeof(row->label), "%s", wine_nx_controls[i].label );
+            snprintf( row->value, sizeof(row->value), "%s",
+                      wine_nx_key_label( i, control_key( &keys, base, i ), label, sizeof(label) ) );
+            row->adjustable = 1;
+            row->kind = UI_ROW_VALUE;
+            /* A stick on the mouse has no keys to give: say so rather than
+             * offer four rows that do nothing. */
+            for (device = 0; device < WINE_NX_DEVICE_COUNT_UI; device++)
+            {
+                if (i < wine_nx_devices[device].first || i >= wine_nx_devices[device].first + 4) continue;
+                if (!device_points( &keys, base, device )) continue;
+                snprintf( row->value, sizeof(row->value), "Moves the mouse" );
+                row->adjustable = 0;
+                row->disabled = 1;
+            }
         }
-        rows[0].help = "A and B are the mouse buttons until they are given a key of their own.";
-        rows[16].help = "The left stick steers with the d-pad until it is given keys of its own.";
-        action = ui_list_run( &l->ui, &list, title, "Controls", rows, WINE_NX_CONTROL_COUNT, 1 );
+        rows[WINE_NX_DEVICE_COUNT_UI].help =
+            "A and B are the mouse buttons until they are given a key of their own.";
+        action = ui_list_run( &l->ui, &list, title, "Controls", rows,
+                              WINE_NX_DEVICE_COUNT_UI + WINE_NX_CONTROL_COUNT, 1 );
         if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) break;
-        i = list.selection;
-        code = control_key( &keys, under_path ? &under : NULL, i );
+        if (list.selection < WINE_NX_DEVICE_COUNT_UI)
+        {
+            enum device_choice choice = device_choice( &keys, base, list.selection );
+
+            if (action == UI_ACTION_LEFT || action == UI_ACTION_RIGHT || action == UI_ACTION_CHOOSE)
+            {
+                set_device_choice( &keys, list.selection,
+                                   next_device_choice( list.selection, choice,
+                                                       action != UI_ACTION_LEFT ) );
+                changed = 1;
+            }
+            else if (action == UI_ACTION_RESET)
+            {
+                launcher_kv_set( &keys, wine_nx_devices[list.selection].name, NULL );
+                changed = 1;
+            }
+            continue;
+        }
+        i = list.selection - WINE_NX_DEVICE_COUNT_UI;
+        code = control_key( &keys, base, i );
         switch (action)
         {
         case UI_ACTION_CHOOSE:
