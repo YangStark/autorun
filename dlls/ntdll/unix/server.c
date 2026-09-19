@@ -1276,6 +1276,22 @@ static int remove_fd_from_cache( HANDLE handle )
     return fd;
 }
 
+#ifdef __SWITCH__
+/***********************************************************************
+ *           horizon_client_forget_fd
+ *
+ * The in-process server put another connection into this socket (AcceptEx):
+ * the copy of its old descriptor cached here is closed, and the next use
+ * fetches the new one.
+ */
+void horizon_client_forget_fd( unsigned int handle )
+{
+    int fd = remove_fd_from_cache( ULongToHandle( handle ) );
+
+    if (fd != -1) close( fd );
+}
+#endif
+
 
 /***********************************************************************
  *           server_get_unix_fd

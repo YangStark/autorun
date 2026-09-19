@@ -442,6 +442,8 @@ struct horizon_fd_queue
 #define HORIZON_REQ_SET_FD_NAME_INFO 276
 #define HORIZON_REQ_SET_FD_EOF_INFO 277
 #define HORIZON_REQ_SET_ASYNC_DIRECT_RESULT 137
+#define HORIZON_REQ_CANCEL_ASYNC 135
+#define HORIZON_REQ_GET_ASYNC_RESULT 136
 #define HORIZON_REQ_IOCTL 140
 #define HORIZON_REQ_CREATE_MAPPING 63
 #define HORIZON_REQ_OPEN_MAPPING 64
@@ -552,6 +554,7 @@ struct horizon_fd_queue
 #define HORIZON_REQ_SET_CURSOR 282
 #define HORIZON_STATUS_SUCCESS 0
 #define HORIZON_STATUS_OBJECT_NAME_EXISTS 0x40000000u
+#define HORIZON_STATUS_KERNEL_APC 0x00000100u
 #define HORIZON_STATUS_ALERTED 0x00000101u
 #define HORIZON_STATUS_USER_APC 0x000000c0u
 #define HORIZON_STATUS_TIMEOUT 0x00000102u
@@ -1314,6 +1317,64 @@ struct horizon_ioctl_request
     struct horizon_async_data async;
     /* in_data follows as request data */
 };
+
+#define HORIZON_ASYNC_DATA_DEFINED 1
+#include "horizon_async.h"
+
+struct horizon_get_async_result_request
+{
+    struct horizon_server_request_header header;
+    char pad[4];
+    unsigned long long user_arg;
+};
+
+struct horizon_cancel_async_request
+{
+    struct horizon_server_request_header header;
+    unsigned int handle;
+    unsigned long long iosb;
+    int only_thread;
+};
+
+/* The wire layouts these are read from are server_protocol.h's. */
+typedef char horizon_recv_socket_async_offset[
+    offsetof( struct horizon_recv_socket_request, async ) == 16 ? 1 : -1];
+typedef char horizon_send_socket_async_offset[
+    offsetof( struct horizon_send_socket_request, async ) == 16 ? 1 : -1];
+typedef char horizon_ioctl_async_offset[offsetof( struct horizon_ioctl_request, async ) == 16 ? 1 : -1];
+typedef char horizon_get_async_result_user_offset[
+    offsetof( struct horizon_get_async_result_request, user_arg ) == 16 ? 1 : -1];
+typedef char horizon_cancel_async_iosb_offset[
+    offsetof( struct horizon_cancel_async_request, iosb ) == 16 ? 1 : -1];
+typedef char horizon_set_async_direct_result_status_offset[
+    offsetof( struct horizon_set_async_direct_result_request, status ) == 24 ? 1 : -1];
+
+/* The operations on sockets that wait, and the system APCs that run them. */
+static struct horizon_async_list horizon_asyncs;
+static unsigned int horizon_async_apc_ids;
+
+#define HORIZON_APC_USER      1
+#define HORIZON_APC_ASYNC_IO  2
+#define HORIZON_APC_CALL_SIZE 64  /* union apc_call */
+#define HORIZON_STATUS_NOT_FOUND 0xc0000225u
+#define HORIZON_NT_ERROR(status) (((status) >> 30) == 3)
+/* How long, in performance-counter ticks, a ready operation waits for the
+ * thread that started it before any waiting thread may run it. */
+#define HORIZON_ASYNC_STALE 200000ULL  /* 20 ms */
+
+struct horizon_server_connection;
+static struct horizon_async *horizon_server_async_create_locked( struct horizon_server_connection *connection,
+                                                                 const struct horizon_async_data *data,
+                                                                 int direction, int kind );
+static void horizon_server_async_free_locked( struct horizon_async *async );
+static void horizon_async_finish_locked( struct horizon_async *async, unsigned int status,
+                                         unsigned long long total );
+static unsigned long long horizon_async_now(void);
+static void horizon_report_async( const char *what, const struct horizon_async *async, unsigned int status );
+static void horizon_sock_poller_start(void);
+/* The client's cached copy of a socket's fd, which accepting into the socket
+ * replaces (server.c). */
+extern void horizon_client_forget_fd( unsigned int handle );
 
 struct horizon_ioctl_reply
 {
@@ -4070,6 +4131,10 @@ static unsigned int horizon_server_close_object_handle( unsigned int handle )
     {
         object = entry->object;
         horizon_server_unlink_handle_locked( entry );
+        /* What waits on a socket that is closed ends, as wineserver ends it. */
+        if (object && object->type == HORIZON_SERVER_OBJECT_SOCK && horizon_asyncs.head &&
+            horizon_async_cancel( &horizon_asyncs, handle, 0, 0, horizon_async_now(), 1 ))
+            horizon_server_signal_changed_locked();
         /* server/completion.c's close_handle: closing a port's last handle
          * abandons the waits on it. */
         if (object && object->type == HORIZON_SERVER_OBJECT_COMPLETION &&
@@ -9953,10 +10018,13 @@ static int horizon_server_handle_open_thread( struct horizon_server_connection *
 /* AFD ioctl codes, mirrored from include/wine/afd.h (CTL_CODE expanded;
  * winsock headers must not be included here next to the BSD ones). */
 #define HORIZON_IOCTL_AFD_BIND              0x00012003 /* BEEP/0x800/NEITHER */
+#define HORIZON_IOCTL_AFD_LISTEN            0x0001200b /* BEEP/0x802/NEITHER */
 #define HORIZON_IOCTL_AFD_POLL              0x00012024 /* BEEP/0x809/BUFFERED */
 #define HORIZON_IOCTL_AFD_GETSOCKNAME       0x0001202f /* BEEP/0x80b/NEITHER */
 #define HORIZON_IOCTL_AFD_EVENT_SELECT      0x00012087 /* BEEP/0x821/NEITHER */
 #define HORIZON_IOCTL_AFD_WINE_CREATE       0x00120320 /* NETWORK/200/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_ACCEPT       0x00120324 /* NETWORK/201/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_ACCEPT_INTO  0x00120328 /* NETWORK/202/BUFFERED */
 #define HORIZON_IOCTL_AFD_WINE_CONNECT      0x0012032c /* NETWORK/203/BUFFERED */
 #define HORIZON_IOCTL_AFD_WINE_SHUTDOWN     0x00120330 /* NETWORK/204/BUFFERED */
 #define HORIZON_IOCTL_AFD_WINE_FIONBIO      0x00120344 /* NETWORK/209/BUFFERED */
@@ -9969,6 +10037,17 @@ static int horizon_server_handle_open_thread( struct horizon_server_connection *
 #define HORIZON_IOCTL_AFD_WINE_SET_SO_RCVBUF    0x00120394 /* NETWORK/229/BUFFERED */
 #define HORIZON_IOCTL_AFD_WINE_SET_SO_SNDBUF    0x001203ac /* NETWORK/235/BUFFERED */
 #define HORIZON_IOCTL_AFD_WINE_SET_IP_HDRINCL   0x001203dc /* NETWORK/247/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_SET_SO_KEEPALIVE  0x00120380 /* NETWORK/224/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_SET_SO_OOBINLINE  0x00120390 /* NETWORK/228/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_SET_SO_REUSEADDR  0x001203a8 /* NETWORK/234/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_SET_TCP_NODELAY   0x00120474 /* NETWORK/285/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_GET_SO_BROADCAST  0x00120370 /* NETWORK/220/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_GET_SO_KEEPALIVE  0x0012037c /* NETWORK/223/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_GET_SO_OOBINLINE  0x0012038c /* NETWORK/227/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_GET_SO_RCVBUF     0x00120398 /* NETWORK/230/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_GET_SO_REUSEADDR  0x001203a4 /* NETWORK/233/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_GET_SO_SNDBUF     0x001203b0 /* NETWORK/236/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_GET_TCP_NODELAY   0x00120470 /* NETWORK/284/BUFFERED */
 
 #define HORIZON_AFD_POLL_READ        0x0001
 #define HORIZON_AFD_POLL_OOB         0x0002
@@ -10121,6 +10200,259 @@ static unsigned int horizon_server_find_sock_locked( unsigned int handle,
     return HORIZON_STATUS_SUCCESS;
 }
 
+static unsigned long long horizon_async_now(void)
+{
+    LARGE_INTEGER now;
+
+    NtQueryPerformanceCounter( &now, NULL );
+    return now.QuadPart;
+}
+
+/* Whether overlapped sockets are used and how they end: a couple dozen lines,
+ * enough to see a program's first connection go through. */
+static void horizon_report_async( const char *what, const struct horizon_async *async, unsigned int status )
+{
+    static LONG reported;
+    char message[192];
+
+    if (__atomic_add_fetch( &reported, 1, __ATOMIC_RELAXED ) > 24) return;
+    snprintf( message, sizeof(message), "[ASYNC] %s: socket %04x %s by %04x, status %08x%s%s",
+              what, async->sock,
+              async->kind == HORIZON_ASYNC_ACCEPT_INTO ? "AcceptEx" :
+              async->kind == HORIZON_ASYNC_ACCEPT ? "accept" :
+              async->direction == HORIZON_ASYNC_READ ? "recv" : "send",
+              async->owner_tid, status, async->port ? ", port" : "", async->data.event ? ", event" : "" );
+    wine_nx_runtime_trace( message );
+}
+
+/* server/async.c's create_async: the event the program gave is reset, and the
+ * socket's completion port is taken as it is now -- the result goes there
+ * even if the socket is closed first. */
+static struct horizon_async *horizon_server_async_create_locked( struct horizon_server_connection *connection,
+                                                                 const struct horizon_async_data *data,
+                                                                 int direction, int kind )
+{
+    struct horizon_server_handle_entry *event;
+    struct horizon_server_object *sock = NULL;
+    struct horizon_async *async;
+
+    if (!(async = calloc( 1, sizeof(*async) ))) return NULL;
+    async->id = horizon_async_new_id( &horizon_asyncs );
+    async->owner_tid = connection->tid;
+    async->sock = data->handle;
+    async->direction = direction;
+    async->kind = kind;
+    async->state = HORIZON_ASYNC_DIRECT;
+    async->status = HORIZON_STATUS_ALERTED;
+    async->data = *data;
+    if (!horizon_server_find_sock_locked( data->handle, &sock ) && sock->file_completion)
+    {
+        async->port = sock->file_completion;
+        sock->file_completion->refs++;
+        async->port_key = sock->file_completion_key;
+        async->port_flags = sock->file_completion_flags;
+    }
+    if (data->event && (event = horizon_server_find_handle_locked( data->event )) &&
+        event->object->type == HORIZON_SERVER_OBJECT_EVENT)
+        event->object->signaled = 0;
+    horizon_async_add( &horizon_asyncs, async );
+    return async;
+}
+
+static void horizon_server_async_free_locked( struct horizon_async *async )
+{
+    struct horizon_server_object *port = async->port;
+
+    if (port && !--port->refs) horizon_server_free_object( port );
+    horizon_async_free( async );
+}
+
+/* A socket accept() made, with what the listening one has: its blocking mode
+ * and its WSAEventSelect, as server/sock.c's accept_socket gives it. */
+static struct horizon_server_handle_entry *horizon_server_accepted_sock_locked( struct horizon_server_object *listener,
+                                                                                int fd )
+{
+    struct horizon_server_handle_entry *entry;
+    struct horizon_server_object *sock;
+
+    if (!(entry = horizon_server_create_handle_locked( HORIZON_SERVER_OBJECT_SOCK ))) return NULL;
+    sock = entry->object;
+    sock->file_access = listener->file_access;
+    sock->file_options = listener->file_options;
+    sock->file_fd = fd;
+    sock->sock_bound = 1;
+    sock->sock_nonblocking = listener->sock_nonblocking;
+    sock->sock_event_handle = listener->sock_event_handle;
+    sock->sock_event_mask = listener->sock_event_mask;
+    return entry;
+}
+
+/* server/sock.c's fill_accept_output: what AcceptEx writes, which the
+ * client's callback fetches with get_async_result. Returns 0 while the first
+ * data it asked for has not come. */
+static int horizon_sock_accept_output_locked( struct horizon_async *async, struct horizon_server_object *target )
+{
+    unsigned int local_at, remote_at, remote_len;
+    struct sockaddr_in addr;
+    socklen_t addr_len;
+    unsigned char *out;
+    int received = 0, len;
+
+    if (!horizon_async_accept_layout( async->out_size, async->recv_len, async->local_len,
+                                      &local_at, &remote_at, &remote_len ))
+    {
+        horizon_async_ready( async, HORIZON_STATUS_BUFFER_TOO_SMALL, horizon_async_now() );
+        return 1;
+    }
+    if (!(out = calloc( 1, async->out_size )))
+    {
+        horizon_async_ready( async, HORIZON_STATUS_NO_MEMORY, horizon_async_now() );
+        return 1;
+    }
+    if (async->recv_len && (received = recv( target->file_fd, out, async->recv_len, 0 )) == -1)
+    {
+        unsigned int status = horizon_sock_errno_status( errno );
+
+        free( out );
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        horizon_async_ready( async, status, horizon_async_now() );
+        return 1;
+    }
+    if (async->local_len)
+    {
+        addr_len = sizeof(addr);
+        if (getsockname( target->file_fd, (struct sockaddr *)&addr, &addr_len ) == -1 ||
+            !(len = horizon_ws_sockaddr_from_unix( &addr, out + local_at + sizeof(int),
+                                                   async->local_len - sizeof(int) )))
+            goto too_small;
+        memcpy( out + local_at, &len, sizeof(len) );
+    }
+    addr_len = sizeof(addr);
+    if (getpeername( target->file_fd, (struct sockaddr *)&addr, &addr_len ) == -1 ||
+        !(len = horizon_ws_sockaddr_from_unix( &addr, out + remote_at + sizeof(int), remote_len - sizeof(int) )))
+        goto too_small;
+    memcpy( out + remote_at, &len, sizeof(len) );
+    async->out = out;
+    async->out_status = HORIZON_STATUS_SUCCESS;
+    async->out_info = received;
+    horizon_async_ready( async, HORIZON_STATUS_ALERTED, horizon_async_now() );
+    return 1;
+
+too_small:
+    free( out );
+    horizon_async_ready( async, HORIZON_STATUS_BUFFER_TOO_SMALL, horizon_async_now() );
+    return 1;
+}
+
+/* An accept waiting on a listening socket whose connection may have come:
+ * accept() makes a new socket, AcceptEx puts the connection into the socket it
+ * was given, whose old descriptor the client may still have cached. Returns 1
+ * once the async is ready for its thread. */
+static int horizon_sock_accept_async_locked( struct horizon_server_object *listener, struct horizon_async *async )
+{
+    struct horizon_server_handle_entry *entry;
+    struct horizon_server_object *target = NULL;
+    unsigned int handle;
+    int fd;
+
+    if (async->kind == HORIZON_ASYNC_ACCEPT_INTO &&
+        (horizon_server_find_sock_locked( async->accept_into, &target ) || target->file_fd == -1))
+    {
+        horizon_async_ready( async, HORIZON_STATUS_INVALID_HANDLE, horizon_async_now() );
+        return 1;
+    }
+    if (!async->accepted)
+    {
+        if ((fd = accept( listener->file_fd, NULL, NULL )) == -1)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 0;
+            horizon_async_ready( async, horizon_sock_errno_status( errno ), horizon_async_now() );
+            return 1;
+        }
+        fcntl( fd, F_SETFL, O_NONBLOCK );
+        if (async->kind == HORIZON_ASYNC_ACCEPT)
+        {
+            if (!(async->out = malloc( sizeof(handle) )) ||
+                !(entry = horizon_server_accepted_sock_locked( listener, fd )))
+            {
+                close( fd );
+                free( async->out );
+                async->out = NULL;
+                horizon_async_ready( async, HORIZON_STATUS_NO_MEMORY, horizon_async_now() );
+                return 1;
+            }
+            handle = entry->handle;
+            memcpy( async->out, &handle, sizeof(handle) );
+            async->out_size = sizeof(handle);
+            async->out_status = HORIZON_STATUS_SUCCESS;
+            async->out_info = sizeof(handle);
+            horizon_async_ready( async, HORIZON_STATUS_ALERTED, horizon_async_now() );
+            return 1;
+        }
+        close( target->file_fd );
+        target->file_fd = fd;
+        target->sock_bound = 1;
+        target->sock_pending_events = 0;
+        horizon_client_forget_fd( async->accept_into );
+        async->accepted = 1;
+    }
+    return horizon_sock_accept_output_locked( async, target );
+}
+
+/* The operations waiting on one socket, oldest first in each direction: a
+ * recv or send whose socket is ready goes to its thread to be done, an accept
+ * is done here. Returns whether any became ready. */
+static int horizon_sock_poll_asyncs_locked( unsigned int handle, struct horizon_server_object *sock )
+{
+    int direction, changed = 0;
+
+    for (direction = HORIZON_ASYNC_READ; direction <= HORIZON_ASYNC_WRITE; direction++)
+    {
+        struct horizon_async *async = horizon_async_next_queued( &horizon_asyncs, handle, direction );
+        struct horizon_server_object *target;
+        struct pollfd pfd;
+
+        if (!async) continue;
+        pfd.fd = sock->file_fd;
+        /* AcceptEx that asked for the first data waits for it on the socket
+         * the connection went into. */
+        if (async->kind == HORIZON_ASYNC_ACCEPT_INTO && async->accepted &&
+            !horizon_server_find_sock_locked( async->accept_into, &target ))
+            pfd.fd = target->file_fd;
+        if (pfd.fd == -1) continue;
+        pfd.events = direction == HORIZON_ASYNC_READ ? POLLIN : POLLOUT;
+        pfd.revents = 0;
+        if (poll( &pfd, 1, 0 ) <= 0 || !(pfd.revents & (pfd.events | POLLHUP | POLLERR))) continue;
+        if (async->kind == HORIZON_ASYNC_IO)
+            horizon_async_ready( async, HORIZON_STATUS_ALERTED, horizon_async_now() );
+        else if (!horizon_sock_accept_async_locked( sock, async ))
+            continue;
+        changed = 1;
+    }
+    return changed;
+}
+
+/* Every socket an operation waits on, each looked at once. */
+static int horizon_sock_poll_all_asyncs_locked(void)
+{
+    struct horizon_server_object *sock;
+    struct horizon_async *async;
+    unsigned int handles[64], count = 0, i;
+    int changed = 0;
+
+    for (async = horizon_asyncs.head; async && count < ARRAY_SIZE(handles); async = async->next)
+    {
+        if (async->state != HORIZON_ASYNC_QUEUED) continue;
+        for (i = 0; i < count; i++) if (handles[i] == async->sock) break;
+        if (i == count) handles[count++] = async->sock;
+    }
+    for (i = 0; i < count; i++)
+        if (!horizon_server_find_sock_locked( handles[i], &sock ) && sock->file_fd != -1 &&
+            horizon_sock_poll_asyncs_locked( handles[i], sock ))
+            changed = 1;
+    return changed;
+}
+
 /* Poller for WSAEventSelect: scans sockets with a registered event mask and
  * sets the associated event object when new activity shows up.  Waiters are
  * poll-based (select_wait re-checks on TIMEOUT), so flipping signaled under
@@ -10130,6 +10462,8 @@ static int horizon_sock_poller_running;
 
 static void *horizon_sock_poller_thread( void *param )
 {
+    int busy = 1, since_scan = 0;
+
     (void)param;
     for (;;)
     {
@@ -10140,10 +10474,16 @@ static void *horizon_sock_poller_thread( void *param )
             if (&wine_nx_quit_requested && wine_nx_quit_requested && &wine_nx_quit_point) wine_nx_quit_point();
         }
         struct horizon_server_handle_entry *entry;
+        int changed = 0, tick = busy ? 5000 : 50000;
 
-        usleep( 50000 );
+        /* Overlapped operations waiting on a socket are looked at every 5 ms,
+         * which is what a round trip to the program's own server costs;
+         * WSAEventSelect sockets every 50 ms, as before. */
+        usleep( tick );
+        since_scan += tick;
         pthread_mutex_lock( &horizon_server_objects_mutex );
-        for (entry = horizon_server_handles; entry; entry = entry->next)
+        if (horizon_asyncs.head) changed = horizon_sock_poll_all_asyncs_locked();
+        for (entry = since_scan >= 50000 ? horizon_server_handles : NULL; entry; entry = entry->next)
         {
             struct horizon_server_object *o = entry->object;
             struct pollfd pfd;
@@ -10237,6 +10577,12 @@ static void *horizon_sock_poller_thread( void *param )
                     horizon_server_signal_object_locked( o->sock_event_handle );
             }
         }
+        if (since_scan >= 50000) since_scan = 0;
+        busy = horizon_async_any_queued( &horizon_asyncs );
+        /* Waiting threads look for what is ready for them, or has waited too
+         * long for its own thread. */
+        if (changed || horizon_async_any_stale( &horizon_asyncs, horizon_async_now(), HORIZON_ASYNC_STALE ))
+            horizon_server_signal_changed_locked();
         pthread_mutex_unlock( &horizon_server_objects_mutex );
     }
     return NULL;
@@ -10569,6 +10915,11 @@ static unsigned int horizon_sock_ioctl_setsockopt( unsigned int code, unsigned i
     case HORIZON_IOCTL_AFD_WINE_SET_SO_RCVBUF:    option = SO_RCVBUF; break;
     case HORIZON_IOCTL_AFD_WINE_SET_SO_SNDBUF:    option = SO_SNDBUF; break;
     case HORIZON_IOCTL_AFD_WINE_SET_IP_HDRINCL:   level = IPPROTO_IP; option = IP_HDRINCL; break;
+    case HORIZON_IOCTL_AFD_WINE_SET_SO_KEEPALIVE: option = SO_KEEPALIVE; break;
+    case HORIZON_IOCTL_AFD_WINE_SET_SO_OOBINLINE: option = SO_OOBINLINE; break;
+    /* Asio's acceptor sets this before it binds, and gives up if it fails. */
+    case HORIZON_IOCTL_AFD_WINE_SET_SO_REUSEADDR: option = SO_REUSEADDR; break;
+    case HORIZON_IOCTL_AFD_WINE_SET_TCP_NODELAY:  level = IPPROTO_TCP; option = TCP_NODELAY; break;
     default:                                      option = SO_LINGER; break;
     }
 
@@ -10601,6 +10952,186 @@ static unsigned int horizon_sock_ioctl_setsockopt( unsigned int code, unsigned i
     return status;
 }
 
+/* The options getsockopt reads as an int. */
+static unsigned int horizon_sock_ioctl_getsockopt( unsigned int code, unsigned int handle,
+                                                   unsigned char *out, unsigned int out_max, unsigned int *out_size )
+{
+    int fd, level = SOL_SOCKET, option, value = 0;
+    socklen_t optlen = sizeof(value);
+    unsigned int status;
+
+    switch (code)
+    {
+    case HORIZON_IOCTL_AFD_WINE_GET_SO_BROADCAST: option = SO_BROADCAST; break;
+    case HORIZON_IOCTL_AFD_WINE_GET_SO_KEEPALIVE: option = SO_KEEPALIVE; break;
+    case HORIZON_IOCTL_AFD_WINE_GET_SO_OOBINLINE: option = SO_OOBINLINE; break;
+    case HORIZON_IOCTL_AFD_WINE_GET_SO_RCVBUF:    option = SO_RCVBUF; break;
+    case HORIZON_IOCTL_AFD_WINE_GET_SO_REUSEADDR: option = SO_REUSEADDR; break;
+    case HORIZON_IOCTL_AFD_WINE_GET_SO_SNDBUF:    option = SO_SNDBUF; break;
+    default:                                      level = IPPROTO_TCP; option = TCP_NODELAY; break;
+    }
+    if (out_max < sizeof(value)) return HORIZON_STATUS_BUFFER_TOO_SMALL;
+    if ((status = horizon_server_get_sock_fd( handle, &fd, NULL ))) return status;
+    if (getsockopt( fd, level, option, &value, &optlen ) == -1) return horizon_sock_errno_status( errno );
+    if (level == SOL_SOCKET && option != SO_RCVBUF && option != SO_SNDBUF) value = !!value;
+    memcpy( out, &value, sizeof(value) );
+    *out_size = sizeof(value);
+    return HORIZON_STATUS_SUCCESS;
+}
+
+/* listen(): server/sock.c refuses a socket that was never bound. */
+static unsigned int horizon_sock_ioctl_listen( unsigned int handle, const unsigned char *data, unsigned int data_size )
+{
+    struct horizon_server_object *object;
+    int params[3]; /* unknown, backlog, unknown */
+    unsigned int status;
+    int fd = -1;
+
+    if (data_size < sizeof(params)) return HORIZON_STATUS_INVALID_PARAMETER;
+    memcpy( params, data, sizeof(params) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    status = horizon_server_find_sock_locked( handle, &object );
+    if (!status && (object->file_fd == -1 || !object->sock_bound)) status = HORIZON_STATUS_INVALID_PARAMETER;
+    if (!status) fd = object->file_fd;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    if (!status && listen( fd, params[1] ) == -1) status = horizon_sock_errno_status( errno );
+    horizon_trace( "[server] LISTEN handle=%08x backlog=%d -> %08x\n", handle, params[1], status );
+    return status;
+}
+
+/* accept(): a connection that is there is taken at once; with none, a
+ * nonblocking socket says so and a blocking one waits, as an async that the
+ * poller finishes and ws2_32 waits for on its event. */
+static unsigned int horizon_sock_ioctl_accept( struct horizon_server_connection *connection,
+                                               const struct horizon_async_data *data,
+                                               unsigned char *out, unsigned int out_max, unsigned int *out_size )
+{
+    struct horizon_server_handle_entry *entry;
+    struct horizon_server_object *listener;
+    struct horizon_async *async;
+    unsigned int status;
+    int fd;
+
+    if (out_max < sizeof(entry->handle)) return HORIZON_STATUS_BUFFER_TOO_SMALL;
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(status = horizon_server_find_sock_locked( data->handle, &listener )))
+    {
+        if (listener->file_fd == -1) status = HORIZON_STATUS_INVALID_PARAMETER;
+        else if ((fd = accept( listener->file_fd, NULL, NULL )) != -1)
+        {
+            fcntl( fd, F_SETFL, O_NONBLOCK );
+            if ((entry = horizon_server_accepted_sock_locked( listener, fd )))
+            {
+                memcpy( out, &entry->handle, sizeof(entry->handle) );
+                *out_size = sizeof(entry->handle);
+            }
+            else
+            {
+                close( fd );
+                status = HORIZON_STATUS_NO_MEMORY;
+            }
+        }
+        else if (errno != EAGAIN && errno != EWOULDBLOCK) status = horizon_sock_errno_status( errno );
+        else if (listener->sock_nonblocking) status = HORIZON_STATUS_DEVICE_NOT_READY;
+        else if (!(async = horizon_server_async_create_locked( connection, data, HORIZON_ASYNC_READ,
+                                                               HORIZON_ASYNC_ACCEPT )))
+            status = HORIZON_STATUS_NO_MEMORY;
+        else
+        {
+            async->state = HORIZON_ASYNC_QUEUED;
+            async->pending = 1;
+            status = HORIZON_STATUS_PENDING;
+            horizon_report_async( "pending", async, status );
+        }
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    if (status == HORIZON_STATUS_PENDING) horizon_sock_poller_start();
+    return status;
+}
+
+/* AcceptEx: always pending, as server/sock.c queues it, into a socket that
+ * was made for it and never bound. out_size is the whole buffer the program
+ * gave: the first data, then room for the two addresses. */
+static unsigned int horizon_sock_ioctl_accept_into( struct horizon_server_connection *connection,
+                                                    const struct horizon_async_data *data,
+                                                    const unsigned char *in, unsigned int in_size,
+                                                    unsigned int out_size )
+{
+    struct horizon_server_object *listener, *target;
+    unsigned int params[3]; /* accept_handle, recv_len, local_len */
+    unsigned int local_at, remote_at, remote_len;
+    struct horizon_async *async;
+    unsigned int status;
+
+    if (in_size < sizeof(params)) return HORIZON_STATUS_INVALID_PARAMETER;
+    memcpy( params, in, sizeof(params) );
+    if (!horizon_async_accept_layout( out_size, params[1], params[2], &local_at, &remote_at, &remote_len ))
+        return HORIZON_STATUS_BUFFER_TOO_SMALL;
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(status = horizon_server_find_sock_locked( data->handle, &listener )) &&
+        !(status = horizon_server_find_sock_locked( params[0], &target )))
+    {
+        if (listener->file_fd == -1 || target->file_fd == -1 || target->sock_bound)
+            status = HORIZON_STATUS_INVALID_PARAMETER;
+        else if (!(async = horizon_server_async_create_locked( connection, data, HORIZON_ASYNC_READ,
+                                                               HORIZON_ASYNC_ACCEPT_INTO )))
+            status = HORIZON_STATUS_NO_MEMORY;
+        else
+        {
+            async->accept_into = params[0];
+            async->recv_len = params[1];
+            async->local_len = params[2];
+            async->out_size = out_size;
+            async->state = HORIZON_ASYNC_QUEUED;
+            async->pending = 1;
+            status = HORIZON_STATUS_PENDING;
+            horizon_report_async( "pending", async, status );
+        }
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    if (status == HORIZON_STATUS_PENDING) horizon_sock_poller_start();
+    return status;
+}
+
+/* An ioctl done at once is told as server/async.c tells any operation that
+ * ends directly: the event it gave is reset when it starts and set when it
+ * is done, and on a socket tied to a port a packet goes there unless the
+ * socket skips that. ConnectEx that connects at once returns TRUE, and Asio
+ * then waits for that packet like any other. */
+static void horizon_server_ioctl_start( const struct horizon_async_data *data )
+{
+    struct horizon_server_handle_entry *event;
+
+    if (!data->event) return;
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if ((event = horizon_server_find_handle_locked( data->event )) &&
+        event->object->type == HORIZON_SERVER_OBJECT_EVENT)
+        event->object->signaled = 0;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+}
+
+static void horizon_server_ioctl_done( unsigned int tid, const struct horizon_async_data *data,
+                                       unsigned int status, unsigned int information )
+{
+    struct horizon_server_object *sock = NULL;
+    struct horizon_async async;
+
+    if (HORIZON_NT_ERROR( status ) || (!data->event && !data->apc && !data->apc_context)) return;
+    memset( &async, 0, sizeof(async) );
+    async.owner_tid = tid;
+    async.sock = data->handle;
+    async.data = *data;
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!horizon_server_find_sock_locked( data->handle, &sock ) && sock->file_completion)
+    {
+        async.port = sock->file_completion;
+        async.port_key = sock->file_completion_key;
+        async.port_flags = sock->file_completion_flags;
+    }
+    horizon_async_finish_locked( &async, status, information );
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+}
+
 static int horizon_server_handle_ioctl( struct horizon_server_connection *connection,
                                         const unsigned char *message,
                                         const unsigned char *data, unsigned int data_size )
@@ -10615,6 +11146,7 @@ static int horizon_server_handle_ioctl( struct horizon_server_connection *connec
 
     if (out_max > sizeof(out)) out_max = sizeof(out);
     memset( &reply, 0, sizeof(reply) );
+    horizon_server_ioctl_start( &request->async );
 
     switch (request->code)
     {
@@ -10626,6 +11158,19 @@ static int horizon_server_handle_ioctl( struct horizon_server_connection *connec
         status = horizon_sock_ioctl_connect( handle, data, data_size );
         break;
 
+    case HORIZON_IOCTL_AFD_LISTEN:
+        status = horizon_sock_ioctl_listen( handle, data, data_size );
+        break;
+
+    case HORIZON_IOCTL_AFD_WINE_ACCEPT:
+        status = horizon_sock_ioctl_accept( connection, &request->async, out, out_max, &out_size );
+        break;
+
+    case HORIZON_IOCTL_AFD_WINE_ACCEPT_INTO:
+        status = horizon_sock_ioctl_accept_into( connection, &request->async, data, data_size,
+                                                 request->header.reply_size );
+        break;
+
     case HORIZON_IOCTL_AFD_BIND:
         status = horizon_sock_ioctl_bind( handle, data, data_size, out, out_max, &out_size );
         break;
@@ -10635,7 +11180,21 @@ static int horizon_server_handle_ioctl( struct horizon_server_connection *connec
     case HORIZON_IOCTL_AFD_WINE_SET_SO_RCVBUF:
     case HORIZON_IOCTL_AFD_WINE_SET_SO_SNDBUF:
     case HORIZON_IOCTL_AFD_WINE_SET_IP_HDRINCL:
+    case HORIZON_IOCTL_AFD_WINE_SET_SO_KEEPALIVE:
+    case HORIZON_IOCTL_AFD_WINE_SET_SO_OOBINLINE:
+    case HORIZON_IOCTL_AFD_WINE_SET_SO_REUSEADDR:
+    case HORIZON_IOCTL_AFD_WINE_SET_TCP_NODELAY:
         status = horizon_sock_ioctl_setsockopt( request->code, handle, data, data_size );
+        break;
+
+    case HORIZON_IOCTL_AFD_WINE_GET_SO_BROADCAST:
+    case HORIZON_IOCTL_AFD_WINE_GET_SO_KEEPALIVE:
+    case HORIZON_IOCTL_AFD_WINE_GET_SO_OOBINLINE:
+    case HORIZON_IOCTL_AFD_WINE_GET_SO_RCVBUF:
+    case HORIZON_IOCTL_AFD_WINE_GET_SO_REUSEADDR:
+    case HORIZON_IOCTL_AFD_WINE_GET_SO_SNDBUF:
+    case HORIZON_IOCTL_AFD_WINE_GET_TCP_NODELAY:
+        status = horizon_sock_ioctl_getsockopt( request->code, handle, out, out_max, &out_size );
         break;
 
     case HORIZON_IOCTL_AFD_POLL:
@@ -10742,6 +11301,8 @@ static int horizon_server_handle_ioctl( struct horizon_server_connection *connec
         break;
     }
 
+    if (status != HORIZON_STATUS_PENDING)
+        horizon_server_ioctl_done( connection->tid, &request->async, status, out_size );
     reply.header.error = status;
     reply.header.reply_size = out_size;
     reply.wait = 0;
@@ -10794,30 +11355,124 @@ static int horizon_server_handle_socket_get_events( struct horizon_server_connec
 static int horizon_server_handle_socket_io( struct horizon_server_connection *connection,
                                             const unsigned char *message )
 {
+    const struct horizon_server_request_header *header = (const void *)message;
+    const struct horizon_async_data *data;
     struct horizon_socket_io_reply reply;
+    struct horizon_async *async;
+    int direction;
 
-    (void)message;
+    if (header->req == HORIZON_REQ_RECV_SOCKET)
+    {
+        data = &((const struct horizon_recv_socket_request *)message)->async;
+        direction = HORIZON_ASYNC_READ;
+    }
+    else
+    {
+        data = &((const struct horizon_send_socket_request *)message)->async;
+        direction = HORIZON_ASYNC_WRITE;
+    }
     memset( &reply, 0, sizeof(reply) );
-    /* ALERTED tells ntdll's socket.c to do the recvmsg/sendmsg itself on
-     * the cached fd.  The wait token is a placeholder consumed only by
-     * set_async_direct_result below; nonblocking makes EAGAIN surface as
-     * WSAEWOULDBLOCK instead of waiting for an async that will never run. */
+    /* ALERTED tells ntdll's socket.c to do the recvmsg/sendmsg itself on the
+     * cached fd, and to tell set_async_direct_result how it went. The async
+     * behind the wait token is what that result is kept against: an
+     * overlapped operation that would block goes pending there and is
+     * finished later, when the socket is ready. nonblocking keeps a plain
+     * blocking call surfacing EAGAIN as WSAEWOULDBLOCK, as before. */
     reply.header.error = HORIZON_STATUS_ALERTED;
     reply.wait = 1;
     reply.options = 0;
     reply.nonblocking = 1;
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if ((async = horizon_server_async_create_locked( connection, data, direction, HORIZON_ASYNC_IO )))
+        reply.wait = async->id;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
 }
 
 static int horizon_server_handle_set_async_direct_result( struct horizon_server_connection *connection,
                                                           const unsigned char *message )
 {
+    const struct horizon_set_async_direct_result_request *request = (const void *)message;
     struct horizon_set_async_direct_result_reply reply;
+    struct horizon_async *async;
+    int queued = 0;
 
-    (void)message;
     memset( &reply, 0, sizeof(reply) );
-    reply.handle = 0; /* nothing pending: caller skips wait_async */
+    reply.handle = 0; /* nothing for the client to wait on: it returns what it has */
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if ((async = horizon_async_find_id( &horizon_asyncs, request->handle )) &&
+        async->state == HORIZON_ASYNC_DIRECT)
+    {
+        if (request->status == HORIZON_STATUS_PENDING)
+        {
+            /* The program was told ERROR_IO_PENDING: it hears when the
+             * socket is ready and the operation has been done. */
+            async->state = HORIZON_ASYNC_QUEUED;
+            async->pending = 1;
+            queued = 1;
+            horizon_report_async( "pending", async, request->status );
+        }
+        else
+        {
+            async->pending = request->mark_pending;
+            horizon_async_remove( &horizon_asyncs, async );
+            horizon_async_finish_locked( async, request->status, request->information );
+            horizon_server_async_free_locked( async );
+        }
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    if (queued) horizon_sock_poller_start();
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+/* get_async_result: what an accept the server did left for the client's
+ * callback, which it copies into the program's buffer. */
+static int horizon_server_handle_get_async_result( struct horizon_server_connection *connection,
+                                                   const unsigned char *message )
+{
+    const struct horizon_get_async_result_request *request = (const void *)message;
+    struct horizon_server_reply_header reply;
+    struct horizon_async *async;
+    unsigned char *out = NULL;
+    unsigned int size = 0;
+    int ret;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(async = horizon_async_find_user( &horizon_asyncs, request->user_arg )) || !async->out)
+        reply.error = HORIZON_STATUS_INVALID_PARAMETER;
+    else
+    {
+        reply.error = async->out_status;
+        size = min( async->out ? async->out_size : 0, request->header.reply_size );
+        if (size && (out = malloc( size ))) memcpy( out, async->out, size );
+        else size = 0;
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    reply.reply_size = size;
+    ret = horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), out, size );
+    free( out );
+    return ret;
+}
+
+/* cancel_async: CancelIo and CancelIoEx, which Asio calls on a socket it is
+ * done with. What is cancelled is finished as cancelled, which a program that
+ * was told ERROR_IO_PENDING hears about on its port like any other result. */
+static int horizon_server_handle_cancel_async( struct horizon_server_connection *connection,
+                                               const unsigned char *message )
+{
+    const struct horizon_cancel_async_request *request = (const void *)message;
+    unsigned int status = HORIZON_STATUS_NOT_FOUND;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (horizon_async_cancel( &horizon_asyncs, request->handle, request->iosb,
+                              request->only_thread ? connection->tid : 0, horizon_async_now(), 0 ))
+    {
+        status = HORIZON_STATUS_SUCCESS;
+        horizon_server_signal_changed_locked();
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_status( connection->reply_fd, status );
 }
 
 #ifdef __SWITCH__
@@ -11672,8 +12327,18 @@ static int horizon_server_handle_query_completion( struct horizon_server_connect
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
 }
 
+/* Files and sockets are what I/O completion ports are tied to. */
+static unsigned int horizon_server_find_io_object_locked( unsigned int handle, struct horizon_server_object **object )
+{
+    unsigned int status = horizon_server_find_typed_object_locked( handle, HORIZON_SERVER_OBJECT_FILE, object );
+
+    if (status == HORIZON_STATUS_OBJECT_TYPE_MISMATCH)
+        status = horizon_server_find_typed_object_locked( handle, HORIZON_SERVER_OBJECT_SOCK, object );
+    return status;
+}
+
 /* server/fd.c's set_completion_info, add_fd_completion and
- * set_fd_completion_mode, for regular files. */
+ * set_fd_completion_mode, for files and sockets. */
 static int horizon_server_handle_set_completion_info( struct horizon_server_connection *connection,
                                                       const unsigned char *message )
 {
@@ -11682,7 +12347,7 @@ static int horizon_server_handle_set_completion_info( struct horizon_server_conn
     unsigned int status;
 
     pthread_mutex_lock( &horizon_server_objects_mutex );
-    status = horizon_server_find_typed_object_locked( request->handle, HORIZON_SERVER_OBJECT_FILE, &file );
+    status = horizon_server_find_io_object_locked( request->handle, &file );
     if (status == HORIZON_STATUS_SUCCESS &&
         (!horizon_completion_file_overlapped( file->file_options ) || file->file_completion))
         status = HORIZON_STATUS_INVALID_PARAMETER;
@@ -11708,7 +12373,7 @@ static int horizon_server_handle_add_fd_completion( struct horizon_server_connec
     unsigned int status;
 
     pthread_mutex_lock( &horizon_server_objects_mutex );
-    status = horizon_server_find_typed_object_locked( request->handle, HORIZON_SERVER_OBJECT_FILE, &file );
+    status = horizon_server_find_io_object_locked( request->handle, &file );
     if (status == HORIZON_STATUS_SUCCESS && file->file_completion &&
         horizon_completion_file_posts( request->async, file->file_completion_flags ))
         horizon_server_post_completion_locked( file->file_completion, file->file_completion_key,
@@ -11725,7 +12390,7 @@ static int horizon_server_handle_set_fd_completion_mode( struct horizon_server_c
     unsigned int status;
 
     pthread_mutex_lock( &horizon_server_objects_mutex );
-    status = horizon_server_find_typed_object_locked( request->handle, HORIZON_SERVER_OBJECT_FILE, &file );
+    status = horizon_server_find_io_object_locked( request->handle, &file );
     if (status == HORIZON_STATUS_SUCCESS)
     {
         if (horizon_completion_file_overlapped( file->file_options ))
@@ -12249,14 +12914,119 @@ static int horizon_server_handle_queue_apc( struct horizon_server_connection *co
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
 }
 
+static int horizon_server_select_signals( const struct horizon_select_request *request,
+                                          const unsigned char *data, unsigned int data_size )
+{
+    int op;
+
+    if (request->size < sizeof(op)) return 0;
+    if (data_size >= HORIZON_APC_RESULT_SIZE + request->size) data += HORIZON_APC_RESULT_SIZE;
+    else if (data_size < request->size) return 0;
+    memcpy( &op, data, sizeof(op) );
+    return op == HORIZON_SELECT_SIGNAL_AND_WAIT;
+}
+
+/* server/async.c's async_set_result: how an operation on a socket that has
+ * ended is told -- its completion routine as a user APC on the thread that
+ * started it, or a packet on the socket's port, and its event. */
+static void horizon_async_finish_locked( struct horizon_async *async, unsigned int status,
+                                         unsigned long long total )
+{
+    struct horizon_server_object *port = async->port, *thread;
+    struct horizon_server_handle_entry *event;
+    unsigned int actions;
+
+    actions = horizon_async_completion( async, HORIZON_NT_ERROR( status ), port != NULL,
+                                        async->port_flags & HORIZON_FILE_SKIP_COMPLETION_PORT_ON_SUCCESS );
+    if (actions & HORIZON_ASYNC_APC)
+    {
+        unsigned char call[HORIZON_APC_CALL_SIZE];
+        unsigned int type = HORIZON_APC_USER;
+
+        /* union apc_call's user: func, then apc_context, the status block, 0. */
+        memset( call, 0, sizeof(call) );
+        memcpy( call, &type, sizeof(type) );
+        memcpy( call + 8, &async->data.apc, 8 );
+        memcpy( call + 16, &async->data.apc_context, 8 );
+        memcpy( call + 24, &async->data.iosb, 8 );
+        for (thread = horizon_server_threads; thread; thread = thread->thread_next)
+            if (thread->thread.tid == async->owner_tid) break;
+        if (thread) horizon_server_queue_user_apc_locked( thread, call, sizeof(call) );
+    }
+    if (actions & HORIZON_ASYNC_POST)
+        horizon_server_post_completion_locked( port, async->port_key, async->data.apc_context, status, total );
+    if ((actions & HORIZON_ASYNC_EVENT) && (event = horizon_server_find_handle_locked( async->data.event )) &&
+        event->object->type == HORIZON_SERVER_OBJECT_EVENT && !event->object->signaled)
+    {
+        event->object->signaled = 1;
+        horizon_server_signal_changed_locked();
+    }
+    if (async->pending) horizon_report_async( "done", async, status );
+}
+
+/* What the client's callback made of an operation it ran as a system APC,
+ * which comes back with its next select: not ready after all, and it waits
+ * for the socket again, or ended. */
+static void horizon_server_async_result_locked( const struct horizon_select_request *request,
+                                                const unsigned char *data, unsigned int data_size )
+{
+    struct horizon_async *async;
+    unsigned int status, total;
+
+    if (!request->prev_apc || !(async = horizon_async_find_apc( &horizon_asyncs, request->prev_apc ))) return;
+    async->apc_id = 0;
+    status = HORIZON_STATUS_PENDING;
+    total = 0;
+    if (data_size >= HORIZON_APC_RESULT_SIZE + request->size)
+    {
+        memcpy( &status, data + 4, sizeof(status) );  /* union apc_result's async_io */
+        memcpy( &total, data + 8, sizeof(total) );
+    }
+    if (status == HORIZON_STATUS_PENDING)
+    {
+        async->state = HORIZON_ASYNC_QUEUED;
+        async->status = HORIZON_STATUS_ALERTED;
+        return;
+    }
+    horizon_async_remove( &horizon_asyncs, async );
+    horizon_async_finish_locked( async, status, total );
+    horizon_server_async_free_locked( async );
+}
+
+/* An operation ready for this thread to run, as server/async.c's
+ * async_terminate hands it over: APC_ASYNC_IO with ALERTED to do it now (or
+ * fetch what an accept left), or how it ended. */
+static unsigned int horizon_server_async_apc_locked( struct horizon_server_connection *connection,
+                                                     unsigned char *call )
+{
+    struct horizon_async *async;
+    unsigned int type = HORIZON_APC_ASYNC_IO, result;
+
+    if (!horizon_asyncs.head ||
+        !(async = horizon_async_ready_for( &horizon_asyncs, connection->tid, horizon_async_now(),
+                                           HORIZON_ASYNC_STALE )))
+        return 0;
+    async->state = HORIZON_ASYNC_RUNNING;
+    if (!(async->apc_id = ++horizon_async_apc_ids)) async->apc_id = ++horizon_async_apc_ids;
+    result = async->status == HORIZON_STATUS_ALERTED ? async->out_info : 0;
+    memset( call, 0, HORIZON_APC_CALL_SIZE );
+    memcpy( call, &type, sizeof(type) );
+    memcpy( call + 4, &async->status, sizeof(async->status) );
+    memcpy( call + 8, &async->data.user, 8 );
+    memcpy( call + 16, &async->data.iosb, 8 );
+    memcpy( call + 24, &result, sizeof(result) );
+    return async->apc_id;
+}
+
 static int horizon_server_handle_select( struct horizon_server_connection *connection,
                                          const unsigned char *message,
                                          const unsigned char *data, unsigned int data_size )
 {
     const struct horizon_select_request *request = (const void *)message;
+    unsigned char system_call[HORIZON_APC_CALL_SIZE];
     struct horizon_user_apc *apc = NULL;
     struct horizon_select_reply reply;
-    int polls, ret;
+    int polls, signals, ret;
 
     memset( &reply, 0, sizeof(reply) );
     /* Each client has its own server connection/thread. A pending wait sleeps on
@@ -12268,11 +13038,23 @@ static int horizon_server_handle_select( struct horizon_server_connection *conne
      * positive deadlines use NT wall-clock time; INT64_MAX means infinite.
      * Signal-and-wait must perform its signal only on the first attempt. */
     pthread_mutex_lock( &horizon_server_objects_mutex );
+    horizon_server_async_result_locked( request, data, data_size );
     polls = horizon_server_select_polls_locked( request, data, data_size );
+    signals = horizon_server_select_signals( request, data, data_size );
     for (int initial = 1;; initial = 0)
     {
         LARGE_INTEGER now;
         long long timeout = HORIZON_SERVER_WAIT_SLICE;
+
+        /* A system APC comes first, in any wait: the socket operation the
+         * thread started is ready to be done. Not before a signal-and-wait
+         * has signalled, which the client leaves out when it waits again. */
+        if (!(initial && signals) &&
+            (reply.apc_handle = horizon_server_async_apc_locked( connection, system_call )))
+        {
+            reply.header.error = HORIZON_STATUS_KERNEL_APC;
+            break;
+        }
 
         /* Before the wait itself, as Windows does: an APC that arrived while
          * the thread ran is due the moment it waits alertably. */
@@ -12310,6 +13092,13 @@ static int horizon_server_handle_select( struct horizon_server_connection *conne
 
     TRACE( "Horizon server select size %u timeout %lld status %08x.\n",
            request->size, request->timeout, reply.header.error );
+    if (reply.apc_handle)
+    {
+        unsigned int size = min( (unsigned int)sizeof(system_call), request->header.reply_size );
+
+        reply.header.reply_size = size;
+        return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), system_call, size );
+    }
     if (apc)
     {
         unsigned int size = min( apc->size, request->header.reply_size );
@@ -12434,6 +13223,12 @@ static void *horizon_server_thread( void *param )
             break;
         case HORIZON_REQ_SET_ASYNC_DIRECT_RESULT:
             status = horizon_server_handle_set_async_direct_result( connection, message );
+            break;
+        case HORIZON_REQ_GET_ASYNC_RESULT:
+            status = horizon_server_handle_get_async_result( connection, message );
+            break;
+        case HORIZON_REQ_CANCEL_ASYNC:
+            status = horizon_server_handle_cancel_async( connection, message );
             break;
         case HORIZON_REQ_QUEUE_APC:
             status = horizon_server_handle_queue_apc( connection, message, request_data,

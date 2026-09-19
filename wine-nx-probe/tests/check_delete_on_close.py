@@ -37,6 +37,13 @@ fixture = r'''
 #define HORIZON_STATUS_INVALID_HANDLE 0xc0000008u
 #define HORIZON_SERVER_OBJECT_FILE 1
 #define HORIZON_SERVER_OBJECT_COMPLETION 2
+#define HORIZON_SERVER_OBJECT_SOCK 3
+/* Closing a socket ends what waits on it (check_horizon_async_sockets.py); no socket here. */
+static struct { void *head; } horizon_asyncs;
+static unsigned long long horizon_async_now(void) { return 0; }
+static unsigned horizon_async_cancel(void *list, unsigned sock, unsigned long long iosb, unsigned tid,
+                                     unsigned long long now, int closing) {
+    (void)list; (void)sock; (void)iosb; (void)tid; (void)now; (void)closing; return 0; }
 #define horizon_trace(...) ((void)0)
 struct horizon_server_object { unsigned refs, type, file_options; char *file_name; int file_is_dir, file_fd, file_delete, completion_closed; void *reg_key; };
 struct horizon_server_handle_entry { unsigned handle; struct horizon_server_object *object; struct horizon_server_handle_entry *next, **pprev, *hash_next; };

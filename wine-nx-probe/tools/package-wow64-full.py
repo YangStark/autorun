@@ -141,6 +141,14 @@ subprocess.run([str(toolchain / 'i686-w64-mingw32-clang'), '-O1', '-mwindows',
                 '-o', str(apc_test), str(probe / 'tests/win32/apc-test.c')], check=True)
 assert 'Arch: i386\n' in readobj('--file-headers', apc_test)
 
+# What Asio does with sockets -- a completion port, AcceptEx, ConnectEx and
+# overlapped reads -- which is all The Sims 2 Legacy's launcher emulation does.
+socket_test = stage / 'drive_c/Socket Test/socket-test.exe'
+socket_test.parent.mkdir(parents=True, exist_ok=True)
+subprocess.run([str(toolchain / 'i686-w64-mingw32-clang'), '-O1', '-mwindows',
+                '-o', str(socket_test), str(probe / 'tests/win32/socket-test.c'), '-lws2_32'], check=True)
+assert 'Arch: i386\n' in readobj('--file-headers', socket_test)
+
 # The Sims 2 Ultimate Collection is shipped installed; what is left is telling
 # the game where each of its packs is, which its release does with a batch file
 # of reg add lines whose every path comes from the folder it is run in.
