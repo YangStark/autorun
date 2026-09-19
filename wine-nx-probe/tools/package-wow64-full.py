@@ -203,6 +203,25 @@ sims2-setup.exe before running it:
 ''')
 (stage / 'drive_c/The Sims 2').mkdir(exist_ok=True)
 
+# Fallout New Vegas hands itself over to its own launcher unless it recognises
+# the card's display: FalloutNV.exe compares sD3DDevice with what adapter 0
+# calls itself, and with no FalloutPrefs.ini that default is the empty string,
+# which never matches. It then ShellExecutes FalloutNVLauncher.exe and returns.
+# The card gets the file the launcher would have written, naming the Switch's
+# adapter the way DXVK reports it, at 720p. The game rewrites this file itself
+# once its own options are used, so the values are a starting point, not a rule.
+fallout = stage / 'drive_c/users/wine/Documents/My Games/FalloutNV'
+fallout.mkdir(parents=True, exist_ok=True)
+(fallout / 'FalloutPrefs.ini').write_bytes('\r\n'.join((
+    '[Display]',
+    'sD3DDevice="NVIDIA Tegra X1 (GM20B) (NVK GM20B)"',
+    'iAdapter=0',
+    'iSize W=1280',
+    'iSize H=720',
+    'bFull Screen=1',
+    'iMultiSample=0',
+    '')).encode())
+
 # The classes those DLLs serve, which on Windows their own DllRegisterServer
 # would have written when they were installed.
 subprocess.run([sys.executable, str(tools / 'make-classes-reg.py'), str(stage)], check=True)
@@ -294,7 +313,16 @@ address space.
 
 Fallout New Vegas (GOG): xinput1_3, d3dx9_38 and the windowscodecs that loads its
 textures are staged, with msvcp110 and msvcr110 for Galaxy.dll and GalaxyWrp.dll.
-Its executable relocates, so it needs no forwarder.
+Its executable relocates, so it needs no forwarder. Started with no settings of
+its own the game hands itself to FalloutNVLauncher.exe and closes, because the
+display it is told to use is not one it recognises, so the payload brings the
+settings file it would have written:
+
+    C:\\users\\wine\\Documents\\My Games\\FalloutNV\\FalloutPrefs.ini
+
+It names the Switch's GPU as DXVK reports it, at 1280x720. The game rewrites
+that file once its own options are used; if it already holds settings worth
+keeping, keep the [Display] sD3DDevice line and merge the rest.
 
 The Sims 2 Ultimate Collection: everything Sims2EP9.exe imports is already
 staged, and gdiplus for the Activation.dll it loads. The release comes installed, so nothing has to be unpacked; what is
