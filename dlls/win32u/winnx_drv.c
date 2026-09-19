@@ -40,6 +40,7 @@ extern int   wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons );
 extern int   wine_nx_pointer_take( int *x, int *y, unsigned int *buttons, unsigned int *pressed,
                                    unsigned int *released );
 extern void  wine_nx_pointer_set_pos( int x, int y );
+extern void  wine_nx_pointer_follow( int x, int y );
 extern void  wine_nx_cursor_show( int visible );
 extern void  wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 extern int   wine_nx_runtime_verbose __attribute__((weak));
@@ -747,7 +748,7 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
                           pos.x, pos.y, x, y );
                 wine_nx_runtime_trace( line );
             }
-            wine_nx_pointer_set_pos( pos.x, pos.y );
+            wine_nx_pointer_follow( pos.x, pos.y );
         }
     }
     if (first) nxdrv_trace( "[NXINPUT] buttons=%x flags=%x,%x x=%d", buttons, first, second, x );

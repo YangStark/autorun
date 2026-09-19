@@ -225,6 +225,54 @@ static void test_warp_keeps_unsent_motion(void)
     assert( run_warp_loop( 0, slow, 4, &min_turn, &max_turn ) < 10 );
 }
 
+/* A program that took the mouse for itself: the server holds the cursor still
+ * and tells the program the movement instead, and the driver follows the
+ * cursor back after each poll. Returns the movement the program was told. */
+static double run_held_cursor_loop( int held_x, int stick_x, int seconds )
+{
+    enum { CY = 360, FRAME_MS = 27, POLL_MS = 16 };
+    struct pointer_cursor c = cursor_at( held_x, CY );
+    unsigned long long last_poll = 0;
+    double told = 0;
+    int t;
+
+    for (t = 1; t <= seconds * 1000; t++)
+    {
+        if (t % POLL_MS == 5)
+        {
+            pointer_cursor_step( &c, stick_x, 0, (t - last_poll) * MS );
+            last_poll = t;
+        }
+        if (t % FRAME_MS == 0)
+        {
+            int sent_x = (int)c.x;
+
+            pointer_cursor_step( &c, stick_x, 0, (t - last_poll) * MS );
+            last_poll = t;
+            sent_x = (int)c.x;
+            /* What the server makes of it, before the screen's edges. */
+            told += sent_x - held_x;
+            /* And the driver following the cursor, which did not move. */
+            pointer_cursor_warp( &c, sent_x, (int)c.y, held_x, (int)c.y );
+        }
+    }
+    return told;
+}
+
+static void test_held_cursor_still_moves(void)
+{
+    /* Both ways, at the same rate: 1000 px/s for two seconds. */
+    assert( fabs( run_held_cursor_loop( 640, 32767, 2 ) - 2000 ) < 60 );
+    assert( fabs( run_held_cursor_loop( 640, -32767, 2 ) + 2000 ) < 60 );
+    /* Wherever the cursor happened to be when the program took the mouse, as
+     * long as a frame's worth of movement fits between it and the edge: the
+     * pointer is pulled back to it every frame and never comes to rest there.
+     * Held against the very edge, the movement into it is still lost -- the
+     * pointer has nowhere to go, and nothing here can tell it otherwise. */
+    assert( fabs( run_held_cursor_loop( 40, -32767, 2 ) + 2000 ) < 60 );
+    assert( fabs( run_held_cursor_loop( 1240, 32767, 2 ) - 2000 ) < 60 );
+}
+
 int main(void)
 {
     test_buttons_between_takes();
@@ -236,7 +284,8 @@ int main(void)
     test_stall_and_edges();
     test_paint_restores_pixels();
     test_warp_keeps_unsent_motion();
+    test_held_cursor_still_moves();
     puts( "pointer cursor: buttons between takes, dead zone, speed curve, time scaling, edges, sprite "
-          "restore and motion kept across warps passed" );
+          "restore, motion kept across warps and a held cursor still moving passed" );
     return 0;
 }

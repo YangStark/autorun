@@ -52,7 +52,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-208"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-209"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -830,17 +830,34 @@ int wine_nx_pointer_take( int *x, int *y, unsigned int *buttons, unsigned int *p
 
 /* Follow a position set by the application (SetCursorPos), keeping the stick
  * motion Wine has not been handed yet (pointer_cursor_warp). */
-void wine_nx_pointer_set_pos( int x, int y )
+static void wine_nx_pointer_warp( int x, int y, int is_move )
 {
     pthread_mutex_lock( &wine_nx_pointer_mutex );
-    wine_nx_pointer_moved = pointer_cursor_warp( &wine_nx_pointer, wine_nx_pointer_sent_x,
-                                                 wine_nx_pointer_sent_y, x, y );
+    if (pointer_cursor_warp( &wine_nx_pointer, wine_nx_pointer_sent_x, wine_nx_pointer_sent_y, x, y ) &&
+        is_move)
+        wine_nx_pointer_moved = 1;
     wine_nx_pointer_sent_x = x;
     wine_nx_pointer_sent_y = y;
     x = (int)wine_nx_pointer.x;
     y = (int)wine_nx_pointer.y;
     pthread_mutex_unlock( &wine_nx_pointer_mutex );
     wine_nx_cursor_move( x, y );
+}
+
+void wine_nx_pointer_set_pos( int x, int y )
+{
+    wine_nx_pointer_warp( x, y, 1 );
+}
+
+/* The cursor is where the server put it rather than where the stick pushed:
+ * clipped to the screen, or held still for a program that took the mouse for
+ * itself. Carry on from there, keeping the stick motion Wine has not been
+ * handed -- but this is not movement of its own. Counting it as movement sends
+ * it back again on the next poll, and the two pull against each other for as
+ * long as the program holds the mouse. */
+void wine_nx_pointer_follow( int x, int y )
+{
+    wine_nx_pointer_warp( x, y, 0 );
 }
 
 static int call_pe_entry_point( void *entry )
