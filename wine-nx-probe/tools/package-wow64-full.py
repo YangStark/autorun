@@ -76,12 +76,16 @@ SOURCE_DLLS = ['avifil32']
 # imports WINSPOOL.DRV. Without it keystone does not load, the check cannot
 # run, and Halo stops with "one of the Halo PC files is missing or corrupted".
 HALO_DLLS = ['winspool.drv']
+# The Sims 2 loads Activation.dll, which draws with GDI+; everything else it and
+# the game import is staged already. Its own VP6 codec is the release's to
+# supply, being nobody else's to give away.
+SIMS2_DLLS = ['gdiplus']
 # The runtime staged here is the one linked with Mesa, so the card can run
 # Vulkan; the DXVK overlay adds DXVK's d3d9 in C:\\dxvk, which needs Wine's
 # 32-bit loader in syswow64. vulkan-1 loads winevulkan by hand and imports
 # nothing else of it, so no import walk reaches either: name both.
 VULKAN_DLLS = 'vulkan-1 winevulkan'.split()
-GAME_DLLS = NFS_DLLS + FALLOUT_DLLS + SOURCE_DLLS + HALO_DLLS + VULKAN_DLLS
+GAME_DLLS = NFS_DLLS + FALLOUT_DLLS + SOURCE_DLLS + HALO_DLLS + SIMS2_DLLS + VULKAN_DLLS
 pe = probe / 'build-wine-wow64-pe'
 toolchain = probe / 'toolchains/llvm-mingw-20260505-ucrt-macos-universal/bin'
 env = dict(os.environ, PATH=f'{toolchain}:/opt/homebrew/opt/bison/bin:' + os.environ['PATH'])
@@ -158,6 +162,12 @@ did in wine-nx-runtime.log as [SIMS2 SETUP] lines. Running it again is harmless.
 
 The game is then C:\\The Sims 2\\EP9\\TSBin\\Sims2EP9.exe, which is the one
 executable the collection has; it relocates, so it needs no forwarder.
+
+The movies are VP6, a codec that is the release's to supply and nobody else's to
+give away: copy __Installer\\customcomponent\\vp6\\vp6vfw.dll into
+C:\\windows\\syswow64 on the card. The setup registers it under both the names
+Video for Windows opens it by, whether or not it is there; without it the game
+runs and its movies do not.
 
 For a language other than English, put its number in language.txt beside
 sims2-setup.exe before running it:
@@ -268,7 +278,7 @@ textures are staged, with msvcp110 and msvcr110 for Galaxy.dll and GalaxyWrp.dll
 Its executable relocates, so it needs no forwarder.
 
 The Sims 2 Ultimate Collection: everything Sims2EP9.exe imports is already
-staged. The release comes installed, so nothing has to be unpacked; what is
+staged, and gdiplus for the Activation.dll it loads. The release comes installed, so nothing has to be unpacked; what is
 missing is the registry the game reads to find each pack, which its own batch
 file writes with the paths of the computer it was unpacked on. C:\\The Sims 2
 Setup\\sims2-setup.exe writes the same with the card's, and its README says how.

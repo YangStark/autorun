@@ -19,6 +19,11 @@
  * - 1.0\language, the number the batch file asks for. language.txt beside this
  *   program holds it, and without one it is 1, English (United States); the
  *   numbers are in the readme.
+ * - vidc.VP60 and vidc.VP61 under Drivers32, which is what the release's
+ *   vp6.reg holds: the game's movies are VP6, a codec nobody else has to give
+ *   away, and Video for Windows finds it by those two names. The DLL itself is
+ *   the release's to copy, and the readme says from where; registering a codec
+ *   that is not there costs nothing, since a movie is all that wants it.
  *
  * Each step is reported to wine-nx-runtime.log as a [SIMS2 SETUP] line; the
  * exit code is 0 when every step worked. Running it again is harmless. */
@@ -86,16 +91,31 @@ static void report( const char *label, const WCHAR *name, const char *result, DW
     NtDisplayString( &str );
 }
 
-static LONG set_value( const WCHAR *path, const WCHAR *name, DWORD type, const BYTE *data, DWORD size )
+static LONG set_value_in( HKEY root, const WCHAR *path, const WCHAR *name, DWORD type,
+                          const BYTE *data, DWORD size )
 {
     HKEY key;
     LONG status;
 
-    if ((status = RegCreateKeyExW( HKEY_CURRENT_USER, path, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL )))
-        return status;
+    if ((status = RegCreateKeyExW( root, path, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL ))) return status;
     status = RegSetValueExW( key, name, 0, type, data, size );
     RegCloseKey( key );
     return status;
+}
+
+static LONG set_value( const WCHAR *path, const WCHAR *name, DWORD type, const BYTE *data, DWORD size )
+{
+    return set_value_in( HKEY_CURRENT_USER, path, name, type, data, size );
+}
+
+/* A codec is the machine's, not one person's. */
+static BOOL set_machine_string( const WCHAR *path, const WCHAR *name, const WCHAR *value )
+{
+    LONG status = set_value_in( HKEY_LOCAL_MACHINE, path, name, REG_SZ, (const BYTE *)value,
+                                (wide_length( value ) + 1) * sizeof(WCHAR) );
+
+    report( "set", name, status ? "failed, error" : "ok", (DWORD)status );
+    return !status;
 }
 
 static BOOL set_string( const WCHAR *path, const WCHAR *name, const WCHAR *value )
@@ -178,6 +198,7 @@ void __stdcall start(void)
         L"Sims2EP5.exe,Sims2SP4.exe,Sims2SP5.exe,Sims2EP6.exe,Sims2SP6.exe,,Sims2EP7.exe,"
         L"Sims2SP7.exe,Sims2SP8.exe,Sims2EP8.exe,Sims2EP9.exe";
     static const WCHAR collection[] = L"Software\\Electronic Arts\\The Sims 2 Ultimate Collection 25";
+    static const WCHAR drivers32[] = L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Drivers32";
     WCHAR setup_folder[MAX_PATH], game[MAX_PATH], path[MAX_PATH * 2], folder[MAX_PATH];
     unsigned int i, at, found = 0;
     BOOL ok = TRUE;
@@ -227,6 +248,10 @@ void __stdcall start(void)
         if (!i || i + 1 == sizeof(packs) / sizeof(packs[0]))
             ok &= set_string( path, L"Game Registry", collection );
     }
+
+    /* The movies' codec, by the two names Video for Windows opens it under. */
+    ok &= set_machine_string( drivers32, L"vidc.VP60", L"vp6vfw.dll" );
+    ok &= set_machine_string( drivers32, L"vidc.VP61", L"vp6vfw.dll" );
 
     if (!found)
     {
