@@ -5,6 +5,11 @@
  * routine sets a byte, giving up the moment the wait returns anything but
  * WAIT_IO_COMPLETION. Halo takes that path because the platform id says NT.
  *
+ * Then what The Sims 2 Legacy does to a thread it starts: create it suspended,
+ * queue it an APC and resume it. The APC runs before the thread's own code,
+ * which must still start at its entry point with its parameter. And a window
+ * procedure's result, which SendMessage returns after a callback.
+ *
  * The result goes in a message box, which the runtime log records, and in
  * apc-test.txt beside the program.
  */
@@ -70,9 +75,30 @@ static int read_it( const char *path, DWORD flags, char *out, size_t size )
     return ok && done_flag && done_bytes == sizeof(buffer);
 }
 
+static volatile LONG started_apc, started_entry;
+static volatile ULONG_PTR started_param;
+
+static void CALLBACK before_start( ULONG_PTR arg )
+{
+    started_apc = (LONG)arg;
+}
+
+static DWORD WINAPI started( void *param )
+{
+    started_param = (ULONG_PTR)param;
+    started_entry = started_apc ? 2 : 1;   /* 2: the APC ran first */
+    return 0x51;
+}
+
+static LRESULT CALLBACK answer_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+{
+    if (msg == WM_USER + 7) return 0x1234;
+    return DefWindowProcA( hwnd, msg, wparam, lparam );
+}
+
 int WINAPI WinMain( HINSTANCE instance, HINSTANCE prev, LPSTR cmdline, int show )
 {
-    char path[MAX_PATH], plain[192], overlapped[192], apc[96], report[640];
+    char path[MAX_PATH], plain[192], overlapped[192], apc[96], thread[128], callback[64], report[1024];
     OSVERSIONINFOA version = { sizeof(version) };
     DWORD sleep_ret;
     int rounds = 0;
@@ -90,14 +116,45 @@ int WINAPI WinMain( HINSTANCE instance, HINSTANCE prev, LPSTR cmdline, int show 
     sleep_ret = wait_for_it( &rounds );
     snprintf( apc, sizeof(apc), "sleep=%lx rounds=%d flag=%ld", sleep_ret, rounds, done_flag );
 
-    snprintf( report, sizeof(report), "platform=%lu | plain: %s | overlapped: %s | QueueUserAPC: %s",
-              version.dwPlatformId, plain, overlapped, apc );
+    /* A thread made suspended, given an APC, then resumed. */
+    {
+        HANDLE handle = CreateThread( NULL, 0, started, (void *)0x5eed, CREATE_SUSPENDED, NULL );
+        DWORD code = 0;
+
+        QueueUserAPC( before_start, handle, 7 );
+        ResumeThread( handle );
+        WaitForSingleObject( handle, 5000 );
+        GetExitCodeThread( handle, &code );
+        snprintf( thread, sizeof(thread), "apc=%ld entry=%ld param=%#lx exit=%#lx",
+                  started_apc, started_entry, (unsigned long)started_param, code );
+        CloseHandle( handle );
+    }
+
+    /* A window procedure's result through SendMessage. */
+    {
+        WNDCLASSA cls = { 0 };
+        HWND hwnd;
+
+        cls.lpfnWndProc = answer_proc;
+        cls.hInstance = instance;
+        cls.lpszClassName = "apc-test-answer";
+        RegisterClassA( &cls );
+        hwnd = CreateWindowA( "apc-test-answer", "", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, instance, NULL );
+        snprintf( callback, sizeof(callback), "SendMessage=%#lx",
+                  hwnd ? (unsigned long)SendMessageA( hwnd, WM_USER + 7, 0, 0 ) : 0xdeadUL );
+        if (hwnd) DestroyWindow( hwnd );
+    }
+
+    snprintf( report, sizeof(report),
+              "platform=%lu | plain: %s | overlapped: %s | QueueUserAPC: %s | suspended thread: %s | %s",
+              version.dwPlatformId, plain, overlapped, apc, thread, callback );
 
     if ((file = fopen( "apc-test.txt", "w" )))
     {
         fprintf( file, "%s\n", report );
         fclose( file );
     }
-    MessageBoxA( NULL, report, "APC test", MB_OK );
+    /* "quiet" for a run on a desktop, where the box would wait for someone. */
+    if (!strstr( cmdline, "quiet" )) MessageBoxA( NULL, report, "APC test", MB_OK );
     return 0;
 }

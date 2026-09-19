@@ -20,7 +20,8 @@ struct wine_nx_wow64_host
     NTSTATUS (*unix_call)( void *opaque, ULONGLONG handle, ULONG code, ULONG arguments );
     /* Optional: TRUE (and consumed) when the native call replaced the whole
      * context, i.e. WoW64 set WOW64_CPURESERVED_FLAG_RESET_STATE for NtContinue,
-     * exception or APC dispatch. The new context's Eax is then kept. */
+     * exception or APC dispatch. The call's result still goes in Eax, as
+     * wow64cpu puts it there; NtContinue's result is the new context's Eax. */
     BOOL (*context_replaced)( void *opaque );
 };
 
@@ -32,8 +33,8 @@ struct wine_nx_wow64_gates
 
 /* Called only after Box64 stops BEFORE executing one of the registered gates
  * and exports the complete guest state into Wine's current I386_CONTEXT.
- * STATUS_SUCCESS means a gate was dispatched; its result lives in Eax, unless
- * the call replaced the context (see context_replaced).
+ * STATUS_SUCCESS means a gate was dispatched; its result lives in Eax, also
+ * when the call replaced the context (see context_replaced).
  * Errors leave the context unchanged. Native callbacks may alter this same
  * context or reenter guest execution: no cached snapshot may overwrite it. */
 NTSTATUS wine_nx_wow64_dispatch_gate( I386_CONTEXT *context,

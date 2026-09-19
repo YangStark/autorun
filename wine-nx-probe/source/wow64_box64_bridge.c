@@ -35,9 +35,15 @@ NTSTATUS wine_nx_wow64_dispatch_gate( I386_CONTEXT *context,
         status = host->unix_call( opaque, (ULONGLONG)stack[1] | ((ULONGLONG)stack[2] << 32),
                                  stack[3], stack[4] );
     else status = host->syscall( opaque, number, arguments );
-    /* wow64cpu returns through the full saved context in that case: RtlUnwind
-     * and C++ catch continuations resume via NtContinue with a meaningful Eax. */
-    if (host->context_replaced && host->context_replaced( opaque )) return STATUS_SUCCESS;
+    /* wow64cpu's syscall_32to64 and unix_call_32to64: the result goes in Eax
+     * whether or not the call replaced the context, and a replaced one is
+     * then resumed whole. NtContinue returns the new context's own Eax
+     * (wow64's get_context_return_value), so a C++ catch continuation keeps
+     * RtlUnwind's; a context put back after a user APC or a window-procedure
+     * callback gets the result of the call that ran it -- SleepEx's
+     * WAIT_IO_COMPLETION, SendMessage's LRESULT -- and a thread still at its
+     * start keeps the entry point in Eax. */
+    if (host->context_replaced) host->context_replaced( opaque );
     context->Eax = status;
     return STATUS_SUCCESS;
 }

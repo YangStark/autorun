@@ -12,7 +12,7 @@ struct fixture
     ULONG stack[16];
     ULONG number, args, calls, replaced_queries;
     ULONGLONG handle;
-    BOOL read_fault, redirect, reenter, replaced;
+    BOOL read_fault, redirect, restore, reenter, replaced;
 };
 
 static NTSTATUS read_guest( void *opaque, ULONG address, void *buffer, SIZE_T size )
@@ -64,12 +64,22 @@ static NTSTATUS native_syscall( void *opaque, ULONG number, ULONG args )
     }
     if (f->redirect)
     {
-        /* NtContinue to a C++ catch continuation: Eax is RtlUnwind's return value. */
+        /* NtContinue to a C++ catch continuation: Eax is RtlUnwind's return
+         * value, and wow64_NtContinueEx returns it (get_context_return_value). */
         f->context.Eip = 0x20000000;
         f->context.Esp = 0x2020;
         f->context.Ecx = 0xabcdef01;
         f->context.Eax = 0x0badcafe;
         f->replaced = TRUE;
+        return (NTSTATUS)f->context.Eax;
+    }
+    if (f->restore)
+    {
+        /* A user APC or window-procedure callback ran while the call waited,
+         * and wow64 put the program's context back when it was done. */
+        f->context.Eax = f->number;
+        f->replaced = TRUE;
+        return (NTSTATUS)0xc0; /* STATUS_USER_APC */
     }
     return (NTSTATUS)0x12345678;
 }
@@ -114,11 +124,16 @@ static void test_gates(void)
     assert( f.context.Eip == 0x20000000 && f.context.Esp == 0x2020 );
     assert( f.context.Ecx == 0xabcdef01 );
 
-    /* With RESET_STATE reporting, a replaced context keeps its own Eax... */
+    /* With RESET_STATE reporting, NtContinue's context keeps its own Eax... */
     f = initial(); f.redirect = TRUE;
     assert( !wine_nx_wow64_dispatch_gate( &f.context, &gates, &reset_host, &f ) );
     assert( f.context.Eip == 0x20000000 && f.context.Esp == 0x2020 );
     assert( f.context.Eax == 0x0badcafe && f.replaced_queries == 1 && !f.replaced );
+    /* ...a context put back after an APC gets the wait's status, as wow64cpu
+     * stores it (SleepEx's WAIT_IO_COMPLETION)... */
+    f = initial(); f.restore = TRUE;
+    assert( !wine_nx_wow64_dispatch_gate( &f.context, &gates, &reset_host, &f ) );
+    assert( f.context.Eax == 0xc0 && f.context.Eip == 0x18000000 && f.replaced_queries == 1 && !f.replaced );
     /* ...and an ordinary call still returns its status in Eax. */
     f = initial();
     assert( !wine_nx_wow64_dispatch_gate( &f.context, &gates, &reset_host, &f ) );

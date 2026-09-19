@@ -455,6 +455,8 @@ static BOOL inline_unix_call( struct nx_engine *engine )
 
     if (engine->host->context_replaced && engine->host->context_replaced( engine->opaque ))
     {
+        /* As wow64cpu's unix_call_32to64: the result in Eax, the rest as replaced. */
+        ctx->Eax = status;
         engine->context_replaced = 1;
         return FALSE;
     }
