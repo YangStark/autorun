@@ -6,7 +6,13 @@
  * ConnectEx, overlapped WSARecv and WSASend, and GetQueuedCompletionStatus for
  * every result. Closing a socket must end what waits on it, which Wine does
  * with STATUS_HANDLES_CLOSED (676 from GetQueuedCompletionStatus). A plain
- * blocking accept() comes last.
+ * blocking accept() comes next.
+ *
+ * Then what EA's DirtySock does, which the game itself talks to the launcher
+ * emulation with: IPv6 sockets used dual-stack. A datagram socket bound to
+ * ::ffff:0:0 waits in an overlapped WSARecvFrom that its thread polls with
+ * GetOverlappedResult between sleeps, and a stream socket reaches the IPv4
+ * listener at ::ffff:127.0.0.1.
  *
  * The result goes in a message box, which the runtime log records, and in
  * socket-test.txt beside the program.
@@ -18,7 +24,11 @@
 #include <stdio.h>
 #include <string.h>
 
-static char report[1024];
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW( IOC_VENDOR, 12 )
+#endif
+
+static char report[1536];
 static size_t used;
 
 static void say( const char *format, ... )
@@ -57,6 +67,121 @@ static const char *next_packet( HANDLE port, OVERLAPPED **which, DWORD *bytes, D
     if (!*which) snprintf( text, sizeof(text), "none(%lu)", *error );
     else snprintf( text, sizeof(text), "%lums", GetTickCount() - start );
     return text;
+}
+
+/* ::ffff:127.0.0.1, or ::ffff:0:0 for any address. */
+static void mapped( struct sockaddr_in6 *six, unsigned short port, int loopback )
+{
+    memset( six, 0, sizeof(*six) );
+    six->sin6_family = AF_INET6;
+    six->sin6_port = port;
+    six->sin6_addr.s6_addr[10] = six->sin6_addr.s6_addr[11] = 0xff;
+    if (loopback)
+    {
+        six->sin6_addr.s6_addr[12] = 127;
+        six->sin6_addr.s6_addr[15] = 1;
+    }
+}
+
+static int is_mapped_loopback( const struct sockaddr_in6 *six )
+{
+    return six->sin6_family == AF_INET6 && six->sin6_addr.s6_addr[10] == 0xff &&
+           six->sin6_addr.s6_addr[11] == 0xff && six->sin6_addr.s6_addr[12] == 127 &&
+           six->sin6_addr.s6_addr[15] == 1;
+}
+
+/* DirtySock's two sockets, against the IPv4 listener at port (network order). */
+static void dirtysock( SOCKET listener, unsigned short port )
+{
+    struct sockaddr_in6 six, name6, from6;
+    SOCKET udp, tcp, strict, peer;
+    WSAOVERLAPPED ov;
+    DWORD bytes, flags;
+    WSABUF buf;
+    char dgram[16];
+    u_long on = 1;
+    int off = 0, len, from_len, i, rc;
+    BOOL no = FALSE, yes = TRUE;
+    fd_set writable;
+    struct timeval tv = { 2, 0 };
+
+    udp = WSASocketW( AF_INET6, SOCK_DGRAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED );
+    if (udp == INVALID_SOCKET)
+    {
+        say( "\nIPv6 udp=FAIL(%d)", WSAGetLastError() );
+        return;
+    }
+    ioctlsocket( udp, FIONBIO, &on );
+    setsockopt( udp, SOL_SOCKET, SO_BROADCAST, (char *)&yes, sizeof(yes) );
+    say( "\nIPv6 udp: v6only=%s", setsockopt( udp, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&off, sizeof(off) ) ?
+         "FAIL" : "0" );
+    WSAIoctl( udp, SIO_UDP_CONNRESET, &no, sizeof(no), NULL, 0, &bytes, NULL, NULL );
+    mapped( &six, 0, 0 );
+    len = sizeof(name6);
+    if (bind( udp, (struct sockaddr *)&six, sizeof(six) ) || getsockname( udp, (struct sockaddr *)&name6, &len ))
+        say( " bind=FAIL(%d)", WSAGetLastError() );
+    else
+        say( " bind=%d/%d", name6.sin6_family, len );
+
+    memset( &ov, 0, sizeof(ov) );
+    ov.hEvent = WSACreateEvent();
+    buf.buf = dgram;
+    buf.len = sizeof(dgram);
+    flags = 0;
+    from_len = sizeof(from6);
+    memset( &from6, 0, sizeof(from6) );
+    rc = WSARecvFrom( udp, &buf, 1, NULL, &flags, (struct sockaddr *)&from6, &from_len, &ov, NULL );
+    say( " WSARecvFrom=%s", !rc ? "at-once" : WSAGetLastError() == WSA_IO_PENDING ? "pending" : "FAIL" );
+    mapped( &six, name6.sin6_port, 1 );
+    say( " sendto=%d", sendto( udp, "wake", 4, 0, (struct sockaddr *)&six, sizeof(six) ) );
+    /* GetOverlappedResult without waiting, and a sleep between: no wait of this
+     * thread's own ever runs the read. */
+    for (i = 0; i < 200 && !WSAGetOverlappedResult( udp, &ov, &bytes, FALSE, &flags ); i++) Sleep( 10 );
+    say( " got=%lu@%dms from=", i < 200 ? bytes : 0, i * 10 );
+    if (i < 200 && is_mapped_loopback( &from6 )) say( "::ffff:127.0.0.1" );
+    else
+    {
+        char text[64] = "?";
+        DWORD text_len = sizeof(text);
+
+        WSAAddressToStringA( (struct sockaddr *)&from6, from_len, NULL, text, &text_len );
+        say( "%s(family %d, %d bytes)", text, from6.sin6_family, from_len );
+    }
+    WSACloseEvent( ov.hEvent );
+    closesocket( udp );
+
+    /* Windows makes an IPv6 socket IPv6 only: IPv4 written the IPv6 way is not reached. */
+    strict = WSASocketW( AF_INET6, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED );
+    mapped( &six, port, 1 );
+    rc = connect( strict, (struct sockaddr *)&six, sizeof(six) );
+    say( "\nIPv6 tcp: v6only-default=%d", rc ? WSAGetLastError() : 0 );
+    closesocket( strict );
+
+    tcp = WSASocketW( AF_INET6, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED );
+    ioctlsocket( tcp, FIONBIO, &on );
+    setsockopt( tcp, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&off, sizeof(off) );
+    memset( &six, 0, sizeof(six) );
+    six.sin6_family = AF_INET6;
+    bind( tcp, (struct sockaddr *)&six, sizeof(six) );
+    mapped( &six, port, 1 );
+    rc = connect( tcp, (struct sockaddr *)&six, sizeof(six) );
+    say( " connect=%s", !rc ? "at-once" : WSAGetLastError() == WSAEWOULDBLOCK ? "wouldblock" : "FAIL" );
+    FD_ZERO( &writable );
+    FD_SET( tcp, &writable );
+    say( " writable=%d", select( 0, NULL, &writable, NULL, &tv ) );
+    peer = accept( listener, NULL, NULL );
+    say( " accept()=%s", peer != INVALID_SOCKET ? "ok" : "FAIL" );
+    if (peer != INVALID_SOCKET)
+    {
+        send( peer, "<LSX>", 5, 0 );
+        for (i = 0; i < 200 && (rc = recv( tcp, dgram, sizeof(dgram), 0 )) < 0; i++) Sleep( 10 );
+        say( " recv=%d", rc );
+        closesocket( peer );
+    }
+    len = sizeof(name6);
+    say( " peer=%s", !getpeername( tcp, (struct sockaddr *)&name6, &len ) && is_mapped_loopback( &name6 ) &&
+         name6.sin6_port == port ? "::ffff:127.0.0.1" : "WRONG" );
+    closesocket( tcp );
 }
 
 static const char *which_name( OVERLAPPED *which, OVERLAPPED *names[], const char *labels[], int count )
@@ -200,6 +325,8 @@ int WINAPI WinMain( HINSTANCE instance, HINSTANCE prev, LPSTR cmdline, int show 
     }
     closesocket( plain );
     closesocket( client );
+
+    dirtysock( listener, addr.sin_port );
 
 done:
     closesocket( listener );

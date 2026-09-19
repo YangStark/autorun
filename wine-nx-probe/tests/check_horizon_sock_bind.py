@@ -16,6 +16,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[2]
 source = (root / 'dlls/ntdll/unix/horizon.c').read_text()
+sockaddr_header = (root / 'dlls/ntdll/unix/horizon_sockaddr.h').read_text()
 
 
 def block(marker):
@@ -29,7 +30,7 @@ def block(marker):
 
 
 defines = '\n'.join(line for line in source.splitlines()
-                    if re.match(r'#define HORIZON_(STATUS_|WS_AF_INET\b|IOCTL_AFD_(BIND|WINE_SET_))', line))
+                    if re.match(r'#define HORIZON_(STATUS_|WS_AF_INET6?\b|IOCTL_AFD_(BIND|WINE_SET_))', line))
 
 fixture = f'''
 #include <errno.h>
@@ -47,9 +48,11 @@ fixture = f'''
 
 static void horizon_trace( const char *format, ... ) {{ (void)format; }}
 
+{sockaddr_header}
+
 /* One socket stands in for the server's object table. */
-struct horizon_server_object {{ int file_fd; int sock_bound; }};
-static struct horizon_server_object test_socket = {{ -1, 0 }};
+struct horizon_server_object {{ int file_fd; int sock_bound; int sock_family; }};
+static struct horizon_server_object test_socket = {{ -1, 0, 0 }};
 static pthread_mutex_t horizon_server_objects_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static unsigned int horizon_server_find_sock_locked( unsigned int handle,
@@ -74,8 +77,9 @@ static unsigned int horizon_server_get_sock_fd( unsigned int handle, int *fd, in
 }}
 
 {block('static unsigned int horizon_sock_errno_status(')}
+{block('static unsigned int horizon_ws_sockaddr_to_unix_for(')}
 {block('static unsigned int horizon_ws_sockaddr_to_unix(')}
-{block('static unsigned int horizon_ws_sockaddr_from_unix(')}
+{block('static unsigned int horizon_ws_sockaddr_from_unix_as(')}
 {block('static unsigned int horizon_sock_ioctl_bind(')}
 {block('static unsigned int horizon_sock_ioctl_setsockopt(')}
 
@@ -171,11 +175,41 @@ int main( void )
     printf( "busy %08x\\n",
             horizon_sock_ioctl_bind( 1, params, sizeof(params), out, sizeof(out), &out_size ) );
 
-    /* A family libnx has no sockets for, and a payload without an address. */
-    ws_addr( params, 23 /* AF_INET6 */, 0, "127.0.0.1" );
+    /* A family no socket has, and a payload without an address. */
+    ws_addr( params, 99, 0, "127.0.0.1" );
     out_size = 0;
     printf( "family %08x\\n",
             horizon_sock_ioctl_bind( 1, params, sizeof(params), out, sizeof(out), &out_size ) );
+
+    /* An IPv6 socket, an IPv4 one underneath: :: binds any address and is
+     * reported back as IPv6; an address with no IPv4 behind it is not local. */
+    {{
+        unsigned char params6[4 + 28], out6[28];
+        static const unsigned char zero16[16];
+
+        close( second );
+        second = socket( AF_INET, SOCK_DGRAM, 0 );
+        test_socket.file_fd = second;
+        test_socket.sock_bound = 0;
+        test_socket.sock_family = 23;
+        memset( params6, 0, sizeof(params6) );
+        params6[4] = 23;
+        out_size = 0;
+        status = horizon_sock_ioctl_bind( 1, params6, sizeof(params6), out6, sizeof(out6), &out_size );
+        printf( "bind6 %08x size=%u family=%u port=%u any=%d\\n", status, out_size, out6[0],
+                (out6[2] << 8) | out6[3], !memcmp( out6 + 8, zero16, 16 ) );
+        params6[4 + 8] = 0xfe; params6[4 + 9] = 0x80; params6[4 + 23] = 1;
+        test_socket.sock_bound = 0;
+        out_size = 0;
+        printf( "bind6-v6-only-address %08x\\n",
+                horizon_sock_ioctl_bind( 1, params6, sizeof(params6), out6, sizeof(out6), &out_size ) );
+        /* The rest on a fresh IPv4 socket. */
+        close( second );
+        second = socket( AF_INET, SOCK_DGRAM, 0 );
+        test_socket.file_fd = second;
+        test_socket.sock_bound = 0;
+        test_socket.sock_family = 0;
+    }}
     ws_addr( params, HORIZON_WS_AF_INET, 0, "127.0.0.1" );
     out_size = 0;
     printf( "short %08x\\n", horizon_sock_ioctl_bind( 1, params, 8, out, sizeof(out), &out_size ) );
@@ -214,8 +248,11 @@ assert int(port.removeprefix('port=')) > 0, rows['bind']
 assert rows['rebind'][0] == '%08x' % 0xc0000238, rows['rebind']
 assert rows['busy'][0] == '%08x' % 0xc0000043, rows['busy']
 assert rows['family'][0] == '%08x' % 0xc00000bb, rows['family']
+assert rows['bind6'][0] == '00000000' and rows['bind6'][1:3] == ['size=28', 'family=23'], rows['bind6']
+assert int(rows['bind6'][3].removeprefix('port=')) > 0 and rows['bind6'][4] == 'any=1', rows['bind6']
+assert rows['bind6-v6-only-address'][0] == '%08x' % 0xc0000207, rows['bind6-v6-only-address']
 assert rows['short'][0] == '%08x' % 0xc000000d, rows['short']
 assert rows['no-room'][1] == 'size=0', rows['no-room']
 
 print('Socket bind: options set, port assigned and reported, second bind, busy port, '
-      'bad family and short requests refused as Windows does')
+      'bad family and short requests refused as Windows does, IPv6 bound on IPv4')

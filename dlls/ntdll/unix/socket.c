@@ -45,6 +45,10 @@
 #endif
 #ifdef __SWITCH__
 # include <arpa/inet.h> /* htons/htonl live here on newlib */
+# include "horizon_sockaddr.h"
+/* The family the program opened a socket with (horizon.c): Horizon's sockets
+ * are all IPv4, and an AF_INET6 one is IPv4 underneath. */
+extern unsigned int horizon_server_sock_family( unsigned int handle );
 #endif
 
 #ifdef HAVE_NETIPX_IPX_H
@@ -236,6 +240,21 @@ static socklen_t sockaddr_to_unix( const struct WS_sockaddr *wsaddr, int wsaddrl
 
         if (wsaddrlen < sizeof(win)) return 0;
         memcpy( &win, wsaddr, sizeof(win) );
+#ifdef __SWITCH__
+        {
+            unsigned char v4[4];
+
+            /* Horizon has IPv4 alone: an address with IPv4 behind it goes
+             * there, and any other is left for sendmsg to refuse. */
+            if (horizon_in6_to_v4( (const unsigned char *)&win.sin6_addr, v4 ))
+            {
+                uaddr->in.sin_family = AF_INET;
+                uaddr->in.sin_port = win.sin6_port;
+                memcpy( &uaddr->in.sin_addr, v4, sizeof(v4) );
+                return sizeof(uaddr->in);
+            }
+        }
+#endif
         uaddr->in6.sin6_family = AF_INET6;
         uaddr->in6.sin6_port = win.sin6_port;
         uaddr->in6.sin6_flowinfo = win.sin6_flowinfo;
@@ -877,6 +896,19 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
      * MSDN says that the address is ignored for connection-oriented sockets, so
      * don't try to translate it.
      */
+#ifdef __SWITCH__
+    /* Where a datagram came from, as the program's socket speaks: IPv6 on one
+     * it opened as AF_INET6, though the socket underneath is IPv4. */
+    if (async->addr && hdr.msg_namelen && unix_addr.addr.sa_family == AF_INET &&
+        horizon_server_sock_family( HandleToULong( async->io.handle ) ) == WS_AF_INET6)
+    {
+        unsigned int len = horizon_ws_in6_from_v4( (const unsigned char *)&unix_addr.in.sin_port,
+                                                   (const unsigned char *)&unix_addr.in.sin_addr,
+                                                   (unsigned char *)async->addr, *async->addr_len );
+        *async->addr_len = len ? (int)len : -1;
+    }
+    else
+#endif
     if (async->addr && hdr.msg_namelen)
         *async->addr_len = sockaddr_from_unix( &unix_addr, async->addr, *async->addr_len );
 
@@ -2586,6 +2618,13 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
             return do_setsockopt( handle, io, IPPROTO_IPV6, IPV6_UNICAST_IF, in_buffer, in_size );
 #endif
 
+#ifdef __SWITCH__
+        /* Horizon's sockets are IPv4: the server keeps what an IPv6 one was told. */
+        case IOCTL_AFD_WINE_GET_IPV6_V6ONLY:
+        case IOCTL_AFD_WINE_SET_IPV6_V6ONLY:
+            status = STATUS_BAD_DEVICE_TYPE;
+            break;
+#else
         case IOCTL_AFD_WINE_GET_IPV6_V6ONLY:
             return do_getsockopt( handle, io, IPPROTO_IPV6, IPV6_V6ONLY, out_buffer, out_size );
 
@@ -2610,6 +2649,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
             status = ret ? sock_errno_to_status( errno ) : STATUS_SUCCESS;
             break;
         }
+#endif
 
 #ifdef HAS_IPX
 #ifdef SOL_IPX

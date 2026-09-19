@@ -17,6 +17,7 @@ import tempfile
 root = Path(__file__).resolve().parents[2]
 source = (root / 'dlls/ntdll/unix/horizon.c').read_text(errors='surrogateescape')
 header = (root / 'dlls/ntdll/unix/horizon_async.h').read_text()
+sockaddr_header = (root / 'dlls/ntdll/unix/horizon_sockaddr.h').read_text()
 
 
 def definition(name):
@@ -39,7 +40,8 @@ def struct(name):
 
 
 defines = '\n'.join(line for line in source.splitlines()
-                    if re.match(r'#define HORIZON_(STATUS_\w+ |APC_|ASYNC_STALE|NT_ERROR|WS_AF_INET\b)', line))
+                    if re.match(r'#define HORIZON_(STATUS_\w+ |APC_|ASYNC_STALE|NT_ERROR|WS_AF_INET6?\b|'
+                                r'IOCTL_AFD_WINE_(GET_INFO|[GS]ET_IPV6_V6ONLY)\b)', line))
 
 # The select handler takes a result before anything else, and hands out a
 # system APC before it would wait, but not before a signal-and-wait signals.
@@ -58,7 +60,9 @@ assert 'HORIZON_SERVER_OBJECT_SOCK' in definition('horizon_server_find_io_object
 assert 'horizon_server_find_io_object_locked' in definition('horizon_server_handle_set_completion_info')
 
 functions = '\n\n'.join(definition(name) for name in (
-    'horizon_sock_errno_status', 'horizon_ws_sockaddr_from_unix',
+    'horizon_sock_errno_status', 'horizon_ws_sockaddr_to_unix_for', 'horizon_ws_sockaddr_from_unix_as',
+    'horizon_server_get_sock_fd', 'horizon_sock_ioctl_create', 'horizon_sock_ioctl_connect',
+    'horizon_sock_ioctl_family',
     'horizon_server_async_create_locked', 'horizon_server_async_free_locked',
     'horizon_server_accepted_sock_locked', 'horizon_sock_accept_output_locked',
     'horizon_sock_accept_async_locked', 'horizon_sock_poll_asyncs_locked',
@@ -85,6 +89,7 @@ fixture = r'''
 #define LONG int
 
 @HEADER@
+@SOCKADDR@
 
 enum { HORIZON_SERVER_OBJECT_EVENT = 1, HORIZON_SERVER_OBJECT_COMPLETION, HORIZON_SERVER_OBJECT_SOCK };
 enum { HORIZON_SELECT_NONE, HORIZON_SELECT_WAIT, HORIZON_SELECT_WAIT_ALL, HORIZON_SELECT_SIGNAL_AND_WAIT };
@@ -97,6 +102,7 @@ struct horizon_server_object
     int type, refs, signaled, file_fd;
     unsigned int file_access, file_options;
     int sock_bound, sock_nonblocking;
+    int sock_family, sock_type, sock_protocol, sock_v6only;
     unsigned int sock_event_handle;
     int sock_event_mask, sock_pending_events;
     struct horizon_server_object *file_completion;
@@ -480,16 +486,82 @@ int main( void )
         assert( !horizon_server_select_signals( &request, select_data, sizeof(select_data) ) );
     }
 
+    /* DirtySock, which The Sims 2 Legacy reaches its launcher with: an AF_INET6
+     * stream socket, IPv4 underneath, V6ONLY cleared, connected to
+     * ::ffff:127.0.0.1 -- anadius's IPv4 listener. */
+    {
+        unsigned int v6_h = horizon_server_create_handle_locked( HORIZON_SERVER_OBJECT_SOCK )->handle;
+        unsigned int into_h, got, value;
+        int create[4] = { HORIZON_WS_AF_INET6, 1, 0, 0 }, info[3];
+        unsigned char connect6[8 + 28];
+        struct horizon_async *accept6;
+
+        assert( !horizon_sock_ioctl_create( v6_h, (unsigned char *)create, sizeof(create) ) );
+        assert( entries[v6_h].object->sock_family == HORIZON_WS_AF_INET6 && entries[v6_h].object->sock_v6only );
+        got = 0;
+        assert( !horizon_sock_ioctl_family( HORIZON_IOCTL_AFD_WINE_GET_INFO, v6_h, NULL, 0,
+                                            (unsigned char *)info, sizeof(info), &got ) );
+        assert( got == 12 && info[0] == HORIZON_WS_AF_INET6 && info[1] == 1 && info[2] == 0 );
+
+        memset( connect6, 0, sizeof(connect6) );
+        connect6[0] = 28;                                   /* afd_connect_params.addr_len */
+        connect6[8] = HORIZON_WS_AF_INET6;
+        memcpy( connect6 + 8 + 2, &listen_addr.sin_port, 2 );
+        connect6[8 + 18] = connect6[8 + 19] = 0xff;
+        connect6[8 + 20] = 127; connect6[8 + 23] = 1;
+        /* IPv6 only, as Windows makes one: IPv4 written the IPv6 way is not reached. */
+        assert( horizon_sock_ioctl_connect( v6_h, connect6, sizeof(connect6) ) == HORIZON_STATUS_NETWORK_UNREACHABLE );
+        value = 0;
+        got = 0;
+        assert( !horizon_sock_ioctl_family( HORIZON_IOCTL_AFD_WINE_SET_IPV6_V6ONLY, v6_h,
+                                            (unsigned char *)&value, sizeof(value), NULL, 0, &got ) );
+        value = 1;
+        assert( !horizon_sock_ioctl_family( HORIZON_IOCTL_AFD_WINE_GET_IPV6_V6ONLY, v6_h, NULL, 0,
+                                            (unsigned char *)&value, sizeof(value), &got ) && got == 4 && !value );
+        /* An IPv4 socket has no V6ONLY to read. */
+        assert( horizon_sock_ioctl_family( HORIZON_IOCTL_AFD_WINE_GET_IPV6_V6ONLY, target_h, NULL, 0,
+                                           (unsigned char *)&value, sizeof(value), &got ) ==
+                HORIZON_STATUS_INVALID_PARAMETER );
+
+        /* The listener's AcceptEx, into a socket made the same way as the listener: IPv6. */
+        into_h = new_sock( 0, NULL );
+        entries[into_h].object->sock_family = HORIZON_WS_AF_INET6;
+        memset( &data, 0, sizeof(data) );
+        data.handle = listener_h; data.user = 0x61; data.apc_context = 0xb000;
+        params[0] = into_h; params[1] = 0; params[2] = 28 + 16;
+        assert( horizon_sock_ioctl_accept_into( &owner, &data, (unsigned char *)params, sizeof(params),
+                                                2 * (28 + 16) ) == HORIZON_STATUS_PENDING );
+        accept6 = horizon_async_find_user( &horizon_asyncs, 0x61 );
+        assert( !horizon_sock_ioctl_connect( v6_h, connect6, sizeof(connect6) ) );
+        assert( poll_ready( listener_h ) );
+        /* [len][sockaddr_in6 ::ffff:127.0.0.1:listener] [len][sockaddr_in6 ::ffff:127.0.0.1:client] */
+        assert( u32( accept6->out ) == 28 && accept6->out[4] == HORIZON_WS_AF_INET6 );
+        assert( ws_port( accept6->out + 4 ) == ntohs( listen_addr.sin_port ) );
+        assert( accept6->out[4 + 8 + 10] == 0xff && accept6->out[4 + 8 + 12] == 127 );
+        assert( u32( accept6->out + 44 ) == 28 && accept6->out[48] == HORIZON_WS_AF_INET6 );
+        apc = horizon_server_async_apc_locked( &owner, call );
+        send_result( apc, HORIZON_STATUS_SUCCESS, 0 );
+        assert( nposts == 7 && posts[6].value == 0xb000 );
+        /* Too late to change once bound. */
+        entries[v6_h].object->sock_bound = 1;
+        assert( horizon_sock_ioctl_family( HORIZON_IOCTL_AFD_WINE_SET_IPV6_V6ONLY, v6_h,
+                                           (unsigned char *)&value, sizeof(value), NULL, 0, &got ) ==
+                HORIZON_STATUS_INVALID_PARAMETER );
+        close( entries[v6_h].object->file_fd );
+        close( entries[into_h].object->file_fd );
+    }
+
     assert( !horizon_asyncs.head && port->refs == 3 );
     close( client ); close( client2 ); close( client3 );
     printf( "overlapped sockets: AcceptEx, accept, pending recv, completion routine, cancel and ConnectEx "
-            "end on the port as Windows ends them\n" );
+            "end on the port as Windows ends them; IPv6 sockets reach IPv4 as DirtySock's does\n" );
     return 0;
 }
 '''
 
 fixture = (fixture.replace('@DEFINES@', defines)
                   .replace('@HEADER@', header)
+                  .replace('@SOCKADDR@', sockaddr_header)
                   .replace('@SELECT@', struct('horizon_select_request'))
                   .replace('@FUNCTIONS@', functions))
 

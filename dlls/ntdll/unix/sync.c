@@ -2527,6 +2527,24 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
         return status;
     }
 
+#ifdef __SWITCH__
+    {
+        extern int horizon_async_any_ready(void);
+
+        /* wineserver interrupts a sleeping thread with a signal to run the
+         * socket operations that became ready for it. Horizon has no such
+         * signal: while one is ready, a sleep waits in the server instead,
+         * where it is handed over. The wait is not alertable, so no user APC
+         * runs, and it lasts as long as the sleep. */
+        if (horizon_async_any_ready())
+        {
+            if ((status = server_wait( NULL, 0, SELECT_INTERRUPTIBLE, timeout )) == STATUS_TIMEOUT)
+                status = STATUS_SUCCESS;
+            return status;
+        }
+    }
+#endif
+
     if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE)  /* sleep forever */
     {
 #ifdef __SWITCH__

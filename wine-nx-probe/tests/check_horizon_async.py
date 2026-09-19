@@ -63,7 +63,8 @@ int main( void )
     assert( horizon_async_any_queued( &list ) );
 
     /* While the first is with its thread, the second must not overtake it. */
-    horizon_async_ready( a, HORIZON_ASYNC_STATUS_ALERTED, 1000 );
+    horizon_async_ready( &list, a, HORIZON_ASYNC_STATUS_ALERTED, 1000 );
+    assert( list.ready == 1 );
     assert( !horizon_async_next_queued( &list, 8, HORIZON_ASYNC_READ ) );
     assert( horizon_async_ready_for( &list, 4, 1000, 200 ) == a );
     /* Another thread gets it only once it has waited for its own too long. */
@@ -71,8 +72,8 @@ int main( void )
     assert( !horizon_async_any_stale( &list, 1199, 200 ) );
     assert( horizon_async_ready_for( &list, 20, 1200, 200 ) == a );
     assert( horizon_async_any_stale( &list, 1200, 200 ) );
-    a->state = HORIZON_ASYNC_RUNNING;
-    a->apc_id = 77;
+    horizon_async_run( &list, a, 77 );
+    assert( !list.ready && a->state == HORIZON_ASYNC_RUNNING );
     assert( !horizon_async_ready_for( &list, 4, 5000, 200 ) );
     assert( horizon_async_find_apc( &list, 77 ) == a );
     assert( !horizon_async_find_apc( &list, 0 ) );

@@ -98,6 +98,7 @@ struct horizon_async_list
 {
     struct horizon_async *head;
     unsigned int next_id;      /* ids the client sees, never 0 */
+    int ready;                 /* how many are ready and not yet handed to a thread */
 };
 
 static inline unsigned int horizon_async_new_id( struct horizon_async_list *list )
@@ -167,11 +168,22 @@ static inline struct horizon_async *horizon_async_find_user( const struct horizo
     return NULL;
 }
 
-static inline void horizon_async_ready( struct horizon_async *async, unsigned int status, unsigned long long now )
+static inline void horizon_async_ready( struct horizon_async_list *list, struct horizon_async *async,
+                                        unsigned int status, unsigned long long now )
 {
+    if (async->state != HORIZON_ASYNC_READY) __atomic_add_fetch( &list->ready, 1, __ATOMIC_RELAXED );
     async->state = HORIZON_ASYNC_READY;
     async->status = status;
     async->ready_at = now;
+}
+
+/* A ready one handed to a thread as a system APC. */
+static inline void horizon_async_run( struct horizon_async_list *list, struct horizon_async *async,
+                                      unsigned int apc_id )
+{
+    if (async->state == HORIZON_ASYNC_READY) __atomic_sub_fetch( &list->ready, 1, __ATOMIC_RELAXED );
+    async->state = HORIZON_ASYNC_RUNNING;
+    async->apc_id = apc_id;
 }
 
 /* The one to run next on this thread: one the thread started, or one that has
@@ -291,7 +303,7 @@ static inline unsigned int horizon_async_cancel( struct horizon_async_list *list
         if (iosb && async->data.iosb != iosb) continue;
         if (tid && async->owner_tid != tid) continue;
         if (async->state != HORIZON_ASYNC_QUEUED && async->state != HORIZON_ASYNC_READY) continue;
-        horizon_async_ready( async, closing && async->kind == HORIZON_ASYNC_IO ?
+        horizon_async_ready( list, async, closing && async->kind == HORIZON_ASYNC_IO ?
                              HORIZON_ASYNC_STATUS_HANDLES_CLOSED : HORIZON_ASYNC_STATUS_CANCELLED, now );
         count++;
     }

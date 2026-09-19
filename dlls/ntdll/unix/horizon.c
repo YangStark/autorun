@@ -1320,6 +1320,7 @@ struct horizon_ioctl_request
 
 #define HORIZON_ASYNC_DATA_DEFINED 1
 #include "horizon_async.h"
+#include "horizon_sockaddr.h"
 
 struct horizon_get_async_result_request
 {
@@ -2846,6 +2847,9 @@ struct horizon_server_object
     char *dir_mask;
     int sock_nonblocking;
     int sock_bound;                 /* bind() succeeded; Windows fails a second bind */
+    int sock_family;                /* what the program asked for: WS AF_INET, or AF_INET6 on IPv4 */
+    int sock_type, sock_protocol;
+    int sock_v6only;                /* IPV6_V6ONLY: an IPv6 socket does not reach ::ffff:a.b.c.d */
     unsigned int sock_event_handle; /* event signaled by the poller (WSAEventSelect) */
     int sock_event_mask;            /* AFD_POLL_* bits the app asked for */
     int sock_pending_events;        /* accumulated AFD_POLL_* bits not yet fetched */
@@ -10048,6 +10052,9 @@ static int horizon_server_handle_open_thread( struct horizon_server_connection *
 #define HORIZON_IOCTL_AFD_WINE_GET_SO_REUSEADDR  0x001203a4 /* NETWORK/233/BUFFERED */
 #define HORIZON_IOCTL_AFD_WINE_GET_SO_SNDBUF     0x001203b0 /* NETWORK/236/BUFFERED */
 #define HORIZON_IOCTL_AFD_WINE_GET_TCP_NODELAY   0x00120470 /* NETWORK/284/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_GET_INFO          0x00120368 /* NETWORK/218/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_GET_IPV6_V6ONLY   0x0012045c /* NETWORK/279/BUFFERED */
+#define HORIZON_IOCTL_AFD_WINE_SET_IPV6_V6ONLY   0x00120460 /* NETWORK/280/BUFFERED */
 
 #define HORIZON_AFD_POLL_READ        0x0001
 #define HORIZON_AFD_POLL_OOB         0x0002
@@ -10157,31 +10164,58 @@ static unsigned int horizon_sock_errno_wsa( int err )
 
 /* Windows sockaddr_in (16-bit sin_family, no sin_len) <-> BSD sockaddr_in.
  * libnx is IPv4 only; reject everything else cleanly. */
-static unsigned int horizon_ws_sockaddr_to_unix( const unsigned char *ws, unsigned int len,
-                                                 struct sockaddr_in *sa )
+/* A Windows address as the IPv4 socket underneath takes it. An IPv6 address
+ * with no IPv4 behind it (horizon_sockaddr.h) is one Horizon cannot reach:
+ * unreachable for a connect, not a local address for a bind. So is IPv4
+ * written the IPv6 way on a socket that asked to be IPv6 only, as a host
+ * socket with IPV6_V6ONLY refuses it for wineserver. */
+static unsigned int horizon_ws_sockaddr_to_unix_for( const unsigned char *ws, unsigned int len,
+                                                     struct sockaddr_in *sa, int v6only, int connecting )
 {
     unsigned short family;
 
     if (len < 16) return HORIZON_STATUS_INVALID_PARAMETER;
     memcpy( &family, ws, sizeof(family) );
-    if (family != HORIZON_WS_AF_INET) return HORIZON_STATUS_NOT_SUPPORTED;
-
     memset( sa, 0, sizeof(*sa) );
     sa->sin_len = sizeof(*sa);
     sa->sin_family = AF_INET;
+    if (family == HORIZON_WS_AF_INET6)
+    {
+        unsigned char port[2], v4[4];
+        int found = horizon_ws_in6_to_v4( ws, len, port, v4 );
+
+        if (found < 0) return HORIZON_STATUS_INVALID_PARAMETER;
+        if (!found || (connecting && v6only && horizon_in6_is_mapped( ws + 8 )))
+            return connecting ? HORIZON_STATUS_NETWORK_UNREACHABLE : HORIZON_STATUS_INVALID_ADDRESS_COMPONENT;
+        memcpy( &sa->sin_port, port, 2 );
+        memcpy( &sa->sin_addr, v4, 4 );
+        return HORIZON_STATUS_SUCCESS;
+    }
+    if (family != HORIZON_WS_AF_INET) return HORIZON_STATUS_NOT_SUPPORTED;
     memcpy( &sa->sin_port, ws + 2, 2 );
     memcpy( &sa->sin_addr, ws + 4, 4 );
     return HORIZON_STATUS_SUCCESS;
 }
 
-static unsigned int horizon_ws_sockaddr_from_unix( const struct sockaddr_in *sa,
-                                                   unsigned char *ws, unsigned int len )
+static unsigned int horizon_ws_sockaddr_to_unix( const unsigned char *ws, unsigned int len,
+                                                 struct sockaddr_in *sa )
 {
-    unsigned short family = HORIZON_WS_AF_INET;
+    return horizon_ws_sockaddr_to_unix_for( ws, len, sa, 0, 0 );
+}
 
+/* An IPv4 address as a socket of the given family reports it: a
+ * sockaddr_in, or a sockaddr_in6 for one the program opened as IPv6. */
+static unsigned int horizon_ws_sockaddr_from_unix_as( const struct sockaddr_in *sa, int family,
+                                                      unsigned char *ws, unsigned int len )
+{
+    unsigned short ws_family = HORIZON_WS_AF_INET;
+
+    if (family == HORIZON_WS_AF_INET6)
+        return horizon_ws_in6_from_v4( (const unsigned char *)&sa->sin_port,
+                                       (const unsigned char *)&sa->sin_addr, ws, len );
     if (len < 16) return 0;
     memset( ws, 0, 16 );
-    memcpy( ws, &family, sizeof(family) );
+    memcpy( ws, &ws_family, sizeof(ws_family) );
     memcpy( ws + 2, &sa->sin_port, 2 );
     memcpy( ws + 4, &sa->sin_addr, 4 );
     return 16;
@@ -10198,6 +10232,26 @@ static unsigned int horizon_server_find_sock_locked( unsigned int handle,
     if (entry->object->type != HORIZON_SERVER_OBJECT_SOCK) return HORIZON_STATUS_OBJECT_TYPE_MISMATCH;
     *object = entry->object;
     return HORIZON_STATUS_SUCCESS;
+}
+
+/* The family a socket was opened with, for the client's recvfrom, which
+ * reports where a datagram came from the way the program's socket speaks. */
+unsigned int horizon_server_sock_family( unsigned int handle )
+{
+    struct horizon_server_object *object;
+    unsigned int family = HORIZON_WS_AF_INET;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!horizon_server_find_sock_locked( handle, &object ) && object->sock_family) family = object->sock_family;
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return family;
+}
+
+/* Whether a socket operation is ready to be run by a thread: a thread that
+ * sleeps then waits in the server, where it is handed over (sync.c). */
+int horizon_async_any_ready(void)
+{
+    return __atomic_load_n( &horizon_asyncs.ready, __ATOMIC_RELAXED ) > 0;
 }
 
 static unsigned long long horizon_async_now(void)
@@ -10284,6 +10338,10 @@ static struct horizon_server_handle_entry *horizon_server_accepted_sock_locked( 
     sock->sock_nonblocking = listener->sock_nonblocking;
     sock->sock_event_handle = listener->sock_event_handle;
     sock->sock_event_mask = listener->sock_event_mask;
+    sock->sock_family = listener->sock_family;
+    sock->sock_type = listener->sock_type;
+    sock->sock_protocol = listener->sock_protocol;
+    sock->sock_v6only = listener->sock_v6only;
     return entry;
 }
 
@@ -10292,6 +10350,7 @@ static struct horizon_server_handle_entry *horizon_server_accepted_sock_locked( 
  * data it asked for has not come. */
 static int horizon_sock_accept_output_locked( struct horizon_async *async, struct horizon_server_object *target )
 {
+    int family = target->sock_family ? target->sock_family : HORIZON_WS_AF_INET;
     unsigned int local_at, remote_at, remote_len;
     struct sockaddr_in addr;
     socklen_t addr_len;
@@ -10301,12 +10360,12 @@ static int horizon_sock_accept_output_locked( struct horizon_async *async, struc
     if (!horizon_async_accept_layout( async->out_size, async->recv_len, async->local_len,
                                       &local_at, &remote_at, &remote_len ))
     {
-        horizon_async_ready( async, HORIZON_STATUS_BUFFER_TOO_SMALL, horizon_async_now() );
+        horizon_async_ready( &horizon_asyncs, async, HORIZON_STATUS_BUFFER_TOO_SMALL, horizon_async_now() );
         return 1;
     }
     if (!(out = calloc( 1, async->out_size )))
     {
-        horizon_async_ready( async, HORIZON_STATUS_NO_MEMORY, horizon_async_now() );
+        horizon_async_ready( &horizon_asyncs, async, HORIZON_STATUS_NO_MEMORY, horizon_async_now() );
         return 1;
     }
     if (async->recv_len && (received = recv( target->file_fd, out, async->recv_len, 0 )) == -1)
@@ -10315,32 +10374,33 @@ static int horizon_sock_accept_output_locked( struct horizon_async *async, struc
 
         free( out );
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        horizon_async_ready( async, status, horizon_async_now() );
+        horizon_async_ready( &horizon_asyncs, async, status, horizon_async_now() );
         return 1;
     }
     if (async->local_len)
     {
         addr_len = sizeof(addr);
         if (getsockname( target->file_fd, (struct sockaddr *)&addr, &addr_len ) == -1 ||
-            !(len = horizon_ws_sockaddr_from_unix( &addr, out + local_at + sizeof(int),
-                                                   async->local_len - sizeof(int) )))
+            !(len = horizon_ws_sockaddr_from_unix_as( &addr, family, out + local_at + sizeof(int),
+                                                      async->local_len - sizeof(int) )))
             goto too_small;
         memcpy( out + local_at, &len, sizeof(len) );
     }
     addr_len = sizeof(addr);
     if (getpeername( target->file_fd, (struct sockaddr *)&addr, &addr_len ) == -1 ||
-        !(len = horizon_ws_sockaddr_from_unix( &addr, out + remote_at + sizeof(int), remote_len - sizeof(int) )))
+        !(len = horizon_ws_sockaddr_from_unix_as( &addr, family, out + remote_at + sizeof(int),
+                                                  remote_len - sizeof(int) )))
         goto too_small;
     memcpy( out + remote_at, &len, sizeof(len) );
     async->out = out;
     async->out_status = HORIZON_STATUS_SUCCESS;
     async->out_info = received;
-    horizon_async_ready( async, HORIZON_STATUS_ALERTED, horizon_async_now() );
+    horizon_async_ready( &horizon_asyncs, async, HORIZON_STATUS_ALERTED, horizon_async_now() );
     return 1;
 
 too_small:
     free( out );
-    horizon_async_ready( async, HORIZON_STATUS_BUFFER_TOO_SMALL, horizon_async_now() );
+    horizon_async_ready( &horizon_asyncs, async, HORIZON_STATUS_BUFFER_TOO_SMALL, horizon_async_now() );
     return 1;
 }
 
@@ -10358,7 +10418,7 @@ static int horizon_sock_accept_async_locked( struct horizon_server_object *liste
     if (async->kind == HORIZON_ASYNC_ACCEPT_INTO &&
         (horizon_server_find_sock_locked( async->accept_into, &target ) || target->file_fd == -1))
     {
-        horizon_async_ready( async, HORIZON_STATUS_INVALID_HANDLE, horizon_async_now() );
+        horizon_async_ready( &horizon_asyncs, async, HORIZON_STATUS_INVALID_HANDLE, horizon_async_now() );
         return 1;
     }
     if (!async->accepted)
@@ -10366,7 +10426,7 @@ static int horizon_sock_accept_async_locked( struct horizon_server_object *liste
         if ((fd = accept( listener->file_fd, NULL, NULL )) == -1)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 0;
-            horizon_async_ready( async, horizon_sock_errno_status( errno ), horizon_async_now() );
+            horizon_async_ready( &horizon_asyncs, async, horizon_sock_errno_status( errno ), horizon_async_now() );
             return 1;
         }
         fcntl( fd, F_SETFL, O_NONBLOCK );
@@ -10378,7 +10438,7 @@ static int horizon_sock_accept_async_locked( struct horizon_server_object *liste
                 close( fd );
                 free( async->out );
                 async->out = NULL;
-                horizon_async_ready( async, HORIZON_STATUS_NO_MEMORY, horizon_async_now() );
+                horizon_async_ready( &horizon_asyncs, async, HORIZON_STATUS_NO_MEMORY, horizon_async_now() );
                 return 1;
             }
             handle = entry->handle;
@@ -10386,7 +10446,7 @@ static int horizon_sock_accept_async_locked( struct horizon_server_object *liste
             async->out_size = sizeof(handle);
             async->out_status = HORIZON_STATUS_SUCCESS;
             async->out_info = sizeof(handle);
-            horizon_async_ready( async, HORIZON_STATUS_ALERTED, horizon_async_now() );
+            horizon_async_ready( &horizon_asyncs, async, HORIZON_STATUS_ALERTED, horizon_async_now() );
             return 1;
         }
         close( target->file_fd );
@@ -10424,7 +10484,7 @@ static int horizon_sock_poll_asyncs_locked( unsigned int handle, struct horizon_
         pfd.revents = 0;
         if (poll( &pfd, 1, 0 ) <= 0 || !(pfd.revents & (pfd.events | POLLHUP | POLLERR))) continue;
         if (async->kind == HORIZON_ASYNC_IO)
-            horizon_async_ready( async, HORIZON_STATUS_ALERTED, horizon_async_now() );
+            horizon_async_ready( &horizon_asyncs, async, HORIZON_STATUS_ALERTED, horizon_async_now() );
         else if (!horizon_sock_accept_async_locked( sock, async ))
             continue;
         changed = 1;
@@ -10696,7 +10756,9 @@ static unsigned int horizon_sock_ioctl_create( unsigned int handle, const unsign
     if (data_size < sizeof(params)) return HORIZON_STATUS_INVALID_PARAMETER;
     memcpy( params, data, sizeof(params) );
 
-    if (params[0] != HORIZON_WS_AF_INET)
+    /* AF_INET6 is an IPv4 socket underneath: Horizon has no IPv6, and what a
+     * Windows program reaches through one is IPv4 (horizon_sockaddr.h). */
+    if (params[0] != HORIZON_WS_AF_INET && params[0] != HORIZON_WS_AF_INET6)
     {
         horizon_trace( "[server] WINE_CREATE family=%d unsupported\n", params[0] );
         return HORIZON_STATUS_NOT_SUPPORTED;
@@ -10721,6 +10783,11 @@ static unsigned int horizon_sock_ioctl_create( unsigned int handle, const unsign
         object->file_fd = fd;
         object->sock_nonblocking = 0;
         object->sock_bound = 0;
+        object->sock_family = params[0];
+        object->sock_type = params[1];
+        object->sock_protocol = params[2];
+        /* Windows makes an IPv6 socket IPv6 only until told otherwise. */
+        object->sock_v6only = params[0] == HORIZON_WS_AF_INET6;
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
@@ -10742,7 +10809,15 @@ static unsigned int horizon_sock_ioctl_connect( unsigned int handle, const unsig
     if (8u + (unsigned int)addr_len > data_size) return HORIZON_STATUS_INVALID_PARAMETER;
 
     if ((status = horizon_server_get_sock_fd( handle, &fd, &nonblocking ))) return status;
-    if ((status = horizon_ws_sockaddr_to_unix( data + 8, addr_len, &sa ))) return status;
+    {
+        struct horizon_server_object *object;
+        int v6only = 0;
+
+        pthread_mutex_lock( &horizon_server_objects_mutex );
+        if (!horizon_server_find_sock_locked( handle, &object )) v6only = object->sock_v6only;
+        pthread_mutex_unlock( &horizon_server_objects_mutex );
+        if ((status = horizon_ws_sockaddr_to_unix_for( data + 8, addr_len, &sa, v6only, 1 ))) return status;
+    }
 
     {
         const unsigned char *ip = (const unsigned char *)&sa.sin_addr;
@@ -10864,6 +10939,8 @@ static unsigned int horizon_sock_ioctl_bind( unsigned int handle, const unsigned
     unsigned int status;
     int fd = -1;
 
+    int family = HORIZON_WS_AF_INET;
+
     if (data_size < 4 + 16) return HORIZON_STATUS_INVALID_PARAMETER;
     if ((status = horizon_ws_sockaddr_to_unix( data + 4, data_size - 4, &sa ))) return status;
 
@@ -10871,7 +10948,11 @@ static unsigned int horizon_sock_ioctl_bind( unsigned int handle, const unsigned
     status = horizon_server_find_sock_locked( handle, &object );
     if (!status && object->file_fd == -1) status = HORIZON_STATUS_INVALID_HANDLE;
     if (!status && object->sock_bound) status = HORIZON_STATUS_ADDRESS_ALREADY_ASSOCIATED;
-    if (!status) fd = object->file_fd;
+    if (!status)
+    {
+        fd = object->file_fd;
+        if (object->sock_family) family = object->sock_family;
+    }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
     if (status) return status;
 
@@ -10890,7 +10971,7 @@ static unsigned int horizon_sock_ioctl_bind( unsigned int handle, const unsigned
     if (getsockname( fd, (struct sockaddr *)&bound, &bound_len ) == -1) bound = sa;
     else bound.sin_addr = sa.sin_addr;
     /* A buffer too small for the address is not an error; Windows binds anyway. */
-    if (out_max >= 16) *out_size = horizon_ws_sockaddr_from_unix( &bound, out, out_max );
+    *out_size = horizon_ws_sockaddr_from_unix_as( &bound, family, out, out_max );
     horizon_trace( "[server] AFD_BIND handle=%08x fd=%d port=%u -> bound port=%u\n", handle, fd,
                    (unsigned)((data[6] << 8) | data[7]),
                    (unsigned)((((const unsigned char *)&bound.sin_port)[0] << 8) |
@@ -10977,6 +11058,57 @@ static unsigned int horizon_sock_ioctl_getsockopt( unsigned int code, unsigned i
     memcpy( out, &value, sizeof(value) );
     *out_size = sizeof(value);
     return HORIZON_STATUS_SUCCESS;
+}
+
+/* What the program opened the socket as, kept by the server since the socket
+ * underneath is IPv4 whatever it asked for: GET_INFO (getsockopt's
+ * SO_PROTOCOL_INFO, WSADuplicateSocket) and IPV6_V6ONLY, which the client
+ * cannot ask an IPv4 socket about. As on Windows, V6ONLY belongs to IPv6
+ * sockets and is set before the bind; wineserver's client lets it be set on
+ * an unbound IPv4 socket and does nothing. */
+static unsigned int horizon_sock_ioctl_family( unsigned int code, unsigned int handle,
+                                               const unsigned char *in, unsigned int in_size,
+                                               unsigned char *out, unsigned int out_max, unsigned int *out_size )
+{
+    struct horizon_server_object *object;
+    unsigned int status;
+    int value, info[3];
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    status = horizon_server_find_sock_locked( handle, &object );
+    if (status) goto done;
+    switch (code)
+    {
+    case HORIZON_IOCTL_AFD_WINE_GET_INFO:
+        if (out_max < sizeof(info)) { status = HORIZON_STATUS_BUFFER_TOO_SMALL; break; }
+        info[0] = object->sock_family ? object->sock_family : HORIZON_WS_AF_INET;
+        info[1] = object->sock_type;
+        info[2] = object->sock_protocol;
+        memcpy( out, info, sizeof(info) );
+        *out_size = sizeof(info);
+        break;
+    case HORIZON_IOCTL_AFD_WINE_GET_IPV6_V6ONLY:
+        if (object->sock_family != HORIZON_WS_AF_INET6) { status = HORIZON_STATUS_INVALID_PARAMETER; break; }
+        if (out_max < sizeof(value)) { status = HORIZON_STATUS_BUFFER_TOO_SMALL; break; }
+        value = object->sock_v6only;
+        memcpy( out, &value, sizeof(value) );
+        *out_size = sizeof(value);
+        break;
+    default:
+        if (in_size < sizeof(value)) { status = HORIZON_STATUS_INVALID_PARAMETER; break; }
+        memcpy( &value, in, sizeof(value) );
+        if (object->sock_family != HORIZON_WS_AF_INET6)
+        {
+            if (object->sock_bound) status = HORIZON_STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (object->sock_bound) { status = HORIZON_STATUS_INVALID_PARAMETER; break; }
+        object->sock_v6only = !!value;
+        break;
+    }
+done:
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return status;
 }
 
 /* listen(): server/sock.c refuses a socket that was never bound. */
@@ -11162,6 +11294,12 @@ static int horizon_server_handle_ioctl( struct horizon_server_connection *connec
         status = horizon_sock_ioctl_listen( handle, data, data_size );
         break;
 
+    case HORIZON_IOCTL_AFD_WINE_GET_INFO:
+    case HORIZON_IOCTL_AFD_WINE_GET_IPV6_V6ONLY:
+    case HORIZON_IOCTL_AFD_WINE_SET_IPV6_V6ONLY:
+        status = horizon_sock_ioctl_family( request->code, handle, data, data_size, out, out_max, &out_size );
+        break;
+
     case HORIZON_IOCTL_AFD_WINE_ACCEPT:
         status = horizon_sock_ioctl_accept( connection, &request->async, out, out_max, &out_size );
         break;
@@ -11214,7 +11352,8 @@ static int horizon_server_handle_ioctl( struct horizon_server_connection *connec
         else
             ret = getpeername( fd, (struct sockaddr *)&sa, &sa_len );
         if (ret == -1) { status = horizon_sock_errno_status( errno ); break; }
-        if (!(out_size = horizon_ws_sockaddr_from_unix( &sa, out, out_max )))
+        if (!(out_size = horizon_ws_sockaddr_from_unix_as( &sa, horizon_server_sock_family( handle ),
+                                                           out, out_max )))
             status = HORIZON_STATUS_BUFFER_TOO_SMALL;
         else
             status = HORIZON_STATUS_SUCCESS;
@@ -13006,8 +13145,8 @@ static unsigned int horizon_server_async_apc_locked( struct horizon_server_conne
         !(async = horizon_async_ready_for( &horizon_asyncs, connection->tid, horizon_async_now(),
                                            HORIZON_ASYNC_STALE )))
         return 0;
-    async->state = HORIZON_ASYNC_RUNNING;
-    if (!(async->apc_id = ++horizon_async_apc_ids)) async->apc_id = ++horizon_async_apc_ids;
+    if (!++horizon_async_apc_ids) ++horizon_async_apc_ids;
+    horizon_async_run( &horizon_asyncs, async, horizon_async_apc_ids );
     result = async->status == HORIZON_STATUS_ALERTED ? async->out_info : 0;
     memset( call, 0, HORIZON_APC_CALL_SIZE );
     memcpy( call, &type, sizeof(type) );
