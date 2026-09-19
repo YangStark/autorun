@@ -1958,16 +1958,26 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
     {
         const char *base = file_name( p->path );
         int in_library = find_program( l, p->path ) >= 0;
-        int x86 = p->machine == 0x014c, dxvk_beside, dxvk_installed;
+        int x86 = p->machine == 0x014c, x64 = p->machine == 0x8664, dxvk_beside, dxvk_installed;
+        const char *dxvk_dir = launcher_dxvk_directory( p->machine );
         enum ui_action action;
         struct ui_row *row;
 
         snprintf( name, sizeof(name), "%.*s", (int)(strlen( base ) > 4 ? strlen( base ) - 4 : strlen( base )), base );
         snprintf( dir, sizeof(dir), "%s", p->path );
         parent_dir( dir );
-        snprintf( path, sizeof(path), "%s/d3d9.dll", dir );
+        snprintf( path, sizeof(path), "%s/%s", dir, x64 ? "d3d11.dll" : "d3d9.dll" );
         dxvk_beside = file_exists( path );
-        dxvk_installed = file_exists( LAUNCHER_DRIVE_C "/dxvk/d3d9.dll" );
+        if (x64)
+        {
+            snprintf( path, sizeof(path), "%s/dxgi.dll", dir );
+            dxvk_beside |= file_exists( path );
+        }
+        snprintf( path, sizeof(path), LAUNCHER_DRIVE_C "/%s/d3d9.dll", dxvk_dir ? dxvk_dir : "dxvk" );
+        dxvk_installed = dxvk_dir && file_exists( path );
+        if (x64) dxvk_installed = dxvk_installed &&
+            file_exists( LAUNCHER_DRIVE_C "/dxvk64/d3d11.dll" ) &&
+            file_exists( LAUNCHER_DRIVE_C "/dxvk64/dxgi.dll" );
 
         count = 0;
 #define ADD_ROW(i, section, text, help_text) \
@@ -2018,25 +2028,21 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
                   state_text( p->settings.framebuffer, l->options->framebuffer, "Framebuffer", "Compositor",
                               buffer, sizeof(buffer) ) );
 
-        if (l->options->vulkan && x86)
+        if (l->options->vulkan && (x86 || x64))
         {
-            ADD_ROW( ROW_D3D9, SECTION_GRAPHICS, "Direct3D 9",
-                     "Wine draws Direct3D 9 with OpenGL. DXVK draws it with Vulkan: C:\\dxvk\\d3d9.dll is "
-                     "loaded instead of Wine's. A d3d9.dll next to the program is always loaded first." );
-            if (dxvk_beside)
+            ADD_ROW( ROW_D3D9, SECTION_GRAPHICS, x64 ? "Direct3D 9/10/11" : "Direct3D 9",
+                     x64 ? "Uses C:\\dxvk64. Graphics DLLs next to the game have priority." :
+                           "Uses C:\\dxvk\\d3d9.dll. A DLL next to the game has priority." );
+            if (!dxvk_installed && !p->settings.dxvk)
             {
                 row->disabled = 1;
-                snprintf( row->value, sizeof(row->value), "d3d9.dll next to the program" );
-            }
-            else if (!dxvk_installed && !p->settings.dxvk)
-            {
-                row->disabled = 1;
-                snprintf( row->value, sizeof(row->value), "Wine (no C:\\dxvk\\d3d9.dll)" );
+                snprintf( row->value, sizeof(row->value), "Wine (no C:\\%s payload)", dxvk_dir );
             }
             else
             {
                 row->adjustable = 1;
-                snprintf( row->value, sizeof(row->value), "%s", p->settings.dxvk ? "DXVK" : "Wine" );
+                snprintf( row->value, sizeof(row->value), "%s%s", p->settings.dxvk ? "DXVK" : "Wine",
+                          dxvk_beside ? " (app DLL first)" : "" );
             }
         }
 
@@ -2355,9 +2361,9 @@ static const struct { const char *name, *value, *help; } credits[] =
     { "Wine", "WineHQ, LGPL-2.1+",
       "https://www.winehq.org\nThe Windows API, the loader, WoW64 and the Direct3D, OpenGL and Vulkan layers." },
     { "Box64", "ptitSeb, MIT",
-      "https://github.com/ptitSeb/box64\nRuns 32-bit x86 code: its interpreter and ARM64 dynarec are the WoW64 CPU." },
+      "https://github.com/ptitSeb/box64\nRuns x86 and x86-64 code through its interpreter and ARM64 dynarec." },
     { "DXVK", "Philip Rebohle, zlib",
-      "https://github.com/doitsujin/dxvk\nDirect3D 9 over Vulkan, for programs set to d3d9=dxvk." },
+      "https://github.com/doitsujin/dxvk\nDirect3D over Vulkan, for programs set to d3d=dxvk." },
     { "Mesa", "Mesa3D, MIT",
       "https://mesa3d.org\nOpenGL through nvc0 and Vulkan through NVK on the Switch GPU." },
     { "mesa-switch", "danfromtico, NaGaa95 and others",
@@ -2776,8 +2782,8 @@ static void settings_menu( struct launcher *l )
         snprintf( rows[SET_MAKE_MAIN].label, sizeof(rows[0].label), "Make an Autorun forwarder" );
         snprintf( rows[SET_MAKE_MAIN].value, sizeof(rows[0].value), "%s",
                   l->options->install_forwarder ? "Autorun" : "Unavailable" );
-        rows[SET_MAKE_MAIN].help = "Autorun itself on the home menu, in the address space the Homebrew Menu "
-                                   "gives it, so it opens without going through it. Only on an emuMMC.";
+        rows[SET_MAKE_MAIN].help = "Autorun itself on the home menu with the 39-bit address space required "
+                                   "by AMD64 programs. Only on an emuMMC.";
         rows[SET_MAKE_MAIN].adjustable = 0;
         rows[SET_MAKE_MAIN].disabled = !l->options->install_forwarder;
         snprintf( rows[SET_CREDITS].label, sizeof(rows[0].label), "Credits" );
@@ -2829,7 +2835,7 @@ static void settings_menu( struct launcher *l )
             if (action == UI_ACTION_CHOOSE) make_forwarder( l, 32 );
             break;
         case SET_MAKE_MAIN:
-            if (action == UI_ACTION_CHOOSE) make_forwarder( l, 36 );
+            if (action == UI_ACTION_CHOOSE) make_forwarder( l, 39 );
             break;
 
         case SET_CREDITS:
@@ -2950,7 +2956,8 @@ static int file_browser_pick( struct launcher *l, char *target, size_t size )
         {
             "C: Wine", "Z: SD card", "D: USB 1", "E: USB 2", "F: USB 3", "G: USB 4", "H: USB 5"
         };
-        const char *volumes[ARRAY_SIZE(volume_paths)];
+        enum { VOLUME_CAPACITY = sizeof(volume_paths) / sizeof(volume_paths[0]) };
+        const char *volumes[VOLUME_CAPACITY];
         int count, has_up, volume_count = 0, rows, i, reload = 0;
 
         while (!read_dir( l, dir, &count ) && !is_root( dir )) parent_dir( dir );
@@ -2973,7 +2980,7 @@ static int file_browser_pick( struct launcher *l, char *target, size_t size )
         }
         else
         {
-            for (i = 0; i < ARRAY_SIZE(volume_paths); i++)
+            for (i = 0; i < VOLUME_CAPACITY; i++)
             {
                 if (stat( volume_paths[i], &st ) || !S_ISDIR( st.st_mode ) || !strcmp( volume_paths[i], dir )) continue;
                 memset( file_rows + rows, 0, sizeof(file_rows[0]) );

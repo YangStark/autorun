@@ -10,7 +10,8 @@ from types import SimpleNamespace
 
 root = Path(__file__).resolve().parents[2]
 package = root / 'wine-nx-probe/tools/package-amd64.py'
-selected = {'module_name', 'apiset', 'coff_blocks', 'imports', 'forwarders', 'stage_closure'}
+selected = {'module_name', 'apiset', 'import_host', 'coff_blocks', 'imports', 'forwarders',
+            'stage_closure', 'validate_external_imports'}
 tree = ast.parse(package.read_text(), filename=str(package))
 helpers = ast.Module(body=[node for node in tree.body
                            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in selected],
@@ -247,3 +248,37 @@ with tempfile.TemporaryDirectory(prefix='wine-nx-package-amd64-arch-') as temp:
 print('PASS: AMD64 dependency staging unions ARM64 and embedded ARM64EC normal and delayed imports '
       'through used named and ordinal forwarders, handles cycles and case, skips API sets and '
       'unused Win16 forwarders, and rejects mismatched architectures')
+
+with tempfile.TemporaryDirectory(prefix='wine-nx-package-dxvk-') as temp:
+    fixture = Fixture(temp)
+    fixture.add('aarch64', 'dxgi.dll', imports=import_dump(
+        ('API-MS-Win-Test-L1-1-0.DLL', [('Named', 0)])) + delay_import_dump(
+        ('host.dll', [('', 7)])))
+    fixture.add('aarch64', 'host.dll', exports=hybrid_export_dump(
+        ('Named', 1, 'FORWARD.Real'), ('', 7, None)))
+    fixture.add('aarch64', 'forward.dll', exports=export_dump(('Real', 3, None)))
+    fixture.install()
+    namespace['api_sets'] = {'api-ms-win-test-l1-1-0': 'host.dll'}
+    paths = {name: fixture.built(name, 'aarch64') for name in ('dxgi.dll', 'host.dll', 'forward.dll')}
+    namespace['validate_external_imports']([paths['dxgi.dll']], paths)
+
+    def rejects_imports(message):
+        namespace['forwarders'].cache_clear()
+        try:
+            namespace['validate_external_imports']([paths['dxgi.dll']], paths)
+        except ValueError as error:
+            assert message in str(error), error
+        else:
+            raise AssertionError('accepted an unresolved external import')
+
+    fixture.objects['aarch64', 'forward.dll']['--coff-exports'] = export_dump(('Other', 3, None))
+    rejects_imports('does not export Real')
+    fixture.objects['aarch64', 'forward.dll']['--coff-exports'] = export_dump(('Real', 3, 'HOST.Named'))
+    rejects_imports('Forwarder cycle')
+    paths.pop('forward.dll')
+    rejects_imports('Missing imported DLL')
+    namespace['api_sets'] = {}
+    rejects_imports('Unknown API set')
+
+print('PASS: DXVK normal/delayed imports, API sets, ordinal and ARM64EC forwarded exports; '
+      'missing symbols/modules and forwarder cycles are rejected')

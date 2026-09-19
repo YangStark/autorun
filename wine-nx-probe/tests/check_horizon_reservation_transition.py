@@ -25,16 +25,22 @@ fixture = r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <pthread.h>
 typedef int BOOL;
 typedef int LONG;
+typedef uint32_t u32;
+typedef uint64_t u64;
 typedef uintptr_t ULONG_PTR;
+typedef struct { u64 addr, size; u32 type, perm, attr; } MemoryInfo;
 #define PROT_NONE 0
 #define PROT_READ 1
 #define PROT_WRITE 2
 #define MAP_FAILED ((void *)-1)
 #define MAP_PRIVATE 2
 #define MAP_ANON 0x20
+#define MemType_Unmapped 0
+#define R_SUCCEEDED(result) ((result) == 0)
 typedef struct { uintptr_t start, end; int used; } VirtmemReservation;
 struct horizon_mapping { void *addr; size_t size; VirtmemReservation *reservation; };
 static VirtmemReservation reservations[32];
@@ -42,6 +48,18 @@ static struct horizon_mapping *maps[8];
 static int map_count, mapping_pool, allocations, fail_allocation, fail_reservation;
 static int observe, require_target, kernel_target, violation, fail_replace;
 static pthread_mutex_t mapping_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int svcQueryMemory(MemoryInfo *info, u32 *page_info, u64 address)
+{ (void)info; (void)page_info; (void)address; return -1; }
+static struct horizon_mapping *find_overlap_mapping(void *p, size_t size)
+{
+    uintptr_t start = (uintptr_t)p, end = start + size;
+    for (int i = 0; i < map_count; i++)
+    {
+        uintptr_t map_start = (uintptr_t)maps[i]->addr;
+        if (start < map_start + maps[i]->size && end > map_start) return maps[i];
+    }
+    return NULL;
+}
 static int covered(uintptr_t p)
 {
     if (kernel_target && p == 0x12000) return 1;

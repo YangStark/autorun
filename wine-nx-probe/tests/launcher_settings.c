@@ -85,10 +85,20 @@ static void test_settings( const char *dir )
     launcher_settings_read( &kv, &settings );
     assert( settings.address_space == 0 );
 
+    load_text( &kv, "d3d=wine\nd3d9=dxvk\n" );
+    launcher_settings_read( &kv, &settings );
+    assert( settings.dxvk == 0 );
+    load_text( &kv, "d3d=DXVK\n" );
+    launcher_settings_read( &kv, &settings );
+    assert( settings.dxvk == 1 );
+    assert( !strcmp( launcher_dxvk_directory( 0x014c ), "dxvk" ) );
+    assert( !strcmp( launcher_dxvk_directory( 0x8664 ), "dxvk64" ) );
+    assert( !launcher_dxvk_directory( 0xaa64 ) && !launcher_dxvk_directory( 0 ) );
+
     snprintf( path, sizeof(path), "%s/game.wine-nx.txt", dir );
     load_text( &kv, "# written by hand\n" );
     memset( &settings, 0, sizeof(settings) );
-    settings.address_space = -1;
+    settings.own_controls = settings.address_space = -1;
     strcpy( settings.title, "Need for Speed" );
     settings.hidden = 1;
     settings.verbose = -1;
@@ -97,14 +107,14 @@ static void test_settings( const char *dir )
     settings.dxvk = 1;
     assert( launcher_settings_write( &kv, &settings ) && launcher_kv_save( &kv, path ) );
     assert( launcher_kv_load( &kv, path ) );
-    assert( !strcmp( kv.text, "# written by hand\ntitle=Need for Speed\nhidden=1\nprofile=1\nwindows=compositor\nd3d9=dxvk\n" ) );
+    assert( !strcmp( kv.text, "# written by hand\ntitle=Need for Speed\nhidden=1\nprofile=1\nwindows=compositor\nd3d=dxvk\n" ) );
     launcher_settings_read( &kv, &back );
     assert( !strcmp( back.title, settings.title ) && back.hidden == 1 && back.verbose == -1 && back.profile == 1 );
     assert( back.framebuffer == 0 && back.dxvk == 1 );
 
     /* Back to the global settings: only the comment stays; without it the file goes. */
     memset( &settings, 0, sizeof(settings) );
-    settings.verbose = settings.profile = settings.framebuffer = settings.address_space = -1;
+    settings.verbose = settings.profile = settings.framebuffer = settings.own_controls = settings.address_space = -1;
     assert( launcher_settings_write( &kv, &settings ) && !strcmp( kv.text, "# written by hand\n" ) );
     assert( launcher_kv_save( &kv, path ) && !access( path, F_OK ) );
     load_text( &kv, "" );

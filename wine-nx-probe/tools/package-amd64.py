@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 from zipfile import ZipFile, ZIP_DEFLATED
 
+from dxvk_payload import DLLS as DXVK_DLLS, validate_payload
+
 probe = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--pe', type=Path, default=probe / 'build-wine-amd64-pe')
@@ -20,10 +22,14 @@ parser.add_argument('--jobs', type=int, default=8)
 parser.add_argument('--no-build', action='store_true', help='Package existing DLLs without invoking make')
 parser.add_argument('--minimal', action='store_true', help='Only console smoke-test dependencies')
 parser.add_argument('--vulkan', action='store_true', help='Include Vulkan DLLs for a mesa-switch runtime')
+parser.add_argument('--dxvk', type=Path, help='AMD64 payload produced by tools/build-dxvk.py (requires --vulkan)')
 parser.add_argument('--interpreter-nro', type=Path, help='Include an interpreter-only diagnostic NRO')
 args = parser.parse_args()
 if args.vulkan and args.minimal:
     parser.error('--vulkan requires the full GUI package')
+if args.dxvk and not args.vulkan:
+    parser.error('--dxvk requires --vulkan')
+dxvk_manifest = validate_payload(args.dxvk) if args.dxvk else None
 pe, build = args.pe.resolve(), args.build.resolve()
 env = os.environ.copy()
 if env.get('WINE_NX_LLVM_MINGW'):
@@ -80,6 +86,20 @@ def module_name(name):
 
 def apiset(name):
     return name.startswith(('api-ms-', 'ext-ms-'))
+
+
+api_sets = dict(re.findall(r'^apiset (\S+) = (\S+)$',
+                          (probe.parent / 'dlls/apisetschema/apisetschema.spec').read_text(), re.M))
+
+
+def import_host(name):
+    name = module_name(name)
+    if not apiset(name):
+        return name
+    host = api_sets.get(name.removesuffix('.dll'))
+    if not host:
+        raise ValueError(f'Unknown API set: {name}')
+    return module_name(host)
 
 
 def coff_blocks(path, option, kinds):
@@ -168,7 +188,44 @@ def stage_closure(seeds, arch, directory):
     return copied
 
 
+def validate_external_imports(paths, modules):
+    @functools.lru_cache(None)
+    def exports(path):
+        result = set()
+        for block in coff_blocks(path, '--coff-exports', 'Export'):
+            name = re.search(r'^  Name: (.*)$', block, re.M)
+            ordinal = re.search(r'^  Ordinal: (\d+)$', block, re.M)
+            if name and name.group(1):
+                result.add(name.group(1))
+            if ordinal:
+                result.add('#' + ordinal.group(1))
+        return result
+
+    def resolve(name, symbol, chain=()):
+        name = import_host(name)
+        if name not in modules:
+            raise ValueError(f'Missing imported DLL: {name}')
+        path = modules[name]
+        key = (name, symbol)
+        if key in chain:
+            raise ValueError(f'Forwarder cycle: {chain + (key,)}')
+        if symbol not in exports(path):
+            raise ValueError(f'{name} does not export {symbol}')
+        for target in forwarders(path).get(symbol, ()):
+            dependency, export = target.rsplit('.', 1)
+            resolve(dependency, export, chain + (key,))
+
+    for path in paths:
+        for name, symbols in imports(path):
+            for symbol in symbols:
+                try:
+                    resolve(name, symbol)
+                except ValueError as error:
+                    raise ValueError(f'{path.name}: {error}') from error
+
+
 common = 'ntdll kernel32 kernelbase msvcrt ucrtbase advapi32 sechost'.split()
+dxvk_paths = [args.dxvk / name for name in DXVK_DLLS] if args.dxvk else []
 if args.vulkan:
     common += ['vulkan-1', 'winevulkan']
 if not args.minimal:
@@ -178,6 +235,10 @@ if not args.minimal:
                'xinput9_1_0 dbghelp windowscodecs '
                'd3dx9_38 d3dx9_43 winhttp oleacc wsock32 psapi').split()
 native_seeds = common + ['winebox64', 'winebox64ec', 'wow64', 'wow64win', 'apisetschema']
+if args.dxvk:
+    native_seeds += ['d3d10', 'd3d10_1', 'd3dcompiler_43', 'd3dcompiler_47']
+    native_seeds += sorted({import_host(name) for path in dxvk_paths for name, symbols in imports(path)
+                            if module_name(name) not in DXVK_DLLS})
 prebuild(native_seeds, 'aarch64')
 native = stage_closure(native_seeds, 'aarch64', 'system32')
 prebuild(common, 'i386')
@@ -239,6 +300,21 @@ if args.vulkan:
     build_pe64('vulkan', 'pe32_vulkan.c', ('vulkan-1', 'user32', 'kernel32', 'ntdll'),
                ('-Wno-missing-field-initializers', '-idirafter', str(probe.parent / 'include'),
                 '-L', str(imports64)))
+if args.dxvk:
+    destination = drive / 'dxvk64'
+    destination.mkdir()
+    for path in dxvk_paths:
+        shutil.copy2(path, destination / path.name)
+    shutil.copy2(args.dxvk / 'dxvk-manifest.json', destination / 'dxvk-manifest.json')
+    build_pe64('dxvk-d3d9', 'pe32_d3d9.c', ('d3d9', 'gdi32', 'user32', 'kernel32', 'ntdll'))
+    libraries = ('d3d11', 'dxgi', 'd3dcompiler_47', 'dxguid', 'user32', 'kernel32', 'ntdll')
+    build_pe64('dxvk-d3d11', 'pe64_d3d11.c', libraries, ('-DTEST_REQUIRE_DXVK=1',))
+    build_pe64('dxvk-d3d11-fullscreen', 'pe64_d3d11.c', libraries,
+               ('-DTEST_REQUIRE_DXVK=1', '-DTEST_FULLSCREEN=1', '-DTEST_WIDTH=800', '-DTEST_HEIGHT=600'))
+    for name in ('dxvk-d3d9', 'dxvk-d3d11', 'dxvk-d3d11-fullscreen'):
+        (win64 / f'pe64-{name}.wine-nx.txt').write_text('d3d=dxvk\n')
+    (destination / 'DarkSoulsII.wine-nx.txt').write_text('d3d=dxvk\n')
+    shutil.copy2(probe / 'DXVK.md', stage / 'DXVK-README.md')
 for test in ('smoke', 'functional', 'threads', 'lifecycle'):
     run(['i686-w64-mingw32-clang', '-Os', '-fno-builtin', '-nostdlib', '-Wl,--entry,_start@0',
          '-Wl,--image-base,0x10000000', '-Wl,--dynamicbase',
@@ -269,6 +345,12 @@ for source, name in ((probe.parent / 'COPYING.LIB', 'Wine-LGPL-2.1.txt'),
                      (probe / 'vendor/box64/LICENSE', 'Box64-MIT.txt'),
                      (probe.parent / 'dlls/winebox64ec/LICENSE.FEX', 'FEX-MIT.txt')):
     shutil.copy2(source, licenses / name)
+if args.dxvk:
+    for name in dxvk_manifest['licenses']:
+        shutil.copy2(args.dxvk / 'licenses' / name, licenses / name)
+    modules = {path.name: path for path in (drive / 'windows/system32').iterdir()}
+    modules.update({path.name: path for path in dxvk_paths})
+    validate_external_imports(dxvk_paths + sorted(win64.glob('pe64-dxvk-*.exe')), modules)
 
 for directory, modules in (('system32', native), ('syswow64', guest)):
     for name in modules:
@@ -311,14 +393,17 @@ manifest = {
     'wine': subprocess.check_output(['git', '-C', str(probe.parent), 'rev-parse', 'HEAD'], text=True).strip(),
     'hardware_verified': False,
     'features': {'amd64': True, 'dynarec': enabled('WINE_NX_BOX64_DYNAREC'),
-                 'vulkan': args.vulkan, 'interpreter_fallback': bool(args.interpreter_nro)},
+                 'vulkan': args.vulkan, 'dxvk': bool(args.dxvk),
+                 'interpreter_fallback': bool(args.interpreter_nro)},
     'mesa_switch': mesa_revision,
+    'dxvk': dxvk_manifest,
     'validation': {'default': 'win64-tests/pe64-functional.exe',
                    'win64': ['pe64-smoke.exe'] + win64_tests},
     'files': {str(path.relative_to(stage)): hashlib.sha256(path.read_bytes()).hexdigest() for path in files},
 }
 (stage / 'build-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-archive = build / ('wine-nx-amd64-box64-mesa-vulkan.zip' if args.vulkan else 'wine-nx-amd64-box64.zip')
+archive = build / ('wine-nx-amd64-box64-mesa-dxvk.zip' if args.dxvk else
+                   'wine-nx-amd64-box64-mesa-vulkan.zip' if args.vulkan else 'wine-nx-amd64-box64.zip')
 with ZipFile(archive, 'w', ZIP_DEFLATED) as output:
     for path in sorted(stage.rglob('*')):
         if path.is_file() and path.suffix != '.log':

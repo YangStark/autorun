@@ -22,7 +22,8 @@ Keep a separate 32-bit-address-space forwarder for x86 programs that require
 fixed low addresses. Relocatable x86 programs can also use the 39-bit launch
 profile when enough low address space is available. Changing profiles requires
 launching a different application process, not another NRO in the same process.
-This package does not install or generate forwarder titles.
+The launcher can install both the main 39-bit forwarder and the 32-bit no-alias
+forwarder from Settings.
 
 ## Build
 
@@ -52,7 +53,8 @@ To link an already built mesa-switch installation, set
 `WINE_NX_MESA_SWITCH_DIR` to its library directory **inside the container**,
 for example `/work/wine-nx-probe/build-mesa-switch/install/opt/devkitpro/portlibs/switch/lib`.
 The existing `build-mesa-switch.sh` accepts `WINE_NX_MESA_SWITCH_SRC` for the
-local Mesa checkout. No DXVK upgrade or AMD64 DXVK payload is included here.
+local Mesa checkout. Set `WINE_NX_DXVK=1` to build and include the pinned AMD64
+DXVK 3.1.1 payload; see [DXVK.md](DXVK.md) for requirements and DS2 validation.
 With Mesa enabled, the package is named
 `wine-nx-amd64-box64-mesa-vulkan.zip` and records the exact mesa-switch commit.
 The DXVK option searches `C:\dxvk` for x86 and `C:\dxvk64` for AMD64, so it
@@ -60,6 +62,9 @@ cannot accidentally load the existing x86 payload into a 64-bit application.
 The archive's `build-manifest.json` records the source revisions, enabled
 features and file hashes. A default build uses the devkitPro OpenGL driver;
 Vulkan requires the separate mesa-switch build above.
+The DXVK-enabled archive is `wine-nx-amd64-box64-mesa-dxvk.zip`. Select DXVK
+per title with `d3d=dxvk` or the launcher's Direct3D option; Wine remains the
+default. The older `d3d9=dxvk` setting remains readable.
 
 ## First hardware checks
 
@@ -98,7 +103,7 @@ UASP transport and BOT fallback as Cemu-nx. The first five volumes are `D:` to
 folder, two folder levels deep: `Wine\Game\Game.exe` or
 `Wine\Game\Bin\Game.exe`. Use exFAT for games with files over 4 GiB, which
 FAT32 cannot hold. NTFS and ext4 are not supported. Plug the drive in before
-starting Wine-NX, and close the running program before unplugging it.
+starting Autorun, and close the running program before unplugging it.
 
 ## Host regression checks
 
@@ -112,15 +117,16 @@ fatal with `UBSAN_OPTIONS=halt_on_error=1`.
 
 ## Validation boundary
 
-This is an unverified-on-Switch AMD64 bring-up, not a claim of general Win64
-application compatibility. Host tests cover the CPU core, transition assembly,
+The user reports that the Win64 validation suite passes on Switch. This is not
+a claim of general Win64 game compatibility or verification of the new DXVK
+path. Host tests cover the CPU core, transition assembly,
 Unix ABI, image parsing and address-space bookkeeping; cross-compilation checks
 the PE DLLs and NRO. They cannot establish hardware graphics/audio behavior.
 Both x86 and AMD64 core suites passed in interpreter and dynarec modes on
 AArch64 Linux. The assembly fixtures passed; platform and Unix-bridge tests
 also passed with fatal sanitizer checks. Both NRO variants built with
 devkitA64 GCC 15.2. The smoke executable also
-passed on Windows; that validates the test, not Wine-NX on Switch.
+passed on Windows; that validates the test, not Autorun on Switch.
 
 Known limits include precise resumable exceptions inside translated code,
 remote thread context/suspend handling, AVX/XSTATE, and the base port's existing

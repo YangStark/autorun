@@ -26,7 +26,7 @@ struct wine_nx_launcher_options
     const char *build;
     /* 0 with the program's IMAGE_FILE_MACHINE_* when this runtime can start it. */
     int (*machine_of)( const char *path, unsigned short *machine );
-    int vulkan;                /* the runtime has Vulkan, so DXVK's d3d9 can run */
+    int vulkan;                /* the runtime has Vulkan for DXVK */
     /* How wide an address space Horizon gave this process: 32 when the low 4 GB
      * is all of it, 36 or 39 when it reaches beyond, 0 when it could not be
      * read. The title that started the process fixes it, so a program that needs
@@ -42,7 +42,7 @@ struct wine_nx_launcher_options
     /* Whether an application is still installed: the one named as the 32-bit
      * forwarder may have been deleted since it was named. */
     int (*title_installed)( unsigned long long id );
-    /* Build a forwarder for this program and install it. bits is 32 or 36;
+    /* Build a forwarder for this program and install it. bits is 32 or 39;
      * returns 0, leaving step pointing at what failed otherwise. */
     unsigned int (*install_forwarder)( int bits, const char *name, unsigned long long *id, const char **step );
     /* The global settings on entry, as the user left them on return. The

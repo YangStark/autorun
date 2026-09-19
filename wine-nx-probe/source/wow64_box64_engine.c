@@ -266,11 +266,13 @@ BOOL wine_nx_box64_handle_fault( ULONG_PTR address, ULONG access, ULONG_PTR pc,
      * translated code the x86 state is in the native registers, as Box64's
      * copyUCTXreg2Emu takes it, and the instruction is the one the block maps
      * the native pc to. */
-    if (x && active_engine->dynarec) recover_translated_state( &active_engine->emu, pc, x );
+    if (active_engine->is32bits && x && active_engine->dynarec)
+        recover_translated_state( &active_engine->emu, pc, x );
 #else
     (void)pc; (void)x;  /* the interpreter keeps each instruction's state as it goes */
 #endif
-    stop_fault( &active_engine->emu, address, access );
+    if (active_engine->is32bits) stop_fault( &active_engine->emu, address, access );
+    stop_engine( &active_engine->emu, STATUS_ACCESS_VIOLATION );
     return TRUE;
 }
 

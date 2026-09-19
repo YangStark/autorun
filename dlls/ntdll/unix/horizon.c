@@ -10320,7 +10320,9 @@ static unsigned int horizon_ws_sockaddr_to_unix_for( const unsigned char *ws, un
     if (len < 16) return HORIZON_STATUS_INVALID_PARAMETER;
     memcpy( &family, ws, sizeof(family) );
     memset( sa, 0, sizeof(*sa) );
+#ifndef __linux__
     sa->sin_len = sizeof(*sa);
+#endif
     sa->sin_family = AF_INET;
     if (family == HORIZON_WS_AF_INET6)
     {

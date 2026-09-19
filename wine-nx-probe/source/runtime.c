@@ -402,9 +402,7 @@ int wine_nx_runtime_verbose;
 /* The sampling profiler's [PROF] lines (thread_profile.c): sdmc:/switch/wine/profile.txt
  * containing 1, which the launcher's X toggles like Y does verbose.txt. */
 static int runtime_profile;
-/* Set by d3d9=dxvk in the program's own settings (launcher_settings.h): its DLL
- * path looks in C:\dxvk before system32, so DXVK's d3d9.dll loads in place of Wine's. */
-static int runtime_d3d9_dxvk;
+static int runtime_dxvk;
 
 /* libdrm_nouveau's switch for CPU-cacheable pinned GPU memory, cleared by
  * sdmc:/switch/wine/gl-uncached.txt containing 1. */
@@ -1624,14 +1622,20 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     size_t chars, size, i;
     WCHAR *cursor;
     const char *cmdline_str;
+    const char *dxvk_dir = launcher_dxvk_directory( main_image_info.Machine );
 
     if (!target_to_dos_path( target, dos_path, dos_path_size )) return NULL;
     dos_dirname( dos_path, current_dir, sizeof(current_dir) );
     snprintf( nt_path, sizeof(nt_path), "\\??\\%s", dos_path );
     /* Keep native DXVK DLLs separate for each guest architecture. */
-    snprintf( dll_path, sizeof(dll_path), "%s;%sC:\\windows\\system32;C:\\windows;C:\\",
-              current_dir, !runtime_d3d9_dxvk ? "" :
-              main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64 ? "C:\\dxvk64;" : "C:\\dxvk;" );
+    if (runtime_dxvk && dxvk_dir)
+    {
+        snprintf( dll_path, sizeof(dll_path), "%s;C:\\%s;C:\\windows\\system32;C:\\windows;C:\\",
+                  current_dir, dxvk_dir );
+        log_line( "[DXVK] %s payload C:\\%s; application-local DLLs take priority",
+                  main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64 ? "AMD64" : "x86", dxvk_dir );
+    }
+    else snprintf( dll_path, sizeof(dll_path), "%s;C:\\windows\\system32;C:\\windows;C:\\", current_dir );
     /* The current directory ends in a backslash, as RtlSetCurrentDirectory_U
      * stores it; relative paths are appended to it directly. */
     if ((chars = strlen( current_dir )) && current_dir[chars - 1] != '\\' && chars + 1 < sizeof(current_dir))
@@ -3142,7 +3146,7 @@ static unsigned int launcher_install_forwarder( int bits, const char *name, unsi
         .args = NULL,
         .name = name,
         .author = "ticoverse.com",
-        .address_space = bits == 32 ? WINE_NX_SPACE_32BIT_NO_ALIAS : WINE_NX_SPACE_36BIT,
+        .address_space = bits == 32 ? WINE_NX_SPACE_32BIT_NO_ALIAS : WINE_NX_SPACE_39BIT,
         .icon = bits == 32 ? wine_nx_icon_32bit : wine_nx_icon_any,
         .icon_size = bits == 32 ? wine_nx_icon_32bit_size : wine_nx_icon_any_size,
     };
@@ -3441,9 +3445,9 @@ int main( int argc, char **argv )
             if (settings.profile >= 0) runtime_profile = settings.profile;
             if (settings.framebuffer >= 0) wine_nx_compositor_mode = !settings.framebuffer;
 #ifdef WINE_NX_MESA_SWITCH
-            runtime_d3d9_dxvk = settings.dxvk;
+            runtime_dxvk = settings.dxvk;
 #endif
-            log_line( "[SETTINGS] %s: verbose %s, profiler %s, windows %s, Direct3D 9 %s", settings_path,
+            log_line( "[SETTINGS] %s: verbose %s, profiler %s, windows %s, Direct3D %s", settings_path,
                       settings.verbose < 0 ? "global" : settings.verbose ? "on" : "off",
                       settings.profile < 0 ? "global" : settings.profile ? "on" : "off",
                       settings.framebuffer < 0 ? "global" : settings.framebuffer ? "framebuffer" : "compositor",

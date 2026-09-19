@@ -65,4 +65,9 @@ python3 "$root/wine-nx-probe/tests/check_horizon_sections.py"
 python3 "$root/wine-nx-probe/tests/check_horizon_image_info.py"
 python3 "$root/wine-nx-probe/tests/check_memory_status.py"
 python3 "$root/wine-nx-probe/tests/check_horizon_sock_bind.py"
+python3 "$root/wine-nx-probe/tests/check_dxvk_payload.py"
+python3 "$root/wine-nx-probe/tests/check_package_amd64.py"
+if [ -f "$root/wine-nx-probe/vendor/dxvk/src/dxvk/dxvk_device_info.cpp" ]; then
+    python3 "$root/wine-nx-probe/tests/check_dxvk_requirements.py"
+fi
 python3 "$root/wine-nx-probe/tools/make-7zr-tree.py" "$build/drive_c" >/dev/null
