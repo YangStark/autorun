@@ -2911,6 +2911,9 @@ static unsigned int horizon_rawinput_device_count;
 static int horizon_alt_pressed;  /* wineserver's desktop->alt_pressed */
 static unsigned int horizon_next_input_message_id = 1;
 static unsigned int horizon_mouse_buttons;
+/* The last place a touch pointed at, which the next one is a movement from. */
+#define HORIZON_NOWHERE 0x7fffffff
+static int horizon_pointed_at_x = HORIZON_NOWHERE, horizon_pointed_at_y = HORIZON_NOWHERE;
 static struct horizon_message_queue horizon_posted_messages = { NULL, &horizon_posted_messages.head };
 static struct horizon_win_timers horizon_timers;
 static struct horizon_msgqs horizon_msg_queues;
@@ -7514,9 +7517,31 @@ static int horizon_server_handle_send_hardware_message( struct horizon_server_co
             x = (flags & HORIZON_MOUSEEVENTF_ABSOLUTE) ? mouse->x : desktop->cursor.x + mouse->x;
             y = (flags & HORIZON_MOUSEEVENTF_ABSOLUTE) ? mouse->y : desktop->cursor.y + mouse->y;
             /* What the mouse did, before the screen's edges are applied: a view
-             * being turned must not stop because the cursor reached a corner. */
-            dx = x - desktop->cursor.x;
-            dy = y - desktop->cursor.y;
+             * being turned must not stop because the cursor reached a corner.
+             * A touch points at a place rather than moving by an amount, and
+             * the amount is from the last place it pointed at, as a finger
+             * drawn across a trackpad -- not from the cursor, which a program
+             * holding the mouse leaves in a corner. */
+            if (!(flags & HORIZON_MOUSEEVENTF_ABSOLUTE))
+            {
+                dx = mouse->x;
+                dy = mouse->y;
+            }
+            else
+            {
+                dx = horizon_pointed_at_x == HORIZON_NOWHERE ? 0 : mouse->x - horizon_pointed_at_x;
+                dy = horizon_pointed_at_y == HORIZON_NOWHERE ? 0 : mouse->y - horizon_pointed_at_y;
+            }
+        }
+        /* A touch that has just begun is where the next one is measured from. */
+        if (flags & HORIZON_MOUSEEVENTF_ABSOLUTE)
+        {
+            if (flags & HORIZON_MOUSEEVENTF_LEFTDOWN) dx = dy = 0;
+            horizon_pointed_at_x = mouse->x;
+            horizon_pointed_at_y = mouse->y;
+        }
+        if (flags & HORIZON_MOUSEEVENTF_MOVE)
+        {
             if (x < desktop->cursor.clip.left) x = desktop->cursor.clip.left;
             if (y < desktop->cursor.clip.top) y = desktop->cursor.clip.top;
             if (x >= desktop->cursor.clip.right) x = desktop->cursor.clip.right - 1;

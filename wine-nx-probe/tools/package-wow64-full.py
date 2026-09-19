@@ -146,7 +146,7 @@ assert 'Arch: i386\n' in readobj('--file-headers', apc_test)
 # virtual-key code in decimal or 0x form. Remove the # to change one. A and B
 # are not here: they stay the left and right mouse buttons.
 #
-# UP=0x26      d-pad up, or the left stick pushed up
+# UP=0x26      d-pad up, and the left stick pushed up unless LUP is set
 # DOWN=0x28
 # LEFT=0x25
 # RIGHT=0x27
@@ -160,6 +160,10 @@ assert 'Arch: i386\n' in readobj('--file-headers', apc_test)
 # MINUS=0x09   tab
 # STICKL=0x11  control
 # STICKR=0x12  alt
+# LUP=0        the left stick alone, for a game that walks with one set of keys
+# LDOWN=0      and works its menus with another. Unset, it sends what the d-pad
+# LLEFT=0      does.
+# LRIGHT=0
 ''')
 (stage / f'BUILD-{marker}-README.txt').write_text(f'''Wine-NX build {marker}: the whole SD-card payload.
 Copy the switch folder to the SD card, merging folders; it replaces the runtime
@@ -189,10 +193,15 @@ Its executable relocates, so it needs no forwarder.
 Halo: Combat Evolved: winspool.drv is staged, which is what Halo checks its own
 files with. Delete the ._ files a Mac leaves beside every file on the card if
 the game was copied from one: Halo loads every DLL in its Controls folder and
-one of those is not a DLL. Its menu takes the arrows and Enter, so put this
-beside HALO.EXE as HALO.keys.txt, which is applied over keys.txt:
+one of those is not a DLL. Halo walks with w, a, s and d and works its menus
+with the arrows, so the left stick takes one set and the d-pad the other. Put
+this beside HALO.EXE as HALO.keys.txt, which is applied over keys.txt:
 
-    UP=0x26
+    LUP=0x57    w, forward: the left stick alone
+    LDOWN=0x53  s
+    LLEFT=0x41  a
+    LRIGHT=0x44 d
+    UP=0x26     the arrows, for the menus: the d-pad alone
     DOWN=0x28
     LEFT=0x25
     RIGHT=0x27
@@ -204,8 +213,10 @@ beside HALO.EXE as HALO.keys.txt, which is applied over keys.txt:
     ZR=0x09     tab, the scores
     MINUS=0x1b  Escape, to go back
 
-A and B stay the left and right mouse buttons, so A fires and clicks. Holding +
-and - together leaves the game whatever the keys say.
+A and B stay the left and right mouse buttons, so A fires and clicks. The right
+stick turns the view and the touchscreen drags it like a trackpad. Holding +
+and - together leaves the game whatever the keys say. Everything else is in
+Halo's own Settings, Controls, which the mouse can now reach.
 
 Left 4 Dead 2: the engine will not start without bin\\valve_avi.dll, which is one
 of the app systems its launcher creates, and that imports AVIFIL32, so avifil32

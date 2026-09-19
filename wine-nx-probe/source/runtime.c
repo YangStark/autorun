@@ -52,7 +52,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-210"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-211"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -680,13 +680,18 @@ enum
     WINE_NX_KEY_UP, WINE_NX_KEY_DOWN, WINE_NX_KEY_LEFT, WINE_NX_KEY_RIGHT,
     WINE_NX_KEY_X, WINE_NX_KEY_Y, WINE_NX_KEY_L, WINE_NX_KEY_R,
     WINE_NX_KEY_ZL, WINE_NX_KEY_ZR, WINE_NX_KEY_PLUS, WINE_NX_KEY_MINUS,
-    WINE_NX_KEY_STICKL, WINE_NX_KEY_STICKR, WINE_NX_KEY_A, WINE_NX_KEY_B, WINE_NX_KEY_COUNT
+    WINE_NX_KEY_STICKL, WINE_NX_KEY_STICKR, WINE_NX_KEY_A, WINE_NX_KEY_B,
+    /* The left stick on its own, for a game that walks with one set of keys
+     * and works its menus with another. Unset, it sends what the d-pad does. */
+    WINE_NX_KEY_LUP, WINE_NX_KEY_LDOWN, WINE_NX_KEY_LLEFT, WINE_NX_KEY_LRIGHT,
+    WINE_NX_KEY_COUNT
 };
 
 static const char *const wine_nx_pad_key_names[WINE_NX_KEY_COUNT] =
 {
     "UP", "DOWN", "LEFT", "RIGHT", "X", "Y", "L", "R",
-    "ZL", "ZR", "PLUS", "MINUS", "STICKL", "STICKR", "A", "B"
+    "ZL", "ZR", "PLUS", "MINUS", "STICKL", "STICKR", "A", "B",
+    "LUP", "LDOWN", "LLEFT", "LRIGHT"
 };
 
 /* Defaults that suit a game: the d-pad and left stick steer, the triggers
@@ -701,6 +706,7 @@ unsigned short wine_nx_pad_keys[WINE_NX_KEY_COUNT] =
     0x1b, 0x09,              /* plus escape, minus tab */
     0x11, 0x12,              /* stick presses: control, alt */
     0, 0,                    /* A and B: none, so they click */
+    0, 0, 0, 0,              /* the left stick: none, so it steers with the d-pad */
 };
 
 /* Which of those controls are held, read by the display driver's ProcessEvents
@@ -779,10 +785,13 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
 
         for (i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
             if (held & buttons[i].button) keys |= 1u << buttons[i].key;
-        if (steer.y >  12000) keys |= 1u << WINE_NX_KEY_UP;
-        if (steer.y < -12000) keys |= 1u << WINE_NX_KEY_DOWN;
-        if (steer.x < -12000) keys |= 1u << WINE_NX_KEY_LEFT;
-        if (steer.x >  12000) keys |= 1u << WINE_NX_KEY_RIGHT;
+        /* The left stick steers with the d-pad unless it was given keys of
+         * its own: Halo walks with w, a, s and d and works its menus with the
+         * arrows, and one controller has to do both. */
+        if (steer.y >  12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LUP] ? WINE_NX_KEY_LUP : WINE_NX_KEY_UP);
+        if (steer.y < -12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LDOWN] ? WINE_NX_KEY_LDOWN : WINE_NX_KEY_DOWN);
+        if (steer.x < -12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LLEFT] ? WINE_NX_KEY_LLEFT : WINE_NX_KEY_LEFT);
+        if (steer.x >  12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LRIGHT] ? WINE_NX_KEY_LRIGHT : WINE_NX_KEY_RIGHT);
         if (gamepad) keys = 0;
         __atomic_store_n( &wine_nx_pad_key_state, keys, __ATOMIC_RELAXED );
     }

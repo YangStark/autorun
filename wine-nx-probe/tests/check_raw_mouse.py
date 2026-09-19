@@ -27,8 +27,12 @@ def function(source, name):
     return source[start:end]
 
 send = function(horizon, 'static int horizon_server_handle_send_hardware_message')
-# The movement asked for, taken before the screen's edges are applied to it.
-assert send.index('dx = x - desktop->cursor.x') < send.index('if (x < desktop->cursor.clip.left)')
+# The movement, taken before the screen's edges are applied to it: what the
+# mouse did for a stick, and the step from the last place pointed at for a
+# touch, which owes nothing to where the cursor is.
+assert send.index('dx = mouse->x;') < send.index('if (x < desktop->cursor.clip.left)')
+assert send.index('mouse->x - horizon_pointed_at_x') < send.index('if (x < desktop->cursor.clip.left)')
+assert 'if (flags & HORIZON_MOUSEEVENTF_LEFTDOWN) dx = dy = 0;' in send
 # Raw input first, and a program that asked for the mouse alone gets nothing else.
 assert send.index('horizon_server_queue_raw_mouse_locked') < send.index('HORIZON_WM_MOUSEMOVE')
 assert 'legacy = !raw_device || !(raw_device->flags & HORIZON_RIDEV_NOLEGACY)' in send
@@ -36,7 +40,7 @@ assert 'if (legacy && (flags & HORIZON_MOUSEEVENTF_MOVE)' in send
 assert 'if (!legacy) continue;' in send
 # And the cursor stays where it is for one.
 cursor = send.index('desktop->cursor.x = x;')
-assert send.rindex('if (legacy)', 0, cursor) > send.index('dx = x - desktop->cursor.x')
+assert send.rindex('if (legacy)', 0, cursor) > send.index('mouse->x - horizon_pointed_at_x')
 
 message = function(horizon, 'static int horizon_server_handle_get_message(')
 assert 'HORIZON_RIM_TYPEMOUSE' in message and 'queued->raw_m' in message
