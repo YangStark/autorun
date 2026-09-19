@@ -137,6 +137,43 @@ subprocess.run([str(toolchain / 'i686-w64-mingw32-clang'), '-O1', '-mwindows',
                 '-o', str(apc_test), str(probe / 'tests/win32/apc-test.c')], check=True)
 assert 'Arch: i386\n' in readobj('--file-headers', apc_test)
 
+# The Sims 2 Ultimate Collection is shipped installed; what is left is telling
+# the game where each of its packs is, which its release does with a batch file
+# of reg add lines whose every path comes from the folder it is run in.
+sims2 = stage / 'drive_c/The Sims 2 Setup'
+sims2.mkdir(parents=True, exist_ok=True)
+subprocess.run([str(toolchain / 'i686-w64-mingw32-clang'), '-Os', '-Wall', '-Wextra', '-Werror',
+                '-fno-builtin', '-nostdlib', '-Wl,--entry,_start@0', '-Wl,--image-base,0x10000000',
+                '-Wl,--dynamicbase', '-o', str(sims2 / 'sims2-setup.exe'),
+                str(tools / 'sims2_setup.c'), '-ladvapi32', '-lkernel32', '-lntdll'], check=True)
+assert 'Arch: i386\n' in readobj('--file-headers', sims2 / 'sims2-setup.exe')
+(sims2 / 'README.txt').write_text('''The Sims 2 Ultimate Collection
+==============================
+
+Copy the release's Base, EP1-EP9 and SP1-SP8 folders into C:\\The Sims 2 on the
+card -- leave __Installer and Support behind, they are for a computer -- and run
+sims2-setup.exe once from the launcher. It writes what the release's own
+"Instalar Registros" batch file writes, with the card's paths, and says what it
+did in wine-nx-runtime.log as [SIMS2 SETUP] lines. Running it again is harmless.
+
+The game is then C:\\The Sims 2\\EP9\\TSBin\\Sims2EP9.exe, which is the one
+executable the collection has; it relocates, so it needs no forwarder.
+
+For a language other than English, put its number in language.txt beside
+sims2-setup.exe before running it:
+
+  1 English (United States)   10 Portuguese (Brazil)    17 Chinese (Simplified)
+  2 French                    11 Czech                  18 Chinese (Traditional)
+  3 German                    13 English (United Kingdom) 20 Polish
+  4 Italian                   14 Japanese               21 Thai
+  5 Spanish                   15 Korean                 22 Norwegian
+  6 Swedish                   16 Russian                23 Portuguese (Portugal)
+  7 Finnish                                             24 Hungarian
+  8 Dutch
+  9 Danish
+''')
+(stage / 'drive_c/The Sims 2').mkdir(exist_ok=True)
+
 # The classes those DLLs serve, which on Windows their own DllRegisterServer
 # would have written when they were installed.
 subprocess.run([sys.executable, str(tools / 'make-classes-reg.py'), str(stage)], check=True)
@@ -229,6 +266,12 @@ address space.
 Fallout New Vegas (GOG): xinput1_3, d3dx9_38 and the windowscodecs that loads its
 textures are staged, with msvcp110 and msvcr110 for Galaxy.dll and GalaxyWrp.dll.
 Its executable relocates, so it needs no forwarder.
+
+The Sims 2 Ultimate Collection: everything Sims2EP9.exe imports is already
+staged. The release comes installed, so nothing has to be unpacked; what is
+missing is the registry the game reads to find each pack, which its own batch
+file writes with the paths of the computer it was unpacked on. C:\\The Sims 2
+Setup\\sims2-setup.exe writes the same with the card's, and its README says how.
 
 Halo: Combat Evolved: winspool.drv is staged, which is what Halo checks its own
 files with. Delete the ._ files a Mac leaves beside every file on the card if
