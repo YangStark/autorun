@@ -137,7 +137,8 @@ static BOOL set_dword( const WCHAR *path, const WCHAR *name, DWORD value )
     return !status;
 }
 
-/* The folder this program is in, without its name or the slash. */
+/* The folder this program is in, without its name or the trailing slash --
+ * except at the root of a drive, where the slash is part of the name. */
 static BOOL own_folder( WCHAR *out, unsigned int max )
 {
     unsigned int n = GetModuleFileNameW( NULL, out, max );
@@ -145,11 +146,32 @@ static BOOL own_folder( WCHAR *out, unsigned int max )
     if (!n || n >= max) return FALSE;
     while (n && out[n - 1] != '\\') n--;
     if (!n) return FALSE;
-    out[n - 1] = 0;
+    out[n > 3 ? n - 1 : n] = 0;
+    return TRUE;
+}
+
+/* The folder above that one, where the game sits beside this program rather
+ * than inside it: C:\The Sims 2 next to C:\The Sims 2 Setup. */
+static BOOL parent_folder( const WCHAR *folder, WCHAR *out, unsigned int max )
+{
+    unsigned int n = 0;
+
+    while (folder[n] && n + 1 < max) { out[n] = folder[n]; n++; }
+    out[n] = 0;
     while (n && out[n - 1] != '\\') n--;
     if (!n) return FALSE;
-    out[n - 1] = 0;  /* and the setup folder itself: the game is beside it */
+    out[n > 3 ? n - 1 : n] = 0;
     return TRUE;
+}
+
+/* folder\name, without doubling the slash at the root of a drive. */
+static void join( WCHAR *out, unsigned int max, const WCHAR *folder, const WCHAR *name )
+{
+    unsigned int at = 0;
+
+    wide_append( out, &at, max, folder );
+    if (at && out[at - 1] != '\\') wide_append( out, &at, max, L"\\" );
+    wide_append( out, &at, max, name );
 }
 
 static BOOL folder_exists( const WCHAR *path )
@@ -159,17 +181,27 @@ static BOOL folder_exists( const WCHAR *path )
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+/* Whether the packs are here: the base game, or the newest expansion for
+ * someone who copied only part of the collection. */
+static BOOL holds_the_game( const WCHAR *root )
+{
+    WCHAR path[MAX_PATH];
+
+    join( path, MAX_PATH, root, L"Base" );
+    if (folder_exists( path )) return TRUE;
+    join( path, MAX_PATH, root, L"EP9" );
+    return folder_exists( path );
+}
+
 /* The number in language.txt beside this program, or 1 for English. */
 static DWORD chosen_language( const WCHAR *setup_folder )
 {
     WCHAR path[MAX_PATH];
     char text[16];
-    unsigned int at = 0;
     DWORD read = 0, value = 0, i;
     HANDLE file;
 
-    wide_append( path, &at, MAX_PATH, setup_folder );
-    wide_append( path, &at, MAX_PATH, L"\\language.txt" );
+    join( path, MAX_PATH, setup_folder, L"language.txt" );
     file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
     if (file == INVALID_HANDLE_VALUE) return 1;
     if (ReadFile( file, text, sizeof(text) - 1, &read, NULL ))
@@ -206,15 +238,35 @@ void __stdcall start(void)
     BOOL ok = TRUE;
 
     report( "start", NULL, "build", 1 );
-    if (!GetModuleFileNameW( NULL, setup_folder, MAX_PATH ) || !own_folder( game, MAX_PATH ))
+    if (!own_folder( setup_folder, MAX_PATH ))
     {
         report( "find the game", NULL, "failed: cannot read this program's own path, error", GetLastError() );
         ExitProcess( 1 );
     }
-    /* setup_folder is this program's own, for language.txt. */
-    at = wide_length( setup_folder );
-    while (at && setup_folder[at - 1] != '\\') at--;
-    if (at) setup_folder[at - 1] = 0;
+    /* Where the packs are: in here, if they were copied in beside this
+     * program; in the folder the readme names, beside this one; or in the
+     * folder this one is in, for a setup dropped into the game itself. */
+    {
+        WCHAR above[MAX_PATH];
+        BOOL have_above = parent_folder( setup_folder, above, MAX_PATH );
+        unsigned int n = 0;
+
+        wide_append( game, &n, MAX_PATH, setup_folder );
+        if (!holds_the_game( game ) && have_above)
+        {
+            join( game, MAX_PATH, above, L"The Sims 2" );
+            if (!holds_the_game( game ))
+            {
+                n = 0;
+                wide_append( game, &n, MAX_PATH, above );
+            }
+        }
+    }
+    if (!holds_the_game( game ))
+    {
+        report( "find the game", game, "FAILED: no Base or EP9 folder there, error", 0 );
+        ExitProcess( 1 );
+    }
     report( "the game is in", game, "found", 0 );
 
     ok &= set_string( collection, L"DisplayName", L"The Sims 2 Legacy" );
@@ -227,11 +279,7 @@ void __stdcall start(void)
 
     for (i = 0; i < sizeof(packs) / sizeof(packs[0]); i++)
     {
-        unsigned int n = 0;
-
-        wide_append( folder, &n, MAX_PATH, game );
-        wide_append( folder, &n, MAX_PATH, L"\\" );
-        wide_append( folder, &n, MAX_PATH, packs[i].folder );
+        join( folder, MAX_PATH, game, packs[i].folder );
         if (!folder_exists( folder ))
         {
             /* A key for a pack that is not there would send the game to an

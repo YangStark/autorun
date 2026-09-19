@@ -34,4 +34,13 @@ assert 'if (!i || i + 1 == sizeof(packs) / sizeof(packs[0]))' in source
 # A pack that is not there gets no key, rather than one pointing at nothing.
 assert 'if (!folder_exists( folder ))' in source and 'continue;' in source
 
+# The game sits beside the setup, not inside it and not at the root of the
+# drive: looking one folder too far up found C: and skipped every pack.
+assert source.count('holds_the_game( game )') == 3
+assert 'join( game, MAX_PATH, above, L"The Sims 2" )' in source
+# A path is joined without doubling the slash, which C:\ would.
+assert "if (at && out[at - 1] != '\\\\') wide_append( out, &at, max, L\"\\\\\" );" in source
+# And the trailing slash is kept only where it is part of the name.
+assert source.count('out[n > 3 ? n - 1 : n] = 0;') == 2
+
 print(f'sims2 setup: {len(folders)} packs, the list and the table in step, the empty place kept')
