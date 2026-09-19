@@ -44,6 +44,7 @@
 #include "launcher_ui.h"
 #include "steamgriddb.h"
 #include "dxvk_releases.h"
+#include "box64_options.h"
 
 #define ICON_SIDE      128    /* icons are decoded no larger than this */
 #define ICON_TEXTURES  12     /* at most 12 MiB with 512px artwork */
@@ -195,11 +196,24 @@ struct launcher
     int result_count;
     unsigned int icon_use;
     Uint32 icon_event;
+    Uint32 usb_event;
+    SDL_atomic_t usb_changed;
 };
 
 static struct launcher launcher;
 static struct file_entry files[MAX_FILES];
 static struct ui_row file_rows[MAX_FILES + 8];
+
+void wine_nx_launcher_usb_changed(void)
+{
+    SDL_Event event;
+
+    if (!launcher.usb_event) return;
+    SDL_AtomicSet( &launcher.usb_changed, 1 );
+    memset( &event, 0, sizeof(event) );
+    event.type = launcher.usb_event;
+    SDL_PushEvent( &event );
+}
 
 extern int wine_nx_launcher_console_run( const char *drive_c, const char *runtime_dir, const char *build,
                                          int (*machine_of)( const char *path, unsigned short *machine ),
@@ -401,15 +415,15 @@ static int folder_title( const char *path, char *out, size_t size )
 
 static void load_program_settings( struct launcher *l, struct program *p )
 {
-    char path[520];
+    char path[768];
     struct launcher_kv kv;
     size_t len;
 
-    (void)l;
     p->own_files = 0;
     memset( &p->settings, 0, sizeof(p->settings) );
     p->settings.verbose = p->settings.profile = p->settings.framebuffer = -1;
-    if (launcher_settings_path( p->path, path, sizeof(path) ) && launcher_kv_load( &kv, path ))
+    if (launcher_program_settings_path( l->options->runtime_dir, p->path, path, sizeof(path) ) &&
+        launcher_kv_load( &kv, path ))
     {
         launcher_settings_read( &kv, &p->settings );
         p->own_files |= kv.size && file_exists( path );
@@ -646,10 +660,17 @@ static void rebuild_history( struct launcher *l, int keep_index )
 static void save_program_settings( struct launcher *l, struct program *p )
 {
     struct launcher_kv kv;
-    char path[520];
+    char path[768], folder[768];
+    int ready = 1;
 
-    if (!launcher_settings_path( p->path, path, sizeof(path) ) || !launcher_kv_load( &kv, path ) ||
-        !launcher_settings_write( &kv, &p->settings ) || !launcher_kv_save( &kv, path ))
+    if (launcher_settings_on_usb( p->path ))
+    {
+        runtime_file( l, "program-settings", folder, sizeof(folder) );
+        ready = !mkdir( folder, 0777 ) || errno == EEXIST;
+    }
+    if (!ready || !launcher_program_settings_path( l->options->runtime_dir, p->path, path, sizeof(path) ) ||
+        !launcher_kv_load( &kv, path ) || !launcher_settings_write( &kv, &p->settings ) ||
+        !launcher_kv_save( &kv, path ))
         ui_toast( &l->ui, "Could not save the program's settings", 2500 );
     load_program_settings( l, p );
 }
@@ -1513,8 +1534,13 @@ static void draw_carousel_card( struct launcher *l, int index, SDL_Rect rect, fl
                             (SDL_Color){ 255, 255, 255, (int)(38 * focus) } );
     if (p->missing)
     {
-        ui_rounded( ui, x + 12, y + 12, 72, 24, 10, (SDL_Color){ 120, 28, 32, 230 } );
-        ui_text( ui, ui->small, x + 20, y + 14, "Missing", ui->value );
+        int badge_h = TTF_FontHeight( ui->small ) + 8;
+        int badge_w = ui_text_width( ui, ui->small, "Missing" ) + 20;
+
+        ui_rounded( ui, x + 12, y + 12, badge_w, badge_h, badge_h / 2,
+                    (SDL_Color){ 120, 28, 32, 230 } );
+        ui_text( ui, ui->small, x + 22, y + 12 + (badge_h - TTF_FontHeight( ui->small )) / 2,
+                 "Missing", ui->value );
     }
 }
 
@@ -1614,7 +1640,7 @@ static void draw_home( struct launcher *l )
         ui_text_fit( ui, ui->normal, title_x, HOME_TITLE_Y, ui->width - SHELL_MARGIN - title_x - 120, p->title,
                      ui->value, 1 );
         if (p->missing)
-            draw_tag( ui, title_x, HOME_TITLE_Y + TTF_FontHeight( ui->normal ) + 12, "Missing", 1 );
+            draw_tag( ui, title_x, HOME_TITLE_Y + TTF_FontHeight( ui->normal ) + 20, "Missing", 1 );
 
         if (l->zone == ZONE_HEADER) hints[0].label = "Select";
         ui_hints_right( ui, hints, 3, ui->width - SHELL_MARGIN, HOME_HINT_Y );
@@ -1799,24 +1825,6 @@ static int next_state( int state, int direction )
     return order[(i + (direction < 0 ? 2 : 1)) % 3];
 }
 
-static void show_file( struct launcher *l, const char *title, const char *path, const char *missing )
-{
-    char text[1024];
-    FILE *file = fopen( path, "rb" );
-    size_t size, i, j;
-
-    if (!file)
-    {
-        ui_message( &l->ui, title, missing );
-        return;
-    }
-    size = fread( text, 1, sizeof(text) - 1, file );
-    fclose( file );
-    for (i = j = 0; i < size; i++) if (text[i] != '\r') text[j++] = text[i];
-    text[j] = 0;
-    ui_message( &l->ui, title, j ? text : "The file is empty." );
-}
-
 /* What the program needs of the address space: what it was told, or what the
  * program itself says when it was told nothing. */
 static enum launcher_address_space program_address_space( struct program *p )
@@ -1972,23 +1980,24 @@ static void dxvk_install_progress( void *opaque, enum dxvk_progress_stage stage,
     progress->started = 1;
 }
 
-static int dxvk_release_menu( struct launcher *l, struct program *p )
+static int dxvk_release_menu( struct launcher *l, struct program *p, const struct ui_list *anchor )
 {
     static struct dxvk_release releases[DXVK_MAX_RELEASES];
     static struct ui_row rows[DXVK_MAX_RELEASES + 1];
-    struct ui_list list = {0};
     int refresh = 0;
 
     for (;;)
     {
         enum dxvk_result result;
-        enum ui_action action;
         char root_version[32] = "", message[320];
-        int count = 0, cached = 0, latest = -1, current = -1, i;
+        int ids[DXVK_MAX_RELEASES + 1];
+        int release_count = 0, count = 0, cached = 0, latest = -1, current = -1, chosen, i;
 
-        dxvk_wait_screen( l, "DXVK versions", refresh ? "Refreshing releases..." : "Loading releases..." );
+        ui_toast( &l->ui, refresh ? "Refreshing DXVK releases..." : "Loading DXVK releases...", 15000 );
+        ui_present( &l->ui );
         result = dxvk_release_catalog( l->options->runtime_dir, releases, DXVK_MAX_RELEASES,
-                                       &count, refresh, &cached );
+                                       &release_count, refresh, &cached );
+        ui_toast( &l->ui, "", 0 );
         refresh = 0;
         if (result != DXVK_OK)
         {
@@ -1997,44 +2006,46 @@ static int dxvk_release_menu( struct launcher *l, struct program *p )
         }
         dxvk_root_version( l->options->runtime_dir, p->machine, root_version, sizeof(root_version) );
         memset( rows, 0, sizeof(rows) );
-        snprintf( rows[0].label, sizeof(rows[0].label), "Refresh release list" );
-        snprintf( rows[0].value, sizeof(rows[0].value), "%s", cached ? "Cached" : "Up to date" );
-        rows[0].help = "Fetch the current release list from the official DXVK GitHub repository.";
-        for (i = 0; i < count; i++)
+        for (i = 0; i < release_count; i++)
         {
             int installed = dxvk_release_installed( l->options->runtime_dir, p->machine, releases[i].version ) ||
                             (root_version[0] && !strcmp( root_version, releases[i].version ) &&
                              dxvk_release_installed( l->options->runtime_dir, p->machine, "" ));
+            int index;
 
+            if (!launcher_dxvk_version_selectable( releases[i].version )) continue;
+            index = count++;
+            ids[index] = i;
             if (latest < 0 && !releases[i].prerelease) latest = i;
             if ((p->settings.dxvk_version[0] && !strcmp( p->settings.dxvk_version, releases[i].version )) ||
                 (!p->settings.dxvk_version[0] && root_version[0] && !strcmp( root_version, releases[i].version )))
-                current = i;
-            snprintf( rows[i + 1].label, sizeof(rows[i + 1].label), "DXVK %s", releases[i].version );
+                current = index;
+            snprintf( rows[index].label, sizeof(rows[index].label), "%s", releases[i].version );
             if (installed)
-                snprintf( rows[i + 1].value, sizeof(rows[i + 1].value), "%s%s",
+                snprintf( rows[index].value, sizeof(rows[index].value), "%s%s",
                           i == latest ? "Latest / " : "", "Installed" );
             else if (i == latest)
-                snprintf( rows[i + 1].value, sizeof(rows[i + 1].value), "Latest" );
+                snprintf( rows[index].value, sizeof(rows[index].value), "Latest" );
             else if (releases[i].prerelease)
-                snprintf( rows[i + 1].value, sizeof(rows[i + 1].value), "Pre-release" );
-            rows[i + 1].download = !installed;
-            rows[i + 1].help = releases[i].prerelease ?
-                "An official DXVK pre-release. Download installs both its x86 and x64 DLLs." :
-                "An official stable DXVK release. Download installs both its x86 and x64 DLLs.";
+                snprintf( rows[index].value, sizeof(rows[index].value), "Pre-release" );
+            rows[index].download = !installed;
         }
-        if (!list.started) list.selection = (current >= 0 ? current : latest >= 0 ? latest : 0) + 1;
-        action = ui_list_run( &l->ui, &list, "DXVK versions", p->title, rows, count + 1, 0 );
-        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return 0;
-        if (action != UI_ACTION_CHOOSE) continue;
-        if (!list.selection)
+        if (latest >= 0 && current < 0)
+            for (i = 0; i < count; i++)
+                if (ids[i] == latest) { current = i; break; }
+        ids[count] = -1;
+        snprintf( rows[count].label, sizeof(rows[count].label), "Refresh releases" );
+        snprintf( rows[count].value, sizeof(rows[count].value), "%s", cached ? "Cached" : "Up to date" );
+        count++;
+        chosen = ui_settings_dropdown( &l->ui, anchor, rows, count, current >= 0 ? current : 0 );
+        if (chosen < 0) return 0;
+        i = ids[chosen];
+        if (i < 0)
         {
             refresh = 1;
-            memset( &list, 0, sizeof(list) );
             continue;
         }
-        i = list.selection - 1;
-        if (rows[list.selection].download)
+        if (rows[chosen].download)
         {
             struct dxvk_progress_ui progress;
 
@@ -2069,6 +2080,148 @@ static int dxvk_release_menu( struct launcher *l, struct program *p )
         snprintf( message, sizeof(message), "DXVK %s selected", releases[i].version );
         ui_toast( &l->ui, message, 1800 );
         return 1;
+    }
+}
+
+static int box64_configured_count( const struct launcher_kv *kv, int advanced )
+{
+    char value[64];
+    int count = 0, i;
+
+    for (i = 0; i < NX_BOX64_OPTION_COUNT; i++)
+        if (nx_box64_options[i].advanced == advanced &&
+            launcher_kv_get( kv, nx_box64_options[i].name, value, sizeof(value) )) count++;
+    return count;
+}
+
+static void box64_options_status( const char *path, char *value, size_t size )
+{
+    struct launcher_kv kv;
+    int count;
+
+    if (!launcher_kv_load( &kv, path ))
+    {
+        snprintf( value, size, "File too large" );
+        return;
+    }
+    count = box64_configured_count( &kv, 0 ) + box64_configured_count( &kv, 1 );
+    if (count) snprintf( value, size, "%d flag%s set", count, count == 1 ? "" : "s" );
+    else if (file_exists( path )) snprintf( value, size, "Custom file" );
+    else snprintf( value, size, "Default" );
+}
+
+static int box64_option_value( const struct launcher_kv *kv, const struct nx_box64_option *option,
+                               long *value, char *text, size_t size )
+{
+    int choice;
+
+    if (!launcher_kv_get( kv, option->name, text, size ))
+    {
+        *value = option->default_value;
+        choice = nx_box64_option_choice( option, *value );
+        snprintf( text, size, "%s", option->value_names[choice] );
+        return choice;
+    }
+    if (!nx_box64_option_parse_value( text, value ) ||
+        (choice = nx_box64_option_choice( option, *value )) < 0)
+    {
+        char invalid[64];
+
+        snprintf( invalid, sizeof(invalid), "%s", text );
+        snprintf( text, size, "Unsupported (%s)", invalid );
+        return -1;
+    }
+    snprintf( text, size, "%s", option->value_names[choice] );
+    return choice;
+}
+
+static int box64_option_rows( struct ui_row *rows, int *ids, int count,
+                              const struct launcher_kv *kv, int advanced )
+{
+    int i;
+
+    for (i = 0; i < NX_BOX64_OPTION_COUNT; i++)
+    {
+        long value;
+
+        if (nx_box64_options[i].advanced != advanced) continue;
+        ids[count] = i;
+        snprintf( rows[count].label, sizeof(rows[count].label), "%s", nx_box64_options[i].name );
+        box64_option_value( kv, nx_box64_options + i, &value,
+                            rows[count].value, sizeof(rows[count].value) );
+        rows[count].help = nx_box64_options[i].help;
+        rows[count].kind = UI_ROW_VALUE;
+        rows[count].adjustable = 1;
+        count++;
+    }
+    return count;
+}
+
+static void box64_options_menu( struct launcher *l, struct program *p )
+{
+    struct ui_row rows[NX_BOX64_OPTION_COUNT + 1];
+    int ids[NX_BOX64_OPTION_COUNT + 1];
+    struct ui_list list = {0};
+    struct launcher_kv kv;
+    char path[520];
+    int count, expanded = 0, i;
+
+    if (!launcher_sibling_path( p->path, ".box64.txt", path, sizeof(path) ) ||
+        !launcher_kv_load( &kv, path ))
+    {
+        ui_message( &l->ui, "Box64 options", "The options file is too large to edit." );
+        return;
+    }
+    for (;;)
+    {
+        enum ui_action action;
+        int set;
+
+        memset( rows, 0, sizeof(rows) );
+        count = box64_option_rows( rows, ids, 0, &kv, 0 );
+        set = box64_configured_count( &kv, 1 );
+        ids[count] = -1;
+        snprintf( rows[count].label, sizeof(rows[count].label), "Advanced flags" );
+        snprintf( rows[count].value, sizeof(rows[count].value), expanded ? "Hide (%d set)" : "Show (%d set)", set );
+        rows[count].help = "Compatibility and lower-level DynaRec controls supported by Wine-NX's embedded Box64 backend.";
+        rows[count].kind = UI_ROW_DROPDOWN;
+        rows[count].on = expanded;
+        count++;
+        if (expanded) count = box64_option_rows( rows, ids, count, &kv, 1 );
+        action = ui_list_run( &l->ui, &list, "Box64 options", p->title, rows, count, 1 );
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return;
+        i = ids[list.selection];
+        if (i < 0)
+        {
+            if (action == UI_ACTION_CHOOSE) expanded = !expanded;
+            continue;
+        }
+        else
+        {
+            const struct nx_box64_option *option = nx_box64_options + i;
+            char current_text[64], number[16];
+            long current_value;
+            int current = box64_option_value( &kv, option, &current_value,
+                                               current_text, sizeof(current_text) );
+            int next;
+
+            if (action == UI_ACTION_RESET) next = nx_box64_option_choice( option, option->default_value );
+            else
+            {
+                if (current < 0) current = nx_box64_option_choice( option, option->default_value );
+                next = (current + (action == UI_ACTION_LEFT ? option->value_count - 1 : 1)) % option->value_count;
+            }
+            snprintf( number, sizeof(number), "%d", option->values[next] );
+            if (!launcher_kv_set( &kv, option->name,
+                                  option->values[next] == option->default_value ? NULL : number ) ||
+                !launcher_kv_save( &kv, path ))
+            {
+                ui_message( &l->ui, "Box64 options", "The options could not be saved." );
+                if (!launcher_kv_load( &kv, path )) return;
+                continue;
+            }
+            load_program_settings( l, p );
+        }
     }
 }
 
@@ -2173,7 +2326,8 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
                       dxvk_beside ? " (app DLL first)" : "" );
 
             ADD_ROW( ROW_DXVK_VERSION, SECTION_GRAPHICS, "DXVK version",
-                     "Choose any official DXVK GitHub release. Missing versions show a download icon and install both architectures." );
+                     "Choose an official DXVK GitHub release." );
+            row->kind = UI_ROW_DROPDOWN;
             row->download = !dxvk_installed;
             if (p->settings.dxvk_version[0])
                 snprintf( row->value, sizeof(row->value), "%s", p->settings.dxvk_version );
@@ -2219,12 +2373,12 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
             }
         }
 
-        if (x86)
+        if (x86 || x64)
         {
             ADD_ROW( ROW_BOX64, SECTION_DIAGNOSTICS, "Box64 options",
-                     "Options for the x86 translator, read from NAME.box64.txt next to the program." );
+                     "Per-game performance and compatibility flags for the Box64 translator." );
             launcher_sibling_path( p->path, ".box64.txt", path, sizeof(path) );
-            snprintf( row->value, sizeof(row->value), "%s", file_exists( path ) ? file_name( path ) : "None" );
+            box64_options_status( path, row->value, sizeof(row->value) );
         }
 
         if (in_library)
@@ -2334,7 +2488,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
         case ROW_D3D9:
             if (action == UI_ACTION_RESET || p->settings.dxvk) p->settings.dxvk = 0;
             else if (dxvk_installed) p->settings.dxvk = 1;
-            else { dxvk_release_menu( l, p ); break; }
+            else { dxvk_release_menu( l, p, &list ); break; }
             save_program_settings( l, p );
             break;
 
@@ -2344,7 +2498,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
                 p->settings.dxvk_version[0] = 0;
                 save_program_settings( l, p );
             }
-            else if (action == UI_ACTION_CHOOSE) dxvk_release_menu( l, p );
+            else if (action == UI_ACTION_CHOOSE) dxvk_release_menu( l, p, &list );
             break;
 
         case ROW_ADDRESS:
@@ -2380,8 +2534,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
         case ROW_BOX64:
             if (action != UI_ACTION_CHOOSE) break;
-            launcher_sibling_path( p->path, ".box64.txt", path, sizeof(path) );
-            show_file( l, "Box64 options", path, "This program uses the default Box64 options." );
+            box64_options_menu( l, p );
             break;
 
         case ROW_HIDE:
@@ -3382,6 +3535,41 @@ static void rebuild_lists( struct launcher *l, int keep_index )
     rebuild_history( l, keep_index );
 }
 
+static int usb_program_path( const char *path )
+{
+    return !strncasecmp( path, "ums", 3 ) && path[3] >= '0' && path[3] <= '4' &&
+           path[4] == ':' && (path[5] == '/' || path[5] == '\\');
+}
+
+static int refresh_usb_programs( struct launcher *l )
+{
+    int changed = 0, i;
+
+    for (i = 0; i < l->program_count; i++)
+    {
+        struct program *p = l->programs + i;
+        unsigned short machine;
+        int available;
+
+        if (p->removed || !usb_program_path( p->path )) continue;
+        available = file_exists( p->path ) && !l->options->machine_of( p->path, &machine );
+        if (available == !p->missing) continue;
+        p->missing = !available;
+        if (available)
+        {
+            p->machine = machine;
+            p->resource_title[0] = 0;
+            launcher_pe_describe( p->path, 0, NULL, p->resource_title, sizeof(p->resource_title) );
+            load_program_settings( l, p );
+            if (!p->icon) p->icon_state = ICON_UNKNOWN;
+            if (!p->square_icon) p->square_state = ICON_UNKNOWN;
+            if (!p->hero_icon) p->hero_state = ICON_UNKNOWN;
+        }
+        changed++;
+    }
+    return changed;
+}
+
 static void show_library( struct launcher *l, int *home, struct ui *ui )
 {
     if (*home) ui_start_screen( ui );
@@ -3631,6 +3819,22 @@ static int run_library( struct launcher *l, char *target, size_t size )
             if (!ui->running) return 0;
         }
         if (!ui->running) break;
+        if (SDL_AtomicCAS( &l->usb_changed, 1, 0 ))
+        {
+            int keep = current_index( l, home );
+            int changed = refresh_usb_programs( l );
+
+            if (changed)
+            {
+                char message[80];
+
+                rebuild_lists( l, keep );
+                snprintf( message, sizeof(message), changed == 1 ? "%d USB game refreshed" : "%d USB games refreshed",
+                          changed );
+                launcher_log( "[LAUNCHER] %s after a mount change", message );
+                ui_toast( ui, message, 1800 );
+            }
+        }
         if (home) draw_home( l );
         else draw_library( l );
         ui_present( ui );
@@ -3688,6 +3892,8 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
     l->ui.header_status = header_status;
     l->ui.header_status_data = l;
     l->ui.footer_mark = footer_mark;
+    l->usb_event = SDL_RegisterEvents( 1 );
+    if (l->usb_event == (Uint32)-1) l->usb_event = SDL_USEREVENT;
 
     {
         SDL_RendererInfo info;
@@ -3745,6 +3951,7 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
     for (i = 0; i < SYMBOL_COUNT; i++)
         if (l->symbols[i]) SDL_DestroyTexture( l->symbols[i] );
     if (l->logo) SDL_DestroyTexture( l->logo );
+    l->usb_event = 0;
     ui_quit( &l->ui );
     launcher_platform_font_release();
     return ret;

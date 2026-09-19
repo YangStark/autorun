@@ -2,9 +2,9 @@
  * Settings files of the launcher: lines of key=value, with other lines (comments,
  * keys a later build adds) kept as they are when a value is changed.
  *
- * A program's own settings live next to it, named after it: SPEED2.EXE reads
- * SPEED2.wine-nx.txt. The launcher writes them and the runtime applies them to
- * the program it starts, whether the launcher chose it or target.txt did.
+ * A program on the SD card keeps its settings next to it: SPEED2.EXE reads
+ * SPEED2.wine-nx.txt. A program on USB keeps them under the runtime directory
+ * on the SD card.
  * The launcher's own look is in sdmc:/switch/wine/launcher.txt.
  */
 #ifndef WINE_NX_LAUNCHER_SETTINGS_H
@@ -206,6 +206,16 @@ static inline int launcher_dxvk_version_valid( const char *version )
     return p - (const unsigned char *)version < 32 && isalnum( p[-1] );
 }
 
+static inline int launcher_dxvk_version_selectable( const char *version )
+{
+    char *end;
+    unsigned long major;
+
+    if (!launcher_dxvk_version_valid( version )) return 0;
+    major = strtoul( version, &end, 10 );
+    return end != version && major >= 1;
+}
+
 static inline int launcher_dxvk_version_directory( unsigned short machine, const char *version,
                                                    char *out, size_t size )
 {
@@ -226,6 +236,33 @@ static inline int launcher_settings_path( const char *exe_path, char *out, size_
     memcpy( out, exe_path, len - 4 );
     memcpy( out + len - 4, ".wine-nx.txt", suffix_size );
     return 1;
+}
+
+static inline int launcher_settings_on_usb( const char *exe_path )
+{
+    return exe_path && !strncasecmp( exe_path, "ums", 3 ) && isdigit( (unsigned char)exe_path[3] ) &&
+           exe_path[4] == ':';
+}
+
+static inline int launcher_program_settings_path( const char *runtime_dir, const char *exe_path,
+                                                  char *out, size_t size )
+{
+    unsigned long long hash = 1469598103934665603ULL;
+    const unsigned char *p;
+    int length;
+
+    if (!launcher_settings_on_usb( exe_path )) return launcher_settings_path( exe_path, out, size );
+    if (!runtime_dir || !runtime_dir[0]) return 0;
+    for (p = (const unsigned char *)exe_path; *p; p++)
+    {
+        unsigned char c = *p == '\\' ? '/' : (unsigned char)tolower( *p );
+
+        hash ^= c;
+        hash *= 1099511628211ULL;
+    }
+    length = snprintf( out, size, "%s%sprogram-settings/%016llx.wine-nx.txt", runtime_dir,
+                       runtime_dir[strlen( runtime_dir ) - 1] == '/' ? "" : "/", hash );
+    return length >= 0 && (size_t)length < size;
 }
 
 static inline int launcher_setting_state( const struct launcher_kv *kv, const char *key )

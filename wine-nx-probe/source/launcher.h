@@ -65,6 +65,7 @@ struct wine_nx_launcher_options
 /* Show the launcher. Returns 1 with the chosen program's path in target, or 0
  * when the user quits. target on entry preselects a program. */
 int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target, size_t target_size );
+void wine_nx_launcher_usb_changed(void);
 
 /* A line in wine-nx-runtime.log (runtime.c). */
 void wine_nx_runtime_trace( const char *msg );

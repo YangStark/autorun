@@ -1672,7 +1672,8 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
         struct launcher_kv kv;
         int own = -1;
 
-        if (target[1] != ':' && launcher_settings_path( target, settings_path, sizeof(settings_path) ) &&
+        if (target[1] != ':' &&
+            launcher_program_settings_path( RUNTIME_DIR, target, settings_path, sizeof(settings_path) ) &&
             launcher_kv_load( &kv, settings_path ) && kv.size)
         {
             launcher_settings_read( &kv, &settings );
@@ -3459,7 +3460,8 @@ int main( int argc, char **argv )
 
         runtime_dxvk = 0;
         runtime_dxvk_version[0] = 0;
-        if (target[1] != ':' && launcher_settings_path( target, settings_path, sizeof(settings_path) ) &&
+        if (target[1] != ':' &&
+            launcher_program_settings_path( RUNTIME_DIR, target, settings_path, sizeof(settings_path) ) &&
             launcher_kv_load( &kv, settings_path ) && kv.size)
         {
             launcher_settings_read( &kv, &settings );

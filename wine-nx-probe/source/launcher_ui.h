@@ -221,7 +221,7 @@ void ui_progress_end( struct ui *ui );
  * the caller changes what it must and calls it again. */
 /* How a settings row draws what it carries on the right: an arrow into a screen
  * of its own, a value the row itself changes, or a switch. */
-enum ui_row_kind { UI_ROW_ACTION, UI_ROW_VALUE, UI_ROW_SWITCH };
+enum ui_row_kind { UI_ROW_ACTION, UI_ROW_VALUE, UI_ROW_SWITCH, UI_ROW_DROPDOWN };
 
 struct ui_row
 {
@@ -278,5 +278,7 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
 enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char *title, const char *context,
                                 const char *const *groups, int group_count,
                                 const struct ui_row *rows, int count, int can_reset, int *group );
+int ui_settings_dropdown( struct ui *ui, const struct ui_list *anchor,
+                          const struct ui_row *rows, int count, int selection );
 
 #endif

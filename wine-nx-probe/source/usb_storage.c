@@ -25,6 +25,7 @@ static void usb_status_changed( const UsbHsFsDevice *devices, u32 count, void *u
     usb_device_count = devices ? count : 0;
     if (usb_device_count) memcpy( usb_devices, devices, usb_device_count * sizeof(*devices) );
     mutexUnlock( &usb_mutex );
+    wine_nx_launcher_usb_changed();
 }
 
 void wine_nx_usb_start(void)

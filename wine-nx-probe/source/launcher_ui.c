@@ -1506,6 +1506,9 @@ static void ui_download_icon( struct ui *ui, int x, int y, SDL_Color color )
     ui_rounded( ui, x + 1, y + 16, 18, 3, 1, color );
 }
 
+static void ui_chevron_down( struct ui *ui, int x, int y, SDL_Color color );
+static void ui_chevron_up( struct ui *ui, int x, int y, SDL_Color color );
+
 enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *title, const char *context,
                             const struct ui_row *rows, int count, int can_reset )
 {
@@ -1649,9 +1652,11 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
             int y = LIST_TOP + (int)(i * ROW_HEIGHT - list->scroll), current = i == list->selection;
             int text_y = y + (ROW_HEIGHT - TTF_FontHeight( ui->normal )) / 2;
             int icon_w = rows[i].download ? 30 : 0;
+            int disclosure_w = rows[i].kind == UI_ROW_DROPDOWN ? 28 : 0;
             int value_w = rows[i].value[0] ? ui_text_width( ui, ui->small, rows[i].value ) : 0;
             int value_max = value_w < column_w / 3 ? value_w : column_w / 3;
-            int label_w = value_right - ROW_PADDING - column_x - icon_w - (value_w ? value_max + 28 : 0);
+            int label_w = value_right - ROW_PADDING - column_x - icon_w - disclosure_w -
+                          (value_w ? value_max + 28 : 0);
             SDL_Color color = rows[i].disabled ? ui->dim : rows[i].destructive ? ui->danger : current ? ui->value : ui->text;
 
             any_adjustable |= rows[i].adjustable && !rows[i].disabled;
@@ -1662,12 +1667,19 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
                                     UI_FOCUS_DIM, UI_FOCUS_LIT );
             ui_text_fit( ui, ui->normal, column_x + ROW_PADDING, text_y, label_w, rows[i].label, color, current );
             if (value_w)
-                ui_text_fit( ui, ui->small, value_right - icon_w - value_max,
+                ui_text_fit( ui, ui->small, value_right - icon_w - disclosure_w - value_max,
                              text_y + (TTF_FontHeight( ui->normal ) - TTF_FontHeight( ui->small )) / 2,
                              column_w / 3, rows[i].value, current ? ui->value : ui->dim, current );
             if (rows[i].download)
-                ui_download_icon( ui, value_right - 20, y + (ROW_HEIGHT - 19) / 2,
+                ui_download_icon( ui, value_right - disclosure_w - 20, y + (ROW_HEIGHT - 19) / 2,
                                   current ? ui->value : ui->dim );
+            if (rows[i].kind == UI_ROW_DROPDOWN)
+            {
+                SDL_Color arrow = current ? ui->value : ui->dim;
+
+                if (rows[i].on) ui_chevron_up( ui, value_right - 18, y + (ROW_HEIGHT - 9) / 2, arrow );
+                else ui_chevron_down( ui, value_right - 18, y + (ROW_HEIGHT - 9) / 2, arrow );
+            }
         }
         SDL_RenderSetClipRect( ui->renderer, NULL );
         if (count > visible)
@@ -1751,6 +1763,151 @@ static void ui_chevron_dir( struct ui *ui, int x, int y, int direction, SDL_Colo
 static void ui_chevron( struct ui *ui, int x, int y, SDL_Color color )
 {
     ui_chevron_dir( ui, x, y, 1, color );
+}
+
+static void ui_chevron_down( struct ui *ui, int x, int y, SDL_Color color )
+{
+    int i;
+
+    for (i = 0; i < 8; i++)
+    {
+        ui_rounded( ui, x + i, y + i, 2, 2, 1, color );
+        ui_rounded( ui, x + 14 - i, y + i, 2, 2, 1, color );
+    }
+}
+
+static void ui_chevron_up( struct ui *ui, int x, int y, SDL_Color color )
+{
+    int i;
+
+    for (i = 0; i < 8; i++)
+    {
+        ui_rounded( ui, x + i, y + 7 - i, 2, 2, 1, color );
+        ui_rounded( ui, x + 14 - i, y + 7 - i, 2, 2, 1, color );
+    }
+}
+
+int ui_settings_dropdown( struct ui *ui, const struct ui_list *anchor,
+                          const struct ui_row *rows, int count, int selection )
+{
+    const int panel_w = 430, row_h = 48, padding = 8, max_visible = 5;
+    struct ui_input input;
+    SDL_Rect clip;
+    int x, y, h, visible, top, chosen = -1;
+
+    if (count <= 0) return -1;
+    if (selection < 0 || selection >= count) selection = 0;
+    x = ui->width - UI_HEADER_MARGIN - ROW_PADDING - panel_w;
+    y = LIST_TOP + (anchor->selection - anchor->top + 1) * SET_ROW_H - 6;
+    visible = (ui->height - 58 - y - 2 * padding) / row_h;
+    if (visible > max_visible) visible = max_visible;
+    if (visible > count) visible = count;
+    if (visible < 2)
+    {
+        visible = count < max_visible ? count : max_visible;
+        y = LIST_TOP + (anchor->selection - anchor->top) * SET_ROW_H - visible * row_h - 2 * padding + 4;
+        if (y < UI_HEADER_HEIGHT + 8) y = UI_HEADER_HEIGHT + 8;
+    }
+    h = visible * row_h + 2 * padding;
+    top = selection - visible / 2;
+    if (top > count - visible) top = count - visible;
+    if (top < 0) top = 0;
+
+    ui_keep_screen( ui );
+    ui->modal_depth++;
+    while (ui_begin_frame( ui ))
+    {
+        while (ui_poll( ui, &input ))
+        {
+            int direction = 0;
+
+            if (input.button == UI_B || input.button == UI_PLUS) goto done;
+            if (input.button == UI_A) { chosen = selection; goto done; }
+            if (input.button == UI_UP) direction = -1;
+            if (input.button == UI_DOWN) direction = 1;
+            if (input.button == UI_L) direction = -visible;
+            if (input.button == UI_R) direction = visible;
+            if (input.touch == UI_TOUCH_SCROLL_UP) direction = input.steps;
+            if (input.touch == UI_TOUCH_SCROLL_DOWN) direction = -input.steps;
+            if (input.touch == UI_TOUCH_TAP)
+            {
+                int hit = top + (input.y - y - padding) / row_h;
+
+                if (input.x < x || input.x >= x + panel_w || input.y < y + padding ||
+                    input.y >= y + h - padding || hit < top || hit >= top + visible || hit >= count)
+                    goto done;
+                chosen = hit;
+                goto done;
+            }
+            if (direction)
+            {
+                selection += direction;
+                if (selection < 0) selection = 0;
+                if (selection >= count) selection = count - 1;
+            }
+        }
+        if (!ui->running) break;
+        if (selection < top) top = selection;
+        if (selection >= top + visible) top = selection - visible + 1;
+
+        if (ui->snapshot) SDL_RenderCopy( ui->renderer, ui->snapshot, NULL, NULL );
+        else ui_background( ui );
+        ui_rounded( ui, x + 6, y + 8, panel_w, h, 14, (SDL_Color){ 0, 0, 0, 135 } );
+        ui_rounded( ui, x, y, panel_w, h, 14, (SDL_Color){ 22, 27, 30, 252 } );
+        ui_outline( ui, x, y, panel_w, h, 14, 1, (SDL_Color){ 236, 240, 246, 105 } );
+        clip = (SDL_Rect){ x + 4, y + padding, panel_w - 8, visible * row_h };
+        SDL_RenderSetClipRect( ui->renderer, &clip );
+        {
+            int i;
+
+            for (i = top; i < count && i < top + visible; i++)
+            {
+                int row_y = y + padding + (i - top) * row_h;
+                int current = i == selection;
+                int icon_w = rows[i].download ? 28 : 0;
+                int value_w = rows[i].value[0] ? ui_text_width( ui, ui->small, rows[i].value ) : 0;
+
+                if (value_w > panel_w / 3) value_w = panel_w / 3;
+                if (current)
+                    ui_animated_border( ui, x + 8, row_y + 2, panel_w - 16, row_h - 4, 10, 2,
+                                        UI_FOCUS_DIM, UI_FOCUS_LIT );
+                ui_text_fit( ui, ui->normal, x + 8 + ROW_PADDING,
+                             row_y + (row_h - TTF_FontHeight( ui->normal )) / 2,
+                             panel_w - 48 - 2 * ROW_PADDING - icon_w - value_w,
+                             rows[i].label, current ? ui->value : ui->text, current );
+                if (value_w)
+                    ui_text_fit( ui, ui->small, x + panel_w - 22 - icon_w - value_w,
+                                 row_y + (row_h - TTF_FontHeight( ui->small )) / 2,
+                                 value_w, rows[i].value, current ? ui->value : ui->dim, current );
+                if (rows[i].download)
+                    ui_download_icon( ui, x + panel_w - 38, row_y + (row_h - 19) / 2,
+                                      current ? ui->value : ui->dim );
+            }
+        }
+        SDL_RenderSetClipRect( ui->renderer, NULL );
+        if (count > visible)
+        {
+            int track_h = h - 2 * padding - 8;
+            int thumb = track_h * visible / count;
+
+            if (thumb < 16) thumb = 16;
+            ui_rounded( ui, x + panel_w - 7, y + padding + 4, 3, track_h, 2,
+                        (SDL_Color){ 66, 73, 85, 180 } );
+            ui_rounded( ui, x + panel_w - 7,
+                        y + padding + 4 + (track_h - thumb) * top / (count - visible),
+                        3, thumb, 2, ui->selection );
+        }
+        ui_present( ui );
+        ui_wait( ui );
+    }
+done:
+    if (ui->screen && ui->snapshot)
+    {
+        SDL_SetRenderTarget( ui->renderer, ui->screen );
+        SDL_RenderCopy( ui->renderer, ui->snapshot, NULL, NULL );
+    }
+    ui->modal_depth--;
+    return chosen;
 }
 
 enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char *title, const char *context,
@@ -1980,6 +2137,7 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
                 break;
             case UI_ROW_VALUE:
             case UI_ROW_ACTION:
+            case UI_ROW_DROPDOWN:
             default:
                 if (r->download && !(current && list->editing && r->adjustable))
                     ui_download_icon( ui, right - 46, middle - 10,
@@ -1995,6 +2153,13 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
                 {
                     ui_chevron_dir( ui, right - 42 - value_w, middle - 8, -1, ui->value );
                     ui_chevron_dir( ui, right - 14, middle - 8, 1, ui->value );
+                }
+                else if (r->kind == UI_ROW_DROPDOWN)
+                {
+                    SDL_Color arrow = r->disabled ? ui->dim : current ? ui->value : ui->dim;
+
+                    if (r->on) ui_chevron_up( ui, right - 18, middle - 4, arrow );
+                    else ui_chevron_down( ui, right - 18, middle - 4, arrow );
                 }
                 else if (!r->adjustable)
                     ui_chevron( ui, right - 14, middle - 8, r->disabled ? ui->dim : current ? ui->value : ui->dim );

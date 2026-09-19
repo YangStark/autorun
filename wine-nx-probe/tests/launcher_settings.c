@@ -66,7 +66,7 @@ static void test_settings( const char *dir )
 {
     struct launcher_settings settings, back;
     struct launcher_kv kv;
-    char path[512];
+    char path[768], other[768];
 
     assert( launcher_settings_path( "sdmc:/switch/wine/drive_c/nfsu2/SPEED2.EXE", path, sizeof(path) ) );
     assert( !strcmp( path, "sdmc:/switch/wine/drive_c/nfsu2/SPEED2.wine-nx.txt" ) );
@@ -97,6 +97,8 @@ static void test_settings( const char *dir )
     assert( launcher_dxvk_version_valid( "3.1.1" ) && launcher_dxvk_version_valid( "2.0-rc1" ) );
     assert( !launcher_dxvk_version_valid( "" ) && !launcher_dxvk_version_valid( "../3.1" ) &&
             !launcher_dxvk_version_valid( "3.1/other" ) );
+    assert( launcher_dxvk_version_selectable( "1.0" ) && launcher_dxvk_version_selectable( "3.1.1" ) );
+    assert( !launcher_dxvk_version_selectable( "0.96" ) && !launcher_dxvk_version_selectable( "bad" ) );
     assert( !strcmp( launcher_dxvk_directory( 0x014c ), "dxvk" ) );
     assert( !strcmp( launcher_dxvk_directory( 0x8664 ), "dxvk64" ) );
     assert( !launcher_dxvk_directory( 0xaa64 ) && !launcher_dxvk_directory( 0 ) );
@@ -136,6 +138,15 @@ static void test_settings( const char *dir )
 
     snprintf( path, sizeof(path), "%s/missing.txt", dir );
     assert( launcher_kv_load( &kv, path ) && kv.size == 0 );
+
+    assert( launcher_settings_on_usb( "ums0:/Games/Test/Game.EXE" ) );
+    assert( !launcher_settings_on_usb( "sdmc:/switch/wine/drive_c/Game.EXE" ) );
+    assert( launcher_program_settings_path( dir, "ums0:/Games/Test/Game.EXE", path, sizeof(path) ) );
+    assert( launcher_program_settings_path( dir, "UMS0:\\games\\test\\game.exe", other, sizeof(other) ) );
+    assert( !strcmp( path, other ) );
+    assert( strstr( path, "/program-settings/" ) );
+    assert( launcher_program_settings_path( dir, "sdmc:/Games/Test/Game.EXE", path, sizeof(path) ) );
+    assert( !strcmp( path, "sdmc:/Games/Test/Game.wine-nx.txt" ) );
 }
 
 int main(void)
