@@ -137,6 +137,10 @@ subprocess.run([str(toolchain / 'i686-w64-mingw32-clang'), '-O1', '-mwindows',
                 '-o', str(apc_test), str(probe / 'tests/win32/apc-test.c')], check=True)
 assert 'Arch: i386\n' in readobj('--file-headers', apc_test)
 
+# The classes those DLLs serve, which on Windows their own DllRegisterServer
+# would have written when they were installed.
+subprocess.run([sys.executable, str(tools / 'make-classes-reg.py'), str(stage)], check=True)
+
 # The launcher lists every program in drive_c; target.txt only preselects one.
 (stage / 'target.txt').write_text('sdmc:/switch/wine/drive_c/WarCraft III Setup/war3-setup.exe\n')
 # Everything a person sets, in one file, where a dozen loose toggles were.
