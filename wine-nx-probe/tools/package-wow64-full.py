@@ -239,7 +239,7 @@ config.mkdir(parents=True, exist_ok=True)
   "display-devices": true,
   "windows-through-opengl": true,
   "vulkan-probe": false,
-  "reopen-the-launcher-on-exit": false,
+  "reopen-the-launcher-on-exit": true,
   "hand-the-process-back-anyway": false,
   "gl-pinned-buffers-cached": true,
   "gl-clean-before-submit": true,

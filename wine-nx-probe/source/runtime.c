@@ -3198,7 +3198,7 @@ int main( int argc, char **argv )
               wine_nx_compositor_mode ? "the OpenGL compositor" : "the framebuffer" );
     /* Both are wanted on the way out, when the card is a poor thing to ask. */
     runtime_loader_anyway = config_bool( "hand-the-process-back-anyway", 0, "loader-anyway.txt", 0 );
-    runtime_reopen_launcher = config_bool( "reopen-the-launcher-on-exit", 0, "reload-launcher.txt", 0 );
+    runtime_reopen_launcher = config_bool( "reopen-the-launcher-on-exit", 1, "reload-launcher.txt", 0 );
     if (runtime_config_moved && wine_nx_config_save( &runtime_config, CONFIG_FILE ))
         log_line( "[CONFIG] settings written to %s", CONFIG_FILE );
 #ifdef WINE_NX_MESA_SWITCH
