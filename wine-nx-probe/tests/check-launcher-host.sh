@@ -66,7 +66,9 @@ ln -s "$drive_c/notepad.exe" "$card/games/deep/er/still/Deep.exe"
 
 # An empty explicit catalog must stay empty even though drive_c contains several
 # executables. Add OpenTTD through the browser, verify that adding did not launch
-# it, then open its options with Y and start it from there.
+# it, then open its options with Y and start it from there. The browser asks
+# which storage to look in before it shows any folder, so the card is chosen
+# first, then the folder, then the program, then Add in the review.
 cat > "$build/script.txt" <<SCRIPT
 wait 10
 shot $shots/library-empty.png
@@ -77,12 +79,19 @@ wait 3
 key a
 wait 3
 key a
+wait 3
+key a
+wait 3
+key a
 wait 5
 shot $shots/library-added.png
 key y
 wait 5
 shot $shots/game-details.png
+key right
+wait 3
 key a
+wait 5
 SCRIPT
 
 cd "$build/card"
@@ -168,3 +177,67 @@ grep -q "launcher returned 1 target 'sdmc:/switch/wine/drive_c/Vanguard/Game.exe
     cat "$build/carousel-out.txt"; exit 1;
 }
 echo "launcher host run: Home history row, taps, swipes, boundaries, header focus and Y Options passed"
+
+# A library larger than one screenful: the grid has to scroll, and the buttons
+# have to be acted on while the icon worker posts an event per cover decoded.
+# tests/launcher_shot.py stages the games and reads back which cover each card
+# ended up showing, so a cover that went missing or came from another game
+# fails here rather than looking right in a screenshot nobody opens.
+big="$build/big/sdmc:"
+mkdir -p "$big/switch/wine"
+python3 "$probe/tests/launcher_shot.py" stage "$big" "$drive_c/notepad.exe" 120
+
+cat > "$build/scroll-script.txt" <<SCRIPT
+wait 60
+shot $shots/scroll-top.png
+key down
+wait 8
+key down
+wait 8
+key down
+wait 8
+key down
+wait 45
+shot $shots/scroll-down.png
+key up
+wait 8
+key up
+wait 8
+key up
+wait 8
+key up
+wait 45
+shot $shots/scroll-back.png
+SCRIPT
+( cd "$build/big" && SDL_VIDEODRIVER=dummy "$build/launcher_host" "$font" "$build/scroll-script.txt" \
+    > "$build/scroll-out.txt" 2>&1 ) || { cat "$build/scroll-out.txt"; exit 1; }
+grep -q "120 catalog games (120 registered, 120 shown)" "$build/scroll-out.txt" || { cat "$build/scroll-out.txt"; exit 1; }
+# Four presses down put the selection on row 4, so the two rows shown are 3 and
+# 4: games 15 to 24, with the selection the sixth card. Four back up show
+# the first two rows again. A screen that never moved means the buttons were
+# never read, which is what a queue full of the worker's events causes.
+python3 "$probe/tests/launcher_shot.py" check "$shots/scroll-top.png" 0 0
+python3 "$probe/tests/launcher_shot.py" check "$shots/scroll-down.png" 15 5
+python3 "$probe/tests/launcher_shot.py" check "$shots/scroll-back.png" 0 0
+echo "launcher host run: a library past one screenful scrolls and keeps every cover"
+
+# The same library from cold, with the presses coming while the worker is still
+# decoding covers and posting an event for each one. A frame that spent itself
+# on one of those events would leave the buttons queued behind them, and the
+# grid would still be on the first row long after the presses.
+cat > "$build/busy-script.txt" <<SCRIPT
+wait 18
+key down
+wait 2
+key down
+wait 2
+key down
+wait 2
+key down
+wait 25
+shot $shots/busy-scrolled.png
+SCRIPT
+( cd "$build/big" && SDL_VIDEODRIVER=dummy "$build/launcher_host" "$font" "$build/busy-script.txt" \
+    > "$build/busy-out.txt" 2>&1 ) || { cat "$build/busy-out.txt"; exit 1; }
+python3 "$probe/tests/launcher_shot.py" check "$shots/busy-scrolled.png" 15 5 3
+echo "launcher host run: buttons are read while the covers are still being decoded"

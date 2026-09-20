@@ -1151,7 +1151,11 @@ int ui_poll( struct ui *ui, struct ui_input *input )
             y = event.motion.y;
             break;
         default:
-            if (event.type >= SDL_USEREVENT) return 0;  /* a worker has news: redraw */
+            /* A worker has news, which the frame picks up on its own: take the
+             * event and go on reading. Stopping here would spend a whole frame
+             * on one of them, and a library whose covers are all being decoded
+             * posts one an icon: the buttons behind them would wait a second
+             * each, which reads as a screen that has stopped listening. */
             continue;
         }
         ui->busy_until = SDL_GetTicks() + 220;
