@@ -678,6 +678,63 @@ static void save_program_settings( struct launcher *l, struct program *p )
     load_program_settings( l, p );
 }
 
+/* Give a game DXVK's d3d9.dll of its own.
+ *
+ * The runtime puts C:\dxvk on a game's DLL search path when its settings say
+ * DXVK, so a copy is not what makes DXVK reachable; what it does is decide for
+ * the game, since a program's own folder comes first in that search. A game
+ * that has a d3d9.dll already keeps it, whoever put it there.
+ * Returns 1 when the file was written, 0 when nothing was, and -1 on failure. */
+static int give_program_dxvk( struct launcher *l, struct program *p )
+{
+    char source[896], folder[768], target[776];
+    const char *base = launcher_dxvk_directory( p->machine );
+    char buffer[64 * 1024];
+    FILE *in, *out;
+    size_t chunk;
+    int failed = 0;
+
+    if (!base) return 0;
+    snprintf( folder, sizeof(folder), "%s", p->path );
+    parent_dir( folder );
+    if ((size_t)snprintf( target, sizeof(target), "%s/d3d9.dll", folder ) >= sizeof(target)) return -1;
+    if (file_exists( target )) return 0;
+    if ((size_t)snprintf( source, sizeof(source), "%s/drive_c/%s/d3d9.dll",
+                          l->options->runtime_dir, base ) >= sizeof(source)) return -1;
+    if (!(in = fopen( source, "rb" ))) return -1;
+    if (!(out = fopen( target, "wb" )))
+    {
+        fclose( in );
+        return -1;
+    }
+    while ((chunk = fread( buffer, 1, sizeof(buffer), in )))
+        if (fwrite( buffer, 1, chunk, out ) != chunk) { failed = 1; break; }
+    if (ferror( in ) || fclose( out ) || failed)
+    {
+        fclose( in );
+        remove( target );
+        return -1;
+    }
+    fclose( in );
+    /* What the game will load is what its settings should say it loads, so the
+     * version in its options is the one on the screen. */
+    p->settings.dxvk = 1;
+    save_program_settings( l, p );
+    return 1;
+}
+
+/* The copy a game is given when it joins the library, with what it came to said once. */
+static void give_program_dxvk_toast( struct launcher *l, struct program *p )
+{
+    if (!l->options->dxvk_on_add) return;
+    switch (give_program_dxvk( l, p ))
+    {
+    case 1: ui_toast( &l->ui, "DXVK's d3d9.dll copied into the game's folder", 2200 ); break;
+    case -1: ui_toast( &l->ui, "Could not copy DXVK's d3d9.dll into the game's folder", 2500 ); break;
+    default: break;
+    }
+}
+
 /***********************************************************************
  * Icons
  */
@@ -2579,6 +2636,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
                 save_library( l );
                 ui_toast( ui, "Added to the library", 1500 );
                 p = &l->programs[index];
+                give_program_dxvk_toast( l, p );
             }
             break;
         }
@@ -2591,7 +2649,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
 enum settings_row
 {
-    SET_HIDDEN, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_CONTROLS, SET_STEAMGRIDDB,
+    SET_HIDDEN, SET_DXVK_ON_ADD, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_CONTROLS, SET_STEAMGRIDDB,
     SET_REOPEN, SET_FORWARDER, SET_MAKE_32BIT, SET_MAKE_MAIN,
     SET_CREDITS, SETTINGS_ROWS
 };
@@ -3005,7 +3063,7 @@ static void settings_menu( struct launcher *l )
         int i;
         static const unsigned char row_section[SETTINGS_ROWS] =
         {
-            [SET_HIDDEN] = SET_SECTION_LIBRARY,
+            [SET_HIDDEN] = SET_SECTION_LIBRARY, [SET_DXVK_ON_ADD] = SET_SECTION_LIBRARY,
             [SET_VERBOSE] = SET_SECTION_DEFAULTS, [SET_PROFILE] = SET_SECTION_DEFAULTS,
             [SET_WINDOWS] = SET_SECTION_DEFAULTS, [SET_CONTROLS] = SET_SECTION_DEFAULTS,
             [SET_STEAMGRIDDB] = SET_SECTION_ARTWORK,
@@ -3027,6 +3085,12 @@ static void settings_menu( struct launcher *l )
         rows[SET_HIDDEN].help = "Programs hidden from a game's own settings are listed again.";
         rows[SET_HIDDEN].kind = UI_ROW_SWITCH;
         rows[SET_HIDDEN].on = l->show_hidden;
+        snprintf( rows[SET_DXVK_ON_ADD].label, sizeof(rows[0].label), "Give a new game DXVK" );
+        snprintf( rows[SET_DXVK_ON_ADD].value, sizeof(rows[0].value), "%s", on_off[!!l->options->dxvk_on_add] );
+        rows[SET_DXVK_ON_ADD].kind = UI_ROW_SWITCH;
+        rows[SET_DXVK_ON_ADD].on = !!l->options->dxvk_on_add;
+        rows[SET_DXVK_ON_ADD].help = "A game added to the library is given a copy of DXVK's d3d9.dll and set to "
+                                     "draw with it. A game that has one of its own keeps it.";
         snprintf( rows[SET_VERBOSE].label, sizeof(rows[0].label), "Verbose traces" );
         snprintf( rows[SET_VERBOSE].value, sizeof(rows[0].value), "%s", on_off[!!l->options->verbose] );
         rows[SET_VERBOSE].kind = UI_ROW_SWITCH;
@@ -3118,6 +3182,7 @@ static void settings_menu( struct launcher *l )
         case SET_VERBOSE: l->options->verbose = !l->options->verbose; break;
         case SET_PROFILE: l->options->profile = !l->options->profile; break;
         case SET_WINDOWS: l->options->framebuffer = !l->options->framebuffer; break;
+        case SET_DXVK_ON_ADD: l->options->dxvk_on_add = !l->options->dxvk_on_add; break;
         case SET_REOPEN: l->options->reopen_launcher = !l->options->reopen_launcher; break;
         case SET_CONTROLS:
             if (action != UI_ACTION_CHOOSE) break;
@@ -3513,6 +3578,7 @@ static int add_game( struct launcher *l )
         l->program_count--;
         return -1;
     }
+    give_program_dxvk_toast( l, &l->programs[index] );
     launcher_log( "[LAUNCHER] Added %s to the library", path );
     ui_toast( &l->ui, "Game added to the library", 1800 );
     return index;

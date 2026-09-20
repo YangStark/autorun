@@ -1355,7 +1355,7 @@ static int read_bool_file( const char *path )
 static struct wine_nx_config runtime_config;
 static int runtime_config_moved;  /* a setting was found in the file it used to be */
 /* Read at the start, wanted on the way out, when the card may be busy. */
-static int runtime_loader_anyway, runtime_reopen_launcher;
+static int runtime_loader_anyway, runtime_reopen_launcher, runtime_dxvk_on_add;
 
 /* A setting, with the file it used to be for a card written by an earlier
  * build. The file is read only when the settings file has nothing to say, and
@@ -3325,6 +3325,10 @@ int main( int argc, char **argv )
     /* Both are wanted on the way out, when the card is a poor thing to ask. */
     runtime_loader_anyway = config_bool( "hand-the-process-back-anyway", 0, "loader-anyway.txt", 0 );
     runtime_reopen_launcher = config_bool( "reopen-the-launcher-on-exit", 0, "reload-launcher.txt", 0 );
+    /* A game added to the library is given DXVK's d3d9.dll, which is what
+     * decides for it: a program's own folder comes before C:\\dxvk in its
+     * DLL search. */
+    runtime_dxvk_on_add = config_bool( "dxvk-for-new-games", 1, "dxvk-for-new-games.txt", 0 );
     if (runtime_config_moved && wine_nx_config_save( &runtime_config, CONFIG_FILE ))
         log_line( "[CONFIG] settings written to %s", CONFIG_FILE );
 #ifdef WINE_NX_MESA_SWITCH
@@ -3391,6 +3395,7 @@ int main( int argc, char **argv )
 #endif
             .address_space_bits = runtime_address_space_bits(),
         .reopen_launcher = runtime_reopen_launcher,
+            .dxvk_on_add = runtime_dxvk_on_add,
             .title_id = runtime_title_id(),
             .list_titles = launcher_titles,
             .launch_title = launcher_launch_title,
@@ -3437,6 +3442,8 @@ int main( int argc, char **argv )
         wine_nx_config_set_bool( &runtime_config, "windows-through-opengl", !options.framebuffer );
         wine_nx_config_set_bool( &runtime_config, "reopen-the-launcher-on-exit", options.reopen_launcher );
         runtime_reopen_launcher = options.reopen_launcher;
+        wine_nx_config_set_bool( &runtime_config, "dxvk-for-new-games", options.dxvk_on_add );
+        runtime_dxvk_on_add = options.dxvk_on_add;
         wine_nx_config_save( &runtime_config, CONFIG_FILE );
         if (!chosen)
         {

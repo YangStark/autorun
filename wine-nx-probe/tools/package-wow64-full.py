@@ -240,6 +240,7 @@ config.mkdir(parents=True, exist_ok=True)
   "windows-through-opengl": true,
   "vulkan-probe": false,
   "reopen-the-launcher-on-exit": false,
+  "dxvk-for-new-games": true,
   "hand-the-process-back-anyway": false,
   "gl-pinned-buffers-cached": true,
   "gl-clean-before-submit": true,

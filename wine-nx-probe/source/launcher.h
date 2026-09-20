@@ -60,6 +60,7 @@ struct wine_nx_launcher_options
     int profile;
     int framebuffer;
     int reopen_launcher;  /* come back here when a program ends, rather than to the menu */
+    int dxvk_on_add;      /* a game added to the library is given DXVK's d3d9.dll */
 };
 
 /* Show the launcher. Returns 1 with the chosen program's path in target, or 0
