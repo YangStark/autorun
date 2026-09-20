@@ -3324,7 +3324,7 @@ int main( int argc, char **argv )
               wine_nx_compositor_mode ? "the OpenGL compositor" : "the framebuffer" );
     /* Both are wanted on the way out, when the card is a poor thing to ask. */
     runtime_loader_anyway = config_bool( "hand-the-process-back-anyway", 0, "loader-anyway.txt", 0 );
-    runtime_reopen_launcher = config_bool( "reopen-the-launcher-on-exit", 0, "reload-launcher.txt", 0 );
+    runtime_reopen_launcher = config_bool( "reopen-the-launcher-on-exit", 1, "reload-launcher.txt", 0 );
     /* A game added to the library is given DXVK's d3d9.dll, which is what
      * decides for it: a program's own folder comes before C:\\dxvk in its
      * DLL search. */
