@@ -45,7 +45,7 @@
 #include "steamgriddb.h"
 
 #define ICON_SIDE      128    /* icons are decoded no larger than this */
-#define ICON_TEXTURES  12     /* at most 12 MiB with 512px artwork */
+#define ICON_TEXTURES  48     /* a screenful, the row below it and the backdrop, at 1 MiB each */
 #define ICON_JOBS      64
 #define MAX_FILES      1024
 #define FOOTER_SPACE   38
@@ -193,6 +193,9 @@ struct launcher
     struct icon_result results[ICON_JOBS];
     int result_count;
     unsigned int icon_use;
+    /* icon_use as the last frame began to draw: what stands above it was asked
+     * for by that frame, so it is on the screen and must not be thrown away. */
+    unsigned int icon_frame;
     Uint32 icon_event;
 };
 
@@ -886,8 +889,12 @@ static void pump_icons( struct launcher *l )
         oldest = -1;
         for (i = 0; i < l->program_count; i++)
             if ((l->programs[i].icon || l->programs[i].square_icon || l->programs[i].hero_icon) &&
+                l->programs[i].icon_use <= l->icon_frame &&
                 (oldest < 0 || l->programs[i].icon_use < l->programs[oldest].icon_use))
                 oldest = i;
+        /* Everything held is on the screen now: keep it and let the frame be
+         * over the limit rather than throw away a cover about to be drawn. */
+        if (oldest < 0) break;
         if (l->programs[oldest].hero_icon)
         {
             SDL_DestroyTexture( l->programs[oldest].hero_icon );
@@ -3362,6 +3369,7 @@ static int run_library( struct launcher *l, char *target, size_t size )
             if (!ui->running) return 0;
         }
         if (!ui->running) break;
+        l->icon_frame = l->icon_use;
         if (home) draw_home( l );
         else draw_library( l );
         ui_present( ui );
