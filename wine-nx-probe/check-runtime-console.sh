@@ -62,5 +62,7 @@ python3 "$root/wine-nx-probe/tests/check_horizon_backings.py"
 python3 "$root/wine-nx-probe/tests/check_horizon_sections.py"
 python3 "$root/wine-nx-probe/tests/check_horizon_image_info.py"
 python3 "$root/wine-nx-probe/tests/check_memory_status.py"
+python3 "$root/wine-nx-probe/tests/check_sims2_setup.py"
+python3 "$root/wine-nx-probe/tests/check_sims2_layout.py"
 python3 "$root/wine-nx-probe/tests/check_horizon_sock_bind.py"
 python3 "$root/wine-nx-probe/tools/make-7zr-tree.py" "$build/drive_c" >/dev/null

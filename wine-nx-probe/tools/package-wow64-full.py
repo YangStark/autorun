@@ -162,14 +162,22 @@ assert 'Arch: i386\n' in readobj('--file-headers', sims2 / 'sims2-setup.exe')
 (sims2 / 'README.txt').write_text('''The Sims 2 Ultimate Collection
 ==============================
 
-Copy the release's Base, EP1-EP9 and SP1-SP8 folders into C:\\The Sims 2 on the
-card -- leave __Installer and Support behind, they are for a computer -- and run
-sims2-setup.exe once from the launcher. It writes what the release's own
-"Instalar Registros" batch file writes, with the card's paths, and says what it
-did in wine-nx-runtime.log as [SIMS2 SETUP] lines. Running it again is harmless.
+Copy the collection onto the card -- leave __Installer and Support behind, they
+are for a computer -- and run sims2-setup.exe once from the launcher. It writes
+what the release's own "Instalar Registros" batch file writes, with the card's
+paths, and says what it did in wine-nx-runtime.log as [SIMS2 SETUP] lines.
+Running it again is harmless.
 
-The game is then C:\\The Sims 2\\EP9\\TSBin\\Sims2EP9.exe, which is the one
-executable the collection has; it relocates, so it needs no forwarder.
+Where the packs go does not matter much. Each one is recognised by the
+executable in its TSBin, not by the name of the folder around it, so a release
+that calls them Base and EP1-EP9 and one that spells out "The Sims 2 Nightlife"
+both work, and the collection may keep a folder of its own around them. Put
+sims2-setup.exe's folder beside the packs, or beside the folder holding them.
+
+The game is the newest expansion's executable, TSBin\\Sims2EP9.exe. It has no
+relocations and is linked for 0x400000, so it needs a 32-bit forwarder, and
+even then it only starts when nothing else has taken that address: a run that
+says "[IMAGE] this program cannot be moved" wants trying again.
 
 The game's own movies -- the intro, the EA logo, what plays on a television --
 are .movie files in Maxis' own format, which the game reads itself: they need no
