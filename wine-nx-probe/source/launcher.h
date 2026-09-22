@@ -51,6 +51,7 @@ struct wine_nx_launcher_options
     /* Whether an application is still installed: the one named as the 32-bit
      * forwarder may have been deleted since it was named. */
     int (*title_installed)( unsigned long long id );
+    int (*schedule_restart)(void);
     /* Build a forwarder for this program and install it. bits is 32 or 39;
      * returns 0, leaving step pointing at what failed otherwise. */
     unsigned int (*install_forwarder)( int bits, const char *name, unsigned long long *id, const char **step );
@@ -60,7 +61,7 @@ struct wine_nx_launcher_options
     int profile;
     int framebuffer;
     int reopen_launcher;  /* come back here when a program ends, rather than to the menu */
-    int dxvk_on_add;      /* a game added to the library is given DXVK's d3d9.dll */
+    int dxvk_on_add;      /* a game added to the library starts with DXVK enabled */
 };
 
 /* Show the launcher. Returns 1 with the chosen program's path in target, or 0

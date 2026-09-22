@@ -56,6 +56,13 @@ for name in ('APPDATA', 'LOCALAPPDATA', 'USERPROFILE'):
     if value and user_name:
         check(value.group(1).startswith('C:\\\\users\\\\%s' % user_name),
               f'{name} is {value.group(1)!r}, which is not under the profile')
+# Anything else in the environment that names a folder under users\ names this
+# profile: DXVK_CONFIG_FILE came in pointing at users\wine, where the runtime
+# no longer writes the file it names, so DXVK would never have found it.
+block = runtime[runtime.index('runtime_environment[] ='):]
+block = block[:block.index(';')]
+for folder in re.findall(r'users\\\\([^\\"]+)', block):
+    check(folder == user_name, f'the environment names users\\{folder}, not the profile {user_name}')
 check('"USERNAME=%s\\0"' % user_name in runtime,
       f'USERNAME does not answer {user_name!r}, the name GetUserName gives')
 check('"HOMEPATH=\\\\users\\\\%s\\0"' % user_name in runtime,

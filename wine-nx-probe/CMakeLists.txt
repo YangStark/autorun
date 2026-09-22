@@ -610,6 +610,9 @@ add_executable(wine-nx-runtime
     source/launcher_ui.c
     source/steamgriddb.c
     source/dxvk_releases.c
+    source/autorun_update.c
+    source/autorun_install.c
+    source/launcher_update.c
     source/runtime_platform.c
     source/sd_cache.c
     source/wow64_box64_bridge.c
@@ -692,6 +695,43 @@ endif()
 set_source_files_properties(source/forwarder.c PROPERTIES COMPILE_OPTIONS "-std=gnu11")
 set_source_files_properties(source/audio_unix.c source/xinput_unix.c PROPERTIES COMPILE_DEFINITIONS WINE_UNIX_LIB)
 target_include_directories(wine-nx-runtime PRIVATE "${WINE_NX_PE_BUILD_DIR}/include")
+find_package(Git QUIET)
+set(AUTORUN_BUILD_TAG "")
+set(AUTORUN_BUILD_EPOCH 0)
+if(GIT_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --exact-match HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.." OUTPUT_VARIABLE AUTORUN_BUILD_TAG
+        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" log -1 --format=%ct
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.." OUTPUT_VARIABLE AUTORUN_BUILD_EPOCH
+        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --git-path HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.." OUTPUT_VARIABLE AUTORUN_GIT_HEAD
+        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" symbolic-ref -q HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.." OUTPUT_VARIABLE AUTORUN_GIT_REF
+        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(AUTORUN_GIT_HEAD)
+        get_filename_component(AUTORUN_GIT_HEAD "${AUTORUN_GIT_HEAD}" ABSOLUTE
+            BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${AUTORUN_GIT_HEAD}")
+    endif()
+    if(AUTORUN_GIT_REF)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --git-path "${AUTORUN_GIT_REF}"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.." OUTPUT_VARIABLE AUTORUN_GIT_REF_PATH
+            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        get_filename_component(AUTORUN_GIT_REF_PATH "${AUTORUN_GIT_REF_PATH}" ABSOLUTE
+            BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${AUTORUN_GIT_REF_PATH}")
+    endif()
+endif()
+if(NOT AUTORUN_BUILD_EPOCH MATCHES "^[0-9]+$")
+    set(AUTORUN_BUILD_EPOCH 0)
+endif()
+configure_file(cmake/autorun_version.h.in autorun_version.h @ONLY)
+target_include_directories(wine-nx-runtime PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 option(WINE_NX_USB_STORAGE "Mount USB drives as D: to H: through libusbhsfs" OFF)
 if(WINE_NX_USB_STORAGE)
@@ -764,7 +804,9 @@ find_library(SWITCH_HARFBUZZ harfbuzz HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib
 find_library(SWITCH_PNG png HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_BZ2 bz2 HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_Z z HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+find_library(SWITCH_ZSTD zstd HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib" REQUIRED)
 find_library(SWITCH_CURL curl HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+find_library(SWITCH_MINIZIP minizip HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib" REQUIRED)
 find_library(SWITCH_MBEDTLS mbedtls HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_MBEDX509 mbedx509 HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_MBEDCRYPTO mbedcrypto HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
@@ -807,7 +849,6 @@ if(WINE_NX_MESA_SWITCH_DIR)
         list(APPEND SWITCH_EGL "${WINE_NX_MESA_SWITCH_DIR}/lib${lib}.a")
     endforeach()
     find_library(SWITCH_EXPAT expat HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
-    find_library(SWITCH_ZSTD zstd HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
     list(APPEND SWITCH_EGL ${SWITCH_EXPAT} ${SWITCH_ZSTD} ${SWITCH_Z} -Wl,--end-group)
     set(SWITCH_GLAPI "")
     set(SWITCH_DRM_NOUVEAU "")
@@ -843,20 +884,25 @@ if(WINE_NX_MESA_SWITCH_DIR)
         "${CMAKE_CURRENT_SOURCE_DIR}/../dlls/winevulkan"
     )
     target_sources(wine-nx-runtime PRIVATE $<TARGET_OBJECTS:wine-winevulkan-unix-real>)
+    option(WINE_NX_LSFG "Enable the GPL LSFG-VK frame-generation backend" ON)
+    if(WINE_NX_LSFG)
+        include(cmake/LsfgVk.cmake)
+    endif()
 endif()
 # The launcher (source/launcher.c) draws with SDL2 and SDL2_ttf; SDL's GL
 # functions come through eglGetProcAddress, so it works over either Mesa.
 find_library(SWITCH_SDL2 SDL2 HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_SDL2_TTF SDL2_ttf HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
-set_source_files_properties(source/launcher.c source/launcher_catalog.c source/launcher_ui.c source/steamgriddb.c source/dxvk_releases.c PROPERTIES
+set_source_files_properties(source/launcher.c source/launcher_catalog.c source/launcher_ui.c source/launcher_update.c source/steamgriddb.c source/dxvk_releases.c PROPERTIES
     INCLUDE_DIRECTORIES "$ENV{DEVKITPRO}/portlibs/switch/include/SDL2"
     COMPILE_DEFINITIONS _REENTRANT)
+set_property(SOURCE source/launcher_update.c APPEND PROPERTY COMPILE_DEFINITIONS WINE_NX_BUILD_VERSION)
 # The mark in the corner is only there in the build that generates it.
 set_property(SOURCE source/launcher.c APPEND PROPERTY COMPILE_DEFINITIONS WINE_NX_HAS_EMBEDDED_LOGO)
 target_link_libraries(wine-nx-runtime PRIVATE
     ${SWITCH_SDL2_TTF} ${SWITCH_SDL2}
-    ${SWITCH_CURL} ${SWITCH_MBEDTLS} ${SWITCH_MBEDX509} ${SWITCH_MBEDCRYPTO}
-    ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_HARFBUZZ}
+    ${SWITCH_CURL} ${SWITCH_MBEDTLS} ${SWITCH_MBEDX509} ${SWITCH_MBEDCRYPTO} ${SWITCH_MINIZIP}
+    ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_ZSTD} ${SWITCH_HARFBUZZ}
     ${SWITCH_EGL} ${SWITCH_GLAPI} ${SWITCH_DRM_NOUVEAU} stdc++ nx m)
 
 find_program(NACPTOOL nacptool HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")

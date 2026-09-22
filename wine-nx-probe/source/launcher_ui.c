@@ -334,6 +334,7 @@ int ui_init( struct ui *ui, const void *font_data, size_t font_size, int animati
     ui->panel = (SDL_Color){ 12, 16, 17, 242 };
     ui->card = (SDL_Color){ 27, 33, 32, 245 };
     ui->focus = (SDL_Color){ 42, 49, 46, 252 };
+    ui->success = (SDL_Color){ 112, 218, 146, 255 };
     ui->danger = (SDL_Color){ 255, 120, 120, 255 };
 
     SDL_SetMainReady();
@@ -913,18 +914,50 @@ float ui_highlight( struct ui *ui, float target_y )
 
 void ui_toast( struct ui *ui, const char *text, int milliseconds )
 {
+    ui->toast_notice = 0;
     snprintf( ui->toast, sizeof(ui->toast), "%s", text );
-    ui->toast_until = SDL_GetTicks() + milliseconds;
+    ui->toast_since = SDL_GetTicks();
+    ui->toast_until = ui->toast_since + milliseconds;
 }
+
+void ui_notice( struct ui *ui, const char *text )
+{
+    ui_toast( ui, text, 4000 );
+    ui->toast_notice = 1;
+}
+
+static void ui_download_icon( struct ui *ui, int x, int y, SDL_Color color );
 
 void ui_draw_toast( struct ui *ui )
 {
     Uint32 now = SDL_GetTicks();
-    int w, h, alpha;
+    int w, h, alpha, y;
+    float open = 1.0f;
     SDL_Color card, text;
 
     if (!ui->toast[0] || now >= ui->toast_until) return;
-    alpha = ui->toast_until - now < 200 ? 255 * (ui->toast_until - now) / 200 : 255;
+    if (ui->animations)
+    {
+        open = clampf( (now - ui->toast_since) / 240.0f, 0, 1 );
+        if (ui->toast_until - now < 240) open = (ui->toast_until - now) / 240.0f;
+        open = open * open * (3 - 2 * open);
+    }
+    alpha = (int)(255 * open);
+    if (ui->toast_notice)
+    {
+        w = ui_text_width( ui, ui->small, ui->toast ) + 68;
+        h = 48;
+        int x = ui->width - w - 32;
+        y = UI_HEADER_HEIGHT + 14 - (int)(12 * (1 - open));
+        ui_rounded( ui, x + 2, y + 4, w, h, 14, (SDL_Color){0,0,0,80 * alpha / 255} );
+        ui_rounded( ui, x, y, w, h, 14, (SDL_Color){28,33,37,248 * alpha / 255} );
+        ui_outline( ui, x, y, w, h, 14, 1, (SDL_Color){218,228,235,50 * alpha / 255} );
+        ui_download_icon( ui, x + 16, y + 14, (SDL_Color){235,240,243,alpha} );
+        ui_text( ui, ui->small, x + 46, y + (h - TTF_FontHeight( ui->small )) / 2,
+                 ui->toast, (SDL_Color){235,240,243,alpha} );
+        return;
+    }
+    y = ui->height - 78 + (int)(18 * (1 - open));
     /* Between the list panel and the footer. */
     w = ui_text_width( ui, ui->small, ui->toast ) + 40;
     if (w > ui->width - 80) w = ui->width - 80;
@@ -934,8 +967,8 @@ void ui_draw_toast( struct ui *ui )
     if (ui->selection.r * 3 + ui->selection.g * 6 + ui->selection.b < 1600)
         text = (SDL_Color){ 255, 255, 255, alpha };
     else text = (SDL_Color){ 10, 14, 20, alpha };
-    ui_rounded( ui, (ui->width - w) / 2, ui->height - 78, w, h, h / 2, card );
-    ui_text_fit( ui, ui->small, (ui->width - w) / 2 + 20, ui->height - 78 + 6, w - 40, ui->toast, text, 0 );
+    ui_rounded( ui, (ui->width - w) / 2, y, w, h, h / 2, card );
+    ui_text_fit( ui, ui->small, (ui->width - w) / 2 + 20, y + 6, w - 40, ui->toast, text, 0 );
 }
 
 /***********************************************************************
@@ -998,6 +1031,7 @@ static void repeat_held( struct ui *ui )
 int ui_begin_frame( struct ui *ui )
 {
     if (!ui->running || !platform_running()) return ui->running = 0;
+    if (ui->background_tick) ui->background_tick( ui->background_data );
     if (ui->controller && !SDL_GameControllerGetAttached( ui->controller ))
     {
         SDL_GameControllerClose( ui->controller );
@@ -1186,12 +1220,12 @@ void (*ui_present_hook)( SDL_Renderer *renderer );
 
 void ui_present( struct ui *ui )
 {
-    ui_draw_toast( ui );
     if (ui->screen)
     {
         SDL_SetRenderTarget( ui->renderer, NULL );
         SDL_RenderCopy( ui->renderer, ui->screen, NULL, NULL );
     }
+    ui_draw_toast( ui );
     if (ui_present_hook) ui_present_hook( ui->renderer );
     SDL_RenderPresent( ui->renderer );
 }
@@ -1513,6 +1547,13 @@ static void ui_download_icon( struct ui *ui, int x, int y, SDL_Color color )
 static void ui_chevron_down( struct ui *ui, int x, int y, SDL_Color color );
 static void ui_chevron_up( struct ui *ui, int x, int y, SDL_Color color );
 
+static SDL_Color ui_value_color( const struct ui *ui, const struct ui_row *row, int current )
+{
+    if (row->value_tone == UI_VALUE_SUCCESS) return ui->success;
+    if (row->value_tone == UI_VALUE_DANGER) return ui->danger;
+    return current ? ui->value : ui->dim;
+}
+
 enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *title, const char *context,
                             const struct ui_row *rows, int count, int can_reset )
 {
@@ -1673,7 +1714,7 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
             if (value_w)
                 ui_text_fit( ui, ui->small, value_right - icon_w - disclosure_w - value_max,
                              text_y + (TTF_FontHeight( ui->normal ) - TTF_FontHeight( ui->small )) / 2,
-                             column_w / 3, rows[i].value, current ? ui->value : ui->dim, current );
+                             column_w / 3, rows[i].value, ui_value_color( ui, rows + i, current ), current );
             if (rows[i].download)
                 ui_download_icon( ui, value_right - disclosure_w - 20, y + (ROW_HEIGHT - 19) / 2,
                                   current ? ui->value : ui->dim );
@@ -1802,17 +1843,11 @@ int ui_settings_dropdown( struct ui *ui, const struct ui_list *anchor,
     if (count <= 0) return -1;
     if (selection < 0 || selection >= count) selection = 0;
     x = ui->width - UI_HEADER_MARGIN - ROW_PADDING - panel_w;
-    y = LIST_TOP + (anchor->selection - anchor->top + 1) * SET_ROW_H - 6;
-    visible = (ui->height - 58 - y - 2 * padding) / row_h;
-    if (visible > max_visible) visible = max_visible;
-    if (visible > count) visible = count;
-    if (visible < 2)
-    {
-        visible = count < max_visible ? count : max_visible;
-        y = LIST_TOP + (anchor->selection - anchor->top) * SET_ROW_H - visible * row_h - 2 * padding + 4;
-        if (y < UI_HEADER_HEIGHT + 8) y = UI_HEADER_HEIGHT + 8;
-    }
+    visible = count < max_visible ? count : max_visible;
     h = visible * row_h + 2 * padding;
+    y = LIST_TOP + (anchor->selection - anchor->top + 1) * SET_ROW_H - 6;
+    if (y + h > ui->height - 58) y = ui->height - 58 - h;
+    if (y < UI_HEADER_HEIGHT + 8) y = UI_HEADER_HEIGHT + 8;
     top = selection - visible / 2;
     if (top > count - visible) top = count - visible;
     if (top < 0) top = 0;
@@ -1882,7 +1917,7 @@ int ui_settings_dropdown( struct ui *ui, const struct ui_list *anchor,
                 if (value_w)
                     ui_text_fit( ui, ui->small, x + panel_w - 22 - icon_w - value_w,
                                  row_y + (row_h - TTF_FontHeight( ui->small )) / 2,
-                                 value_w, rows[i].value, current ? ui->value : ui->dim, current );
+                                 value_w, rows[i].value, ui_value_color( ui, rows + i, current ), current );
                 if (rows[i].download)
                     ui_download_icon( ui, x + panel_w - 38, row_y + (row_h - 19) / 2,
                                       current ? ui->value : ui->dim );
@@ -1923,6 +1958,7 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
     const int visible = (ui->height - LIST_TOP - 86) / SET_ROW_H;
     int row_w, controls_right;
     int index[64], shown, i;
+    int deferred = -1;
     struct ui_input input;
 
     row_w = controls_right = 0;
@@ -1957,10 +1993,16 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
             {
             case UI_TOUCH_SCROLL_UP:
             case UI_TOUCH_SCROLL_DOWN:
-                list->selection += (input.touch == UI_TOUCH_SCROLL_UP ? 1 : -1) * input.steps;
-                if (list->selection >= shown) list->selection = shown - 1;
-                if (list->selection < 0) list->selection = 0;
+            {
+                int direction = input.touch == UI_TOUCH_SCROLL_UP ? 1 : -1;
+                int next = list->selection + direction * input.steps;
+
+                if (next >= shown) next = shown - 1;
+                if (next < 0) next = 0;
+                while (next >= 0 && next < shown && rows[index[next]].disabled) next += direction;
+                if (next >= 0 && next < shown) list->selection = next;
                 continue;
+            }
             case UI_TOUCH_SWIPE_LEFT:
             case UI_TOUCH_SWIPE_RIGHT:
                 if (!row->disabled && row->adjustable)
@@ -1989,6 +2031,12 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
                 row = rows + index[in_list];
                 if (row->disabled) continue;
                 if (row->adjustable) return input.x >= SET_ROW_X + row_w / 2 ? UI_ACTION_RIGHT : UI_ACTION_LEFT;
+                if (row->kind == UI_ROW_DROPDOWN)
+                {
+                    list->top = list->selection > 0 ? list->selection - 1 : 0;
+                    deferred = UI_ACTION_CHOOSE;
+                    break;
+                }
                 return UI_ACTION_CHOOSE;
             }
             default:
@@ -2018,6 +2066,12 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
                  * else simply happens. */
                 if (row->kind == UI_ROW_SWITCH) return UI_ACTION_CHOOSE;
                 if (row->adjustable) { list->editing = !list->editing; break; }
+                if (row->kind == UI_ROW_DROPDOWN)
+                {
+                    list->top = list->selection > 0 ? list->selection - 1 : 0;
+                    deferred = UI_ACTION_CHOOSE;
+                    break;
+                }
                 return UI_ACTION_CHOOSE;
             case UI_B:
                 if (list->editing) { list->editing = 0; break; }
@@ -2034,6 +2088,7 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
                 }
                 break;
             }
+            if (deferred >= 0) break;
             (void)section;
             if (direction && !list->editing)
             {
@@ -2104,7 +2159,8 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
             const struct ui_row *r = rows + index[i];
             int box_y = LIST_TOP + (i - list->top) * SET_ROW_H + 4, box_h = SET_ROW_H - 10;
             int current = i == list->selection, middle = box_y + box_h / 2;
-            int control_w = r->kind == UI_ROW_SWITCH ? 92 : 44 + (r->download ? 28 : 0);
+            int control_w = r->kind == UI_ROW_SWITCH ? 92 :
+                            r->kind == UI_ROW_INFO ? 0 : 44 + (r->download ? 28 : 0);
             int value_w = r->value[0] ? ui_text_width( ui, ui->small, r->value ) : 0;
             int label_w, right, label_h, help_lines, block_h, text_y;
             SDL_Color color = r->disabled ? ui->dim : r->destructive ? ui->danger : current ? ui->value : ui->text;
@@ -2149,7 +2205,7 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
                 if (value_w)
                     ui_text_fit( ui, ui->small, right - 26 - (r->download ? 28 : 0) - value_w,
                                  middle - TTF_FontHeight( ui->small ) / 2,
-                                 value_w + 4, r->value, current ? ui->value : ui->dim, current );
+                                 value_w + 4, r->value, ui_value_color( ui, r, current ), current );
                 /* The arrow says the row opens something. A row held for
                  * changing puts one on either side of the value instead, which
                  * is what left and right now do. */
@@ -2162,10 +2218,11 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
                 {
                     SDL_Color arrow = r->disabled ? ui->dim : current ? ui->value : ui->dim;
 
-                    if (r->on) ui_chevron_up( ui, right - 18, middle - 4, arrow );
+                    if (r->on || (deferred >= 0 && current))
+                        ui_chevron_up( ui, right - 18, middle - 4, arrow );
                     else ui_chevron_down( ui, right - 18, middle - 4, arrow );
                 }
-                else if (!r->adjustable)
+                else if (!r->adjustable && r->kind != UI_ROW_INFO)
                     ui_chevron( ui, right - 14, middle - 8, r->disabled ? ui->dim : current ? ui->value : ui->dim );
                 break;
             }
@@ -2209,6 +2266,7 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
         if (ui->footer_mark) ui->footer_mark( ui->header_status_data );
         ui_fade( ui );
         ui_present( ui );
+        if (deferred >= 0) return deferred;
         ui_wait( ui );
     }
     return UI_ACTION_QUIT;

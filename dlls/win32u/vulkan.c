@@ -25,9 +25,11 @@
 #include "config.h"
 
 #include <math.h>
+#include <errno.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -43,12 +45,45 @@ static PFN_vkEnumerateInstanceExtensionProperties p_vkEnumerateInstanceExtension
 
 static void *vulkan_handle;
 static struct vulkan_funcs vulkan_funcs;
+static pthread_mutex_t present_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#ifdef WINE_NX_LSFG
+#include "../../wine-nx-probe/source/lsfg.h"
+#endif
 
 #if defined(__SWITCH__) && defined(WINE_NX_MESA_SWITCH)
 /* mesa-switch's loaderless NVK (build-mesa-switch.sh) is linked into the Switch
  * runtime, which has no dynamic linker. */
 extern PFN_vkVoidFunction wine_nx_vkGetDeviceProcAddr( VkDevice device, const char *name ) __asm__("vkGetDeviceProcAddr");
 extern PFN_vkVoidFunction wine_nx_vkGetInstanceProcAddr( VkInstance instance, const char *name ) __asm__("vkGetInstanceProcAddr");
+
+static uint64_t nx_frame_interval;
+static VkPresentModeKHR nx_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+
+void wine_nx_graphics_configure( int frame_limit, int vsync )
+{
+    nx_frame_interval = frame_limit > 0 ? 1000000000ull / frame_limit : 0;
+    nx_present_mode = vsync ? VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_IMMEDIATE_KHR;
+}
+
+static void nx_pace_present( uint64_t *previous )
+{
+    struct timespec now, delay;
+    uint64_t time, remaining;
+
+    if (!nx_frame_interval || clock_gettime( CLOCK_MONOTONIC, &now )) return;
+    time = (uint64_t)now.tv_sec * 1000000000ull + now.tv_nsec;
+    if (*previous && time < *previous + nx_frame_interval)
+    {
+        remaining = *previous + nx_frame_interval - time;
+        delay.tv_sec = remaining / 1000000000ull;
+        delay.tv_nsec = remaining % 1000000000ull;
+        while (nanosleep( &delay, &delay ) && errno == EINTR) {}
+        if (clock_gettime( CLOCK_MONOTONIC, &now )) return;
+        time = (uint64_t)now.tv_sec * 1000000000ull + now.tv_nsec;
+    }
+    *previous = time;
+}
 #endif
 
 #ifdef __SWITCH__
@@ -227,6 +262,14 @@ static const char *debugstr_vkextent2d( const VkExtent2D *ext )
 struct swapchain
 {
     struct vulkan_swapchain obj;
+#ifdef WINE_NX_MESA_SWITCH
+    uint64_t nx_last_present;
+    VkPresentModeKHR nx_present_mode;
+#endif
+#ifdef WINE_NX_LSFG
+    struct wine_nx_lsfg *lsfg;
+    unsigned int lsfg_acquires;
+#endif
     struct surface *surface;
     VkExtent2D extents;
 
@@ -1066,6 +1109,10 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
             features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
             create_info->pEnabledFeatures = &features;
         }
+#ifdef WINE_NX_LSFG
+        wine_nx_lsfg_device_features( instance->host.instance, physical_device->host.physical_device,
+                                     features2 ? &features2->features : &features );
+#endif
 }
 
     if (device->extensions.has_VK_WINE_openvr_device_extensions)
@@ -2785,6 +2832,12 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     VkSwapchainCreateInfoKHR create_info_host = *create_info;
     VkSurfaceCapabilitiesKHR capabilities;
     VkSwapchainKHR host_swapchain;
+#ifdef WINE_NX_LSFG
+    BOOL lsfg;
+#endif
+#ifdef WINE_NX_MESA_SWITCH
+    VkSwapchainPresentModesCreateInfoKHR *present_modes;
+#endif
     RECT client_rect;
     VkResult res;
 
@@ -2859,6 +2912,37 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
                    create_info_host.imageFormat );
     }
 
+#ifdef WINE_NX_MESA_SWITCH
+    create_info_host.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    if (nx_present_mode != VK_PRESENT_MODE_FIFO_KHR)
+    {
+        VkPresentModeKHR *modes;
+        uint32_t count = 0;
+
+        if (!instance->p_vkGetPhysicalDeviceSurfacePresentModesKHR( physical_device->host.physical_device,
+              create_info_host.surface, &count, NULL ) && count && (modes = malloc( count * sizeof(*modes) )))
+        {
+            if (!instance->p_vkGetPhysicalDeviceSurfacePresentModesKHR( physical_device->host.physical_device,
+                  create_info_host.surface, &count, modes ))
+                for (uint32_t i = 0; i < count; ++i)
+                    if (modes[i] == nx_present_mode) create_info_host.presentMode = nx_present_mode;
+            free( modes );
+        }
+    }
+#endif
+#ifdef WINE_NX_LSFG
+    lsfg = wine_nx_lsfg_prepare_swapchain( instance->host.instance, physical_device->host.physical_device,
+                                          &create_info_host );
+#endif
+#ifdef WINE_NX_MESA_SWITCH
+    swapchain->nx_present_mode = create_info_host.presentMode;
+    present_modes = (void *)find_next_struct( (const void *)&create_info_host, VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR );
+    if (present_modes)
+    {
+        present_modes->presentModeCount = 1;
+        present_modes->pPresentModes = &create_info_host.presentMode;
+    }
+#endif
     if ((res = device->p_vkCreateSwapchainKHR( device->host.device, &create_info_host, NULL, &host_swapchain )))
     {
         free( swapchain );
@@ -2892,6 +2976,11 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
               debugstr_vkextent2d(&swapchain->extents), debugstr_vkextent2d(&swapchain->host_extents) );
     }
 
+#ifdef WINE_NX_LSFG
+    if (lsfg)
+        swapchain->lsfg = wine_nx_lsfg_create( instance->host.instance, physical_device->host.physical_device,
+                                             device->host.device, host_swapchain, &create_info_host );
+#endif
     *ret = swapchain->obj.client.swapchain;
     return VK_SUCCESS;
 }
@@ -2906,6 +2995,9 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
     if (!swapchain) return;
 
+#ifdef WINE_NX_LSFG
+    wine_nx_lsfg_destroy( swapchain->lsfg );
+#endif
     if (swapchain->fshack_dpi)
     {
         for (uint32_t i = 0; i < swapchain->n_images; ++i)
@@ -2949,7 +3041,23 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     acquire_info_host.swapchain = swapchain->obj.host.swapchain;
     acquire_info_host.semaphore = semaphore ? semaphore->host.semaphore : 0;
     acquire_info_host.fence = fence ? fence->host.fence : 0;
+#ifdef WINE_NX_LSFG
+    if (swapchain->lsfg)
+    {
+        pthread_mutex_lock( &present_lock );
+        ++swapchain->lsfg_acquires;
+        pthread_mutex_unlock( &present_lock );
+    }
+#endif
     res = device->p_vkAcquireNextImage2KHR( device->host.device, &acquire_info_host, image_index );
+#ifdef WINE_NX_LSFG
+    if (swapchain->lsfg)
+    {
+        pthread_mutex_lock( &present_lock );
+        --swapchain->lsfg_acquires;
+        pthread_mutex_unlock( &present_lock );
+    }
+#endif
 
     if (!res && swapchain_fshack_changed( swapchain, surface ))
     {
@@ -2979,9 +3087,25 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     RECT client_rect;
     VkResult res;
 
+#ifdef WINE_NX_LSFG
+    if (swapchain->lsfg)
+    {
+        pthread_mutex_lock( &present_lock );
+        ++swapchain->lsfg_acquires;
+        pthread_mutex_unlock( &present_lock );
+    }
+#endif
     res = device->p_vkAcquireNextImageKHR( device->host.device, swapchain->obj.host.swapchain, timeout,
                                               semaphore ? semaphore->host.semaphore : 0, fence ? fence->host.fence : 0,
                                               image_index );
+#ifdef WINE_NX_LSFG
+    if (swapchain->lsfg)
+    {
+        pthread_mutex_lock( &present_lock );
+        --swapchain->lsfg_acquires;
+        pthread_mutex_unlock( &present_lock );
+    }
+#endif
 
     if (!res && swapchain_fshack_changed( swapchain, surface ))
     {
@@ -3328,8 +3452,6 @@ done:
 
 static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentInfoKHR *client_present_info )
 {
-    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-
     VkPresentInfoKHR *present_info = (VkPresentInfoKHR *)client_present_info; /* cast away const, it has been copied in the thunks */
     struct vulkan_queue *queue = vulkan_queue_from_handle( client_queue );
     struct vulkan_device *device = queue->device;
@@ -3429,9 +3551,36 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         present_info->pWaitSemaphores = &blit_sema;
     }
 
-    pthread_mutex_lock( &lock );
+    pthread_mutex_lock( &present_lock );
+#ifdef WINE_NX_MESA_SWITCH
+    if (present_info->swapchainCount)
+    {
+        VkSwapchainPresentModeInfoKHR *modes;
+        VkPresentModeKHR *values;
+
+        nx_pace_present( &swapchain_from_handle( client_swapchains[0] )->nx_last_present );
+        modes = (void *)find_next_struct( (const void *)present_info, VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_KHR );
+        if (modes)
+        {
+            if (!(values = mem_alloc( &pool, present_info->swapchainCount * sizeof(*values) )))
+            {
+                pthread_mutex_unlock( &present_lock );
+                goto failed;
+            }
+            for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+                values[i] = swapchain_from_handle( client_swapchains[i] )->nx_present_mode;
+            modes->pPresentModes = values;
+        }
+    }
+#endif
+#ifdef WINE_NX_LSFG
+    if (!present_info->swapchainCount ||
+        !wine_nx_lsfg_present( swapchain_from_handle( client_swapchains[0] )->lsfg,
+                               queue->host.queue, queue->info.queueFamilyIndex,
+                               !swapchain_from_handle( client_swapchains[0] )->lsfg_acquires, present_info, &res ))
+#endif
     res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
-    pthread_mutex_unlock( &lock );
+    pthread_mutex_unlock( &present_lock );
 
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {

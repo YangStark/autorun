@@ -66,7 +66,7 @@ static void test_settings( const char *dir )
 {
     struct launcher_settings settings, back;
     struct launcher_kv kv;
-    char path[768], other[768];
+    char path[768], other[768], config[512];
 
     assert( launcher_settings_path( "sdmc:/switch/wine/drive_c/nfsu2/SPEED2.EXE", path, sizeof(path) ) );
     assert( !strcmp( path, "sdmc:/switch/wine/drive_c/nfsu2/SPEED2.wine-nx.txt" ) );
@@ -102,6 +102,23 @@ static void test_settings( const char *dir )
     assert( !strcmp( launcher_dxvk_directory( 0x014c ), "dxvk" ) );
     assert( !strcmp( launcher_dxvk_directory( 0x8664 ), "dxvk64" ) );
     assert( !launcher_dxvk_directory( 0xaa64 ) && !launcher_dxvk_directory( 0 ) );
+    assert( LAUNCHER_HUD_COUNT == 4 );
+    assert( !strcmp( launcher_hud_values[2], "api,fps,frametimes" ) );
+    assert( !strcmp( launcher_hud_values[3],
+                     "version,api,devinfo,fps,memory,frametimes,compiler" ) );
+    load_text( &kv, "dxvk-hud=api,fps,frametimes\n" );
+    launcher_settings_read( &kv, &settings );
+    assert( settings.dxvk_hud == 2 );
+    load_text( &kv, "dxvk-hud=version,api,devinfo,fps,memory,frametimes,compiler\n" );
+    launcher_settings_read( &kv, &settings );
+    assert( settings.dxvk_hud == 3 );
+    settings.dxvk_hud = LAUNCHER_HUD_COUNT;
+    assert( !launcher_settings_write( &kv, &settings ) );
+    settings.dxvk_hud = 0;
+    assert( LAUNCHER_FRAME_LIMIT_COUNT == 8 );
+    assert( launcher_dxvk_config( &settings, config, sizeof(config) ) );
+    assert( strstr( config, "dxgi.syncInterval = 1" ) );
+    assert( launcher_settings_write( &kv, &settings ) && !strstr( kv.text, "frame-limit=" ) );
     assert( launcher_dxvk_version_directory( 0x8664, "2.7.1", path, sizeof(path) ) &&
             !strcmp( path, "dxvk64\\versions\\2.7.1" ) );
     assert( launcher_dxvk_version_directory( 0x014c, "", path, sizeof(path) ) && !strcmp( path, "dxvk" ) );
@@ -111,6 +128,7 @@ static void test_settings( const char *dir )
     load_text( &kv, "# written by hand\n" );
     memset( &settings, 0, sizeof(settings) );
     settings.own_controls = settings.address_space = -1;
+    settings.vsync = settings.lsfg_performance = settings.lsfg_flow = 1;
     strcpy( settings.title, "Need for Speed" );
     settings.hidden = 1;
     settings.verbose = -1;
@@ -128,6 +146,7 @@ static void test_settings( const char *dir )
     /* Back to the global settings: only the comment stays; without it the file goes. */
     memset( &settings, 0, sizeof(settings) );
     settings.verbose = settings.profile = settings.framebuffer = settings.own_controls = settings.address_space = -1;
+    settings.vsync = settings.lsfg_performance = settings.lsfg_flow = 1;
     assert( launcher_settings_write( &kv, &settings ) && !strcmp( kv.text, "# written by hand\n" ) );
     assert( launcher_kv_save( &kv, path ) && !access( path, F_OK ) );
     load_text( &kv, "" );

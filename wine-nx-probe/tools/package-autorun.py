@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
-"""One zip with everything a card needs: the whole payload, DXVK over it.
-
-package-wow64-full.py stages Wine's files, the i386 DLLs the staged programs
-import, the test programs and the game setups, and writes them as one archive.
-package-wow64-dxvk.py builds DXVK's d3d9.dll and Wine's Vulkan DLLs for i386 as
-an overlay, for a card that already holds that payload.
-
-Someone installing Autorun wants neither half by itself, so this runs both and
-writes what they come to as autorun-NNN.zip: unzip it at the root of the card
-and everything is in switch/wine. The two halves' own archives are taken away
-afterwards, so the build folder holds the one zip.
-"""
+"""Build one SD-card archive with the x86 and AMD64 graphics runtimes."""
 from pathlib import Path
+from pathlib import PurePosixPath
 from zipfile import ZipFile, ZIP_DEFLATED
+import argparse
+import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -22,7 +16,55 @@ tools = probe / 'tools'
 build = probe / 'build-switch-wow64-dynarec'
 stage_root = build / 'full-sd-card'
 stage = stage_root / 'switch/wine'
-marker = re.search(r'nx-wow64-dynarec-(\d+)', (probe / 'source/runtime.c').read_text()).group(1)
+default_amd64 = probe / 'build-switch-amd64/wine-nx-amd64-box64-mesa-dxvk-vkd3d.zip'
+parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+parser.add_argument('--amd64', type=Path,
+                    default=Path(os.environ.get('WINE_NX_AMD64_PACKAGE', default_amd64)))
+args = parser.parse_args()
+
+
+def merge_amd64(archive, root):
+    keep = {
+        'switch/wine/run-entry.txt',
+        'switch/wine/target.txt',
+        'switch/wine/vulkan-probe.txt',
+    }
+    required = {
+        'switch/wine/build-manifest.json',
+        'switch/wine/wine-nx-runtime.nro',
+        'switch/wine/drive_c/windows/system32/winebox64ec.dll',
+        'switch/wine/drive_c/dxvk64/dxgi.dll',
+        'switch/wine/drive_c/vkd3d64/d3d12.dll',
+    }
+    with ZipFile(archive) as z:
+        assert z.testzip() is None, f'{archive} is damaged'
+        names = set()
+        for info in z.infolist():
+            path = PurePosixPath(info.filename)
+            assert path.parts[:2] == ('switch', 'wine') and '..' not in path.parts, info.filename
+            assert not ((info.external_attr >> 16) & 0o170000) == 0o120000, info.filename
+            folded = info.filename.rstrip('/').casefold()
+            assert folded not in names, info.filename
+            names.add(folded)
+        assert {name.casefold() for name in required} <= names, f'{archive} is not a full AMD64 graphics package'
+        manifest = json.loads(z.read('switch/wine/build-manifest.json'))
+        features = manifest.get('features', {})
+        for feature in ('amd64', 'dynarec', 'vulkan', 'dxvk', 'vkd3d', 'lsfg'):
+            assert features.get(feature) is True, f'{archive} has no {feature} support'
+        for info in z.infolist():
+            if info.filename.rstrip('/') in keep:
+                continue
+            destination = root.joinpath(*PurePosixPath(info.filename).parts)
+            if info.is_dir():
+                destination.mkdir(parents=True, exist_ok=True)
+            else:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(info) as source, destination.open('wb') as output:
+                    shutil.copyfileobj(source, output)
+    nro = (root / 'switch/wine/wine-nx-runtime.nro').read_bytes()
+    match = re.search(rb'nx-amd64-box64-(\d+)\0', nro)
+    assert match, f'{archive} does not contain the AMD64 runtime'
+    return match.group(1).decode()
 
 subprocess.run([sys.executable, str(tools / 'package-wow64-full.py')], check=True)
 subprocess.run([sys.executable, str(tools / 'package-wow64-dxvk.py')], check=True)
@@ -38,6 +80,8 @@ with ZipFile(overlay) as z:
         assert name.startswith('switch/wine/'), name
     z.extractall(stage_root)
 
+assert args.amd64.is_file(), f'{args.amd64} is missing; build the AMD64 DXVK/VKD3D package first'
+marker = merge_amd64(args.amd64, stage_root)
 subprocess.run([sys.executable, str(tools / 'verify-wow64-package.py'), str(stage)], check=True)
 
 archive = build / f'autorun-{marker}.zip'

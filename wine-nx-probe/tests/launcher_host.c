@@ -26,6 +26,7 @@
 #include "launcher.h"
 #include "launcher_catalog.h"
 #include "launcher_ui.h"
+#include "launcher_update.h"
 #include "dxvk_releases.h"
 
 static char script[256][300];
@@ -34,6 +35,16 @@ static char prompt_text[512];
 static int prompt_set;
 static const char *font_path;
 static unsigned char *font_data;
+
+struct launcher_update *launcher_update_create( struct ui *ui, const char *root, int (*restart)(void) )
+{
+    (void)ui; (void)root; (void)restart;
+    return NULL;
+}
+void launcher_update_tick( void *update ) { (void)update; }
+void launcher_update_open( struct launcher_update *update ) { (void)update; }
+void launcher_update_destroy( struct launcher_update *update ) { (void)update; }
+int autorun_install_finish( const char *root ) { (void)root; return 1; }
 
 int launcher_platform_font( const void **data, size_t *size )
 {
@@ -108,6 +119,28 @@ const char *dxvk_result_message( enum dxvk_result result )
 {
     (void)result;
     return "DXVK is unavailable in the host launcher test.";
+}
+
+enum dxvk_result vkd3d_release_catalog( const char *runtime_dir, struct dxvk_release *releases,
+                                       int max_releases, int *count, int refresh, int *cached )
+{
+    return dxvk_release_catalog( runtime_dir, releases, max_releases, count, refresh, cached );
+}
+
+enum dxvk_result vkd3d_install_release( const char *runtime_dir, const struct dxvk_release *release,
+                                       dxvk_progress_callback progress, void *opaque )
+{
+    return dxvk_install_release( runtime_dir, release, progress, opaque );
+}
+
+int vkd3d_release_installed( const char *runtime_dir, unsigned short machine, const char *version )
+{
+    return dxvk_release_installed( runtime_dir, machine, version );
+}
+
+int vkd3d_root_version( const char *runtime_dir, unsigned short machine, char *version, size_t size )
+{
+    return dxvk_root_version( runtime_dir, machine, version, size );
 }
 
 static int machine_of( const char *path, unsigned short *machine )

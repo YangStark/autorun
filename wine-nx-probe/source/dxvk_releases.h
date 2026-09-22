@@ -43,4 +43,11 @@ int dxvk_release_installed( const char *runtime_dir, unsigned short machine, con
 int dxvk_root_version( const char *runtime_dir, unsigned short machine, char *version, size_t size );
 const char *dxvk_result_message( enum dxvk_result result );
 
+enum dxvk_result vkd3d_release_catalog( const char *runtime_dir, struct dxvk_release *releases,
+                                       int max_releases, int *count, int refresh, int *cached );
+enum dxvk_result vkd3d_install_release( const char *runtime_dir, const struct dxvk_release *release,
+                                       dxvk_progress_callback progress, void *opaque );
+int vkd3d_release_installed( const char *runtime_dir, unsigned short machine, const char *version );
+int vkd3d_root_version( const char *runtime_dir, unsigned short machine, char *version, size_t size );
+
 #endif

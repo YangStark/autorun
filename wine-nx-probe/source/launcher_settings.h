@@ -178,7 +178,14 @@ struct launcher_settings
     int profile;      /* the sampling profiler */
     int framebuffer;  /* 1: windows go to the framebuffer, 0: through the compositor */
     int dxvk;         /* architecture-specific DXVK payload */
+    char vkd3d_version[32];
     char dxvk_version[32]; /* empty: the bundled latest release */
+    int dxvk_hud;
+    int frame_limit;
+    int vsync;
+    int lsfg_enabled;
+    int lsfg_performance;
+    int lsfg_flow;
     /* Whether the program's own keys apply over the shared ones: -1 they do
      * when it has a file of them, which is what a card written before this
      * setting existed means; 0 Autorun's keys alone, the file kept for when it
@@ -188,6 +195,37 @@ struct launcher_settings
      * -1 read it from the program itself, 0 any, 1 the low 4 GB. */
     int address_space;
 };
+
+enum { LAUNCHER_FRAME_LIMIT_COUNT = 8, LAUNCHER_HUD_COUNT = 4 };
+static const int launcher_frame_limits[] = { 0, 30, 40, 45, 60, 75, 90, 120 };
+static const char *const launcher_frame_limit_labels[] =
+    { "Off", "30", "40", "45", "60", "75", "90", "120" };
+static const char *const launcher_hud_labels[] = { "Disabled", "FPS", "Compact", "Full" };
+static const char *const launcher_hud_values[] =
+    { "0", "fps", "api,fps,frametimes", "version,api,devinfo,fps,memory,frametimes,compiler" };
+static const char *const launcher_lsfg_flow_labels[] = { "12.5%", "25%", "50%" };
+static const char *const launcher_lsfg_flow_values[] = { "0.125", "0.25", "0.5" };
+
+static inline int launcher_dxvk_config( const struct launcher_settings *settings, char *out, size_t size )
+{
+    int length;
+
+    if (settings->frame_limit < 0 || settings->frame_limit >= LAUNCHER_FRAME_LIMIT_COUNT ||
+        settings->dxvk_hud < 0 || settings->dxvk_hud >= LAUNCHER_HUD_COUNT) return 0;
+    length = snprintf( out, size, "dxgi.syncInterval = %d\nd3d9.presentInterval = %d\n",
+                       !!settings->vsync, !!settings->vsync );
+    if (length < 0 || (size_t)length >= size) return 0;
+    if (settings->frame_limit)
+    {
+        int extra = snprintf( out + length, size - length,
+                              "dxgi.maxFrameRate = %d\nd3d9.maxFrameRate = %d\ndxvk.maxFrameRate = %d\n",
+                              launcher_frame_limits[settings->frame_limit],
+                              launcher_frame_limits[settings->frame_limit],
+                              launcher_frame_limits[settings->frame_limit] );
+        if (extra < 0 || (size_t)extra >= size - length) return 0;
+    }
+    return 1;
+}
 
 static inline const char *launcher_dxvk_directory( unsigned short machine )
 {
@@ -220,6 +258,18 @@ static inline int launcher_dxvk_version_directory( unsigned short machine, const
                                                    char *out, size_t size )
 {
     const char *base = launcher_dxvk_directory( machine );
+    int length;
+
+    if (!base || !out || !size || (version && version[0] && !launcher_dxvk_version_valid( version ))) return 0;
+    if (version && version[0]) length = snprintf( out, size, "%s\\versions\\%s", base, version );
+    else length = snprintf( out, size, "%s", base );
+    return length >= 0 && (size_t)length < size;
+}
+
+static inline int launcher_vkd3d_version_directory( unsigned short machine, const char *version,
+                                                   char *out, size_t size )
+{
+    const char *base = machine == 0x014c ? "vkd3d" : machine == 0x8664 ? "vkd3d64" : NULL;
     int length;
 
     if (!base || !out || !size || (version && version[0] && !launcher_dxvk_version_valid( version ))) return 0;
@@ -292,10 +342,28 @@ static inline void launcher_settings_read( const struct launcher_kv *kv, struct 
     if (!launcher_kv_get( kv, "d3d", value, sizeof(value) ) &&
         !launcher_kv_get( kv, "d3d9", value, sizeof(value) )) value[0] = 0;
     settings->dxvk = !strcasecmp( value, "dxvk" );
+    settings->vkd3d_version[0] = 0;
+    if (launcher_kv_get( kv, "vkd3d-version", value, sizeof(value) ) && launcher_dxvk_version_valid( value ))
+        memcpy( settings->vkd3d_version, value, strlen( value ) + 1 );
     settings->dxvk_version[0] = 0;
     if (launcher_kv_get( kv, "dxvk-version", value, sizeof(value) ) && launcher_dxvk_version_valid( value ))
         memcpy( settings->dxvk_version, value, strlen( value ) + 1 );
     settings->own_controls = launcher_setting_state( kv, "own-controls" );
+    settings->dxvk_hud = 0;
+    if (launcher_kv_get( kv, "dxvk-hud", value, sizeof(value) ))
+        for (int i = 1; i < LAUNCHER_HUD_COUNT; i++)
+            if (!strcasecmp( value, launcher_hud_values[i] )) settings->dxvk_hud = i;
+    settings->frame_limit = 0;
+    if (launcher_kv_get( kv, "frame-limit", value, sizeof(value) ))
+        for (int i = 1; i < LAUNCHER_FRAME_LIMIT_COUNT; i++)
+            if (!strcasecmp( value, launcher_frame_limit_labels[i] )) settings->frame_limit = i;
+    settings->vsync = launcher_setting_state( kv, "vsync" ) != 0;
+    settings->lsfg_enabled = launcher_setting_state( kv, "lsfg" ) == 1;
+    settings->lsfg_performance = launcher_setting_state( kv, "lsfg-performance" ) != 0;
+    settings->lsfg_flow = 1;
+    if (launcher_kv_get( kv, "lsfg-flow", value, sizeof(value) ))
+        for (int i = 0; i < 3; i++)
+            if (!strcasecmp( value, launcher_lsfg_flow_values[i] )) settings->lsfg_flow = i;
     settings->address_space = -1;
     if (launcher_kv_get( kv, "address-space", value, sizeof(value) ))
     {
@@ -309,6 +377,9 @@ static inline int launcher_settings_write( struct launcher_kv *kv, const struct 
 {
     static const char *states[] = { NULL, "0", "1" };
 
+    if (settings->dxvk_hud < 0 || settings->dxvk_hud >= LAUNCHER_HUD_COUNT ||
+        settings->frame_limit < 0 || settings->frame_limit >= LAUNCHER_FRAME_LIMIT_COUNT ||
+        settings->lsfg_flow < 0 || settings->lsfg_flow >= 3) return 0;
     return launcher_kv_set( kv, "title", settings->title[0] ? settings->title : NULL ) &&
            launcher_kv_set( kv, "hidden", settings->hidden ? "1" : NULL ) &&
            launcher_kv_set( kv, "verbose", states[settings->verbose + 1] ) &&
@@ -317,7 +388,16 @@ static inline int launcher_settings_write( struct launcher_kv *kv, const struct 
                                            settings->framebuffer ? "framebuffer" : "compositor" ) &&
            launcher_kv_set( kv, "d3d9", NULL ) &&
            launcher_kv_set( kv, "d3d", settings->dxvk ? "dxvk" : NULL ) &&
+           launcher_kv_set( kv, "vkd3d-version", settings->vkd3d_version[0] ? settings->vkd3d_version : NULL ) &&
            launcher_kv_set( kv, "dxvk-version", settings->dxvk_version[0] ? settings->dxvk_version : NULL ) &&
+           launcher_kv_set( kv, "dxvk-hud", settings->dxvk_hud ? launcher_hud_values[settings->dxvk_hud] : NULL ) &&
+           launcher_kv_set( kv, "frame-limit", settings->frame_limit ?
+                            launcher_frame_limit_labels[settings->frame_limit] : NULL ) &&
+           launcher_kv_set( kv, "vsync", settings->vsync ? NULL : "0" ) &&
+           launcher_kv_set( kv, "lsfg", settings->lsfg_enabled ? "1" : NULL ) &&
+           launcher_kv_set( kv, "lsfg-performance", settings->lsfg_performance ? NULL : "0" ) &&
+           launcher_kv_set( kv, "lsfg-flow", settings->lsfg_flow == 1 ? NULL :
+                            launcher_lsfg_flow_values[settings->lsfg_flow] ) &&
            launcher_kv_set( kv, "own-controls", states[settings->own_controls + 1] ) &&
            launcher_kv_set( kv, "address-space", settings->address_space < 0 ? NULL :
                                                  settings->address_space ? "32-bit" : "any" );

@@ -66,6 +66,10 @@ The DXVK-enabled archive is `wine-nx-amd64-box64-mesa-dxvk.zip`. Select DXVK
 per title with `d3d=dxvk` or the launcher's Direct3D option; Wine remains the
 default. The older `d3d9=dxvk` setting remains readable.
 
+`tools/package-autorun.py` merges the standard
+`wine-nx-amd64-box64-mesa-dxvk-vkd3d.zip` into the full x86 package. Set
+`WINE_NX_AMD64_PACKAGE` or pass `--amd64` when the archive is elsewhere.
+
 ## First hardware checks
 
 Back up `switch/wine` before replacing the NRO and system DLLs together. Do not
