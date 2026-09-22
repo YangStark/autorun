@@ -31,12 +31,70 @@ struct sd_cache_line
     long long start;   /* file offset of data[0], or -1 while it holds nothing */
     size_t len;        /* bytes held; less than a chunk only at the end of the file */
     unsigned int lru;  /* high bit set on use, shifted down on every miss */
+    unsigned long long used_at;  /* the pool's clock when last read */
 };
 
+/* When every chunk is in use, a file takes the one read longest ago by any
+ * file. Letting a full pool refuse new files instead left everything the
+ * first few files had taken with them for as long as they were open: The
+ * Sims 2 keeps hundreds of packages open, filled the pool in its first
+ * seconds, and read every other package from the card for the rest of the
+ * run -- about eight reads a chunk while there was room, then 149,000 card
+ * reads in five minutes. held lists the lines holding a chunk. */
 struct sd_cache_pool
 {
-    unsigned int used, max;  /* chunks allocated for all files, and the limit */
+    unsigned int used, max;        /* chunks allocated for all files, and the limit */
+    unsigned long long clock;      /* counts every chunk read, across files */
+    struct sd_cache_line **held;   /* the lines holding a chunk, used of them */
 };
+
+static inline void sd_cache_held_add( struct sd_cache_pool *pool, struct sd_cache_line *line )
+{
+    pool->held[pool->used++] = line;
+}
+
+static inline void sd_cache_held_remove( struct sd_cache_pool *pool, struct sd_cache_line *line )
+{
+    unsigned int i;
+
+    for (i = 0; i < pool->used; i++)
+    {
+        if (pool->held[i] != line) continue;
+        pool->held[i] = pool->held[--pool->used];
+        break;
+    }
+    if (!pool->used)
+    {
+        free( pool->held );
+        pool->held = NULL;
+    }
+}
+
+/* A chunk changes hands without the count changing: removing it first would
+ * free the list when it held the only one. */
+static inline void sd_cache_held_replace( struct sd_cache_pool *pool, struct sd_cache_line *old,
+                                          struct sd_cache_line *line )
+{
+    unsigned int i;
+
+    for (i = 0; i < pool->used; i++)
+    {
+        if (pool->held[i] != old) continue;
+        pool->held[i] = line;
+        return;
+    }
+}
+
+/* The chunk read longest ago, by any file. */
+static inline struct sd_cache_line *sd_cache_oldest( struct sd_cache_pool *pool )
+{
+    struct sd_cache_line *oldest = NULL;
+    unsigned int i;
+
+    for (i = 0; i < pool->used; i++)
+        if (!oldest || pool->held[i]->used_at < oldest->used_at) oldest = pool->held[i];
+    return oldest;
+}
 
 struct sd_cache_file
 {
@@ -59,7 +117,7 @@ static inline void sd_cache_drop( struct sd_cache_file *file, struct sd_cache_po
     {
         if (!file->lines[i].data) continue;
         free( file->lines[i].data );
-        pool->used--;
+        sd_cache_held_remove( pool, &file->lines[i] );
         memset( &file->lines[i], 0, sizeof(file->lines[i]) );
     }
 }
@@ -141,11 +199,26 @@ static inline long long sd_cache_read( struct sd_cache_file *file, struct sd_cac
 
             if (sd_cache_known_end( file, start )) break;
             line = sd_cache_victim( file );
-            if (!line->data)
+            if (!line->data && pool->used >= pool->max)
             {
-                if (pool->used >= pool->max || !(line->data = malloc( SD_CACHE_CHUNK )))
+                /* Full: take the chunk read longest ago, whoever read it. */
+                struct sd_cache_line *old = sd_cache_oldest( pool );
+
+                if (!old) return done ? (long long)done : SD_CACHE_BYPASS;
+                line->data = old->data;
+                old->data = NULL;
+                old->start = -1;
+                old->len = 0;
+                old->lru = 0;
+                sd_cache_held_replace( pool, old, line );
+            }
+            else if (!line->data)
+            {
+                if (!pool->held && !(pool->held = calloc( pool->max, sizeof(*pool->held) )))
                     return done ? (long long)done : SD_CACHE_BYPASS;
-                pool->used++;
+                if (!(line->data = malloc( SD_CACHE_CHUNK )))
+                    return done ? (long long)done : SD_CACHE_BYPASS;
+                sd_cache_held_add( pool, line );
             }
             line->start = -1;
             line->len = 0;
@@ -156,6 +229,7 @@ static inline long long sd_cache_read( struct sd_cache_file *file, struct sd_cac
             line->len = (size_t)got;
             if (at >= start + got) break;  /* end of the file */
         }
+        line->used_at = ++pool->clock;
         skip = (size_t)(at - line->start);
         count = line->len - skip;
         if (count > size - done) count = size - done;
