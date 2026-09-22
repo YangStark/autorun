@@ -210,7 +210,7 @@ sims2-setup.exe before running it:
 # The card gets the file the launcher would have written, naming the Switch's
 # adapter the way DXVK reports it, at 720p. The game rewrites this file itself
 # once its own options are used, so the values are a starting point, not a rule.
-fallout = stage / 'drive_c/users/wine/Documents/My Games/FalloutNV'
+fallout = stage / 'drive_c/users/steamuser/Documents/My Games/FalloutNV'
 fallout.mkdir(parents=True, exist_ok=True)
 (fallout / 'FalloutPrefs.ini').write_bytes('\r\n'.join((
     '[Display]',
@@ -319,7 +319,7 @@ its own the game hands itself to FalloutNVLauncher.exe and closes, because the
 display it is told to use is not one it recognises, so the payload brings the
 settings file it would have written:
 
-    C:\\users\\wine\\Documents\\My Games\\FalloutNV\\FalloutPrefs.ini
+    C:\\users\\steamuser\\Documents\\My Games\\FalloutNV\\FalloutPrefs.ini
 
 It names the Switch's GPU as DXVK reports it, at 1280x720. The game rewrites
 that file once its own options are used; if it already holds settings worth

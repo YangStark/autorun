@@ -51,7 +51,12 @@ u32 __nx_exception_ignoredebug = 1;
 #define WINE_ROOT "sdmc:/switch/wine"
 #define WINE_DRIVE_C WINE_ROOT "/drive_c"
 #define WINE_SYSTEM_DIR WINE_DRIVE_C "/windows/system32"
-#define WINE_USER_DIR WINE_DRIVE_C "/users/wine"
+/* The profile shell32 resolves: it ignores %USERPROFILE% and builds every
+ * CSIDL_Type_User folder as ProfilesDirectory + GetUserNameW(), which this
+ * Wine answers "steamuser" (dlls/advapi32/advapi.c). A profile under any
+ * other name leaves SHGetFolderPath failing the folder-exists check, and a
+ * game that does not test the result builds its path from an empty string. */
+#define WINE_USER_DIR WINE_DRIVE_C "/users/steamuser"
 #define RUNTIME_DIR WINE_ROOT
 /* Everything a person sets, in one place. */
 #define CONFIG_DIR  RUNTIME_DIR "/config"
@@ -1586,17 +1591,17 @@ static void put_process_string( WCHAR **cursor, UNICODE_STRING *string, const ch
  * profile is where programs keep saves and settings, and where DXVK keeps
  * its shader cache (LOCALAPPDATA); its directories are made at start-up. */
 static const char runtime_environment[] =
-    "APPDATA=C:\\users\\wine\\AppData\\Roaming\0"
+    "APPDATA=C:\\users\\steamuser\\AppData\\Roaming\0"
     "HOMEDRIVE=C:\0"
-    "HOMEPATH=\\users\\wine\0"
-    "LOCALAPPDATA=C:\\users\\wine\\AppData\\Local\0"
+    "HOMEPATH=\\users\\steamuser\0"
+    "LOCALAPPDATA=C:\\users\\steamuser\\AppData\\Local\0"
     "PATH=C:\\windows\\system32;C:\\windows\0"
     "SystemDrive=C:\0"
     "SystemRoot=C:\\windows\0"
     "TEMP=C:\\windows\\temp\0"
     "TMP=C:\\windows\\temp\0"
-    "USERNAME=wine\0"
-    "USERPROFILE=C:\\users\\wine\0"
+    "USERNAME=steamuser\0"
+    "USERPROFILE=C:\\users\\steamuser\0"
     "WINE_D3D_CONFIG=cs_spin_count=64,explicit_buffer_flush=1\0"
     "windir=C:\\windows\0";
 
@@ -3262,8 +3267,19 @@ int main( int argc, char **argv )
     mkdir( WINE_USER_DIR, 0777 );
     mkdir( WINE_USER_DIR "/AppData", 0777 );
     mkdir( WINE_USER_DIR "/AppData/Local", 0777 );
+    mkdir( WINE_USER_DIR "/AppData/LocalLow", 0777 );
     mkdir( WINE_USER_DIR "/AppData/Roaming", 0777 );
+    /* SHGetFolderPath refuses a folder that is not there unless the caller
+     * asked for it to be created, and a game that ignores that failure reads
+     * its settings from the drive root instead. These are the per-user folders
+     * shell32 marks KFDF_PRECREATE and a Wine prefix comes with. */
+    mkdir( WINE_USER_DIR "/Desktop", 0777 );
     mkdir( WINE_USER_DIR "/Documents", 0777 );
+    mkdir( WINE_USER_DIR "/Downloads", 0777 );
+    mkdir( WINE_USER_DIR "/Music", 0777 );
+    mkdir( WINE_USER_DIR "/Pictures", 0777 );
+    mkdir( WINE_USER_DIR "/Saved Games", 0777 );
+    mkdir( WINE_USER_DIR "/Videos", 0777 );
     log_file = fopen( RUNTIME_DIR "/wine-nx-runtime.log", "w" );
     if (log_file)
     {

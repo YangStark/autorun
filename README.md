@@ -82,7 +82,7 @@ game DXVK**.
 
 Some games read a settings file that their own installer or launcher normally
 writes, and refuse to start without it. Autorun ships those files, in the same
-place Windows keeps them: `switch/wine/drive_c/users/wine/Documents` on the
+place Windows keeps them: `switch/wine/drive_c/users/steamuser/Documents` on the
 card, which a game sees as its Documents folder.
 
 **Fallout: New Vegas** is one. With no settings of its own it decides it does
