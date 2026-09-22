@@ -65,7 +65,7 @@ u32 __nx_exception_ignoredebug = 1;
 #ifdef WINE_NX_AMD64
 #define WINE_NX_RUNTIME_BUILD "nx-amd64-box64-3"
 #elif defined(WINE_NX_BOX64_DYNAREC)
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-218"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-223"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif

@@ -36,6 +36,14 @@ static struct fake_file make_file( long long size )
     return f;
 }
 
+static unsigned int holding( const struct sd_cache_file *file )
+{
+    unsigned int i, count = 0;
+
+    for (i = 0; i < SD_CACHE_LINES; i++) count += !!file->lines[i].data;
+    return count;
+}
+
 static long long cached_read( struct sd_cache_file *file, struct sd_cache_pool *pool, struct fake_file *f,
                               long long offset, char *buf, size_t size )
 {
@@ -49,7 +57,7 @@ static long long cached_read( struct sd_cache_file *file, struct sd_cache_pool *
 /* OpenTTD's pattern: a seek and a 4 KB read per sprite, mostly forward. */
 static void test_sprite_reads(void)
 {
-    struct sd_cache_pool pool = { 0, 64 };
+    struct sd_cache_pool pool = { .max = 64 };
     struct fake_file f = make_file( 3 * SD_CACHE_CHUNK + 12345 );
     struct sd_cache_file file = { .cacheable = 1 };
     char buf[4096];
@@ -72,7 +80,7 @@ static void test_sprite_reads(void)
 
 static void test_end_of_file(void)
 {
-    struct sd_cache_pool pool = { 0, 64 };
+    struct sd_cache_pool pool = { .max = 64 };
     struct fake_file f = make_file( 1000 );
     struct sd_cache_file file = { .cacheable = 1 };
     char buf[2000];
@@ -97,7 +105,7 @@ static void test_end_of_file(void)
 
 static void test_least_recently_used(void)
 {
-    struct sd_cache_pool pool = { 0, 64 };
+    struct sd_cache_pool pool = { .max = 64 };
     struct fake_file f = make_file( 20LL * SD_CACHE_CHUNK );
     struct sd_cache_file file = { .cacheable = 1 };
     char buf[100];
@@ -133,7 +141,7 @@ static void test_least_recently_used(void)
 
 static void test_failures_and_memory(void)
 {
-    struct sd_cache_pool pool = { 0, 64 }, small = { 0, 1 };
+    struct sd_cache_pool pool = { .max = 64 }, small = { .max = 1 };
     struct fake_file f = make_file( 3LL * SD_CACHE_CHUNK );
     struct sd_cache_file a = { .cacheable = 1 }, b = { .cacheable = 1 };
     char buf[300];
@@ -153,22 +161,25 @@ static void test_failures_and_memory(void)
     sd_cache_drop( &a, &pool );
     assert( !pool.used );
 
-    /* With the pool used up, another file reads directly, and a read that
-     * already copied data returns it. */
+    /* With the pool used up, another file takes the chunk read longest ago
+     * rather than reading around the cache. */
     assert( cached_read( &a, &small, &f, 5, buf, 10 ) == 10 && small.used == 1 );
-    assert( cached_read( &b, &small, &f, 0, buf, 10 ) == SD_CACHE_BYPASS );
-    assert( cached_read( &a, &small, &f, SD_CACHE_CHUNK - 100, buf, sizeof(buf) ) == 100 );
+    assert( cached_read( &b, &small, &f, 0, buf, 10 ) == 10 && !memcmp( buf, f.data, 10 ) );
+    assert( small.used == 1 && holding( &a ) == 0 && holding( &b ) == 1 );
+    /* A read across two chunks gets both: the second takes the first's place. */
+    assert( cached_read( &a, &small, &f, SD_CACHE_CHUNK - 100, buf, sizeof(buf) ) == (long long)sizeof(buf) );
+    assert( !memcmp( buf, f.data + SD_CACHE_CHUNK - 100, sizeof(buf) ) );
+    assert( small.used == 1 && holding( &a ) == 1 && holding( &b ) == 0 );
     sd_cache_drop( &a, &small );
-    assert( cached_read( &b, &small, &f, 0, buf, 10 ) == 10 && small.used == 1 );
     sd_cache_drop( &b, &small );
-    assert( !small.used );
+    assert( !small.used && !small.held );
     free( f.data );
 }
 
 static void test_open_files(void)
 {
     static const char grf[] = "sdmc:/switch/wine/drive_c/openttd/baseset/OPENTTD.GRF";
-    struct sd_cache_pool pool = { 0, 64 };
+    struct sd_cache_pool pool = { .max = 64 };
     struct fake_file f = make_file( 1000 );
     struct sd_cache_file *list = NULL, *reader, *writer, *late, *after, *lang;
     char buf[10];
@@ -210,14 +221,72 @@ static void test_open_files(void)
     free( f.data );
 }
 
+/* A full pool gives a new chunk the one read longest ago, whichever file read
+ * it, so a chunk still being read stays where it is. */
+static void test_oldest_across_files(void)
+{
+    struct sd_cache_pool pool = { .max = 2 };
+    struct fake_file f = make_file( 4LL * SD_CACHE_CHUNK );
+    struct sd_cache_file a = { .cacheable = 1 }, b = { .cacheable = 1 }, c = { .cacheable = 1 };
+    unsigned int before;
+    char buf[10];
+
+    assert( cached_read( &a, &pool, &f, 0, buf, 10 ) == 10 );
+    assert( cached_read( &b, &pool, &f, SD_CACHE_CHUNK, buf, 10 ) == 10 );
+    assert( cached_read( &a, &pool, &f, 20, buf, 10 ) == 10 );              /* a is read again */
+    assert( cached_read( &c, &pool, &f, 2 * SD_CACHE_CHUNK, buf, 10 ) == 10 );
+    assert( holding( &a ) == 1 && holding( &b ) == 0 && holding( &c ) == 1 ); /* b's was oldest */
+    before = f.requests;
+    assert( cached_read( &a, &pool, &f, 40, buf, 10 ) == 10 && !memcmp( buf, f.data + 40, 10 ) );
+    assert( f.requests == before );                                           /* still a hit */
+    assert( cached_read( &b, &pool, &f, SD_CACHE_CHUNK + 5, buf, 10 ) == 10 );
+    assert( !memcmp( buf, f.data + SD_CACHE_CHUNK + 5, 10 ) && f.requests == before + 1 );
+    sd_cache_drop( &a, &pool );
+    sd_cache_drop( &b, &pool );
+    sd_cache_drop( &c, &pool );
+    assert( !pool.used && !pool.held );
+    free( f.data );
+}
+
+/* The Sims 2's pattern: hundreds of packages held open all at once, each read
+ * in clusters. The runtime's 256 chunks were taken by the first packages it
+ * opened and every later package read around the cache -- 149,000 card reads
+ * in five minutes. Each package now costs one card read for its cluster. */
+static void test_many_open_files(void)
+{
+    enum { FILES = 300, READS = 30 };
+    struct sd_cache_pool pool = { .max = 256 };
+    struct fake_file f = make_file( 2LL * SD_CACHE_CHUNK );
+    static struct sd_cache_file files[FILES];
+    unsigned int i, r;
+    char buf[64];
+
+    for (i = 0; i < FILES; i++) files[i].cacheable = 1;
+    for (i = 0; i < FILES; i++)
+        for (r = 0; r < READS; r++)
+        {
+            long long at = (long long)(r * 997 % (SD_CACHE_CHUNK - sizeof(buf)));
+
+            assert( cached_read( &files[i], &pool, &f, at, buf, sizeof(buf) ) == (long long)sizeof(buf) );
+            assert( !memcmp( buf, f.data + at, sizeof(buf) ) );
+        }
+    assert( f.requests == FILES );             /* one card read a package, not one a read */
+    assert( pool.used == pool.max );
+    for (i = 0; i < FILES; i++) sd_cache_drop( &files[i], &pool );
+    assert( !pool.used && !pool.held );
+    free( f.data );
+}
+
 int main(void)
 {
     test_sprite_reads();
     test_end_of_file();
     test_least_recently_used();
     test_failures_and_memory();
+    test_oldest_across_files();
+    test_many_open_files();
     test_open_files();
-    puts( "SD read cache: sprite reads, end of file, least recently used, failures, memory limit and open "
-          "files passed" );
+    puts( "SD read cache: sprite reads, end of file, least recently used, failures, a full pool taking the "
+          "oldest chunk of any file, 300 open files and open files passed" );
     return 0;
 }

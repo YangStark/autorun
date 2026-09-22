@@ -31,7 +31,7 @@ static const devoptab_t *sd_cache_base;
 static devoptab_t sd_cache_device;
 static pthread_mutex_t sd_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct sd_cache_file *sd_cache_files;
-static struct sd_cache_pool sd_cache_pool = { 0, 256 };  /* 32 MB */
+static struct sd_cache_pool sd_cache_pool = { .max = 256 };  /* 32 MB */
 static int sd_cache_off;
 
 struct sd_cache_fill_ctx
