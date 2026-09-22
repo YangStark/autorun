@@ -30,7 +30,9 @@ u32 __nx_exception_ignoredebug = 1;
 #endif
 
 #define BASE 0x10000000u
-#define SIZE 0x10000u
+#define SIZE 0x20000u
+/* One more than MAX_INSTS, so the block Box64 builds over them is its longest. */
+#define LONGEST_BLOCK 32761u
 static volatile int native_faults;
 #if defined(WINE_NX_BOX64_DYNAREC) && !defined(__SWITCH__)
 static inline void set_x18( uint64_t value )
@@ -707,6 +709,29 @@ int main(void)
                 (unsigned)run.context.Ecx, (unsigned)run.context.Esp );
         assert( !run.status && run.context.Ecx == 0 && run.context.Esp == BASE + 0x6000 );
     }
+
+    /* The longest block Box64 will build. Marking its instructions alive walks
+     * every one of them, which recursed a stack frame deep each (FalloutNV died
+     * there); the walk a Wine thread's 1 MB has to hold is bounded in
+     * cmake/Box64Core.cmake. */
+    {
+        static const unsigned char completion[] = {0xba,0x20,0x80,0,0x10,0xff,0xe2};
+        struct deep_calls run = { .f = &f };
+        pthread_attr_t attr;
+        pthread_t thread;
+
+        assert( 0x10000 + LONGEST_BLOCK + sizeof(completion) < SIZE - 0x1000 );
+        memset( memory + 0x10000, 0x90, LONGEST_BLOCK );    /* nop */
+        memcpy( memory + 0x10000 + LONGEST_BLOCK, completion, sizeof(completion) );
+        wine_nx_box64_invalidate( BASE + 0x10000, LONGEST_BLOCK + sizeof(completion), 0 );
+        init_context( &run.context, BASE + 0x10000, BASE + 0x6000 );
+        assert( !pthread_attr_init( &attr ) && !pthread_attr_setstacksize( &attr, 0x100000 ) );
+        assert( !pthread_create( &thread, &attr, run_deep_calls, &run ) );
+        assert( !pthread_join( thread, NULL ) );
+        printf( "longest block: status %#x, eip=%#x\n", (unsigned)run.status,
+                (unsigned)run.context.Eip );
+        assert( !run.status && run.context.Eip == BASE + 0x8020 );
+    }
 #endif
 #endif
     /* A unix call that replaces the whole context -- wow64 puts the program's
@@ -765,10 +790,10 @@ int main(void)
     assert( !protect_fault_page( FALSE ) );
     {
         static const unsigned char fault_programs[][7] = {
-            {0xa1,0,0xf0,0,0x10},            /* mov eax, [protected] */
-            {0xa3,0,0xf0,0,0x10},            /* mov [protected], eax */
-            {0x87,0x05,0,0xf0,0,0x10},       /* xchg [protected], eax */
-            {0xf0,0x01,0x05,0,0xf0,0,0x10},  /* lock add [protected], eax */
+            {0xa1,0,0xf0,0x01,0x10},            /* mov eax, [protected] */
+            {0xa3,0,0xf0,0x01,0x10},            /* mov [protected], eax */
+            {0x87,0x05,0,0xf0,0x01,0x10},       /* xchg [protected], eax */
+            {0xf0,0x01,0x05,0,0xf0,0x01,0x10},  /* lock add [protected], eax */
         };
         unsigned int i;
         assert( !wine_nx_box64_handle_fault( BASE + SIZE - 0x1000, 0, 0, NULL ) );
@@ -789,7 +814,7 @@ int main(void)
             0xbb,0x34,0x12,0,0,              /* mov ebx,0x1234 */
             0xb9,0x78,0x56,0,0,              /* mov ecx,0x5678 */
             0x01,0xcb,                       /* add ebx,ecx */
-            0xa1,0,0xf0,0,0x10,              /* mov eax,[protected] */
+            0xa1,0,0xf0,0x01,0x10,              /* mov eax,[protected] */
         };
         ULONG address, access;
 
