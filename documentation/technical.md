@@ -283,9 +283,12 @@ changes, and fails if the pinned text moves.
 - Speed. Heavy Direct3D games are limited by translated x86 code on the game's
   main thread and by Wine's Direct3D layer, rather than by the GPU.
 - Wine's first-run setup (wineboot) does not run. The package writes the COM
-  classes every staged DLL serves to `config/classes.reg`; WarCraft III's setup
-  program (`C:\WarCraft III Setup\war3-setup.exe`) registers DirectShow for its
-  movies.
+  classes every staged DLL serves to `config/classes.reg`, and the runtime runs
+  `C:\windows\autorun-setup.exe` (`tools/autorun_setup.c`) before the first
+  program on a card: the MP3 decoder under Drivers32 and DllRegisterServer for
+  the DirectShow and DMO DLLs staged, which lay out their own filter data. The
+  program waits in `run-next.txt` and starts when the runtime starts again; the
+  mark is `registry/components-1.done`, so a reset registry runs it again.
 - A 32-bit address space leaves a program about 2 GiB of addresses and caps the
   whole process at 2 GiB of memory.
 - AMD64 programs require the 39-bit application forwarder and remain

@@ -149,6 +149,16 @@ subprocess.run([str(toolchain / 'i686-w64-mingw32-clang'), '-O1', '-mwindows',
                 '-o', str(socket_test), str(probe / 'tests/win32/socket-test.c'), '-lws2_32'], check=True)
 assert 'Arch: i386\n' in readobj('--file-headers', socket_test)
 
+# What wineboot registers on a computer and nothing does on the Switch:
+# DirectShow, DirectX Media Objects and the MP3 decoder. The runtime runs it
+# before the first program on a card (source/runtime.c), for every game.
+autorun_setup = stage / 'drive_c/windows/autorun-setup.exe'
+subprocess.run([str(toolchain / 'i686-w64-mingw32-clang'), '-Os', '-Wall', '-Wextra', '-Werror',
+                '-fno-builtin', '-nostdlib', '-Wl,--entry,_start@0', '-Wl,--image-base,0x10000000',
+                '-Wl,--dynamicbase', '-o', str(autorun_setup), str(tools / 'autorun_setup.c'),
+                '-lole32', '-ladvapi32', '-lkernel32', '-lntdll'], check=True)
+assert 'Arch: i386\n' in readobj('--file-headers', autorun_setup)
+
 # The Sims 2 Ultimate Collection is shipped installed; what is left is telling
 # the game where each of its packs is, which its release does with a batch file
 # of reg add lines whose every path comes from the folder it is run in.

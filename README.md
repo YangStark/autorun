@@ -73,9 +73,14 @@ Adding a game enables DXVK, which draws Direct3D games through the Switch's
 Vulkan driver. To keep new games on WineD3D, turn off **Settings -> Give a new
 game DXVK**.
 
-**WarCraft III** needs a one-time setup, which Autorun includes: run
-`C:\WarCraft III Setup\war3-setup.exe` once before playing. Its folder has a
-`README.txt` with the details.
+Before the first program on a card, Autorun sets up the Windows components a
+PC's Windows installation would have registered: DirectShow and the MP3 decoder,
+which game movies and music play through (Fallout: New Vegas, Fable, WarCraft
+III and others). It runs by itself, once, and the game starts right after it.
+
+**WarCraft III** also has a one-time settings program: run
+`C:\WarCraft III Setup\war3-setup.exe` once before playing (**+** -> **Run a
+program once** works). Its folder has a `README.txt` with the details.
 
 ### Settings a game expects to already have
 

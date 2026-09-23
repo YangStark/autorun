@@ -1482,6 +1482,17 @@ static void runtime_report_interpreter(void)
     last_tick = now;
 }
 
+/* A file of one line, replacing what was there. */
+static int write_line( const char *path, const char *text )
+{
+    FILE *file = fopen( path, "w" );
+    int ok;
+
+    if (!file) return 0;
+    ok = fprintf( file, "%s\n", text ) > 0;
+    return !fclose( file ) && ok;
+}
+
 static int read_first_line( const char *path, char *line, size_t size )
 {
     FILE *file = fopen( path, "r" );
@@ -3232,6 +3243,47 @@ static void release_thread_local_pages( void )
     tls_count = 0;
 }
 
+/* Autorun's components setup (tools/autorun_setup.c): what wineboot registers
+ * on a computer -- DirectShow, DirectX Media Objects, the MP3 decoder -- run
+ * once before the first program on a card, and again when a build raises the
+ * version. The mark is kept with the registry it wrote to, so a card whose
+ * registry was reset runs it again. */
+#define COMPONENTS_VERSION 1
+#define COMPONENTS_SETUP   RUNTIME_DIR "/drive_c/windows/autorun-setup.exe"
+#define COMPONENTS_DONE    RUNTIME_DIR "/registry/components-1.done"
+static int runtime_components_run;
+
+/* The exit code the program gave NtTerminateProcess (dlls/ntdll/unix/process.c);
+ * ~0 while it has not ended by itself. */
+unsigned int wine_nx_program_exit_code = ~0u;
+
+/* The components setup takes the program's place when it has not run on this
+ * card; the program goes to run-next.txt, which the runtime started again
+ * afterwards picks up. Only when this runtime can start itself again, so the
+ * program is not left waiting for the next time Autorun is opened. */
+static void run_components_first( char *target, size_t size )
+{
+    const char *name = strrchr( target, '/' );
+
+    if (!access( COMPONENTS_DONE, F_OK ) || access( COMPONENTS_SETUP, F_OK )) return;
+    if (!strcasecmp( target, COMPONENTS_SETUP )) return;
+    if (!envHasNextLoad() || !own_nro[0])
+    {
+        log_line( "[SETUP] Windows components not set up yet; this loader cannot start Autorun again, so "
+                  "%s goes first", name ? name + 1 : target );
+        return;
+    }
+    if (!write_line( RUNTIME_DIR "/run-next.txt", target ))
+    {
+        log_line( "[SETUP] could not write run-next.txt; the components setup waits for the next program" );
+        return;
+    }
+    log_line( "[SETUP] first program on this card: setting up Windows components before %s",
+              name ? name + 1 : target );
+    snprintf( target, size, "%s", COMPONENTS_SETUP );
+    runtime_components_run = 1;
+}
+
 static int return_to_launcher( void )
 {
     int i, still_lent = 0;
@@ -3366,7 +3418,20 @@ static int return_to_launcher( void )
      * Otherwise: close the application the way the HOME menu does, through
      * libnx's applet exit. The console goes back to the menu with no error, and
      * the launcher is one press away. */
-    if (!still_lent && runtime_reopen_launcher &&
+    if (runtime_components_run)
+    {
+        char done[64];
+
+        /* Marked whatever it answered, so a step that cannot work does not
+         * run before every program; the log and the mark say how it went. */
+        snprintf( done, sizeof(done), "version %d, exit code 0x%x", COMPONENTS_VERSION, wine_nx_program_exit_code );
+        write_line( COMPONENTS_DONE, done );
+        log_line( wine_nx_program_exit_code ? "[SETUP] Windows components set up, but a step failed (%s)"
+                                            : "[SETUP] Windows components set up (%s)", done );
+    }
+    /* A program waiting in run-next.txt (after the components setup) is started
+     * by the runtime started again, whether or not the launcher would be. */
+    if (!still_lent && (runtime_reopen_launcher || !access( RUNTIME_DIR "/run-next.txt", F_OK )) &&
         envHasNextLoad() && own_nro[0] && R_SUCCEEDED( envSetNextLoad( own_nro, own_nro ) ))
     {
         log_step( "starting this program again for the launcher" );
@@ -3714,7 +3779,7 @@ int main( int argc, char **argv )
             remove( RUNTIME_DIR "/run-next.txt" );
             snprintf( target, sizeof(target), "%s", handoff );
             autorun = handed_over = 1;
-            log_line( "[LAUNCHER] started here by another forwarder: %s", target );
+            log_line( "[LAUNCHER] handed over in run-next.txt: %s", target );
         }
     }
     if (handed_over || (argc > 1 && argv[1] && argv[1][0]))
@@ -3806,6 +3871,8 @@ int main( int argc, char **argv )
         }
         autorun = 1;
     }
+
+    run_components_first( target, sizeof(target) );
 
     /* From here a thread may be asked to end; this one comes back here. */
     if (setjmp( quit_jump )) return return_to_launcher();
