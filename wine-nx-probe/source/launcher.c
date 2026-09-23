@@ -2892,7 +2892,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
 enum settings_row
 {
-    SET_HIDDEN, SET_HIDE_MISSING, SET_DXVK_ON_ADD, SET_VERBOSE, SET_PROFILE, SET_WINDOWS,
+    SET_HIDDEN, SET_HIDE_MISSING, SET_DXVK_ON_ADD, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_SWKBD,
     SET_CONTROLS, SET_STEAMGRIDDB,
     SET_UPDATE, SET_REOPEN, SET_FORWARDER, SET_MAKE_32BIT, SET_MAKE_MAIN,
     SET_CREDITS, SETTINGS_ROWS
@@ -3417,6 +3417,12 @@ static void settings_menu( struct launcher *l )
                                    "from one. Only on an emuMMC.";
         rows[SET_MAKE_MAIN].adjustable = 0;
         rows[SET_MAKE_MAIN].disabled = !l->options->install_forwarder;
+        snprintf( rows[SET_SWKBD].label, sizeof(rows[0].label), "On-screen keyboard" );
+        snprintf( rows[SET_SWKBD].value, sizeof(rows[0].value), "%s", on_off[!!l->options->swkbd_auto] );
+        rows[SET_SWKBD].kind = UI_ROW_SWITCH;
+        rows[SET_SWKBD].on = !!l->options->swkbd_auto;
+        rows[SET_SWKBD].help = "Opens by itself when a text field takes focus. Off leaves it to Minus + the "
+                               "right stick click, which opens it in any program.";
         snprintf( rows[SET_CREDITS].label, sizeof(rows[0].label), "Credits" );
         snprintf( rows[SET_CREDITS].value, sizeof(rows[0].value), "Wine, Box64, DXVK, Mesa..." );
         rows[SET_CREDITS].help = "The projects and platform references used by Autorun.";
@@ -3475,6 +3481,7 @@ static void settings_menu( struct launcher *l )
             if (action == UI_ACTION_CHOOSE) make_forwarder( l, 39 );
             break;
 
+        case SET_SWKBD: l->options->swkbd_auto = !l->options->swkbd_auto; break;
         case SET_CREDITS:
             credits_screen( l );
             ui_start_screen( ui );

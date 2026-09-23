@@ -445,6 +445,13 @@ extern int wine_nx_nouveau_skip_clean __attribute__((weak));
  * forced virtual screen, in case that walk of the registry misbehaves. */
 int wine_nx_display_devices = 1;
 
+/* Whether the win32u Switch driver opens the on-screen keyboard by itself
+ * when an edit-like control gets keyboard focus (dlls/win32u/winnx_drv.c).
+ * keyboard-on-text-focus: false in config/settings.json turns that off (an
+ * older card's no-swkbd-auto.txt is moved into it), leaving
+ * programs to open it themselves through NtUserShowSoftwareKeyboard. */
+int wine_nx_swkbd_auto_enabled = 1;
+
 /***********************************************************************
  * Framebuffer platform hooks used by the win32u Switch display driver
  * (dlls/win32u/winnx_drv.c).  The driver renders into ordinary DIB memory;
@@ -702,6 +709,41 @@ void wine_nx_cursor_show( int visible )
     wine_nx_compositor_cursor( x, y, visible );
 }
 
+/* The win32u Switch driver opens Horizon's on-screen keyboard for a window
+ * that wants text (dlls/win32u/winnx_drv.c: wine_nx_drv_ShowSoftwareKeyboard,
+ * reached through NtUserShowSoftwareKeyboard or, unless keyboard-on-text-focus
+ * turns it off, automatically when an edit-like control gets focus).
+ * initial and out are UTF-8; out holds what the player typed, or is left
+ * untouched (and 0 returned) if they cancelled. Blocks the calling (guest)
+ * thread, same as launcher_platform_prompt uses for the launcher's own UI. */
+/* Set for the applet's duration; wine_nx_pointer_poll below skips touching
+ * the controller while it is set. Horizon gives the applet the foreground
+ * for as long as it is up, and polling padUpdate/hidGetTouchScreenStates out
+ * from under it while its own blocking call is waiting on exactly that
+ * looks to be why input stayed dead after the keyboard closed on hardware:
+ * not a stuck HID session, just our own unrelated poll never letting it
+ * settle back to this program. */
+int wine_nx_swkbd_active;
+
+int wine_nx_show_keyboard( const char *header, const char *initial, char *out, size_t out_size )
+{
+    SwkbdConfig keyboard;
+    Result rc;
+
+    if (!out_size) return 0;
+    if (R_FAILED( swkbdCreate( &keyboard, 0 ) )) return 0;
+    swkbdConfigMakePresetDefault( &keyboard );
+    swkbdConfigSetHeaderText( &keyboard, header );
+    swkbdConfigSetGuideText( &keyboard, header );
+    swkbdConfigSetInitialText( &keyboard, initial );
+    swkbdConfigSetStringLenMax( &keyboard, out_size - 1 < 500 ? out_size - 1 : 500 );
+    __atomic_store_n( &wine_nx_swkbd_active, 1, __ATOMIC_RELEASE );
+    rc = swkbdShow( &keyboard, out, out_size );
+    __atomic_store_n( &wine_nx_swkbd_active, 0, __ATOMIC_RELEASE );
+    swkbdClose( &keyboard );
+    return R_SUCCEEDED( rc );
+}
+
 /* Buttons reported by wine_nx_pointer_poll(). */
 #define WINE_NX_POINTER_LEFT  0x1
 #define WINE_NX_POINTER_RIGHT 0x2
@@ -765,8 +807,20 @@ unsigned short wine_nx_pad_keys[WINE_NX_KEY_COUNT] =
 };
 
 /* Which of those controls are held, read by the display driver's ProcessEvents
- * (dlls/win32u/winnx_drv.c), which turns the changes into key events. */
+ * (dlls/win32u/winnx_drv.c), which turns the changes into key events. Zeroed
+ * while a program reads the controller through XInput (below), so it never
+ * competes with what the program reads there itself. */
 unsigned int wine_nx_pad_key_state;
+
+/* Minus and the right stick click, updated unconditionally even while
+ * wine_nx_pad_key_state above is zeroed for an XInput reader: the on-screen
+ * keyboard hotkey is a system-level shortcut, not something a program reads
+ * back and would double up on, so it stays live no matter how the program
+ * gets its input. Same bit positions as wine_nx_pad_key_state so ProcessEvents
+ * can use one mask without hardcoding the enum order above. */
+unsigned int wine_nx_swkbd_hotkey_state;
+const unsigned int wine_nx_pad_key_minus_bit = 1u << WINE_NX_KEY_MINUS;
+const unsigned int wine_nx_pad_key_stickr_bit = 1u << WINE_NX_KEY_STICKR;
 
 /* When a program last read the controller through XInput (xinput_unix.c). */
 extern u64 wine_nx_xinput_last_poll;
@@ -780,7 +834,10 @@ void wine_nx_request_quit( const char *why );
 /* One mouse for win32u, in native 1280x720 display coordinates: the right
  * analog stick moves the cursor, A holds the left button and B the right,
  * and a touchscreen contact puts the cursor under the finger with the left
- * button held.  Returns nonzero when the position changed. */
+ * button held.  Returns nonzero when the position changed. wine_nx_swkbd_active
+ * (above, wine_nx_show_keyboard) skips this entirely while the on-screen
+ * keyboard applet is up, for both this thread's polling and the background
+ * one (wine_nx_input_thread). */
 int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
 {
     HidTouchScreenState touch = {0};
@@ -788,6 +845,16 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
     unsigned int pressed = 0;
     u64 now, held, xinput_poll;
     int moved, gamepad, leave = 0;
+
+    if (__atomic_load_n( &wine_nx_swkbd_active, __ATOMIC_ACQUIRE ))
+    {
+        pthread_mutex_lock( &wine_nx_pointer_mutex );
+        *x = (int)wine_nx_pointer.x;
+        *y = (int)wine_nx_pointer.y;
+        *buttons = 0;
+        pthread_mutex_unlock( &wine_nx_pointer_mutex );
+        return 0;
+    }
 
     pthread_mutex_lock( &wine_nx_pointer_mutex );
     if (!wine_nx_pointer_ready)
@@ -916,6 +983,8 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
             if (wine_nx_touch_dx < -WINE_NX_TOUCH_STEP) keys |= 1u << WINE_NX_KEY_TLEFT;
             if (wine_nx_touch_dx >  WINE_NX_TOUCH_STEP) keys |= 1u << WINE_NX_KEY_TRIGHT;
         }
+        __atomic_store_n( &wine_nx_swkbd_hotkey_state,
+                          keys & (wine_nx_pad_key_minus_bit | wine_nx_pad_key_stickr_bit), __ATOMIC_RELAXED );
         if (gamepad) keys = 0;
         __atomic_store_n( &wine_nx_pad_key_state, keys, __ATOMIC_RELAXED );
     }
@@ -3568,6 +3637,8 @@ int main( int argc, char **argv )
     runtime_loader_anyway = config_bool( "hand-the-process-back-anyway", 0, "loader-anyway.txt", 0 );
     runtime_reopen_launcher = config_bool( "reopen-the-launcher-on-exit", 1, "reload-launcher.txt", 0 );
     runtime_dxvk_on_add = wine_nx_config_bool( &runtime_config, "dxvk-for-new-games", 1 );
+    wine_nx_swkbd_auto_enabled = config_bool( "keyboard-on-text-focus", 1, "no-swkbd-auto.txt", 1 );
+    log_line( "[INIT] on-screen keyboard opens on text focus: %s", wine_nx_swkbd_auto_enabled ? "yes" : "no" );
     if (runtime_config_moved && wine_nx_config_save( &runtime_config, CONFIG_FILE ))
         log_line( "[CONFIG] settings written to %s", CONFIG_FILE );
 #ifdef WINE_NX_MESA_SWITCH
@@ -3648,6 +3719,7 @@ int main( int argc, char **argv )
             .verbose = wine_nx_runtime_verbose,
             .profile = runtime_profile,
             .framebuffer = !wine_nx_compositor_mode,
+            .swkbd_auto = wine_nx_swkbd_auto_enabled,
         };
         int chosen;
 
@@ -3685,6 +3757,8 @@ int main( int argc, char **argv )
         runtime_reopen_launcher = options.reopen_launcher;
         wine_nx_config_set_bool( &runtime_config, "dxvk-for-new-games", options.dxvk_on_add );
         runtime_dxvk_on_add = options.dxvk_on_add;
+        wine_nx_config_set_bool( &runtime_config, "keyboard-on-text-focus", options.swkbd_auto );
+        wine_nx_swkbd_auto_enabled = options.swkbd_auto;
         wine_nx_config_save( &runtime_config, CONFIG_FILE );
         if (!chosen)
         {

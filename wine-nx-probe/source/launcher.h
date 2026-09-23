@@ -65,6 +65,7 @@ struct wine_nx_launcher_options
     int framebuffer;
     int reopen_launcher;  /* come back here when a program ends, rather than to the menu */
     int dxvk_on_add;      /* a game added to the library starts with DXVK enabled */
+    int swkbd_auto;       /* the on-screen keyboard opens when a text field takes focus */
 };
 
 /* Show the launcher. Returns 1 with the chosen program's path in target, or 0
