@@ -3624,6 +3624,22 @@ int main( int argc, char **argv )
                 mkdir( WINE_USER_DIR "/AppData/Local/Autorun", 0777 );
                 if (!launcher_dxvk_config( &settings, graphics.text, sizeof(graphics.text) ))
                     return return_to_launcher();
+                {
+                    struct launcher_kv game;
+                    char game_conf[520], *slash;
+
+                    snprintf( game_conf, sizeof(game_conf), "%s", target );
+                    if ((slash = strrchr( game_conf, '/' )) &&
+                        (size_t)(slash + 1 - game_conf) + sizeof("dxvk.conf") <= sizeof(game_conf))
+                    {
+                        strcpy( slash + 1, "dxvk.conf" );
+                        if (launcher_kv_load( &game, game_conf ) && game.size)
+                            log_line( launcher_dxvk_config_add( graphics.text, sizeof(graphics.text),
+                                                                game.text, game.size )
+                                      ? "[DXVK] %s read after the launcher's settings"
+                                      : "[DXVK] %s left out: too large", game_conf );
+                    }
+                }
                 graphics.size = strlen( graphics.text );
                 if (!launcher_kv_save( &graphics, WINE_USER_DIR "/AppData/Local/Autorun/dxvk.conf" ))
                 {

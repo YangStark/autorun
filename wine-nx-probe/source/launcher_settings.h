@@ -227,6 +227,25 @@ static inline int launcher_dxvk_config( const struct launcher_settings *settings
     return 1;
 }
 
+/* The dxvk.conf beside the program goes after the launcher's lines. Without
+ * DXVK_CONFIG_FILE that is the one file DXVK reads, games are set up with one,
+ * and a later line wins over an earlier one and over DXVK's own profile for the
+ * game. Naming only the launcher's file dropped The Sims 2's: DXVK's profile
+ * then reported 2 GB of video memory on a 1.5 GB heap, which the game filled
+ * in five seconds. Returns 0 when both do not fit. */
+static inline int launcher_dxvk_config_add( char *out, size_t size, const char *game, size_t game_size )
+{
+    size_t length = strlen( out );
+
+    if (!game_size) return 1;
+    if (length + game_size + 2 > size) return 0;
+    memcpy( out + length, game, game_size );
+    length += game_size;
+    if (out[length - 1] != '\n') out[length++] = '\n';
+    out[length] = 0;
+    return 1;
+}
+
 static inline const char *launcher_dxvk_directory( unsigned short machine )
 {
     if (machine == 0x014c) return "dxvk";

@@ -117,6 +117,19 @@ static void test_settings( const char *dir )
     settings.dxvk_hud = 0;
     assert( LAUNCHER_FRAME_LIMIT_COUNT == 8 );
     assert( launcher_dxvk_config( &settings, config, sizeof(config) ) );
+    /* A game's own dxvk.conf follows, so its lines win; one without a final
+     * newline gets one, and one that does not fit is refused whole. */
+    {
+        char with_game[256];
+        static const char game[] = "d3d9.maxAvailableMemory = 512";
+
+        assert( launcher_dxvk_config( &settings, with_game, sizeof(with_game) ) );
+        assert( launcher_dxvk_config_add( with_game, sizeof(with_game), game, sizeof(game) - 1 ) );
+        assert( strstr( with_game, "d3d9.presentInterval" ) < strstr( with_game, "d3d9.maxAvailableMemory = 512\n" ) );
+        assert( with_game[strlen( with_game ) - 1] == '\n' );
+        assert( launcher_dxvk_config_add( with_game, sizeof(with_game), "", 0 ) );
+        assert( !launcher_dxvk_config_add( with_game, strlen( with_game ) + 8, game, sizeof(game) - 1 ) );
+    }
     assert( strstr( config, "dxgi.syncInterval = 1" ) );
     assert( launcher_settings_write( &kv, &settings ) && !strstr( kv.text, "frame-limit=" ) );
     assert( launcher_dxvk_version_directory( 0x8664, "2.7.1", path, sizeof(path) ) &&
