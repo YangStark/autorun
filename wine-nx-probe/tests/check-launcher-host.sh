@@ -120,6 +120,34 @@ grep -q "launcher returned 1 target 'sdmc:/switch/wine/drive_c/openttd/openttd.e
 }
 echo "launcher host run: empty home, explicit add, persistence, details and start passed"
 
+# The same game from a 32-bit forwarder that can open others. It can be put
+# anywhere, so it goes to Autorun with 39 bits: straight there when the console
+# has that forwarder, and only after asking when it does not.
+LAUNCHER_HOST_TITLES=0500000000039000 SDL_VIDEODRIVER=dummy "$build/launcher_host" "$font" \
+    "$build/restart-script.txt" > "$build/handoff-out.txt" 2>&1 || { cat "$build/handoff-out.txt"; exit 1; }
+grep -q "^launch_title 0500000000039000$" "$build/handoff-out.txt" || { cat "$build/handoff-out.txt"; exit 1; }
+grep -q "launcher returned 0" "$build/handoff-out.txt" || { cat "$build/handoff-out.txt"; exit 1; }
+grep -qx "sdmc:/switch/wine/drive_c/openttd/openttd.exe" "sdmc:/switch/wine/run-next.txt"
+rm "sdmc:/switch/wine/run-next.txt"
+cat > "$build/handoff-ask-script.txt" <<SCRIPT
+wait 5
+key a
+wait 3
+shot $shots/handoff-first.png
+key a
+wait 5
+shot $shots/handoff-ask.png
+key b
+wait 3
+SCRIPT
+LAUNCHER_HOST_TITLES=none SDL_VIDEODRIVER=dummy "$build/launcher_host" "$font" \
+    "$build/handoff-ask-script.txt" > "$build/handoff-ask-out.txt" 2>&1 || { cat "$build/handoff-ask-out.txt"; exit 1; }
+if grep -q "^launch_title" "$build/handoff-ask-out.txt" || [ -e "sdmc:/switch/wine/run-next.txt" ]; then
+    cat "$build/handoff-ask-out.txt"; exit 1
+fi
+grep -q "launcher returned 0" "$build/handoff-ask-out.txt" || { cat "$build/handoff-ask-out.txt"; exit 1; }
+echo "launcher host run: a game that fits anywhere goes from a 32-bit forwarder to Autorun"
+
 # Eight played covers exercise Home's row: animated hit testing, swipe selection,
 # both ends, the header, Y Options, and the square library.
 cat > "$build/carousel-script.txt" <<SCRIPT

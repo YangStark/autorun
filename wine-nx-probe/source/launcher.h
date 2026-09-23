@@ -55,6 +55,9 @@ struct wine_nx_launcher_options
     /* Build a forwarder for this program and install it. bits is 32 or 39;
      * returns 0, leaving step pointing at what failed otherwise. */
     unsigned int (*install_forwarder)( int bits, const char *name, unsigned long long *id, const char **step );
+    /* The id install_forwarder gives the forwarder it makes with these bits,
+     * to find one made before the launcher kept its id. May be NULL. */
+    unsigned long long (*forwarder_id)( int bits );
     /* The global settings on entry, as the user left them on return. The
      * runtime keeps them; the launcher only says what they became. */
     int verbose;

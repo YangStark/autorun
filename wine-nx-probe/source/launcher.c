@@ -1730,13 +1730,14 @@ static int install_forwarder( struct launcher *l, int bits, unsigned long long *
         ui_start_screen( ui );
         return 0;
     }
+    snprintf( value, sizeof(value), "%016llX", id ? *id : 0ull );
     if (bits == 32)
     {
-        snprintf( value, sizeof(value), "%016llX", id ? *id : 0ull );
         launcher_kv_set( &l->look, "forwarder-32bit", value );
         launcher_kv_set( &l->look, "forwarder-32bit-name", name );
-        save_look( l );
     }
+    else launcher_kv_set( &l->look, "forwarder-39bit", value );
+    save_look( l );
     return 1;
 }
 
@@ -1863,6 +1864,17 @@ static int address_space_fits( struct launcher *l, struct program *p )
            program_address_space( p ) != LAUNCHER_ADDRESS_LOW;
 }
 
+/* Whether a game that runs anywhere is better off in Autorun itself. A 32-bit
+ * forwarder gives the game, Wine, Box64's code and DXVK's memory the low 4 GB
+ * to share, and a large game runs out of it and closes; 39 bits keep all but
+ * the game above it. Only a game that says nothing of its own needs goes:
+ * one set to 32-bit stays here. */
+static int address_space_cramped( struct launcher *l, struct program *p )
+{
+    return l->options->address_space_bits == 32 && l->options->launch_title &&
+           program_address_space( p ) == LAUNCHER_ADDRESS_ANY;
+}
+
 /* The forwarder named under Settings, and whether the console still has it.
  * name comes back as what it was called when it was named. */
 static unsigned long long chosen_forwarder( struct launcher *l, char *name, size_t size, int *installed )
@@ -1881,6 +1893,97 @@ static unsigned long long chosen_forwarder( struct launcher *l, char *name, size
     return id;
 }
 
+/* Autorun on the home menu with 39 bits: the one made from here, or else the
+ * one this program would make, if the console has it. */
+static unsigned long long main_forwarder( struct launcher *l, int *installed )
+{
+    char value[64] = "";
+    unsigned long long id = 0;
+
+    *installed = 0;
+    if (launcher_kv_get( &l->look, "forwarder-39bit", value, sizeof(value) ) && value[0])
+        id = strtoull( value, NULL, 16 );
+    if ((!id || (l->options->title_installed && !l->options->title_installed( id ))) &&
+        l->options->forwarder_id)
+        id = l->options->forwarder_id( 39 );
+    if (!id || id == l->options->title_id) return 0;
+    *installed = !l->options->title_installed || l->options->title_installed( id );
+    return id;
+}
+
+/* The game goes to the forwarder made with the bits it needs, which the
+ * console opens in this one's place. Returns 0 when it is to start here after
+ * all, 1 when it went or the user turned it back. */
+static int hand_over( struct launcher *l, struct program *p, int bits )
+{
+    struct ui *ui = &l->ui;
+    char message[512], name[128] = "", path[512];
+    int installed = 0;
+    unsigned long long id = bits == 32 ? chosen_forwarder( l, name, sizeof(name), &installed )
+                                       : main_forwarder( l, &installed );
+
+    if (bits != 32) snprintf( name, sizeof(name), "Autorun" );
+    /* Named, still installed, and the console will open it: nothing to ask
+     * about -- the game goes there. */
+    if (!id || !installed || !l->options->launch_title)
+    {
+        if (bits == 32)
+        {
+            snprintf( message, sizeof(message),
+                      "%s%s needs the low 4 GB of memory. Autorun is running with %d bits, which begins "
+                      "above it.\n\nA 32-bit forwarder starts Autorun where the game fits.",
+                      id && !installed ? "The 32-bit forwarder is gone. " : "", p->title,
+                      l->options->address_space_bits );
+            if (!l->options->install_forwarder || !l->options->launch_title)
+            {
+                ui_message( ui, "32-bit forwarder needed", message );
+                return 1;
+            }
+            if (!ui_confirm( ui, "32-bit forwarder needed", message, "Install now" ))
+            {
+                ui_start_screen( ui );
+                return 1;
+            }
+        }
+        else
+        {
+            /* Nothing to send it to and no way to make it: as before, here. */
+            if (!l->options->install_forwarder) return 0;
+            snprintf( message, sizeof(message),
+                      "%s does not need this 32-bit forwarder. Here the game shares the low 4 GB with "
+                      "Wine and its graphics, and a large game runs out and closes. Autorun with 39 bits "
+                      "gives it the room.\n\nTo run it here anyway, set its Address space to 32-bit.",
+                      p->title );
+            if (!ui_confirm( ui, "Autorun forwarder needed", message, "Install now" ))
+            {
+                ui_start_screen( ui );
+                return 1;
+            }
+        }
+        if (!install_forwarder( l, bits, &id )) return 1;
+    }
+    /* The game goes on the card before the forwarder is asked for, because
+     * once the console takes the request nothing here runs again. */
+    runtime_file( l, "run-next.txt", path, sizeof(path) );
+    if (!write_line( path, p->path ))
+    {
+        ui_toast( ui, "Could not write run-next.txt", 2500 );
+        return 1;
+    }
+    p->launched_order = l->catalog.next_order++;
+    save_library( l );
+    if (l->options->launch_title( id ))
+    {
+        snprintf( message, sizeof(message), "Opening %s...", bits == 32 ? "the 32-bit forwarder" : "Autorun" );
+        ui_toast( ui, message, 4000 );
+        return 1;
+    }
+    remove( path );
+    snprintf( message, sizeof(message), "The console refused to open %s.", name[0] ? name : "the forwarder" );
+    ui_message( ui, "Could not open it", message );
+    return 1;
+}
+
 static int start_program( struct launcher *l, struct program *p, char *target, size_t size )
 {
     struct ui *ui = &l->ui;
@@ -1892,54 +1995,8 @@ static int start_program( struct launcher *l, struct program *p, char *target, s
         ui_message( ui, "Game unavailable", "The executable is missing or is not supported by this build." );
         return 0;
     }
-    if (!address_space_fits( l, p ))
-    {
-        char message[320], name[128] = "";
-        int installed = 0;
-        unsigned long long id = chosen_forwarder( l, name, sizeof(name), &installed );
-
-        /* Named, still installed, and the console will open it: nothing to ask
-         * about -- the game goes there. */
-        if (!id || !installed || !l->options->launch_title)
-        {
-            snprintf( message, sizeof(message),
-                      "%s%s needs the low 4 GB of memory. Autorun is running with %d bits, which begins "
-                      "above it.\n\nA 32-bit forwarder starts Autorun where the game fits.",
-                      id && !installed ? "The 32-bit forwarder is gone. " : "", p->title,
-                      l->options->address_space_bits );
-            if (!l->options->install_forwarder || !l->options->launch_title)
-            {
-                ui_message( ui, "32-bit forwarder needed", message );
-                return 0;
-            }
-            if (!ui_confirm( ui, "32-bit forwarder needed", message, "Install now" ))
-            {
-                ui_start_screen( ui );
-                return 0;
-            }
-            if (!install_forwarder( l, 32, &id )) return 0;
-            installed = 1;
-        }
-        /* The game goes on the card before the forwarder is asked for, because
-         * once the console takes the request nothing here runs again. */
-        runtime_file( l, "run-next.txt", path, sizeof(path) );
-        if (!write_line( path, p->path ))
-        {
-            ui_toast( ui, "Could not write run-next.txt", 2500 );
-            return 0;
-        }
-        p->launched_order = l->catalog.next_order++;
-        save_library( l );
-        if (l->options->launch_title( id ))
-        {
-            ui_toast( ui, "Opening the 32-bit forwarder...", 4000 );
-            return 0;
-        }
-        remove( path );
-        snprintf( message, sizeof(message), "The console refused to open %s.", name[0] ? name : "the forwarder" );
-        ui_message( ui, "Could not open it", message );
-        return 0;
-    }
+    if (!address_space_fits( l, p ) && hand_over( l, p, 32 )) return 0;
+    if (address_space_cramped( l, p ) && hand_over( l, p, 39 )) return 0;
     p->missing = 0;
     p->launched_order = l->catalog.next_order++;
     save_library( l );
@@ -2475,7 +2532,9 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
             ADD_ROW( ROW_ADDRESS, SECTION_GRAPHICS, "Address space",
                      "What the game needs of the address space Horizon gives Autorun. A game linked for a "
                      "fixed address in the low 4 GB runs only under a forwarder made with 32 bits; the "
-                     "forwarder decides this, and a game that needs one it was not given is not started." );
+                     "forwarder decides this, and a game that needs one it was not given is not started. Any other "
+                     "game started from a 32-bit forwarder is sent to Autorun, where it has more memory, "
+                     "unless this is set to 32-bit." );
             row->adjustable = 1;
             if (p->settings.address_space >= 0)
                 snprintf( row->value, sizeof(row->value), "%s",
@@ -3303,7 +3362,8 @@ static void settings_menu( struct launcher *l )
         snprintf( rows[SET_MAKE_MAIN].value, sizeof(rows[0].value), "%s",
                   l->options->install_forwarder ? "Autorun" : "Unavailable" );
         rows[SET_MAKE_MAIN].help = "Autorun itself on the home menu with the 39-bit address space required "
-                                   "by AMD64 programs. Only on an emuMMC.";
+                                   "by AMD64 programs. Games that need no 32-bit forwarder are sent to it "
+                                   "from one. Only on an emuMMC.";
         rows[SET_MAKE_MAIN].adjustable = 0;
         rows[SET_MAKE_MAIN].disabled = !l->options->install_forwarder;
         snprintf( rows[SET_CREDITS].label, sizeof(rows[0].label), "Credits" );

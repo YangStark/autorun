@@ -3373,6 +3373,12 @@ static unsigned int launcher_install_forwarder( int bits, const char *name, unsi
     return rc;
 }
 
+static unsigned long long launcher_forwarder_id( int bits )
+{
+    return wine_nx_forwarder_title_id( own_nro, NULL, bits == 32 ? WINE_NX_SPACE_32BIT_NO_ALIAS
+                                                                  : WINE_NX_SPACE_39BIT );
+}
+
 /* Whether an application is still installed. The records alone answer it, so
  * this does not ask the console for every application's name as the listing
  * above does. */
@@ -3634,6 +3640,7 @@ int main( int argc, char **argv )
             .launch_title = launcher_launch_title,
             .title_installed = launcher_title_installed,
             .install_forwarder = launcher_install_forwarder,
+            .forwarder_id = launcher_forwarder_id,
             .schedule_restart = envHasNextLoad() ? launcher_schedule_restart : NULL,
 #ifdef WINE_NX_MESA_SWITCH
             .vulkan = 1,

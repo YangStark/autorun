@@ -99,6 +99,11 @@ Speed Underground 2 and Halo are two. Autorun notices when a game needs this and
 offers to set it up: **Settings -> System -> Make a 32-bit forwarder** adds an
 "Autorun 32-bit" icon to the HOME menu. Start those games from that icon.
 
+It works the other way too: a game that does not need it is sent from "Autorun
+32-bit" to the Autorun icon (made with **Make an Autorun forwarder**), since in
+32 bits large games run out of memory and close. To keep a game in "Autorun
+32-bit" anyway, set **Address space** to 32-bit in its options.
+
 ## Using the launcher
 
 | Button | What it does |
