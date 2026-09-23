@@ -33,8 +33,13 @@ static const devoptab_t *sd_cache_base;
 static devoptab_t sd_cache_device;
 static pthread_mutex_t sd_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct sd_cache_file *sd_cache_files;
-static struct sd_cache_pool sd_cache_pool = { .max = SD_CACHE_POOL_MIN, .cap = SD_CACHE_POOL_MAX,
-                                              .fill_min = SD_CACHE_FILL_MIN };
+/* Whole chunks on every miss (fill_min 0). Readahead from 16 KB halved the
+ * bytes The Sims 2 took from the card but nearly tripled the requests, and on
+ * the hardware a request costs 0.83 ms before its transfer at 42 MB/s: card
+ * time went from 41.7 to 39.3 s, which is not worth a request every few
+ * kilobytes. The game rereads close to what it just read more than the
+ * replay in tests/sd_read_cache.c does. */
+static struct sd_cache_pool sd_cache_pool = { .max = SD_CACHE_POOL_MIN, .cap = SD_CACHE_POOL_MAX };
 static int sd_cache_off;
 
 struct sd_cache_fill_ctx

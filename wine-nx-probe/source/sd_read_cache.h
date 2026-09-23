@@ -15,11 +15,10 @@
  * every miss cost The Sims 2 eight bytes from the card for every byte it
  * asked for, since it reads scattered records out of large packages, and at
  * the card's 37 MB/s the transfer, not the request, was most of each miss.
- * On a replay of such reads (tests/sd_read_cache.c) the card time falls from
- * 82 s with whole chunks to 30-32 s with a smallest fill of 4 to 16 KB, and
- * reading in order costs the same either way; 16 KB, since the game's reads
- * have more locality than the replay's. A pool whose fill_min is 0 reads
- * whole aligned chunks every time.
+ * On the hardware it did not pay: 16 KB fills halved the bytes but nearly
+ * tripled the requests, at 0.83 ms each, and the game rereads nearby data more
+ * than the replay in tests/sd_read_cache.c does, so the runtime keeps whole
+ * chunks (fill_min 0) and this stays for a pool that wants it.
  *
  * A file is cached whatever it was opened for, and a write to a path throws
  * away what every open file with that path holds (sd_cache_written), so the

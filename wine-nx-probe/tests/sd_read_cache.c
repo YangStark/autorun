@@ -423,9 +423,12 @@ static void test_readahead(void)
 }
 
 /* A replay of the two policies on the same reads, costed as the card costs
- * them on the hardware: 0.43 ms a request and 37 MB/s, fitted from 152,822
- * small requests taking 74 s and 10,795 of 128 KB taking 41.7 s. The files
- * are generated rather than stored, so they can be as large as packages. */
+ * them on the hardware: 0.83 ms a request and 42 MB/s, fitted from two runs of
+ * The Sims 2 (10,795 requests for 1,390 MB in 41.7 s with whole chunks, 28,552
+ * for 665 MB in 39.3 s from 16 KB). The replay's reads are more scattered than
+ * the game's, so it favours small fills more than the card did: it tests that
+ * readahead works, not which policy the runtime should use. The files are
+ * generated rather than stored, so they can be as large as packages. */
 struct virtual_file { unsigned int id; unsigned long long bytes; unsigned int requests; };
 
 static char virtual_byte( unsigned int id, long long offset )
@@ -501,8 +504,8 @@ static void replay( unsigned int fill_min, int scattered, struct replay *out )
             got = sd_cache_read( &files[which], &pool, at + done, buf, (size_t)piece, virtual_fill, &data[which], &fills );
             assert( got == piece );
             assert( buf[0] == virtual_byte( which, at + done ) && buf[piece - 1] == virtual_byte( which, at + done + piece - 1 ) );
-            out->ms += (data[which].requests - before_requests) * 0.43 +
-                       (double)(data[which].bytes - before_bytes) / (37.0 * 1024 * 1024) * 1000;
+            out->ms += (data[which].requests - before_requests) * 0.83 +
+                       (double)(data[which].bytes - before_bytes) / (42.0 * 1024 * 1024) * 1000;
             done += got;
         }
         out->asked += (unsigned long long)size;
