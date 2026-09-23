@@ -6,8 +6,20 @@
  * SDK keeps one in its fs client library). OpenTTD reads its graphics with a
  * seek and a small read per sprite, so most requests fetch data that a nearby
  * read already had. As Dolphin's SectorReader does for disc images, each file
- * keeps a few aligned chunks: a read inside one is a copy, a miss reads the
- * whole chunk in one request, and the least recently used chunk is replaced.
+ * keeps a few chunks: a read inside one is a copy, a miss reads a chunk in one
+ * request, and the least recently used chunk is replaced.
+ *
+ * How much a miss reads follows the file, as an operating system's readahead
+ * does: fill_min at first, twice the last fill while the file is read in
+ * order, back to fill_min when a read lands elsewhere. Reading 128 KB on
+ * every miss cost The Sims 2 eight bytes from the card for every byte it
+ * asked for, since it reads scattered records out of large packages, and at
+ * the card's 37 MB/s the transfer, not the request, was most of each miss.
+ * On a replay of such reads (tests/sd_read_cache.c) the card time falls from
+ * 82 s with whole chunks to 30-32 s with a smallest fill of 4 to 16 KB, and
+ * reading in order costs the same either way; 16 KB, since the game's reads
+ * have more locality than the replay's. A pool whose fill_min is 0 reads
+ * whole aligned chunks every time.
  *
  * A file is cached whatever it was opened for, and a write to a path throws
  * away what every open file with that path holds (sd_cache_written), so the
@@ -24,7 +36,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define SD_CACHE_CHUNK  (128 * 1024)  /* bytes read per request on a miss */
+#define SD_CACHE_CHUNK  (128 * 1024)  /* the most a miss reads, and a line's buffer */
+#define SD_CACHE_FILL_MIN (16 * 1024) /* what a miss reads until a file is read in order */
 #define SD_CACHE_LINES  8             /* chunks kept per file */
 #define SD_CACHE_DIRECT (64 * 1024)   /* reads this large go straight to the file */
 #define SD_CACHE_BYPASS (-2)          /* sd_cache_read found no memory: read directly */
@@ -57,6 +70,7 @@ struct sd_cache_pool
 {
     unsigned int used, max;        /* chunks allocated for all files, and the limit */
     unsigned int cap;              /* how many held can list; max never passes it */
+    unsigned int fill_min;         /* the smallest fill, or 0 for whole chunks */
     unsigned long long clock;      /* counts every chunk read, across files */
     struct sd_cache_line **held;   /* the lines holding a chunk, used of them */
 };
@@ -135,6 +149,10 @@ struct sd_cache_file
     char *path;
     int writable;
     int cacheable;
+    unsigned int window;     /* the size of the last fill, 0 before the first */
+    long long fill_end;      /* where the last fill ended: a miss there reads on in order */
+    int size_known;          /* a fill came back short: the file ends at size */
+    long long size;
     struct sd_cache_line lines[SD_CACHE_LINES];
     struct sd_cache_file *next;
 };
@@ -153,6 +171,10 @@ static inline void sd_cache_drop( struct sd_cache_file *file, struct sd_cache_po
         sd_cache_held_remove( pool, &file->lines[i] );
         memset( &file->lines[i], 0, sizeof(file->lines[i]) );
     }
+    /* A write may have moved the end, and the order reads come in. */
+    file->window = 0;
+    file->fill_end = 0;
+    file->size_known = 0;
 }
 
 static inline struct sd_cache_line *sd_cache_line_for( struct sd_cache_file *file, long long offset )
@@ -173,18 +195,33 @@ static inline struct sd_cache_line *sd_cache_line_for( struct sd_cache_file *fil
     return NULL;
 }
 
-/* A short chunk at chunk_start marks the end of the file. */
-static inline int sd_cache_known_end( const struct sd_cache_file *file, long long chunk_start )
+/* Where the next fill starts and how much it reads, for a miss at offset. It
+ * starts at a fill_min boundary, so small reads next to one another share it,
+ * and stops short of a line that already holds what follows. Returns 0 at or
+ * past a known end of the file. */
+static inline int sd_cache_plan( const struct sd_cache_file *file, const struct sd_cache_pool *pool,
+                                 long long offset, long long *start, size_t *size, unsigned int *window )
 {
-    unsigned int i;
+    unsigned int step = pool->fill_min ? pool->fill_min : SD_CACHE_CHUNK, i;
+    long long end;
 
+    if (file->size_known && offset >= file->size) return 0;
+    if (!pool->fill_min) *window = SD_CACHE_CHUNK;
+    else if (file->window && offset == file->fill_end)  /* read on in order */
+        *window = file->window * 2 > SD_CACHE_CHUNK ? SD_CACHE_CHUNK : file->window * 2;
+    else *window = pool->fill_min;
+    *start = offset - offset % step;
+    end = *start + *window;
+    if (end - offset < 1) end = offset + 1;
     for (i = 0; i < SD_CACHE_LINES; i++)
     {
         const struct sd_cache_line *line = &file->lines[i];
 
-        if (line->data && line->start == chunk_start && line->len < SD_CACHE_CHUNK) return 1;
+        if (line->data && line->start > offset && line->start < end) end = line->start;
     }
-    return 0;
+    if (file->size_known && end > file->size) end = file->size;
+    *size = (size_t)(end - *start);
+    return 1;
 }
 
 /* The line to fill: a buffer holding nothing, then a free slot, then the
@@ -228,9 +265,11 @@ static inline long long sd_cache_read( struct sd_cache_file *file, struct sd_cac
 
         if (!line)
         {
-            long long start = at - at % SD_CACHE_CHUNK, got;
+            long long start, got;
+            unsigned int window;
+            size_t want;
 
-            if (sd_cache_known_end( file, start )) break;
+            if (!sd_cache_plan( file, pool, at, &start, &want, &window )) break;
             line = sd_cache_victim( file );
             if (!line->data && pool->used >= pool->max)
             {
@@ -257,11 +296,18 @@ static inline long long sd_cache_read( struct sd_cache_file *file, struct sd_cac
             line->start = -1;
             line->len = 0;
             (*fills)++;
-            if ((got = fill( ctx, start, line->data, SD_CACHE_CHUNK )) < 0)
+            if ((got = fill( ctx, start, line->data, want )) < 0)
                 return done ? (long long)done : -1;
             line->start = start;
             line->len = (size_t)got;
-            if (at >= start + got) break;  /* end of the file */
+            file->window = window;
+            file->fill_end = start + got;
+            if ((size_t)got < want)  /* the end of the file */
+            {
+                file->size = start + got;
+                file->size_known = 1;
+            }
+            if (at >= start + got) break;
         }
         line->used_at = ++pool->clock;
         skip = (size_t)(at - line->start);

@@ -136,9 +136,10 @@ seconds: frames, OpenGL and system call rates, memory and translation counters.
 Its reading figures tell a slow load apart from a busy one: `reads`/`read_mb`
 are what the program asked for, `sd_reads`/`sd_mb` what the card was asked for
 after the read cache, and `cache_mb` what that cache holds. The cache
-(`source/sd_read_cache.h`) keeps 128 KB chunks, eight per open file, and takes
+(`source/sd_read_cache.h`) keeps up to eight pieces of each open file, and takes
 between 32 and 192 MB depending on the heap a game leaves free; a write to a
-file throws away what is held for it. `code_mb` is the translated code the run
+file throws away what is held for it. A miss reads 16 KB, and twice the last
+read while a file is read in order, up to 128 KB, as readahead does. `code_mb` is the translated code the run
 holds now over the code memory Horizon gave it, and `code_all_mb` every byte
 ever translated: Horizon grants ten code memory objects in all, so translated
 code that is never reused is what ends a long run in the interpreter

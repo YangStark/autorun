@@ -12,6 +12,7 @@ struct fake_file
     long long size;
     unsigned int requests;
     int fail;
+    unsigned long long bytes;  /* returned by all requests */
 };
 
 static long long fake_fill( void *ctx, long long offset, char *buf, size_t size )
@@ -23,12 +24,13 @@ static long long fake_fill( void *ctx, long long offset, char *buf, size_t size 
     if (offset >= f->size) return 0;
     if ((long long)size > f->size - offset) size = (size_t)(f->size - offset);
     memcpy( buf, f->data + offset, size );
+    f->bytes += size;
     return (long long)size;
 }
 
 static struct fake_file make_file( long long size )
 {
-    struct fake_file f = { malloc( (size_t)size ), size, 0, 0 };
+    struct fake_file f = { malloc( (size_t)size ), size, 0, 0, 0 };
     long long i;
 
     assert( f.data );
@@ -336,6 +338,203 @@ static void test_pool_resized(void)
     free( f.data );
 }
 
+/* Where the last read of the random mix in test_readahead ended. */
+static long long file_next;
+static long long at_next( const struct sd_cache_file *file )
+{
+    (void)file;
+    return file_next;
+}
+
+/* Readahead: scattered small reads each cost fill_min from the card, not a
+ * whole chunk, and a file read in order still ends up in chunk-sized fills. */
+static void test_readahead(void)
+{
+    struct sd_cache_pool pool = { .max = 64, .fill_min = SD_CACHE_FILL_MIN };
+    struct fake_file f = make_file( 4LL * 1024 * 1024 );
+    struct sd_cache_file file = { .cacheable = 1 };
+    char buf[4096];
+    unsigned int i, seed = 7;
+    long long pos;
+
+    /* Far apart: one fill_min request apiece. */
+    for (i = 0; i < 16; i++)
+    {
+        long long at = (long long)i * 256 * 1024 + 5000;
+
+        assert( cached_read( &file, &pool, &f, at, buf, 1000 ) == 1000 && !memcmp( buf, f.data + at, 1000 ) );
+    }
+    assert( f.requests == 16 && f.bytes == 16ull * SD_CACHE_FILL_MIN );
+    /* A read next to the last of them is already there (a file keeps eight). */
+    assert( cached_read( &file, &pool, &f, 15ll * 256 * 1024 + 9000, buf, 2000 ) == 2000 && f.requests == 16 );
+    sd_cache_drop( &file, &pool );
+
+    /* In order from the start: fill_min, twice that, and so on up to a chunk
+     * at a time. The last fill runs on past the reader, as readahead does. */
+    f.requests = 0;
+    f.bytes = 0;
+    for (pos = 0; pos < 1024 * 1024; pos += sizeof(buf))
+    {
+        assert( cached_read( &file, &pool, &f, pos, buf, sizeof(buf) ) == (long long)sizeof(buf) );
+        assert( !memcmp( buf, f.data + pos, sizeof(buf) ) );
+    }
+    {
+        unsigned long long covered = 0, window = SD_CACHE_FILL_MIN;
+        unsigned int requests = 0;
+
+        for (; covered < 1024 * 1024; requests++)
+        {
+            covered += window;
+            window = window * 2 > SD_CACHE_CHUNK ? SD_CACHE_CHUNK : window * 2;
+        }
+        assert( f.requests == requests && f.bytes == covered );
+    }
+    sd_cache_drop( &file, &pool );
+
+    /* The end of the file: found once, then no request past it. */
+    free( f.data );
+    f = make_file( 1000 );
+    assert( cached_read( &file, &pool, &f, 990, buf, 100 ) == 10 && !memcmp( buf, f.data + 990, 10 ) );
+    assert( cached_read( &file, &pool, &f, 1000, buf, 100 ) == 0 && cached_read( &file, &pool, &f, 9000, buf, 1 ) == 0 );
+    assert( cached_read( &file, &pool, &f, 0, buf, 2000 ) == 1000 && !memcmp( buf, f.data, 1000 ) );
+    assert( f.requests == 1 );
+    sd_cache_drop( &file, &pool );
+    free( f.data );
+
+    /* Anything, anywhere, with fills of every size: always the file's bytes. */
+    f = make_file( 3LL * 1024 * 1024 + 777 );
+    for (i = 0; i < 30000; i++)
+    {
+        long long at;
+        size_t size;
+
+        seed = seed * 1103515245 + 12345;
+        at = (i % 5 == 0) ? (long long)(seed % (unsigned int)f.size) : at_next( &file );
+        size = 1 + (seed >> 9) % sizeof(buf);
+        if (at >= f.size) at = f.size - 1;
+        if (at + (long long)size > f.size) size = (size_t)(f.size - at);
+        assert( cached_read( &file, &pool, &f, at, buf, size ) == (long long)size );
+        assert( !memcmp( buf, f.data + at, size ) );
+        file_next = at + (long long)size;
+    }
+    sd_cache_drop( &file, &pool );
+    assert( !pool.used );
+    free( f.data );
+}
+
+/* A replay of the two policies on the same reads, costed as the card costs
+ * them on the hardware: 0.43 ms a request and 37 MB/s, fitted from 152,822
+ * small requests taking 74 s and 10,795 of 128 KB taking 41.7 s. The files
+ * are generated rather than stored, so they can be as large as packages. */
+struct virtual_file { unsigned int id; unsigned long long bytes; unsigned int requests; };
+
+static char virtual_byte( unsigned int id, long long offset )
+{
+    return (char)(((unsigned long long)offset + id * 0x9e3779b9ull) * 2654435761u >> 11);
+}
+
+static long long virtual_fill( void *ctx, long long offset, char *buf, size_t size )
+{
+    struct virtual_file *f = ctx;
+    const long long file_size = 96ll * 1024 * 1024;
+    size_t i;
+
+    f->requests++;
+    if (offset >= file_size) return 0;
+    if ((long long)size > file_size - offset) size = (size_t)(file_size - offset);
+    for (i = 0; i < size; i++) buf[i] = virtual_byte( f->id, offset + (long long)i );
+    f->bytes += size;
+    return (long long)size;
+}
+
+struct replay { double ms; unsigned long long asked, fetched; unsigned int requests; };
+
+static void replay( unsigned int fill_min, int scattered, struct replay *out )
+{
+    enum { FILES = 24, LOADS = 20000 };
+    struct sd_cache_pool pool = { .max = 512, .fill_min = fill_min };
+    static struct sd_cache_file files[FILES];
+    static struct virtual_file data[FILES];
+    static long long recent[2048];
+    static char buf[64 * 1024];
+    unsigned int i, seed = 99, fills, recent_count = 0;
+
+    memset( files, 0, sizeof(files) );
+    memset( data, 0, sizeof(data) );
+    memset( out, 0, sizeof(*out) );
+    for (i = 0; i < FILES; i++) { files[i].cacheable = 1; data[i].id = i; }
+    for (i = 0; i < LOADS; i++)
+    {
+        unsigned int which, before_requests;
+        unsigned long long before_bytes;
+        long long at, size, done;
+
+        seed = seed * 1103515245 + 12345;
+        if (scattered)
+        {
+            /* The Sims 2: a record's header, then its body in 4 KB reads, from
+             * a few packages most of the time; now and then one read again. */
+            which = (seed >> 8) % 100 < 70 ? (seed >> 16) % 6 : (seed >> 16) % FILES;
+            if (recent_count && (seed >> 4) % 4 == 0)
+                at = recent[(seed >> 12) % recent_count];
+            else
+                at = (long long)((seed * 2654435761u) % (96u * 1024 * 1024 - 65536)) & ~15ll;
+            if (recent_count < 2048) recent[recent_count++] = at;
+            size = 256ll << ((seed >> 20) % 8);   /* 256 bytes to 32 KB */
+            size += (seed >> 3) % size;
+        }
+        else
+        {
+            /* OpenTTD: sprites read in order from one file, 4 KB at a time. */
+            which = 0;
+            at = (long long)i * 4096;
+            size = 4096;
+        }
+        for (done = 0; done < size; )
+        {
+            long long piece = size - done > 4096 ? 4096 : size - done;
+            long long got;
+
+            before_requests = data[which].requests;
+            before_bytes = data[which].bytes;
+            fills = 0;
+            got = sd_cache_read( &files[which], &pool, at + done, buf, (size_t)piece, virtual_fill, &data[which], &fills );
+            assert( got == piece );
+            assert( buf[0] == virtual_byte( which, at + done ) && buf[piece - 1] == virtual_byte( which, at + done + piece - 1 ) );
+            out->ms += (data[which].requests - before_requests) * 0.43 +
+                       (double)(data[which].bytes - before_bytes) / (37.0 * 1024 * 1024) * 1000;
+            done += got;
+        }
+        out->asked += (unsigned long long)size;
+    }
+    for (i = 0; i < FILES; i++)
+    {
+        out->fetched += data[i].bytes;
+        out->requests += data[i].requests;
+        sd_cache_drop( &files[i], &pool );
+    }
+    free( pool.held );
+}
+
+static void test_replay(void)
+{
+    struct replay whole, ahead;
+
+    replay( 0, 1, &whole );
+    replay( SD_CACHE_FILL_MIN, 1, &ahead );
+    printf( "scattered records: whole chunks %u requests, %.1fx the bytes asked, %.1f s; "
+            "readahead %u requests, %.1fx, %.1f s\n",
+            whole.requests, (double)whole.fetched / whole.asked, whole.ms / 1000,
+            ahead.requests, (double)ahead.fetched / ahead.asked, ahead.ms / 1000 );
+    assert( ahead.ms < whole.ms * 0.75 );
+
+    replay( 0, 0, &whole );
+    replay( SD_CACHE_FILL_MIN, 0, &ahead );
+    printf( "in order: whole chunks %u requests, %.1f s; readahead %u requests, %.1f s\n",
+            whole.requests, whole.ms / 1000, ahead.requests, ahead.ms / 1000 );
+    assert( ahead.ms <= whole.ms * 1.05 );
+}
+
 int main(void)
 {
     test_sprite_reads();
@@ -345,9 +544,11 @@ int main(void)
     test_oldest_across_files();
     test_many_open_files();
     test_pool_resized();
+    test_readahead();
+    test_replay();
     test_open_files();
     puts( "SD read cache: sprite reads, end of file, least recently used, failures, a full pool taking the "
           "oldest chunk of any file, 300 open files, a pool that grows and shrinks with the free heap, "
-          "and open files a program writes to passed" );
+          "readahead, and open files a program writes to passed" );
     return 0;
 }
