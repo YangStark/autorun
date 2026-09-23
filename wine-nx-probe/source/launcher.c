@@ -3790,6 +3790,26 @@ static int file_browser_pick( struct launcher *l, char *target, size_t size )
     }
 }
 
+/* A program started from the file browser and left out of the library: a
+ * setup, a patch, a tool. It runs with the settings a new game would have,
+ * or its own if it already has a file of them. */
+static int run_once( struct launcher *l, char *target, size_t size )
+{
+    struct program program;
+    char path[512];
+    int index;
+
+    if (!file_browser_pick( l, path, sizeof(path) )) return 0;
+    launcher_log( "[LAUNCHER] Run once: %s", path );
+    if ((index = find_program( l, path )) >= 0) return start_program( l, &l->programs[index], target, size );
+    if (!describe_program( l, &program, path ))
+    {
+        ui_message( &l->ui, "Run a program once", "Autorun cannot run this executable." );
+        return 0;
+    }
+    return start_program( l, &program, target, size );
+}
+
 static int add_game( struct launcher *l )
 {
     struct program program;
@@ -4128,11 +4148,16 @@ static int run_library( struct launcher *l, char *target, size_t size )
                 break;
             case UI_PLUS:
             {
-                static const char *const items[] = { "Add game", "Exit Autorun" };
-                int chosen = ui_menu( ui, "Autorun", items, 2, 0 );
+                static const char *const items[] = { "Add game", "Run a program once", "Exit Autorun" };
+                int chosen = ui_menu( ui, "Autorun", items, 3, 0 );
 
                 ui_start_screen( ui );
                 if (chosen == 1)
+                {
+                    if (run_once( l, target, size )) return 1;
+                    ui_start_screen( ui );
+                }
+                else if (chosen == 2)
                 {
                     if (ui_confirm( ui, "Exit Autorun", "Close Autorun and go back to the Homebrew Menu?",
                                     "Exit" )) return 0;

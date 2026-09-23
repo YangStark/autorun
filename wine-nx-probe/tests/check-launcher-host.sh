@@ -71,6 +71,33 @@ ln -s "$drive_c/notepad.exe" "$drive_c/7zr.exe" "$card/switch/wine/drive_c/"
 ln -s "$drive_c/notepad.exe" "$card/switch/wine/drive_c/openttd/openttd.exe"
 ln -s "$drive_c/notepad.exe" "$card/games/deep/er/still/Deep.exe"
 
+# + -> Run a program once: the browser's pick starts at once and stays out of
+# the library.
+cat > "$build/once-script.txt" <<SCRIPT
+wait 10
+key plus
+wait 3
+key down
+wait 2
+key a
+wait 3
+key a
+wait 3
+key a
+wait 3
+key a
+wait 5
+SCRIPT
+( cd "$build/card" && SDL_VIDEODRIVER=dummy "$build/launcher_host" "$font" "$build/once-script.txt" \
+    > "$build/once-out.txt" 2>&1 ) || { cat "$build/once-out.txt"; exit 1; }
+grep -q "launcher returned 1 target 'sdmc:/switch/wine/drive_c/openttd/openttd.exe'" "$build/once-out.txt" || {
+    cat "$build/once-out.txt"; exit 1; }
+if [ -f "$card/switch/wine/launcher-library-v2.ini" ] && grep -q '^\[game ' "$card/switch/wine/launcher-library-v2.ini"; then
+    cat "$card/switch/wine/launcher-library-v2.ini"; exit 1
+fi
+rm -f "$card/switch/wine/launcher-library-v2.ini" "$card/switch/wine/target.txt"
+echo "launcher host run: + Run a program once starts it without adding it"
+
 # An empty explicit catalog must stay empty even though drive_c contains several
 # executables. Add OpenTTD through the browser, verify that adding did not launch
 # it, then open its options with Y and start it from there. The browser asks

@@ -112,7 +112,7 @@ It works the other way too: a game that does not need it is sent from "Autorun
 | **Y** | The game's options |
 | **L / R** | Switch between Home (recently played) and the Library |
 | **−** | Settings (on Home), filter and sort (in the Library) |
-| **+** | Add a game, or exit Autorun |
+| **+** | Add a game, run a program once without adding it (a setup, a patch), or exit Autorun |
 
 The touchscreen works everywhere too.
 
