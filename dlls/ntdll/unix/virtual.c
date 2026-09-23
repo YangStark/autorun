@@ -4408,6 +4408,9 @@ static void *alloc_virtual_heap( SIZE_T size )
  * only places there, the dynarec's code memory, and the region section anchors
  * are packed into. */
 #define HORIZON_NATIVE_STACKS ((ULONG_PTR)512 * 1024 * 1024)
+/* Where the whole address space is 4 GB the window also holds every code
+ * arena, two aliases apiece, and 512 MB of it ran the dynarec dry. */
+#define HORIZON_NATIVE_STACKS_4G ((ULONG_PTR)768 * 1024 * 1024)
 
 /* The window itself, for the runtime's own placements. */
 void *horizon_native_window_start = NULL;
@@ -4445,7 +4448,23 @@ static void horizon_reserve_guest_address_space(void)
      * at random with 0x200 attempts, so the window does not have to be empty:
      * 96 threads, all Horizon allows, take a megabyte of kernel stack each,
      * and the code arenas are bounded. A region too small keeps half. */
-    stack_room = min( HORIZON_NATIVE_STACKS, ((ULONG_PTR)stack_end - (ULONG_PTR)stack_start) / 2 );
+    /* Half of the region, and five eighths of it where the whole address space
+     * is 4 GB. What the window has to hold decides it: thread stacks and
+     * section anchors everywhere, and on a 4 GB address space the dynarec's
+     * code memory as well, two aliases per arena, which ran out at 133 MB.
+     * A 36- or 39-bit address space has room above everything a 32-bit
+     * program can address, so code goes there instead and the three eighths
+     * stay the program's: Fallout New Vegas reserves its own memory low, and
+     * taking them left it unable to start. */
+    {
+        void *space_start, *space_limit;
+        ULONG_PTR region = (ULONG_PTR)stack_end - (ULONG_PTR)stack_start;
+
+        horizon_get_address_space_limits( &space_start, &space_limit );
+        stack_room = (ULONG_PTR)space_limit > limit_4g
+                     ? min( HORIZON_NATIVE_STACKS, region / 2 )
+                     : min( HORIZON_NATIVE_STACKS_4G, region / 8 * 5 );
+    }
     window_start = (char *)ROUND_ADDR( (ULONG_PTR)stack_end - stack_room, granularity_mask );
     /* horizon.c places section anchors in here itself rather than asking
      * libnx, whose search picks addresses at random. */

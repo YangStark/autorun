@@ -15243,6 +15243,11 @@ static void section_failure( const char *what, void *addr, void *source, size_t 
 extern void *horizon_native_window_start, *horizon_native_window_end;
 static int horizon_query_region( void *context, unsigned long long addr, struct horizon_region *region );
 
+#include "horizon_code_memory.h"
+
+/* Everything a 32-bit program can address. */
+#define WINE_NX_GUEST_LIMIT 0x100000000ull
+
 #define HORIZON_ANCHOR_REGION ((size_t)32 * 1024 * 1024)
 #define HORIZON_ANCHOR_REGIONS 32
 
@@ -15288,17 +15293,36 @@ static void *find_anchor_run_locked( size_t size )
  * search picks at random and asks 512 times, and each ask walks every
  * reservation the process holds: with regions full, that search was 59% of
  * Most Wanted's main thread and its frame rate halved. */
-static void *find_anchor_region_locked( size_t size )
+/* An anchor region is this runtime's before anything is in it: anchors are
+ * packed into it by find_anchor_run_locked, which looks only at the mapping
+ * tree. Its free space reads as free to the kernel and to the tree alike, and
+ * build 227 put a code arena there -- after which every section anchor in the
+ * region failed with EEXIST, and The Sims 2 wrote through the NULL view it was
+ * handed. */
+static char *anchor_region_end_overlapping( const char *start, size_t size )
 {
-    char *candidate = horizon_native_window_start;
-    char *end = horizon_native_window_end;
+    unsigned int i;
+
+    for (i = 0; i < anchor_region_count; i++)
+        if (start < anchor_regions[i].end && anchor_regions[i].start < start + size) return anchor_regions[i].end;
+    return NULL;
+}
+
+static void *find_free_run_locked( char *candidate, char *end, size_t size )
+{
     struct horizon_region region;
 
     if (!candidate || !end) return NULL;
     while (size <= (size_t)(end - candidate))
     {
         struct horizon_mapping *overlap = find_overlap_mapping( candidate, size );
+        char *region_end;
 
+        if ((region_end = anchor_region_end_overlapping( candidate, size )))
+        {
+            candidate = region_end;
+            continue;
+        }
         if (overlap)
         {
             candidate = (char *)overlap->addr + overlap->size;
@@ -15314,6 +15338,11 @@ static void *find_anchor_region_locked( size_t size )
         candidate = (char *)(uintptr_t)(region.addr + region.size);
     }
     return NULL;
+}
+
+static void *find_anchor_region_locked( size_t size )
+{
+    return find_free_run_locked( horizon_native_window_start, horizon_native_window_end, size );
 }
 
 static void *find_anchor_address_locked( size_t size )
@@ -15338,6 +15367,156 @@ static void *find_anchor_address_locked( size_t size )
         anchor_region_end = (char *)region + region_size;
     }
     return find_anchor_run_locked( size );
+}
+
+/* Code memory for the dynarec's arenas, placed in the same window and walked
+ * the same way: what libnx's random probe could not find. Both aliases are
+ * mapped while the window is locked, so the second walk sees the first one and
+ * nothing else can take the range in between. */
+/* Where a code arena may go. A program Wine runs here is 32-bit, so every
+ * address it can name is below 4 GB: on a 36- or 39-bit address space the
+ * range above that is the runtime's to use and no arena need cost the program
+ * anything. Only when the whole address space is 4 GB do the two share, and
+ * then the window is all a code mapping may use, since everything else below
+ * 4 GB is reserved for the program. */
+static void *find_code_run_locked( size_t size )
+{
+    void *space_start, *space_limit;
+
+    horizon_get_address_space_limits( &space_start, &space_limit );
+    if ((unsigned long long)(uintptr_t)space_limit > WINE_NX_GUEST_LIMIT)
+        return find_free_run_locked( (char *)(uintptr_t)WINE_NX_GUEST_LIMIT, space_limit, size );
+    return find_anchor_region_locked( size );
+}
+
+int wine_nx_code_memory_map( void *source, size_t size, struct wine_nx_code_memory *out, unsigned int *rc )
+{
+    Handle handle = INVALID_HANDLE;
+    Result res;
+
+    memset( out, 0, sizeof(*out) );
+    *rc = 0;
+    if (R_FAILED( (res = svcCreateCodeMemory( &handle, source, size )) ))
+    {
+        *rc = res;
+        return 0;
+    }
+    pthread_mutex_lock( &mapping_mutex );
+    virtmemLock();
+    if ((out->rw = find_code_run_locked( size )))
+    {
+        if (R_FAILED( (res = svcControlCodeMemory( handle, CodeMapOperation_MapOwner,
+                                                  out->rw, size, Perm_Rw )) ))
+            out->rw = NULL;
+        else
+            out->rw_token = virtmemAddReservation( out->rw, size );
+    }
+    if (out->rw && (out->rx = find_code_run_locked( size )))
+    {
+        if (R_FAILED( (res = svcControlCodeMemory( handle, CodeMapOperation_MapSlave,
+                                                  out->rx, size, Perm_Rx )) ))
+            out->rx = NULL;
+        else
+            out->rx_token = virtmemAddReservation( out->rx, size );
+    }
+    virtmemUnlock();
+    pthread_mutex_unlock( &mapping_mutex );
+
+    if (out->rw && out->rx)
+    {
+        out->handle = handle;
+        out->size = size;
+        return 1;
+    }
+    *rc = res;  /* 0 when the window simply had no run that large */
+    if (out->rw)
+        svcControlCodeMemory( handle, CodeMapOperation_UnmapOwner, out->rw, size, 0 );
+    virtmemLock();
+    if (out->rw_token) virtmemRemoveReservation( out->rw_token );
+    if (out->rx_token) virtmemRemoveReservation( out->rx_token );
+    virtmemUnlock();
+    svcCloseHandle( handle );
+    memset( out, 0, sizeof(*out) );
+    return 0;
+}
+
+void wine_nx_code_memory_unmap( struct wine_nx_code_memory *memory )
+{
+    if (!memory->handle) return;
+    svcControlCodeMemory( memory->handle, CodeMapOperation_UnmapSlave,
+                          memory->rx, memory->size, 0 );
+    svcControlCodeMemory( memory->handle, CodeMapOperation_UnmapOwner,
+                          memory->rw, memory->size, 0 );
+    svcCloseHandle( memory->handle );
+    virtmemLock();
+    if (memory->rw_token) virtmemRemoveReservation( memory->rw_token );
+    if (memory->rx_token) virtmemRemoveReservation( memory->rx_token );
+    virtmemUnlock();
+    memset( memory, 0, sizeof(*memory) );
+}
+
+/* The largest run the window still holds: what the next arena may ask for, and
+ * in the log the difference between a window that is full and a kernel that
+ * has no code memory object left. The kernel keeps one block per free run, so
+ * each unmapped block is a whole run; only this runtime's own mappings, which
+ * it may hold before the kernel does, still have to be taken off it. */
+size_t wine_nx_native_window_free(void)
+{
+    char *candidate = horizon_native_window_start, *end = horizon_native_window_end;
+    void *space_start, *space_limit;
+    size_t largest = 0;
+
+    horizon_get_address_space_limits( &space_start, &space_limit );
+    if ((unsigned long long)(uintptr_t)space_limit > WINE_NX_GUEST_LIMIT)
+    {
+        /* Above the program's 4 GB, where an arena takes nothing from it. */
+        candidate = (char *)(uintptr_t)WINE_NX_GUEST_LIMIT;
+        end = space_limit;
+    }
+    if (!candidate || !end) return 0;
+    pthread_mutex_lock( &mapping_mutex );
+    virtmemLock();
+    while (candidate < end)
+    {
+        struct horizon_mapping *overlap;
+        struct horizon_region region;
+        char *run_end, *region_end;
+        unsigned int i;
+
+        /* Taken: an anchor region, one of this runtime's mappings, or a block
+         * the kernel has. Otherwise free until the first of those. */
+        if ((region_end = anchor_region_end_overlapping( candidate, 1 )))
+        {
+            candidate = region_end;
+            continue;
+        }
+        if (!horizon_query_region( NULL, (unsigned long long)(uintptr_t)candidate, &region )) break;
+        run_end = (char *)(uintptr_t)(region.addr + region.size);
+        if (run_end <= candidate) break;
+        if (run_end > end) run_end = end;
+        if (region.type != HORIZON_MEMTYPE_UNMAPPED)
+        {
+            candidate = run_end;
+            continue;
+        }
+        if ((overlap = find_overlap_mapping( candidate, (size_t)(run_end - candidate) )))
+        {
+            if ((char *)overlap->addr <= candidate)
+            {
+                candidate = (char *)overlap->addr + overlap->size;
+                continue;
+            }
+            run_end = overlap->addr;
+        }
+        for (i = 0; i < anchor_region_count; i++)
+            if (anchor_regions[i].start > candidate && anchor_regions[i].start < run_end)
+                run_end = anchor_regions[i].start;
+        if ((size_t)(run_end - candidate) > largest) largest = (size_t)(run_end - candidate);
+        candidate = run_end;
+    }
+    virtmemUnlock();
+    pthread_mutex_unlock( &mapping_mutex );
+    return largest;
 }
 
 static void *horizon_section_anchor( void *source, size_t size, void **token )

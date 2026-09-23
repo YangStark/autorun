@@ -1183,7 +1183,7 @@ static void runtime_report_interpreter(void)
         unsigned long long read_ms = &wine_nx_file_read_100ns
                                      ? __atomic_load_n( &wine_nx_file_read_100ns, __ATOMIC_RELAXED ) / 10000 : 0;
         unsigned int syscalls = &wine_nx_syscalls ? __atomic_load_n( &wine_nx_syscalls, __ATOMIC_RELAXED ) : 0;
-        char native[256] = "", gl[512] = "", audio[32] = "", systop[64] = "";
+        char native[384] = "", gl[512] = "", audio[32] = "", systop[64] = "";
 
         if (!start) start = now;
         if (++calls % 2) return;
@@ -1230,8 +1230,16 @@ static void runtime_report_interpreter(void)
             extern unsigned int wine_nx_box64_callret_clean, wine_nx_box64_callret_dirty;
             extern unsigned int wine_nx_box64_translator_locks, wine_nx_box64_inline_unix_calls;
             extern uint64_t wine_nx_box64_dynarec_bytes, wine_nx_box64_arena_bytes;
+            extern uint64_t wine_nx_box64_code_translated;
+            extern unsigned int wine_nx_box64_purges, wine_nx_box64_purged_blocks;
+            extern unsigned long long wine_nx_box64_purged_bytes, wine_nx_box64_purge_ns;
+            /* code_mb is the translated code held now over the code memory the
+             * kernel gave, and code_all_mb every byte ever translated: apart
+             * they say how much of an arena is blocks the run still uses and
+             * how much passed through it. */
             snprintf( native, sizeof(native), " native_entries=%llu block_tests=%u invalidations=%u marked_lookups=%u"
-                      " callret_clean=%u callret_dirty=%u translator_locks=%u inline_unix=%u code_mb=%llu/%llu",
+                      " callret_clean=%u callret_dirty=%u translator_locks=%u inline_unix=%u code_mb=%llu/%llu"
+                      " code_all_mb=%llu purged=%u/%u/%lluMB/%llums",
                       __atomic_load_n( &wine_nx_box64_native_entries, __ATOMIC_RELAXED ),
                       __atomic_load_n( &wine_nx_box64_block_tests, __ATOMIC_RELAXED ),
                       __atomic_load_n( &wine_nx_box64_invalidations, __ATOMIC_RELAXED ),
@@ -1241,7 +1249,13 @@ static void runtime_report_interpreter(void)
                       __atomic_load_n( &wine_nx_box64_translator_locks, __ATOMIC_RELAXED ),
                       __atomic_load_n( &wine_nx_box64_inline_unix_calls, __ATOMIC_RELAXED ),
                       (unsigned long long)(__atomic_load_n( &wine_nx_box64_dynarec_bytes, __ATOMIC_RELAXED ) >> 20),
-                      (unsigned long long)(wine_nx_box64_arena_bytes >> 20) );
+                      (unsigned long long)(wine_nx_box64_arena_bytes >> 20),
+                      (unsigned long long)(__atomic_load_n( &wine_nx_box64_code_translated, __ATOMIC_RELAXED ) >> 20),
+                      /* purges, the blocks they gave back, those blocks' size and the time spent */
+                      __atomic_load_n( &wine_nx_box64_purges, __ATOMIC_RELAXED ),
+                      __atomic_load_n( &wine_nx_box64_purged_blocks, __ATOMIC_RELAXED ),
+                      __atomic_load_n( &wine_nx_box64_purged_bytes, __ATOMIC_RELAXED ) >> 20,
+                      __atomic_load_n( &wine_nx_box64_purge_ns, __ATOMIC_RELAXED ) / 1000000 );
         }
 #endif
         /* OpenGL: frames swapped and the time in eglSwapBuffers, calls into opengl32's unix
@@ -2425,6 +2439,13 @@ static int runtime_describe_image( void *module, SIZE_T size, void **entry )
     main_image_info.ImageFileSize = IMAGE_FIELD(SizeOfImage);
     main_image_info.CheckSum = IMAGE_FIELD(CheckSum);
 
+    /* The dynarec sizes its first code arena from this: the heap has a large
+     * block to give now, and will not have one later (wow64_box64_dynarec.c). */
+    {
+        extern size_t wine_nx_box64_image_size __attribute__((weak));
+
+        if (&wine_nx_box64_image_size) wine_nx_box64_image_size = size;
+    }
     log_line( "[IMAGE] base=%p size=0x%lx preferred=0x%llx entry_rva=0x%x machine=0x%x",
               module, (unsigned long)size,
               (unsigned long long)IMAGE_FIELD(ImageBase),
@@ -2444,9 +2465,21 @@ static int runtime_describe_image( void *module, SIZE_T size, void **entry )
                       "It needs Wine-NX started through a 32-bit forwarder.",
                       (unsigned long long)IMAGE_FIELD(ImageBase), module );
     }
-    log_line( "[IMAGE] subsystem=%u dll_char=0x%x imports=0x%x/0x%x sections=%u",
-              IMAGE_FIELD(Subsystem), IMAGE_FIELD(DllCharacteristics),
-              imports->VirtualAddress, imports->Size, nt->FileHeader.NumberOfSections );
+    /* Whether this program is tied to its own address: one that is not can run
+     * outside a 32-bit forwarder, where the address space is 512 GB instead of
+     * 4 GB and the dynarec has room for all the code it translates. */
+    {
+        const IMAGE_DATA_DIRECTORY *relocs = guest32 ?
+            &nt32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] :
+            &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+
+        log_line( "[IMAGE] subsystem=%u dll_char=0x%x imports=0x%x/0x%x sections=%u relocs=0x%x/0x%x (%s)",
+                  IMAGE_FIELD(Subsystem), IMAGE_FIELD(DllCharacteristics),
+                  imports->VirtualAddress, imports->Size, nt->FileHeader.NumberOfSections,
+                  relocs->VirtualAddress, relocs->Size,
+                  relocs->Size ? "can be moved: the 32-bit forwarder is not needed for it"
+                               : "cannot be moved: it needs the 32-bit forwarder" );
+    }
     return 1;
 #undef IMAGE_FIELD
 }

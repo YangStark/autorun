@@ -67,6 +67,14 @@ static int horizon_get_stack_region(void **start, void **end)
     *end = (void *)stack_hi;
     return 1;
 }
+/* 4 GB unless a case says otherwise: the window keeps more of the stack region
+ * only where the dynarec's code memory has nowhere else to go. */
+static uintptr_t space_limit = 0x100000000ull;
+static void horizon_get_address_space_limits(void **start, void **limit)
+{
+    *start = (void *)0x8000000ull;
+    *limit = (void *)space_limit;
+}
 static int overlaps_native(uintptr_t start, size_t size)
 {
     for (size_t i = 0; i < native_count; i++)
@@ -100,7 +108,8 @@ fixture += block('static struct range_entry *free_ranges_lower_bound(')
 fixture += block('static void free_ranges_exclude(')
 fixture += block('static void free_ranges_restore_exclusions(')
 # The window left for native thread stacks, from the real source.
-fixture += re.search(r'^#define HORIZON_NATIVE_STACKS .*$', source, re.M)[0] + '\n'
+for name in ('HORIZON_NATIVE_STACKS', 'HORIZON_NATIVE_STACKS_4G'):
+    fixture += re.search(r'^#define %s .*$' % name, source, re.M)[0] + '\n'
 # The window the runtime hands horizon.c for its own placements.
 fixture += 'void *horizon_native_window_start, *horizon_native_window_end;\n'
 for marker in ('static void mmap_add_reserved_area(', 'static int mmap_is_in_reserved_area(',
@@ -178,15 +187,15 @@ int main(void)
     assert(mmap_is_in_reserved_area((void *)0x11000000, a.size) == 1);
     /* Future libnx allocations cannot split the protected guest range into
      * 16 MiB gaps. Native allocation still has space outside the reservation. */
-    for (uintptr_t p = 0x1000000; p < 0x20000000; p += 0x1000000)
+    for (uintptr_t p = 0x1000000; p < (uintptr_t)horizon_native_window_start; p += 0x1000000)
         assert(anon_mmap_tryfixed((void *)p, 0x100000, PROT_NONE, 0) == MAP_FAILED);
     /* Unlike generic native mappings, thread stack mirrors MUST lie in the
      * kernel stack region. Build 103 reserved all of it. The window left at
      * the top takes more of them, with their guard pages, than the 96 threads
      * Horizon allows; a stack a megabyte, placed two megabytes apart. */
     {
-        uintptr_t window = HORIZON_NATIVE_STACKS < (stack_hi - stack_lo) / 2
-                           ? HORIZON_NATIVE_STACKS : (stack_hi - stack_lo) / 2;
+        uintptr_t window = HORIZON_NATIVE_STACKS_4G < (stack_hi - stack_lo) / 8 * 5
+                           ? HORIZON_NATIVE_STACKS_4G : (stack_hi - stack_lo) / 8 * 5;
         uintptr_t stacks = 0;
         for (uintptr_t p = stack_hi - window + 0x10000; p + 0x104000 <= stack_hi; p += 0x200000)
         {
@@ -228,16 +237,35 @@ int main(void)
     native[native_count++] = (struct native_map){0x400000, 0x28000000};
     native[native_count++] = (struct native_map){0x78200000, 0xf8200000};
     horizon_reserve_guest_address_space();
-    assert(horizon_native_window_start == (char *)stack_hi - (stack_hi - stack_lo) / 2);
+    /* Five eighths of the stack region: both aliases of every code arena come
+     * out of the window, and half of it ran the dynarec out of room. */
+    assert(horizon_native_window_start == (char *)stack_hi - (stack_hi - stack_lo) / 8 * 5);
     assert(horizon_native_window_end == (void *)stack_hi);
     assert(mmap_is_in_reserved_area((void *)0x40000000, 0xafd0000) == 1);
-    assert(!mmap_is_in_reserved_area((void *)(stack_hi - (stack_hi - stack_lo) / 2), 0x1000));
+    assert(!mmap_is_in_reserved_area((void *)(stack_hi - (stack_hi - stack_lo) / 8 * 5), 0x1000));
     {
         struct alloc_area big = {.size = 0xafd0000, .align_mask = 0xffff};
         void *p = alloc_free_area_in_range(&big, (char *)0x10000, (char *)0x100000000ull);
         assert(p && p != MAP_FAILED);
         assert((uintptr_t)p >= stack_hi && (uintptr_t)p + big.size <= 0x78200000);
     }
+    /* A 39-bit address space: libnx can place code memory outside the window,
+     * so the window is half the region again and the program keeps the rest.
+     * Fallout New Vegas reserves its own memory low, and five eighths here
+     * took 256 MB of what it addresses. */
+    cleanup();
+    space_limit = 0x8000000000ull;
+    stack_lo = 0x8000000;
+    stack_hi = 0x80000000;
+    horizon_reserve_guest_address_space();
+    assert(horizon_native_window_start == (char *)stack_hi - HORIZON_NATIVE_STACKS);
+    assert(horizon_native_window_end == (void *)stack_hi);
+    assert(mmap_is_in_reserved_area((void *)0x50000000, 0x1000) == 1);  /* still the guest's */
+    cleanup();
+    space_limit = 0x100000000ull;
+    stack_lo = 0x200000;
+    stack_hi = 0x40000000;
+
     cleanup();
     stack_query_ok = 0;
     horizon_reserve_guest_address_space();
