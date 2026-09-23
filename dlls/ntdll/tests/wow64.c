@@ -1341,9 +1341,10 @@ static void test_selectors(void)
 static void test_image_mappings(void)
 {
     MEM_EXTENDED_PARAMETER ext = { .Type = MemExtendedParameterImageMachine };
+    SECTION_IMAGE_INFORMATION image;
     HANDLE file, mapping, process = GetCurrentProcess();
     NTSTATUS status;
-    SIZE_T size;
+    SIZE_T size, ret_size;
     LARGE_INTEGER offset;
     void *ptr;
 
@@ -1360,6 +1361,16 @@ static void test_image_mappings(void)
     ok( mapping != 0, "CreateFileMapping failed\n" );
     CloseHandle( file );
 
+    memset( &image, 0, sizeof(image) );
+    status = NtQuerySection( mapping, SectionImageInformation, &image, sizeof(image), &ret_size );
+    ok( !status, "NtQuerySection failed %08lx\n", status );
+    if (!status && current_machine == IMAGE_FILE_MACHINE_AMD64 && native_machine == IMAGE_FILE_MACHINE_ARM64)
+    {
+        ok( image.Machine == IMAGE_FILE_MACHINE_ARM64, "wrong image machine %04x\n", image.Machine );
+        ok( image.ImageContainsCode, "image does not contain code\n" );
+        ok( image.ImageDynamicallyRelocated, "image is not dynamically relocated\n" );
+    }
+
     ptr = NULL;
     size = 0;
     ext.ULong = IMAGE_FILE_MACHINE_AMD64;
@@ -1372,8 +1383,21 @@ static void test_image_mappings(void)
     }
     if (current_machine == IMAGE_FILE_MACHINE_AMD64)
     {
+        IMAGE_DOS_HEADER *dos;
+        IMAGE_NT_HEADERS64 *nt;
+
         ok( status == STATUS_SUCCESS || status == STATUS_IMAGE_NOT_AT_BASE,
             "NtMapViewOfSection returned %08lx\n", status );
+        if ((status == STATUS_SUCCESS || status == STATUS_IMAGE_NOT_AT_BASE) &&
+            native_machine == IMAGE_FILE_MACHINE_ARM64)
+        {
+            dos = ptr;
+            nt = (IMAGE_NT_HEADERS64 *)((char *)ptr + dos->e_lfanew);
+            ok( dos->e_magic == IMAGE_DOS_SIGNATURE, "wrong DOS signature %04x\n", dos->e_magic );
+            ok( nt->Signature == IMAGE_NT_SIGNATURE, "wrong NT signature %08lx\n", nt->Signature );
+            ok( nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64, "wrong mapped machine %04x\n",
+                nt->FileHeader.Machine );
+        }
         NtUnmapViewOfSection( process, ptr );
     }
     else if (current_machine == IMAGE_FILE_MACHINE_ARM64)

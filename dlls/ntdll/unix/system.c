@@ -1861,6 +1861,11 @@ static void init_logical_proc_info(void)
 
 static void read_dev_urandom( void *buf, ULONG len )
 {
+#ifdef __SWITCH__
+    /* Horizon has no /dev/urandom; libnx draws from the csrng service. */
+    extern void randomGet( void *buf, size_t len );
+    randomGet( buf, len );
+#else
     int fd = open( "/dev/urandom", O_RDONLY );
     if (fd != -1)
     {
@@ -1873,6 +1878,7 @@ static void read_dev_urandom( void *buf, ULONG len )
         close( fd );
     }
     else WARN( "can't open /dev/urandom\n" );
+#endif
 }
 
 static void get_random( void *buf, ULONG len )

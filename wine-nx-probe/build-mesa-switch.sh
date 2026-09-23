@@ -14,6 +14,11 @@ src="${WINE_NX_MESA_SWITCH_SRC:-$HOME/mesa-switch}"
 image="${WINE_NX_MESA_IMAGE:-devkitpro-mesa-rust:latest}"
 out="$root/wine-nx-probe/build-mesa-switch"
 lib="$out/install/opt/devkitpro/portlibs/switch/lib"
+revision="$(git -C "$src" rev-parse HEAD)"
+if [ -n "$(git -C "$src" status --porcelain --untracked-files=no)" ]; then
+    echo "Refusing to build mesa-switch from a dirty checkout." >&2
+    exit 1
+fi
 
 mkdir -p "$out"
 docker run --rm --platform linux/arm64 -v "$src:/project" -v "$out:/out" -w /project "$image" bash -lc '
@@ -30,6 +35,7 @@ docker run --rm --platform linux/arm64 -v "$src:/project" -v "$out:/out" -w /pro
     cp bindgen-switch-wrapper.sh /usr/local/libexec/bindgen
     cp rustc-switch-wrapper.sh /usr/local/libexec/rustc
     cp bindgen-atomic-shim.h /usr/local/libexec/bindgen-atomic-shim.h
+    sed -i "s/\r$//" /usr/local/libexec/bindgen /usr/local/libexec/rustc
     chmod +x /usr/local/libexec/bindgen /usr/local/libexec/rustc
     cp -p src/nouveau/headers/nv_device_info.h /opt/devkitpro/portlibs/switch/include/
     [ -d /usr/lib/llvm-15/lib/clang/15/include ] ||
@@ -101,3 +107,4 @@ docker run --rm --platform linux/arm64 -v "$src:/project" -v "$out:/out" -w /pro
     inc=/out/install/opt/devkitpro/portlibs/switch/include
     [ -f $inc/vulkan/vulkan.h ] || { mkdir -p $inc; cp -r include/vulkan include/vk_video $inc/; }'
 ls -la "$lib/libEGL.a" "$lib/libGL.a" "$lib/libglapi.a" "$lib/libvulkan.a"
+printf '%s\n' "$revision" > "$out/source-revision.txt"

@@ -1,6 +1,6 @@
 /* Wine-NX Vulkan checkpoint. Wine's winevulkan hands Vulkan to mesa-switch's
  * NVK on the Switch, so this says whether that chain stands up before DXVK is
- * asked to. It maps host-visible memory from this 32-bit process, repeats what
+ * asked to. It maps host-visible memory from the process, repeats what
  * DXVK does with memory and completion (buffers and images bound at offsets
  * inside larger allocations, timeline semaphore waits, render pass clears read
  * back), then clears a Win32 surface's swapchain through red, green and blue,
@@ -15,8 +15,7 @@
 #define VKAPI_ATTR
 #endif
 
-__declspec(dllimport) NTSTATUS NTAPI NtDisplayString( const UNICODE_STRING *str );
-__declspec(dllimport) NTSTATUS NTAPI NtTerminateProcess( HANDLE process, NTSTATUS status );
+#include "pe_test_io.h"
 
 /* wine/vulkan.h declares no functions (VK_NO_PROTOTYPES). */
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance( const VkInstanceCreateInfo *, const VkAllocationCallbacks *, VkInstance * );
@@ -119,19 +118,20 @@ static void report_text( const char *label, const char *text )
     str.Buffer = buffer;
     str.Length = n * sizeof(WCHAR);
     str.MaximumLength = str.Length;
-    NtDisplayString( &str );
+    pe_test_display_string( &str );
 }
 
-static void report( const char *label, DWORD value )
+static void report( const char *label, ULONG_PTR value )
 {
     static const char hex[] = "0123456789abcdef";
-    char text[11];
+    char text[2 + sizeof(value) * 2 + 1];
     unsigned int i;
 
     text[0] = '0';
     text[1] = 'x';
-    for (i = 0; i < 8; i++) text[2 + i] = hex[(value >> (28 - i * 4)) & 15];
-    text[10] = 0;
+    for (i = 0; i < sizeof(value) * 2; i++)
+        text[2 + i] = hex[(value >> ((sizeof(value) * 2 - 1 - i) * 4)) & 15];
+    text[2 + sizeof(value) * 2] = 0;
     report_text( label, text );
 }
 
@@ -504,7 +504,11 @@ done:
 
 void __stdcall start(void)
 {
+#ifdef _WIN64
+    static const WCHAR class_name[] = L"pe64-vulkan";
+#else
     static const WCHAR class_name[] = L"pe32-vulkan";
+#endif
     static const char *instance_extensions[] = { "VK_KHR_surface", "VK_KHR_win32_surface" };
     static const char *device_extensions[] = { "VK_KHR_swapchain" };
     static const float priority = 1.0f;
@@ -567,7 +571,11 @@ void __stdcall start(void)
     report( "CreateWindowExW", (ULONG_PTR)window );
     if (!window) { failure = 2; goto done; }
 
+#ifdef _WIN64
+    app.pApplicationName = "pe64-vulkan";
+#else
     app.pApplicationName = "pe32-vulkan";
+#endif
     app.apiVersion = VK_API_VERSION_1_3;
     instance_info.pApplicationInfo = &app;
     instance_info.enabledExtensionCount = 2;
@@ -625,7 +633,7 @@ void __stdcall start(void)
     vkGetPhysicalDeviceMemoryProperties( gpu, &memory_props );
 
     /* Host-cached memory: Wine imports its own
-     * 32-bit pages into it (VK_EXT_external_memory_host), and vkMapMemory must
+     * pages into it (VK_EXT_external_memory_host), and vkMapMemory must
      * hand those back in any address space. */
     {
         VkBuffer cached_buffer = 0;
@@ -670,7 +678,7 @@ void __stdcall start(void)
         if (cached_memory) vkFreeMemory( device, cached_memory, NULL );
     }
 
-    /* Host-visible memory mapped into this 32-bit process: Wine imports its own
+    /* Host-visible memory mapped into this process: Wine imports its own
      * low pages into Vulkan for that (VK_EXT_external_memory_host). */
     buffer_info.size = BUFFER_SIZE;
     buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -1149,5 +1157,5 @@ done:
     if (window) DestroyWindow( window );
     if (failure) report( "FAIL step", failure );
     else report_text( "PASS", NULL );
-    NtTerminateProcess( GetCurrentProcess(), failure ? failure : 42 );
+    pe_test_terminate( failure ? failure : 42 );
 }

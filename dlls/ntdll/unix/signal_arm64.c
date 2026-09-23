@@ -51,9 +51,36 @@ void set_process_instrumentation_callback( void *callback )
 NTSTATUS signal_set_full_context( CONTEXT *context )
 {
     extern void horizon_continue_context( const CONTEXT *context );
+    CONTEXT resume;
 
     if (!context || (context->ContextFlags & CONTEXT_ARM64_FULL) != CONTEXT_ARM64_FULL)
         return STATUS_INVALID_PARAMETER;
+    if (is_arm64ec())
+    {
+        void *start, *end;
+
+        horizon_get_address_space_limits( &start, &end );
+        if (context->Pc < (ULONG_PTR)start || context->Pc >= (ULONG_PTR)end ||
+            context->Pc >= 0x8000000000ULL)
+            return STATUS_INVALID_ADDRESS;
+        if (!peb->EcCodeBitMap) return STATUS_INVALID_PARAMETER;
+        if (!is_ec_code( context->Pc ))
+        {
+            CONTEXT *guest;
+            SIZE_T written;
+            NTSTATUS status;
+
+            if (context->Sp < sizeof(*guest) + 16) return STATUS_INVALID_ADDRESS;
+            guest = (CONTEXT *)((context->Sp - sizeof(*guest)) & ~(ULONG_PTR)15);
+            status = NtWriteVirtualMemory( NtCurrentProcess(), guest, context, sizeof(*guest), &written );
+            if (status) return status;
+            if (written != sizeof(*guest)) return STATUS_PARTIAL_COPY;
+            resume = *context;
+            resume.Sp = (ULONG_PTR)guest;
+            resume.Pc = (ULONG_PTR)pKiUserEmulationDispatcher;
+            context = &resume;
+        }
+    }
     horizon_trace( "[CONTINUE] flags=%08x pc=%llx sp=%llx x18=%llx\n",
                    context->ContextFlags, (unsigned long long)context->Pc,
                    (unsigned long long)context->Sp, (unsigned long long)context->X18 );
@@ -142,9 +169,41 @@ void call_raise_user_exception_dispatcher(void)
 
 NTSTATUS call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context )
 {
-    (void)rec;
-    (void)context;
-    return STATUS_NOT_IMPLEMENTED;
+    struct
+    {
+        CONTEXT context;
+        CONTEXT_EX context_ex;
+        EXCEPTION_RECORD rec;
+        ULONG64 align, sp, pc, redzone[2];
+    } frame = {0};
+    CONTEXT resume;
+    ULONG_PTR stack;
+    SIZE_T written;
+    NTSTATUS status;
+
+    C_ASSERT( offsetof(typeof(frame), rec) == 0x3b0 );
+    C_ASSERT( sizeof(frame) == 0x470 );
+    if (!rec || !context || !pKiUserExceptionDispatcher ||
+        (context->ContextFlags & CONTEXT_ARM64_FULL) != CONTEXT_ARM64_FULL)
+        return STATUS_INVALID_PARAMETER;
+    if (context->Sp < sizeof(frame) + 16) return STATUS_INVALID_ADDRESS;
+    stack = (context->Sp & ~(ULONG_PTR)15) - sizeof(frame);
+    frame.context = *context;
+    frame.rec = *rec;
+    frame.sp = context->Sp;
+    frame.pc = context->Pc;
+    frame.context_ex.Legacy.Length = sizeof(CONTEXT);
+    frame.context_ex.Legacy.Offset = -(LONG)sizeof(CONTEXT);
+    frame.context_ex.XState.Offset = offsetof(typeof(frame), redzone) - sizeof(CONTEXT);
+    frame.context_ex.All.Length = offsetof(typeof(frame), redzone);
+    frame.context_ex.All.Offset = -(LONG)sizeof(CONTEXT);
+    status = NtWriteVirtualMemory( NtCurrentProcess(), (void *)stack, &frame, sizeof(frame), &written );
+    if (status) return status;
+    if (written != sizeof(frame)) return STATUS_PARTIAL_COPY;
+    resume = *context;
+    resume.Sp = stack;
+    resume.Pc = (ULONG_PTR)pKiUserExceptionDispatcher;
+    return signal_set_full_context( &resume );
 }
 
 /*
@@ -201,7 +260,7 @@ static __thread TEB *wine_nx_active_pe_teb;
 void wine_nx_set_active_pe_teb( TEB *teb )
 {
     extern void horizon_bind_native_stack( TEB *teb );
-    horizon_bind_native_stack( teb );
+    if (!is_arm64ec()) horizon_bind_native_stack( teb );
     wine_nx_active_pe_teb = teb;
 }
 
@@ -333,8 +392,37 @@ void signal_init_process(void)
 /* Installed by the opt-in runtime after native WoW64 initialization. */
 void (*wine_nx_wow64_thread_start)( PRTL_THREAD_START_ROUTINE, void *, BOOL, TEB * );
 
+void DECLSPEC_NORETURN wine_nx_start_arm64ec_thread( PRTL_THREAD_START_ROUTINE entry, void *arg,
+                                                  BOOL suspend, TEB *teb )
+{
+    extern void horizon_continue_context( const CONTEXT *context );
+    CONTEXT initial = {0}, *saved;
+
+    wine_nx_set_active_pe_teb( teb );
+    initial.ContextFlags = CONTEXT_ARM64_FULL;
+    initial.X0 = (ULONG_PTR)entry;
+    initial.X1 = (ULONG_PTR)arg;
+    initial.X18 = (ULONG_PTR)teb;
+    initial.Sp = (ULONG_PTR)teb->Tib.StackBase & ~(ULONG_PTR)15;
+    initial.Pc = (ULONG_PTR)pRtlUserThreadStart;
+    if (suspend)
+    {
+        initial.ContextFlags |= CONTEXT_EXCEPTION_REPORTING | CONTEXT_EXCEPTION_ACTIVE;
+        wait_suspend( &initial );
+        initial.ContextFlags = CONTEXT_ARM64_FULL;
+    }
+    saved = (CONTEXT *)(initial.Sp & ~(ULONG_PTR)15) - 1;
+    *saved = initial;
+    initial.Sp = (ULONG_PTR)saved;
+    initial.X0 = (ULONG_PTR)saved;
+    initial.Pc = (ULONG_PTR)pLdrInitializeThunk;
+    horizon_continue_context( &initial );
+    for (;;) sleep( 3600 );
+}
+
 void DECLSPEC_NORETURN signal_start_thread( PRTL_THREAD_START_ROUTINE entry, void *arg, BOOL suspend, TEB *teb )
 {
+    if (is_arm64ec()) wine_nx_start_arm64ec_thread( entry, arg, suspend, teb );
     if (get_wow_teb( teb ))
     {
         if (wine_nx_wow64_thread_start) wine_nx_wow64_thread_start( entry, arg, suspend, teb );
@@ -413,6 +501,7 @@ void *wine_nx_current_teb(void)
 unsigned int wine_nx_syscalls;
 /* Calls per system call id (table << 12 | function), for the runtime's [PROGRESS] line. */
 unsigned int wine_nx_syscall_counts[0x2000];
+void *wine_nx_arm64ec_dispatch_ret;
 
 NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
                                     ULONG_PTR x0, ULONG_PTR x1,
@@ -537,7 +626,7 @@ __asm__(
     ".type __wine_syscall_dispatcher, %function\n"
     "__wine_syscall_dispatcher:\n"
     "    /* save callee-saved regs + LR + x18 (PE TEB register) */\n"
-    "    stp x29, x30, [sp, #-96]!\n"
+    "    stp x29, x30, [sp, #-256]!\n"
     /* x30 at entry = address of `ret` in PE syscall stub (set by `blr x16`).
      * Stub saved the real PE caller's LR into x9 before the blr.
      * Overwrite the saved x30 slot with x9 so our final `ret` jumps directly
@@ -548,12 +637,17 @@ __asm__(
     "    stp x19, x20, [sp, #16]\n"
     "    stp x21, x22, [sp, #32]\n"
     "    str x18, [sp, #48]\n"       /* preserve PE's TEB register */
+    "    stp q8, q9, [sp, #96]\n"
+    "    stp q10, q11, [sp, #128]\n"
+    "    stp q12, q13, [sp, #160]\n"
+    "    stp q14, q15, [sp, #192]\n"
+    "    stp q6, q7, [sp, #224]\n"
 
     "    /* save original args and syscall number */\n"
     "    mov w19, w8\n"          /* syscall_id */
     "    mov x20, x0\n"         /* save original x0 */
     "    mov x21, x7\n"         /* save original x7 */
-    "    add x22, x29, #96\n"   /* caller's SP (where stack args live) */
+    "    add x22, x29, #256\n"  /* caller's SP (where stack args live) */
 
     "    /* set up call to wine_nx_do_syscall(stack_args, x0..x7, syscall_id) */\n"
     "    /* arg 0 (x0): stack_args = caller SP */\n"
@@ -586,8 +680,28 @@ __asm__(
     "    mov x0, x19\n"
     "    ldp x19, x20, [x29, #16]\n"
     "    ldp x21, x22, [x29, #32]\n"
-    "    ldp x29, x30, [sp], #96\n"
-    "    ret\n"
+    "    ldp q8, q9, [x29, #96]\n"
+    "    ldp q10, q11, [x29, #128]\n"
+    "    ldp q12, q13, [x29, #160]\n"
+    "    ldp q14, q15, [x29, #192]\n"
+    "    ldp q6, q7, [x29, #224]\n"
+    "    ldp x29, x30, [sp], #256\n"
+    "    lsr x16, x30, #39\n"
+    "    cbnz x16, 1f\n"
+    "    ldr x16, [x18, #0x60]\n"
+    "    ldr x16, [x16, #0x368]\n"
+    "    cbz x16, 2f\n"
+    "    lsr x17, x30, #18\n"
+    "    ldr x16, [x16, x17, lsl #3]\n"
+    "    lsr x17, x30, #12\n"
+    "    lsr x16, x16, x17\n"
+    "    tbnz x16, #0, 2f\n"
+    "1:\n"
+    "    adrp x16, wine_nx_arm64ec_dispatch_ret\n"
+    "    ldr x16, [x16, :lo12:wine_nx_arm64ec_dispatch_ret]\n"
+    "    cbz x16, 2f\n"
+    "    br x16\n"
+    "2:  ret\n"
     ".size __wine_syscall_dispatcher, . - __wine_syscall_dispatcher\n"
 );
 
@@ -624,17 +738,27 @@ __asm__(
     "__wine_unix_call_dispatcher:\n"
     "wine_nx_pe_unix_call_dispatcher:\n"
     "    /* x0=handle, x1=index, x2=args — save x18 (PE TEB) then forward */\n"
-    "    stp x29, x30, [sp, #-48]!\n"
+    "    stp x29, x30, [sp, #-208]!\n"
     "    mov x29, sp\n"
     "    str x18, [sp, #16]\n"
     "    str x19, [sp, #24]\n"
+    "    stp q8, q9, [sp, #48]\n"
+    "    stp q10, q11, [sp, #80]\n"
+    "    stp q12, q13, [sp, #112]\n"
+    "    stp q14, q15, [sp, #144]\n"
+    "    stp q6, q7, [sp, #176]\n"
     "    bl __wine_unix_call_dispatcher_impl\n"
     "    mov x19, x0\n"
     "    bl wine_nx_current_teb\n"
     "    mov x18, x0\n"
     "    mov x0, x19\n"
     "    ldr x19, [sp, #24]\n"
-    "    ldp x29, x30, [sp], #48\n"
+    "    ldp q8, q9, [sp, #48]\n"
+    "    ldp q10, q11, [sp, #80]\n"
+    "    ldp q12, q13, [sp, #112]\n"
+    "    ldp q14, q15, [sp, #144]\n"
+    "    ldp q6, q7, [sp, #176]\n"
+    "    ldp x29, x30, [sp], #208\n"
     "    ret\n"
     ".size __wine_unix_call_dispatcher, . - __wine_unix_call_dispatcher\n"
     ".size wine_nx_pe_unix_call_dispatcher, . - wine_nx_pe_unix_call_dispatcher\n"

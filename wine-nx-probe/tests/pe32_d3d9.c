@@ -13,8 +13,7 @@
 #define COBJMACROS
 #include <d3d9.h>
 
-__declspec(dllimport) NTSTATUS NTAPI NtDisplayString( const UNICODE_STRING *str );
-__declspec(dllimport) NTSTATUS NTAPI NtTerminateProcess( HANDLE process, NTSTATUS status );
+#include "pe_test_io.h"
 
 /* Built without a C runtime; the compiler still expects these for structures. */
 void *memset( void *dst, int c, size_t n )
@@ -50,19 +49,20 @@ static void report_text( const char *label, const char *text )
     str.Buffer = buffer;
     str.Length = n * sizeof(WCHAR);
     str.MaximumLength = str.Length;
-    NtDisplayString( &str );
+    pe_test_display_string( &str );
 }
 
-static void report( const char *label, DWORD value )
+static void report( const char *label, ULONG_PTR value )
 {
     static const char hex[] = "0123456789abcdef";
-    char text[11];
+    char text[2 + sizeof(value) * 2 + 1];
     unsigned int i;
 
     text[0] = '0';
     text[1] = 'x';
-    for (i = 0; i < 8; i++) text[2 + i] = hex[(value >> (28 - i * 4)) & 15];
-    text[10] = 0;
+    for (i = 0; i < sizeof(value) * 2; i++)
+        text[2 + i] = hex[(value >> ((sizeof(value) * 2 - 1 - i) * 4)) & 15];
+    text[2 + sizeof(value) * 2] = 0;
     report_text( label, text );
 }
 
@@ -195,7 +195,11 @@ done:
 
 void __stdcall start(void)
 {
+#ifdef _WIN64
+    static const WCHAR class_name[] = L"pe64-d3d9";
+#else
     static const WCHAR class_name[] = L"pe32-d3d9";
+#endif
     /* Away from the centre, so the read-back below samples the clear colour. */
     struct vertex triangle[3] =
     {
@@ -353,5 +357,5 @@ done:
     if (window) DestroyWindow( window );
     if (failure) report( "FAIL step", failure );
     else report_text( "PASS", NULL );
-    NtTerminateProcess( GetCurrentProcess(), failure ? failure : 42 );
+    pe_test_terminate( failure ? failure : 42 );
 }

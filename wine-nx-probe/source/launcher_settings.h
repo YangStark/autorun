@@ -2,9 +2,9 @@
  * Settings files of the launcher: lines of key=value, with other lines (comments,
  * keys a later build adds) kept as they are when a value is changed.
  *
- * A program's own settings live next to it, named after it: SPEED2.EXE reads
- * SPEED2.wine-nx.txt. The launcher writes them and the runtime applies them to
- * the program it starts, whether the launcher chose it or target.txt did.
+ * A program on the SD card keeps its settings next to it: SPEED2.EXE reads
+ * SPEED2.wine-nx.txt. A program on USB keeps them under the runtime directory
+ * on the SD card.
  * The launcher's own look is in sdmc:/switch/wine/launcher.txt.
  */
 #ifndef WINE_NX_LAUNCHER_SETTINGS_H
@@ -177,7 +177,15 @@ struct launcher_settings
     int verbose;      /* verbose traces */
     int profile;      /* the sampling profiler */
     int framebuffer;  /* 1: windows go to the framebuffer, 0: through the compositor */
-    int dxvk;         /* 1: Direct3D 9 from C:\dxvk\d3d9.dll, 0: Wine's */
+    int dxvk;         /* architecture-specific DXVK payload */
+    char vkd3d_version[32];
+    char dxvk_version[32]; /* empty: the bundled latest release */
+    int dxvk_hud;
+    int frame_limit;
+    int vsync;
+    int lsfg_enabled;
+    int lsfg_performance;
+    int lsfg_flow;
     /* Whether the program's own keys apply over the shared ones: -1 they do
      * when it has a file of them, which is what a card written before this
      * setting existed means; 0 Autorun's keys alone, the file kept for when it
@@ -188,6 +196,107 @@ struct launcher_settings
     int address_space;
 };
 
+enum { LAUNCHER_FRAME_LIMIT_COUNT = 8, LAUNCHER_HUD_COUNT = 4 };
+static const int launcher_frame_limits[] = { 0, 30, 40, 45, 60, 75, 90, 120 };
+static const char *const launcher_frame_limit_labels[] =
+    { "Off", "30", "40", "45", "60", "75", "90", "120" };
+static const char *const launcher_hud_labels[] = { "Disabled", "FPS", "Compact", "Full" };
+static const char *const launcher_hud_values[] =
+    { "0", "fps", "api,fps,frametimes", "version,api,devinfo,fps,memory,frametimes,compiler" };
+static const char *const launcher_lsfg_flow_labels[] = { "12.5%", "25%", "50%" };
+static const char *const launcher_lsfg_flow_values[] = { "0.125", "0.25", "0.5" };
+
+static inline int launcher_dxvk_config( const struct launcher_settings *settings, char *out, size_t size )
+{
+    int length;
+
+    if (settings->frame_limit < 0 || settings->frame_limit >= LAUNCHER_FRAME_LIMIT_COUNT ||
+        settings->dxvk_hud < 0 || settings->dxvk_hud >= LAUNCHER_HUD_COUNT) return 0;
+    length = snprintf( out, size, "dxgi.syncInterval = %d\nd3d9.presentInterval = %d\n",
+                       !!settings->vsync, !!settings->vsync );
+    if (length < 0 || (size_t)length >= size) return 0;
+    if (settings->frame_limit)
+    {
+        int extra = snprintf( out + length, size - length,
+                              "dxgi.maxFrameRate = %d\nd3d9.maxFrameRate = %d\ndxvk.maxFrameRate = %d\n",
+                              launcher_frame_limits[settings->frame_limit],
+                              launcher_frame_limits[settings->frame_limit],
+                              launcher_frame_limits[settings->frame_limit] );
+        if (extra < 0 || (size_t)extra >= size - length) return 0;
+    }
+    return 1;
+}
+
+/* The dxvk.conf beside the program goes after the launcher's lines. Without
+ * DXVK_CONFIG_FILE that is the one file DXVK reads, games are set up with one,
+ * and a later line wins over an earlier one and over DXVK's own profile for the
+ * game. Naming only the launcher's file dropped The Sims 2's: DXVK's profile
+ * then reported 2 GB of video memory on a 1.5 GB heap, which the game filled
+ * in five seconds. Returns 0 when both do not fit. */
+static inline int launcher_dxvk_config_add( char *out, size_t size, const char *game, size_t game_size )
+{
+    size_t length = strlen( out );
+
+    if (!game_size) return 1;
+    if (length + game_size + 2 > size) return 0;
+    memcpy( out + length, game, game_size );
+    length += game_size;
+    if (out[length - 1] != '\n') out[length++] = '\n';
+    out[length] = 0;
+    return 1;
+}
+
+static inline const char *launcher_dxvk_directory( unsigned short machine )
+{
+    if (machine == 0x014c) return "dxvk";
+    if (machine == 0x8664) return "dxvk64";
+    return NULL;
+}
+
+static inline int launcher_dxvk_version_valid( const char *version )
+{
+    const unsigned char *p = (const unsigned char *)version;
+
+    if (!p || !isalnum( *p )) return 0;
+    for (; *p; p++)
+        if (!isalnum( *p ) && *p != '.' && *p != '-' && *p != '_') return 0;
+    return p - (const unsigned char *)version < 32 && isalnum( p[-1] );
+}
+
+static inline int launcher_dxvk_version_selectable( const char *version )
+{
+    char *end;
+    unsigned long major;
+
+    if (!launcher_dxvk_version_valid( version )) return 0;
+    major = strtoul( version, &end, 10 );
+    return end != version && major >= 1;
+}
+
+static inline int launcher_dxvk_version_directory( unsigned short machine, const char *version,
+                                                   char *out, size_t size )
+{
+    const char *base = launcher_dxvk_directory( machine );
+    int length;
+
+    if (!base || !out || !size || (version && version[0] && !launcher_dxvk_version_valid( version ))) return 0;
+    if (version && version[0]) length = snprintf( out, size, "%s\\versions\\%s", base, version );
+    else length = snprintf( out, size, "%s", base );
+    return length >= 0 && (size_t)length < size;
+}
+
+static inline int launcher_vkd3d_version_directory( unsigned short machine, const char *version,
+                                                   char *out, size_t size )
+{
+    const char *base = machine == 0x014c ? "vkd3d" : machine == 0x8664 ? "vkd3d64" : NULL;
+    int length;
+
+    if (!base || !out || !size || (version && version[0] && !launcher_dxvk_version_valid( version ))) return 0;
+    if (version && version[0]) length = snprintf( out, size, "%s\\versions\\%s", base, version );
+    else length = snprintf( out, size, "%s", base );
+    return length >= 0 && (size_t)length < size;
+}
+
 static inline int launcher_settings_path( const char *exe_path, char *out, size_t size )
 {
     size_t len = strlen( exe_path ), suffix_size = sizeof(".wine-nx.txt");
@@ -196,6 +305,33 @@ static inline int launcher_settings_path( const char *exe_path, char *out, size_
     memcpy( out, exe_path, len - 4 );
     memcpy( out + len - 4, ".wine-nx.txt", suffix_size );
     return 1;
+}
+
+static inline int launcher_settings_on_usb( const char *exe_path )
+{
+    return exe_path && !strncasecmp( exe_path, "ums", 3 ) && isdigit( (unsigned char)exe_path[3] ) &&
+           exe_path[4] == ':';
+}
+
+static inline int launcher_program_settings_path( const char *runtime_dir, const char *exe_path,
+                                                  char *out, size_t size )
+{
+    unsigned long long hash = 1469598103934665603ULL;
+    const unsigned char *p;
+    int length;
+
+    if (!launcher_settings_on_usb( exe_path )) return launcher_settings_path( exe_path, out, size );
+    if (!runtime_dir || !runtime_dir[0]) return 0;
+    for (p = (const unsigned char *)exe_path; *p; p++)
+    {
+        unsigned char c = *p == '\\' ? '/' : (unsigned char)tolower( *p );
+
+        hash ^= c;
+        hash *= 1099511628211ULL;
+    }
+    length = snprintf( out, size, "%s%sprogram-settings/%016llx.wine-nx.txt", runtime_dir,
+                       runtime_dir[strlen( runtime_dir ) - 1] == '/' ? "" : "/", hash );
+    return length >= 0 && (size_t)length < size;
 }
 
 static inline int launcher_setting_state( const struct launcher_kv *kv, const char *key )
@@ -210,7 +346,7 @@ static inline int launcher_setting_state( const struct launcher_kv *kv, const ch
 
 static inline void launcher_settings_read( const struct launcher_kv *kv, struct launcher_settings *settings )
 {
-    char value[16];
+    char value[64];
 
     if (!launcher_kv_get( kv, "title", settings->title, sizeof(settings->title) )) settings->title[0] = 0;
     settings->hidden = launcher_setting_state( kv, "hidden" ) == 1;
@@ -222,8 +358,31 @@ static inline void launcher_settings_read( const struct launcher_kv *kv, struct 
         if (!strcasecmp( value, "framebuffer" )) settings->framebuffer = 1;
         else if (!strcasecmp( value, "compositor" )) settings->framebuffer = 0;
     }
-    settings->dxvk = launcher_kv_get( kv, "d3d9", value, sizeof(value) ) && !strcasecmp( value, "dxvk" );
+    if (!launcher_kv_get( kv, "d3d", value, sizeof(value) ) &&
+        !launcher_kv_get( kv, "d3d9", value, sizeof(value) )) value[0] = 0;
+    settings->dxvk = !strcasecmp( value, "dxvk" );
+    settings->vkd3d_version[0] = 0;
+    if (launcher_kv_get( kv, "vkd3d-version", value, sizeof(value) ) && launcher_dxvk_version_valid( value ))
+        memcpy( settings->vkd3d_version, value, strlen( value ) + 1 );
+    settings->dxvk_version[0] = 0;
+    if (launcher_kv_get( kv, "dxvk-version", value, sizeof(value) ) && launcher_dxvk_version_valid( value ))
+        memcpy( settings->dxvk_version, value, strlen( value ) + 1 );
     settings->own_controls = launcher_setting_state( kv, "own-controls" );
+    settings->dxvk_hud = 0;
+    if (launcher_kv_get( kv, "dxvk-hud", value, sizeof(value) ))
+        for (int i = 1; i < LAUNCHER_HUD_COUNT; i++)
+            if (!strcasecmp( value, launcher_hud_values[i] )) settings->dxvk_hud = i;
+    settings->frame_limit = 0;
+    if (launcher_kv_get( kv, "frame-limit", value, sizeof(value) ))
+        for (int i = 1; i < LAUNCHER_FRAME_LIMIT_COUNT; i++)
+            if (!strcasecmp( value, launcher_frame_limit_labels[i] )) settings->frame_limit = i;
+    settings->vsync = launcher_setting_state( kv, "vsync" ) != 0;
+    settings->lsfg_enabled = launcher_setting_state( kv, "lsfg" ) == 1;
+    settings->lsfg_performance = launcher_setting_state( kv, "lsfg-performance" ) != 0;
+    settings->lsfg_flow = 1;
+    if (launcher_kv_get( kv, "lsfg-flow", value, sizeof(value) ))
+        for (int i = 0; i < 3; i++)
+            if (!strcasecmp( value, launcher_lsfg_flow_values[i] )) settings->lsfg_flow = i;
     settings->address_space = -1;
     if (launcher_kv_get( kv, "address-space", value, sizeof(value) ))
     {
@@ -237,13 +396,27 @@ static inline int launcher_settings_write( struct launcher_kv *kv, const struct 
 {
     static const char *states[] = { NULL, "0", "1" };
 
+    if (settings->dxvk_hud < 0 || settings->dxvk_hud >= LAUNCHER_HUD_COUNT ||
+        settings->frame_limit < 0 || settings->frame_limit >= LAUNCHER_FRAME_LIMIT_COUNT ||
+        settings->lsfg_flow < 0 || settings->lsfg_flow >= 3) return 0;
     return launcher_kv_set( kv, "title", settings->title[0] ? settings->title : NULL ) &&
            launcher_kv_set( kv, "hidden", settings->hidden ? "1" : NULL ) &&
            launcher_kv_set( kv, "verbose", states[settings->verbose + 1] ) &&
            launcher_kv_set( kv, "profile", states[settings->profile + 1] ) &&
            launcher_kv_set( kv, "windows", settings->framebuffer < 0 ? NULL :
                                            settings->framebuffer ? "framebuffer" : "compositor" ) &&
-           launcher_kv_set( kv, "d3d9", settings->dxvk ? "dxvk" : NULL ) &&
+           launcher_kv_set( kv, "d3d9", NULL ) &&
+           launcher_kv_set( kv, "d3d", settings->dxvk ? "dxvk" : NULL ) &&
+           launcher_kv_set( kv, "vkd3d-version", settings->vkd3d_version[0] ? settings->vkd3d_version : NULL ) &&
+           launcher_kv_set( kv, "dxvk-version", settings->dxvk_version[0] ? settings->dxvk_version : NULL ) &&
+           launcher_kv_set( kv, "dxvk-hud", settings->dxvk_hud ? launcher_hud_values[settings->dxvk_hud] : NULL ) &&
+           launcher_kv_set( kv, "frame-limit", settings->frame_limit ?
+                            launcher_frame_limit_labels[settings->frame_limit] : NULL ) &&
+           launcher_kv_set( kv, "vsync", settings->vsync ? NULL : "0" ) &&
+           launcher_kv_set( kv, "lsfg", settings->lsfg_enabled ? "1" : NULL ) &&
+           launcher_kv_set( kv, "lsfg-performance", settings->lsfg_performance ? NULL : "0" ) &&
+           launcher_kv_set( kv, "lsfg-flow", settings->lsfg_flow == 1 ? NULL :
+                            launcher_lsfg_flow_values[settings->lsfg_flow] ) &&
            launcher_kv_set( kv, "own-controls", states[settings->own_controls + 1] ) &&
            launcher_kv_set( kv, "address-space", settings->address_space < 0 ? NULL :
                                                  settings->address_space ? "32-bit" : "any" );

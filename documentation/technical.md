@@ -2,12 +2,14 @@
 
 Autorun (previously Wine-NX) is Wine for the Nintendo Switch. A homebrew NRO
 runs Windows programs on Horizon through libnx: 32-bit x86 programs through
-Wine's WoW64 with Box64 as the CPU backend, and ARM64 programs natively. The
-Wine server, memory management, exceptions and the display and input drivers
-are reimplemented for Horizon and run inside the same process.
+Wine's WoW64, x86-64 programs through Wine's ARM64EC loader, both with Box64
+as the CPU backend, and ARM64 programs natively. The Wine server, memory
+management, exceptions and the display and input drivers are reimplemented for
+Horizon and run inside the same process.
 
-The project was renamed; files, logs and code identifiers still say `wine-nx`
-(`wine-nx-runtime.nro`, `wine-nx-runtime.log`, `WINE_NX_RUNTIME_BUILD`).
+The project was renamed; files and code identifiers still say `wine-nx`
+(`wine-nx-runtime.nro`, `WINE_NX_RUNTIME_BUILD`). The runtime's log is
+`logs/autorun_runtime.log`.
 
 For players, see the [README](../README.md).
 
@@ -27,6 +29,7 @@ Verified on hardware:
 | Left 4 Dead 2 | Reaches the main menu. |
 | Direct3D 9 test | Draws and reads every frame back: about 55 fps through wined3d, 58 fps through DXVK. |
 | Vulkan test | Instance, device, memory mapped into a 32-bit program, a surface and a swapchain; 180 frames at about 61 fps. |
+| Win64 validation | AMD64 CPU, threads, audio, Vulkan and DXVK Direct3D 11 tests pass. |
 
 In progress: The Sims 2 Legacy Collection starts, talks to its launcher
 emulation over LSX and loads towards its title screen, then closes. The
@@ -37,7 +40,8 @@ runtime; the full package now ships the Mesa 26 one.
 
 ## What is in place
 
-- **x86 execution.** `dlls/winebox64` is the WoW64 CPU DLL. It runs Box64's
+- **x86 and x86-64 execution.** `dlls/winebox64` is the WoW64 CPU DLL, while
+  `dlls/winebox64ec` connects AMD64 Wine code to ARM64EC. Both use Box64's
   ARM64 dynarec with separate writable and executable code mappings, as Horizon
   requires, including Box64's call/return optimization. System calls and unix
   calls from x86 code are dispatched without leaving the emulator loop; their
@@ -47,7 +51,9 @@ runtime; the full package now ships the Mesa 26 one.
 - **Wine on Horizon.** An in-process Wine server
   (`dlls/ntdll/unix/horizon*.c|h`) covers files (with Windows sharing modes),
   directories, sync objects, threads and user APCs, the registry
-  (`system.reg`/`user.reg` on the card, plus `config/classes.reg`), message
+  (`registry/system.reg` and `registry/user.reg` on the card, over the classes
+  the payload ships in `config/classes.reg`; hives an earlier build left in
+  `switch/wine` itself are moved there on the first start), message
   queues, timers, the clipboard, raw input, object directories and sections,
   including sections with no file whose views share their pages.
 - **Sockets.** Overlapped Winsock on I/O completion ports: pending
@@ -58,9 +64,10 @@ runtime; the full package now ships the Mesa 26 one.
 - **Graphics.** Windows are drawn as layers of one OpenGL compositor, or
   straight to the framebuffer. The runtime links Mesa 26 from
   [mesa-switch](https://github.com/danfromtico/mesa-switch): OpenGL through
-  nvc0 and Vulkan through NVK, with Wine's winevulkan on top. Direct3D 9 runs
-  through wined3d on OpenGL, or through DXVK on Vulkan for programs set to use
-  it; frames of another size than the screen's (800x600 or 640x480 in full
+  nvc0 and Vulkan through NVK, with Wine's winevulkan on top. Direct3D runs
+  through wined3d on OpenGL, or through architecture-specific DXVK payloads on
+  Vulkan for programs set to use it; frames of another size than the screen's
+  (800x600 or 640x480 in full
   screen) are scaled to it, keeping the aspect ratio. The earlier runtime on
   Mesa 20.1's nouveau driver, patched for pinned 32-bit buffers
   (`wine-nx-probe/mesa`), can still be built.
@@ -70,12 +77,15 @@ runtime; the full package now ships the Mesa 26 one.
 - **Memory.** Fixed-base games such as NFSU2 need a 32-bit address space:
   launch the NRO through a forwarder made with "32-bit, no alias", which the
   launcher can install itself and which also raises the memory limit to 2 GiB.
+  AMD64 programs use the main 39-bit application forwarder. The same NRO
+  selects the execution path from the program's PE header.
   Wine reserves the program's low address space early, keeps its allocations
   clear of the memory Horizon hands to libnx, and leaves 32-bit programs'
   Vulkan memory in the driver's own mappings.
 - **Launcher.** An SDL2 launcher with a Home and a Library view, per-game
   options, a controls editor, SteamGridDB artwork, and forwarder installation
-  (`wine-nx-probe/source/launcher*.c`, `forwarder.c`).
+  (`wine-nx-probe/source/launcher*.c`, `forwarder.c`). Add Game begins with an
+  SD Card / USB picker; mounted USB volumes can then be browsed directly.
 - **Diagnostics.** A thread and core report, a sampling profiler, fatal fault
   reports that name the x86 instruction behind translated code, and a map of
   the address space when a program runs out of it.
@@ -83,8 +93,8 @@ runtime; the full package now ships the Mesa 26 one.
 ## Files on the card
 
 Everything lives in `sdmc:/switch/wine`: the runtime `wine-nx-runtime.nro`,
-Wine's files, and `drive_c` with the programs. C: is `drive_c` and Z: is the
-card's root.
+Wine's files, and `drive_c` with the programs. C: is `drive_c`, Z: is the
+card's root, and mounted USB volumes are D: through H:.
 
 Runtime settings are one JSON object in `config/settings.json`. The launcher
 writes most of them; the rest are for testing. Earlier builds kept each as a
@@ -110,21 +120,45 @@ files sit next to its executable, named after it:
 
 | File | Content |
 |---|---|
-| `NAME.wine-nx.txt` | Title, hidden from the library, verbose traces, profiler, `windows` (compositor or framebuffer), `d3d9=dxvk`, address space, own controls |
+| `NAME.wine-nx.txt` | Title, hidden from the library, verbose traces, profiler, `windows` (compositor or framebuffer), `d3d=dxvk`, address space, own controls |
 | `NAME.args.txt` | Its command-line arguments |
 | `NAME.keys.txt` | Its own controls, over `config/keys.txt` |
 | `NAME.box64.txt` | Box64 code generation options, one `BOX64_DYNAREC_*=value` per line |
 
-`d3d9=dxvk` makes the program load DXVK's `d3d9.dll` from `C:\dxvk` instead of
-Wine's. The launcher's look is kept in `launcher.txt` and its library in
-`launcher-library-v2.ini`.
+`d3d=dxvk` selects `C:\dxvk` for x86 programs and `C:\dxvk64` for AMD64
+programs. Application-local graphics DLLs have priority. Existing
+`d3d9=dxvk` settings remain readable. The launcher's look is kept in
+`launcher.txt` and its library in `launcher-library-v2.ini`.
 
 ## Logs
 
-Each run writes `wine-nx-runtime.log`, and a copy named after the program,
-`game-NAME.log`. Its first lines include `[BUILD]`, the runtime version, worth
+Everything the runtime writes is in `switch/wine/logs`. Each run writes
+`autorun_runtime.log`, and a copy named after the program: `NAME.log`, with
+`_verbose` and `_profiler` added to the name when those were on, so a
+diagnostic run keeps its own file. The program's standard handles are
+`stdin.txt`, `stdout.txt` and `stderr.txt` there, and verbose runs add
+`horizon-trace.log`. A log's first lines include `[BUILD]`, the runtime
+version, worth
 checking before reading anything else. `[PROGRESS]` lines report every 10
 seconds: frames, OpenGL and system call rates, memory and translation counters.
+Its reading figures tell a slow load apart from a busy one: `reads`/`read_mb`
+are what the program asked for, `sd_reads`/`sd_mb` what the card was asked for
+after the read cache, and `cache_mb` what that cache holds. The cache
+(`source/sd_read_cache.h`) keeps up to eight pieces of each open file, and takes
+between 32 and 192 MB depending on the heap a game leaves free; a write to a
+file throws away what is held for it. A miss reads a whole 128 KB chunk; the
+cache can also read ahead from 16 KB (`fill_min`), which on The Sims 2 halved
+the bytes from the card but not the time. `code_mb` is the translated code the run
+holds now over the code memory Horizon gave it, and `code_all_mb` every byte
+ever translated: Horizon grants ten code memory objects in all, so translated
+code that is never reused is what ends a long run in the interpreter
+(`source/box64_code_arena.h`). On a 36- or 39-bit address space the code goes
+above 4 GB, out of the program's way; on a 32-bit one it shares the runtime's
+window and runs out near 150 MB. There `BOX64_DYNAREC_PURGE=1` in a game's
+`NAME.box64.txt` lets blocks it has not entered for `BOX64_DYNAREC_PURGE_AGE`
+translations give their room back, at a small cost on every block entry;
+`purged=` counts the passes, blocks, megabytes and milliseconds. Freed code
+waits two seconds before it is reused.
 With the profiler on, `[THREADS]`, `[SERVER]` and `[PROF]` show where each busy
 thread spends its time. DLLs that fail to load are logged (`[NXLDR]`, and
 Wine's `err:` lines) even without verbose traces, and so are files a program
@@ -164,16 +198,23 @@ docker run --rm --platform linux/arm64 -v "$PWD:/work" -w /work devkitpro/devkit
         -DWINE_NX_BOX64_DYNAREC=ON -DCMAKE_BUILD_TYPE=Release \
         -DWINE_NX_MESA_SWITCH_DIR=/work/wine-nx-probe/build-mesa-switch/install/opt/devkitpro/portlibs/switch/lib
     cmake --build wine-nx-probe/build-switch-wow64-mesa-switch --target wine-nx-runtime-nro'
-python3 wine-nx-probe/tools/package-autorun.py    # both halves below, merged: autorun-NNN.zip
+WINE_NX_LLVM_MINGW="$PWD/wine-nx-probe/toolchains/llvm-mingw-20260505-ucrt-macos-universal" \
+WINE_NX_MESA_SWITCH_DIR=/work/wine-nx-probe/build-mesa-switch/install/opt/devkitpro/portlibs/switch/lib \
+WINE_NX_DXVK=1 WINE_NX_VKD3D=1 sh wine-nx-probe/build-amd64-components.sh
+python3 wine-nx-probe/tools/package-autorun.py    # x86 and AMD64 payloads merged: autorun-NNN.zip
 ```
 
-`package-autorun.py` is what a card wants. The halves can also be run on their
-own:
+`package-autorun.py` is what a card wants. The x86 packages can also be run on
+their own:
 
 ```sh
 python3 wine-nx-probe/tools/package-wow64-full.py # the whole SD-card payload as one zip
 python3 wine-nx-probe/tools/package-wow64-dxvk.py # the Mesa 26 runtime, Vulkan and DXVK, over that payload
 ```
+
+The AMD64 component and package flow is documented in
+[`wine-nx-probe/AMD64.md`](../wine-nx-probe/AMD64.md). The pinned DXVK build and
+Mesa requirements are in [`wine-nx-probe/DXVK.md`](../wine-nx-probe/DXVK.md).
 
 The packagers copy the ARM64 PE modules (`winebox64.dll`, `wow64.dll`,
 `ntdll.dll`, `win32u.dll`, `wow64win.dll`) from the PE build tree without
@@ -191,7 +232,7 @@ The runtime's version is `WINE_NX_RUNTIME_BUILD` in
 `wine-nx-probe/build-switch-wow64-dynarec`. Other packagers in
 `wine-nx-probe/tools` stage single programs over the full payload (OpenTTD,
 Quake III's engine, WarCraft III's setup, the Direct3D 9, OpenGL and audio
-tests). `package-wow64-dll-overlay.py --log wine-nx-runtime.log` builds the
+tests). `package-wow64-dll-overlay.py --log autorun_runtime.log` builds the
 i386 DLLs a run reported missing, with everything they import, as an overlay
 zip.
 
@@ -202,6 +243,7 @@ sh wine-nx-probe/check-runtime-console.sh      # host unit tests of runtime and 
 sh wine-nx-probe/check-box64-execution.sh      # Box64 interpreter and dynarec in an ARM64 container, plus their Switch build
 sh wine-nx-probe/check-wow64-box64-bridge.sh   # the x86 system-call gate
 sh wine-nx-probe/check-wow64-box64-unix.sh     # the native side of the CPU DLL
+sh wine-nx-probe/check-amd64.sh                # AMD64, ARM64EC and both Box64 CPU modes
 sh wine-nx-probe/check-audio.sh                # the audio driver
 sh wine-nx-probe/tests/check-launcher-host.sh  # the launcher, headless, with scripted input (Homebrew's sdl2, sdl3, sdl2_ttf, libpng)
 for t in wine-nx-probe/tests/check_*.py; do python3 "$t"; done  # server pieces run against real host sockets and files
@@ -223,9 +265,9 @@ changes, and fails if the pinned text moves.
 |---|---|
 | `dlls/ntdll/unix/horizon*` | Horizon server, memory, sections, sockets, exception handling |
 | `dlls/win32u/winnx_drv.c`, `winnx_vulkan.c` | Display, input and Vulkan surface driver |
-| `dlls/winebox64` | WoW64 CPU DLL |
+| `dlls/winebox64`, `dlls/winebox64ec` | x86 WoW64 and AMD64 ARM64EC CPU DLLs |
 | `wine-nx-probe/source` | Runtime: startup, launcher, compositor, Box64 engine, profiler, audio and XInput backends, forwarder installer |
-| `wine-nx-probe/tests` | Host and PE32 tests |
+| `wine-nx-probe/tests` | Host, PE32 and PE32+ tests |
 | `wine-nx-probe/tools` | Packagers and game setups |
 
 ## Limits
@@ -238,7 +280,8 @@ changes, and fails if the pinned text moves.
   movies.
 - A 32-bit address space leaves a program about 2 GiB of addresses and caps the
   whole process at 2 GiB of memory.
-- 32-bit x86 and ARM64 programs only; x86-64 programs do not run.
+- AMD64 programs require the 39-bit application forwarder and remain
+  experimental.
 - One program at a time; one controller.
 - Missing DLLs: the card only holds what earlier programs needed. The log names
   what is missing, and the overlay packager builds it.
@@ -250,8 +293,8 @@ Autorun is built from these projects; each keeps its own copyright and license.
 | Project | Authors | License | Used for |
 |---|---|---|---|
 | [Wine](https://www.winehq.org) | The Wine project authors | LGPL-2.1-or-later | The Windows API, loader, WoW64, and the Direct3D, OpenGL and Vulkan layers; this repository is a Wine fork |
-| [Box64](https://github.com/ptitSeb/box64) | ptitSeb and contributors | MIT | 32-bit x86 execution: its interpreter and ARM64 dynarec are the WoW64 CPU backend (`wine-nx-probe/vendor/box64`) |
-| [DXVK](https://github.com/doitsujin/dxvk) | Philip Rebohle, Joshua Ashton, Robin Kertels, Jeffrey Ellison and contributors | zlib/libpng | Direct3D 9 over Vulkan, for programs set to `d3d9=dxvk` |
+| [Box64](https://github.com/ptitSeb/box64) | ptitSeb and contributors | MIT | x86 and x86-64 execution through its interpreter and ARM64 dynarec (`wine-nx-probe/vendor/box64`) |
+| [DXVK](https://github.com/doitsujin/dxvk) | Philip Rebohle, Joshua Ashton, Robin Kertels, Jeffrey Ellison and contributors | zlib/libpng | Direct3D over Vulkan, for programs set to `d3d=dxvk` |
 | [Mesa](https://mesa3d.org) | The Mesa authors | MIT (mostly) | OpenGL through nvc0 and Vulkan through NVK |
 | [mesa-switch](https://github.com/danfromtico/mesa-switch) | danfromtico, NaGaa95 and contributors | Mesa's licenses | The Switch port of Mesa 26 (nvc0 and NVK) that the runtime links |
 | Switch ports of Mesa 20.1 and libdrm_nouveau | fincs, Subv, Jules Blok | MIT | The earlier OpenGL path, from devkitPro's packages |
@@ -280,4 +323,6 @@ References that shaped the port without being part of the build:
 
 ## More
 
+- [AMD64 build and validation](../wine-nx-probe/AMD64.md)
+- [DXVK build and validation](../wine-nx-probe/DXVK.md)
 - [Build-by-build notes](../wine-nx-probe/README.md)

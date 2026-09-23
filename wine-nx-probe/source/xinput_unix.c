@@ -1,6 +1,6 @@
 /* Copyright 2026 Wine-NX contributors. LGPL-2.1-or-later.
- * The Switch controller behind Wine's XInput DLLs (dlls/xinput1_3/main.c) for
- * the 32-bit programs the runtime runs: player 1's pad, handheld or docked. */
+ * The Switch controller behind Wine's XInput DLLs: player 1's pad, handheld
+ * or docked. */
 #include <pthread.h>
 #include <string.h>
 #include <switch.h>
@@ -70,7 +70,7 @@ static NTSTATUS nx_xinput_get_state_unix( void *args )
 static NTSTATUS nx_xinput_set_state_unix( void *args )
 {
     struct nx_xinput_vibration_params *params = args;
-    struct nx_xinput_state_params state = { params->index };
+    struct nx_xinput_state_params state = { .index = params->index };
 
     nx_xinput_get_state_unix( &state );
     params->connected = state.connected;
@@ -84,3 +84,11 @@ const unixlib_entry_t wine_nx_xinput_wow64_unix_funcs[] =
 };
 C_ASSERT( ARRAY_SIZE(wine_nx_xinput_wow64_unix_funcs) == nx_xinput_funcs_count );
 const unsigned int wine_nx_xinput_wow64_unix_count = ARRAY_SIZE(wine_nx_xinput_wow64_unix_funcs);
+
+const unixlib_entry_t wine_nx_xinput_unix_funcs[] =
+{
+    nx_xinput_get_state_unix,
+    nx_xinput_set_state_unix,
+};
+C_ASSERT( ARRAY_SIZE(wine_nx_xinput_unix_funcs) == nx_xinput_funcs_count );
+const unsigned int wine_nx_xinput_unix_count = ARRAY_SIZE(wine_nx_xinput_unix_funcs);

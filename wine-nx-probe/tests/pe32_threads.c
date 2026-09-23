@@ -83,6 +83,6 @@ void __stdcall start(void)
     report("BEGIN workers/TLS isolation/events/mutex", 0); result = test_workers();
     report(result ? "FAIL workers" : "PASS workers", result); if (result) mask |= 16;
     report(mask ? "FAIL combined mask" : "PASS ALL", mask);
-    NtTerminateProcess((HANDLE)-1, mask ? 0x100 | mask : 42);
+    pe_test_terminate( mask ? 0x100 | mask : 42 );
     for (;;) {}
 }

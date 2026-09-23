@@ -8,8 +8,8 @@
  *   next to it (launcher_settings.h) and apply whenever it is started.
  * - Settings (X) holds the launcher's look (launcher.txt) and the global
  *   verbose.txt, profile.txt and framebuffer.txt.
- * - The file browser (-) starts a program anywhere on the card: C: is drive_c
- *   and Z: the card's root.
+ * - The file browser adds a program from the SD card or a mounted USB volume:
+ *   C: is drive_c, Z: the card's root and D: through H: are USB volumes.
  *
  * Icons are read and decoded on a worker thread and shown as they arrive.
  * When SDL cannot start, the text menu of launcher_console.c is shown instead.
@@ -42,7 +42,11 @@
 #include "key_names.h"
 #include "launcher_settings.h"
 #include "launcher_ui.h"
+#include "launcher_update.h"
+#include "autorun_install.h"
 #include "steamgriddb.h"
+#include "dxvk_releases.h"
+#include "box64_options.h"
 
 #define ICON_SIDE      128    /* icons are decoded no larger than this */
 #define ICON_TEXTURES  48     /* a screenful, the row below it and the backdrop, at 1 MiB each */
@@ -143,6 +147,7 @@ struct launcher
 {
     struct wine_nx_launcher_options *options;
     struct ui ui;
+    struct launcher_update *update;
 
     struct program programs[LAUNCHER_MAX_ENTRIES];
     int program_count;
@@ -181,7 +186,7 @@ struct launcher
     int status, clock_hour, clock_minute, battery, charging;
 
     struct launcher_kv look;
-    int top_row, show_hidden;
+    int top_row, show_hidden, hide_missing;
     char browse_dir[512];
 
     SDL_Thread *thread;
@@ -197,11 +202,24 @@ struct launcher
      * for by that frame, so it is on the screen and must not be thrown away. */
     unsigned int icon_frame;
     Uint32 icon_event;
+    Uint32 usb_event;
+    SDL_atomic_t usb_changed;
 };
 
 static struct launcher launcher;
 static struct file_entry files[MAX_FILES];
-static struct ui_row file_rows[MAX_FILES + 1];
+static struct ui_row file_rows[MAX_FILES + 8];
+
+void wine_nx_launcher_usb_changed(void)
+{
+    SDL_Event event;
+
+    if (!launcher.usb_event) return;
+    SDL_AtomicSet( &launcher.usb_changed, 1 );
+    memset( &event, 0, sizeof(event) );
+    event.type = launcher.usb_event;
+    SDL_PushEvent( &event );
+}
 
 extern int wine_nx_launcher_console_run( const char *drive_c, const char *runtime_dir, const char *build,
                                          int (*machine_of)( const char *path, unsigned short *machine ),
@@ -403,15 +421,15 @@ static int folder_title( const char *path, char *out, size_t size )
 
 static void load_program_settings( struct launcher *l, struct program *p )
 {
-    char path[520];
+    char path[768];
     struct launcher_kv kv;
     size_t len;
 
-    (void)l;
     p->own_files = 0;
     memset( &p->settings, 0, sizeof(p->settings) );
     p->settings.verbose = p->settings.profile = p->settings.framebuffer = -1;
-    if (launcher_settings_path( p->path, path, sizeof(path) ) && launcher_kv_load( &kv, path ))
+    if (launcher_program_settings_path( l->options->runtime_dir, p->path, path, sizeof(path) ) &&
+        launcher_kv_load( &kv, path ))
     {
         launcher_settings_read( &kv, &p->settings );
         p->own_files |= kv.size && file_exists( path );
@@ -605,7 +623,7 @@ static void rebuild_visible( struct launcher *l, int keep_index )
     {
         const struct program *p = &l->programs[i];
 
-        if (p->removed || (p->settings.hidden && !l->show_hidden) ||
+        if (p->removed || (l->hide_missing && p->missing) || (p->settings.hidden && !l->show_hidden) ||
             (l->favorites_only && !p->favorite) || !contains_case( p->title, l->search )) continue;
         l->visible[l->visible_count++] = i;
     }
@@ -635,7 +653,8 @@ static void rebuild_history( struct launcher *l, int keep_index )
     {
         const struct program *p = &l->programs[i];
 
-        if (p->removed || !p->launched_order || (p->settings.hidden && !l->show_hidden)) continue;
+        if (p->removed || !p->launched_order || (l->hide_missing && p->missing) ||
+            (p->settings.hidden && !l->show_hidden)) continue;
         l->history[l->history_count++] = i;
     }
     sort_launcher = l;
@@ -648,12 +667,26 @@ static void rebuild_history( struct launcher *l, int keep_index )
 static void save_program_settings( struct launcher *l, struct program *p )
 {
     struct launcher_kv kv;
-    char path[520];
+    char path[768], folder[768];
+    int ready = 1;
 
-    if (!launcher_settings_path( p->path, path, sizeof(path) ) || !launcher_kv_load( &kv, path ) ||
-        !launcher_settings_write( &kv, &p->settings ) || !launcher_kv_save( &kv, path ))
+    if (launcher_settings_on_usb( p->path ))
+    {
+        runtime_file( l, "program-settings", folder, sizeof(folder) );
+        ready = !mkdir( folder, 0777 ) || errno == EEXIST;
+    }
+    if (!ready || !launcher_program_settings_path( l->options->runtime_dir, p->path, path, sizeof(path) ) ||
+        !launcher_kv_load( &kv, path ) || !launcher_settings_write( &kv, &p->settings ) ||
+        !launcher_kv_save( &kv, path ))
         ui_toast( &l->ui, "Could not save the program's settings", 2500 );
     load_program_settings( l, p );
+}
+
+static void enable_program_dxvk( struct launcher *l, struct program *p )
+{
+    if (!l->options->dxvk_on_add || !launcher_dxvk_directory( p->machine )) return;
+    p->settings.dxvk = 1;
+    save_program_settings( l, p );
 }
 
 /***********************************************************************
@@ -1519,8 +1552,13 @@ static void draw_carousel_card( struct launcher *l, int index, SDL_Rect rect, fl
                             (SDL_Color){ 255, 255, 255, (int)(38 * focus) } );
     if (p->missing)
     {
-        ui_rounded( ui, x + 12, y + 12, 72, 24, 10, (SDL_Color){ 120, 28, 32, 230 } );
-        ui_text( ui, ui->small, x + 20, y + 14, "Missing", ui->value );
+        int badge_h = TTF_FontHeight( ui->small ) + 8;
+        int badge_w = ui_text_width( ui, ui->small, "Missing" ) + 20;
+
+        ui_rounded( ui, x + 12, y + 12, badge_w, badge_h, badge_h / 2,
+                    (SDL_Color){ 120, 28, 32, 230 } );
+        ui_text( ui, ui->small, x + 22, y + 12 + (badge_h - TTF_FontHeight( ui->small )) / 2,
+                 "Missing", ui->value );
     }
 }
 
@@ -1620,7 +1658,7 @@ static void draw_home( struct launcher *l )
         ui_text_fit( ui, ui->normal, title_x, HOME_TITLE_Y, ui->width - SHELL_MARGIN - title_x - 120, p->title,
                      ui->value, 1 );
         if (p->missing)
-            draw_tag( ui, title_x, HOME_TITLE_Y + TTF_FontHeight( ui->normal ) + 12, "Missing", 1 );
+            draw_tag( ui, title_x, HOME_TITLE_Y + TTF_FontHeight( ui->normal ) + 20, "Missing", 1 );
 
         if (l->zone == ZONE_HEADER) hints[0].label = "Select";
         ui_hints_right( ui, hints, 3, ui->width - SHELL_MARGIN, HOME_HINT_Y );
@@ -1634,7 +1672,10 @@ static void draw_home( struct launcher *l )
 
 enum program_row
 {
-    ROW_START, ROW_FAVORITE, ROW_ARTWORK, ROW_LOCATE, ROW_TITLE, ROW_ARGS, ROW_VERBOSE, ROW_PROFILE, ROW_WINDOWS, ROW_D3D9, ROW_ADDRESS, ROW_OWN_CONTROLS, ROW_CONTROLS, ROW_BOX64,
+    ROW_START, ROW_FAVORITE, ROW_ARTWORK, ROW_LOCATE, ROW_TITLE, ROW_ARGS, ROW_VERBOSE, ROW_PROFILE,
+    ROW_WINDOWS, ROW_D3D9, ROW_VKD3D_VERSION, ROW_DXVK_VERSION, ROW_DXVK_HUD, ROW_FRAME_LIMIT, ROW_VSYNC,
+    ROW_LSFG, ROW_LSFG_DLL, ROW_LSFG_PERFORMANCE, ROW_LSFG_FLOW,
+    ROW_ADDRESS, ROW_OWN_CONTROLS, ROW_CONTROLS, ROW_BOX64,
     ROW_HIDE, ROW_LIBRARY, PROGRAM_ROWS
 };
 
@@ -1689,13 +1730,14 @@ static int install_forwarder( struct launcher *l, int bits, unsigned long long *
         ui_start_screen( ui );
         return 0;
     }
+    snprintf( value, sizeof(value), "%016llX", id ? *id : 0ull );
     if (bits == 32)
     {
-        snprintf( value, sizeof(value), "%016llX", id ? *id : 0ull );
         launcher_kv_set( &l->look, "forwarder-32bit", value );
         launcher_kv_set( &l->look, "forwarder-32bit-name", name );
-        save_look( l );
     }
+    else launcher_kv_set( &l->look, "forwarder-39bit", value );
+    save_look( l );
     return 1;
 }
 
@@ -1805,24 +1847,6 @@ static int next_state( int state, int direction )
     return order[(i + (direction < 0 ? 2 : 1)) % 3];
 }
 
-static void show_file( struct launcher *l, const char *title, const char *path, const char *missing )
-{
-    char text[1024];
-    FILE *file = fopen( path, "rb" );
-    size_t size, i, j;
-
-    if (!file)
-    {
-        ui_message( &l->ui, title, missing );
-        return;
-    }
-    size = fread( text, 1, sizeof(text) - 1, file );
-    fclose( file );
-    for (i = j = 0; i < size; i++) if (text[i] != '\r') text[j++] = text[i];
-    text[j] = 0;
-    ui_message( &l->ui, title, j ? text : "The file is empty." );
-}
-
 /* What the program needs of the address space: what it was told, or what the
  * program itself says when it was told nothing. */
 static enum launcher_address_space program_address_space( struct program *p )
@@ -1838,6 +1862,17 @@ static int address_space_fits( struct launcher *l, struct program *p )
 {
     return !l->options->address_space_bits || l->options->address_space_bits == 32 ||
            program_address_space( p ) != LAUNCHER_ADDRESS_LOW;
+}
+
+/* Whether a game that runs anywhere is better off in Autorun itself. A 32-bit
+ * forwarder gives the game, Wine, Box64's code and DXVK's memory the low 4 GB
+ * to share, and a large game runs out of it and closes; 39 bits keep all but
+ * the game above it. Only a game that says nothing of its own needs goes:
+ * one set to 32-bit stays here. */
+static int address_space_cramped( struct launcher *l, struct program *p )
+{
+    return l->options->address_space_bits == 32 && l->options->launch_title &&
+           program_address_space( p ) == LAUNCHER_ADDRESS_ANY;
 }
 
 /* The forwarder named under Settings, and whether the console still has it.
@@ -1858,6 +1893,97 @@ static unsigned long long chosen_forwarder( struct launcher *l, char *name, size
     return id;
 }
 
+/* Autorun on the home menu with 39 bits: the one made from here, or else the
+ * one this program would make, if the console has it. */
+static unsigned long long main_forwarder( struct launcher *l, int *installed )
+{
+    char value[64] = "";
+    unsigned long long id = 0;
+
+    *installed = 0;
+    if (launcher_kv_get( &l->look, "forwarder-39bit", value, sizeof(value) ) && value[0])
+        id = strtoull( value, NULL, 16 );
+    if ((!id || (l->options->title_installed && !l->options->title_installed( id ))) &&
+        l->options->forwarder_id)
+        id = l->options->forwarder_id( 39 );
+    if (!id || id == l->options->title_id) return 0;
+    *installed = !l->options->title_installed || l->options->title_installed( id );
+    return id;
+}
+
+/* The game goes to the forwarder made with the bits it needs, which the
+ * console opens in this one's place. Returns 0 when it is to start here after
+ * all, 1 when it went or the user turned it back. */
+static int hand_over( struct launcher *l, struct program *p, int bits )
+{
+    struct ui *ui = &l->ui;
+    char message[512], name[128] = "", path[512];
+    int installed = 0;
+    unsigned long long id = bits == 32 ? chosen_forwarder( l, name, sizeof(name), &installed )
+                                       : main_forwarder( l, &installed );
+
+    if (bits != 32) snprintf( name, sizeof(name), "Autorun" );
+    /* Named, still installed, and the console will open it: nothing to ask
+     * about -- the game goes there. */
+    if (!id || !installed || !l->options->launch_title)
+    {
+        if (bits == 32)
+        {
+            snprintf( message, sizeof(message),
+                      "%s%s needs the low 4 GB of memory. Autorun is running with %d bits, which begins "
+                      "above it.\n\nA 32-bit forwarder starts Autorun where the game fits.",
+                      id && !installed ? "The 32-bit forwarder is gone. " : "", p->title,
+                      l->options->address_space_bits );
+            if (!l->options->install_forwarder || !l->options->launch_title)
+            {
+                ui_message( ui, "32-bit forwarder needed", message );
+                return 1;
+            }
+            if (!ui_confirm( ui, "32-bit forwarder needed", message, "Install now" ))
+            {
+                ui_start_screen( ui );
+                return 1;
+            }
+        }
+        else
+        {
+            /* Nothing to send it to and no way to make it: as before, here. */
+            if (!l->options->install_forwarder) return 0;
+            snprintf( message, sizeof(message),
+                      "%s does not need this 32-bit forwarder. Here the game shares the low 4 GB with "
+                      "Wine and its graphics, and a large game runs out and closes. Autorun with 39 bits "
+                      "gives it the room.\n\nTo run it here anyway, set its Address space to 32-bit.",
+                      p->title );
+            if (!ui_confirm( ui, "Autorun forwarder needed", message, "Install now" ))
+            {
+                ui_start_screen( ui );
+                return 1;
+            }
+        }
+        if (!install_forwarder( l, bits, &id )) return 1;
+    }
+    /* The game goes on the card before the forwarder is asked for, because
+     * once the console takes the request nothing here runs again. */
+    runtime_file( l, "run-next.txt", path, sizeof(path) );
+    if (!write_line( path, p->path ))
+    {
+        ui_toast( ui, "Could not write run-next.txt", 2500 );
+        return 1;
+    }
+    p->launched_order = l->catalog.next_order++;
+    save_library( l );
+    if (l->options->launch_title( id ))
+    {
+        snprintf( message, sizeof(message), "Opening %s...", bits == 32 ? "the 32-bit forwarder" : "Autorun" );
+        ui_toast( ui, message, 4000 );
+        return 1;
+    }
+    remove( path );
+    snprintf( message, sizeof(message), "The console refused to open %s.", name[0] ? name : "the forwarder" );
+    ui_message( ui, "Could not open it", message );
+    return 1;
+}
+
 static int start_program( struct launcher *l, struct program *p, char *target, size_t size )
 {
     struct ui *ui = &l->ui;
@@ -1869,54 +1995,8 @@ static int start_program( struct launcher *l, struct program *p, char *target, s
         ui_message( ui, "Game unavailable", "The executable is missing or is not supported by this build." );
         return 0;
     }
-    if (!address_space_fits( l, p ))
-    {
-        char message[320], name[128] = "";
-        int installed = 0;
-        unsigned long long id = chosen_forwarder( l, name, sizeof(name), &installed );
-
-        /* Named, still installed, and the console will open it: nothing to ask
-         * about -- the game goes there. */
-        if (!id || !installed || !l->options->launch_title)
-        {
-            snprintf( message, sizeof(message),
-                      "%s%s needs the low 4 GB of memory. Autorun is running with %d bits, which begins "
-                      "above it.\n\nA 32-bit forwarder starts Autorun where the game fits.",
-                      id && !installed ? "The 32-bit forwarder is gone. " : "", p->title,
-                      l->options->address_space_bits );
-            if (!l->options->install_forwarder || !l->options->launch_title)
-            {
-                ui_message( ui, "32-bit forwarder needed", message );
-                return 0;
-            }
-            if (!ui_confirm( ui, "32-bit forwarder needed", message, "Install now" ))
-            {
-                ui_start_screen( ui );
-                return 0;
-            }
-            if (!install_forwarder( l, 32, &id )) return 0;
-            installed = 1;
-        }
-        /* The game goes on the card before the forwarder is asked for, because
-         * once the console takes the request nothing here runs again. */
-        runtime_file( l, "run-next.txt", path, sizeof(path) );
-        if (!write_line( path, p->path ))
-        {
-            ui_toast( ui, "Could not write run-next.txt", 2500 );
-            return 0;
-        }
-        p->launched_order = l->catalog.next_order++;
-        save_library( l );
-        if (l->options->launch_title( id ))
-        {
-            ui_toast( ui, "Opening the 32-bit forwarder...", 4000 );
-            return 0;
-        }
-        remove( path );
-        snprintf( message, sizeof(message), "The console refused to open %s.", name[0] ? name : "the forwarder" );
-        ui_message( ui, "Could not open it", message );
-        return 0;
-    }
+    if (!address_space_fits( l, p ) && hand_over( l, p, 32 )) return 0;
+    if (address_space_cramped( l, p ) && hand_over( l, p, 39 )) return 0;
     p->missing = 0;
     p->launched_order = l->catalog.next_order++;
     save_library( l );
@@ -1945,13 +2025,317 @@ static void edit_text( const char *header, char *value, size_t size )
     snprintf( value, size, "%s", edited );
 }
 
+struct dxvk_progress_ui
+{
+    struct ui *ui;
+    const struct dxvk_release *release;
+    enum dxvk_progress_stage stage;
+    const char *name;
+    Uint32 last_draw;
+    int started;
+};
+
+static void dxvk_install_progress( void *opaque, enum dxvk_progress_stage stage,
+                                   unsigned long long current, unsigned long long total )
+{
+    struct dxvk_progress_ui *progress = opaque;
+    const char *status;
+    char title[96];
+    Uint32 now = SDL_GetTicks();
+
+    if (stage == DXVK_PROGRESS_DOWNLOAD && !total) total = progress->release->size;
+    if (progress->started && stage == progress->stage && now - progress->last_draw < 40 &&
+        (!total || current < total)) return;
+    switch (stage)
+    {
+    case DXVK_PROGRESS_DOWNLOAD: status = "Downloading from GitHub..."; break;
+    case DXVK_PROGRESS_VERIFY: status = "Verifying download..."; current = total = 0; break;
+    default: status = "Installing x86 and x64 files..."; current = total = 0; break;
+    }
+    snprintf( title, sizeof(title), "Installing %s %s", progress->name, progress->release->version );
+    ui_progress_update( progress->ui, title, status, current, total );
+    progress->stage = stage;
+    progress->last_draw = now;
+    progress->started = 1;
+}
+
+static int graphics_release_menu( struct launcher *l, struct program *p, const struct ui_list *anchor, int vkd3d )
+{
+    static struct dxvk_release releases[DXVK_MAX_RELEASES];
+    static struct ui_row rows[DXVK_MAX_RELEASES + 1];
+    int refresh = 0;
+    const char *name = vkd3d ? "VKD3D" : "DXVK";
+    char *version = vkd3d ? p->settings.vkd3d_version : p->settings.dxvk_version;
+    enum dxvk_result (*catalog)( const char *, struct dxvk_release *, int, int *, int, int * ) =
+        vkd3d ? vkd3d_release_catalog : dxvk_release_catalog;
+    enum dxvk_result (*install)( const char *, const struct dxvk_release *, dxvk_progress_callback, void * ) =
+        vkd3d ? vkd3d_install_release : dxvk_install_release;
+    int (*installed_release)( const char *, unsigned short, const char * ) =
+        vkd3d ? vkd3d_release_installed : dxvk_release_installed;
+    int (*root_release)( const char *, unsigned short, char *, size_t ) =
+        vkd3d ? vkd3d_root_version : dxvk_root_version;
+
+    for (;;)
+    {
+        enum dxvk_result result;
+        char root_version[32] = "", message[320];
+        int ids[DXVK_MAX_RELEASES + 1];
+        int release_count = 0, count = 0, cached = 0, latest = -1, current = -1, chosen, i;
+
+        snprintf( message, sizeof(message), "%s %s releases...", refresh ? "Refreshing" : "Loading", name );
+        ui_toast( &l->ui, message, 15000 );
+        ui_present( &l->ui );
+        result = catalog( l->options->runtime_dir, releases, DXVK_MAX_RELEASES,
+                                       &release_count, refresh, &cached );
+        ui_toast( &l->ui, "", 0 );
+        refresh = 0;
+        if (result != DXVK_OK)
+        {
+            ui_message( &l->ui, name, dxvk_result_message( result ) );
+            return 0;
+        }
+        root_release( l->options->runtime_dir, p->machine, root_version, sizeof(root_version) );
+        memset( rows, 0, sizeof(rows) );
+        for (i = 0; i < release_count; i++)
+        {
+            int installed = installed_release( l->options->runtime_dir, p->machine, releases[i].version ) ||
+                            (root_version[0] && !strcmp( root_version, releases[i].version ) &&
+                             installed_release( l->options->runtime_dir, p->machine, "" ));
+            int index;
+
+            if (!vkd3d && !launcher_dxvk_version_selectable( releases[i].version )) continue;
+            index = count++;
+            ids[index] = i;
+            if (latest < 0 && !releases[i].prerelease) latest = i;
+            if ((version[0] && !strcmp( version, releases[i].version )) ||
+                (!version[0] && root_version[0] && !strcmp( root_version, releases[i].version )))
+                current = index;
+            snprintf( rows[index].label, sizeof(rows[index].label), "%s", releases[i].version );
+            if (installed)
+                snprintf( rows[index].value, sizeof(rows[index].value), "%s%s",
+                          i == latest ? "Latest / " : "", "Installed" );
+            else if (i == latest)
+                snprintf( rows[index].value, sizeof(rows[index].value), "Latest" );
+            else if (releases[i].prerelease)
+                snprintf( rows[index].value, sizeof(rows[index].value), "Pre-release" );
+            rows[index].download = !installed;
+        }
+        if (latest >= 0 && current < 0)
+            for (i = 0; i < count; i++)
+                if (ids[i] == latest) { current = i; break; }
+        ids[count] = -1;
+        snprintf( rows[count].label, sizeof(rows[count].label), "Refresh releases" );
+        snprintf( rows[count].value, sizeof(rows[count].value), "%s", cached ? "Cached" : "Up to date" );
+        count++;
+        chosen = ui_settings_dropdown( &l->ui, anchor, rows, count, current >= 0 ? current : 0 );
+        if (chosen < 0) return 0;
+        i = ids[chosen];
+        if (i < 0)
+        {
+            refresh = 1;
+            continue;
+        }
+        if (rows[chosen].download)
+        {
+            struct dxvk_progress_ui progress;
+
+            if (releases[i].size)
+                snprintf( message, sizeof(message),
+                          "Download %s %s (%.1f MiB) from the official GitHub release and install its x86 and x64 DLLs?",
+                          name, releases[i].version, releases[i].size / 1048576.0 );
+            else
+                snprintf( message, sizeof(message),
+                          "Download %s %s from the official GitHub release and install its x86 and x64 DLLs?",
+                          name, releases[i].version );
+            if (!ui_confirm( &l->ui, name, message, "Download" )) continue;
+            memset( &progress, 0, sizeof(progress) );
+            progress.ui = &l->ui;
+            progress.name = name;
+            progress.release = releases + i;
+            ui_progress_begin( &l->ui );
+            result = install( l->options->runtime_dir, releases + i,
+                                           dxvk_install_progress, &progress );
+            ui_progress_end( &l->ui );
+            if (result != DXVK_OK)
+            {
+                ui_message( &l->ui, name, dxvk_result_message( result ) );
+                continue;
+            }
+        }
+        if (root_version[0] && !strcmp( root_version, releases[i].version ) &&
+            installed_release( l->options->runtime_dir, p->machine, "" ))
+            version[0] = 0;
+        else memcpy( version, releases[i].version, strlen( releases[i].version ) + 1 );
+        p->settings.dxvk = 1;
+        save_program_settings( l, p );
+        snprintf( message, sizeof(message), "%s %s selected", name, releases[i].version );
+        ui_toast( &l->ui, message, 1800 );
+        return 1;
+    }
+}
+
+static int box64_configured_count( const struct launcher_kv *kv, int advanced )
+{
+    char value[64];
+    int count = 0, i;
+
+    for (i = 0; i < NX_BOX64_OPTION_COUNT; i++)
+        if (nx_box64_options[i].advanced == advanced &&
+            launcher_kv_get( kv, nx_box64_options[i].name, value, sizeof(value) )) count++;
+    return count;
+}
+
+static void box64_options_status( const char *path, char *value, size_t size )
+{
+    struct launcher_kv kv;
+    int count;
+
+    if (!launcher_kv_load( &kv, path ))
+    {
+        snprintf( value, size, "File too large" );
+        return;
+    }
+    count = box64_configured_count( &kv, 0 ) + box64_configured_count( &kv, 1 );
+    if (count) snprintf( value, size, "%d flag%s set", count, count == 1 ? "" : "s" );
+    else if (file_exists( path )) snprintf( value, size, "Custom file" );
+    else snprintf( value, size, "Default" );
+}
+
+static int box64_option_value( const struct launcher_kv *kv, const struct nx_box64_option *option,
+                               long *value, char *text, size_t size )
+{
+    int choice;
+
+    if (!launcher_kv_get( kv, option->name, text, size ))
+    {
+        *value = option->default_value;
+        choice = nx_box64_option_choice( option, *value );
+        snprintf( text, size, "%s", option->value_names[choice] );
+        return choice;
+    }
+    if (!nx_box64_option_parse_value( text, value ) ||
+        (choice = nx_box64_option_choice( option, *value )) < 0)
+    {
+        char invalid[64];
+
+        snprintf( invalid, sizeof(invalid), "%s", text );
+        snprintf( text, size, "Unsupported (%s)", invalid );
+        return -1;
+    }
+    snprintf( text, size, "%s", option->value_names[choice] );
+    return choice;
+}
+
+static int box64_option_rows( struct ui_row *rows, int *ids, int count,
+                              const struct launcher_kv *kv, int advanced )
+{
+    int i;
+
+    for (i = 0; i < NX_BOX64_OPTION_COUNT; i++)
+    {
+        long value;
+
+        if (nx_box64_options[i].advanced != advanced) continue;
+        ids[count] = i;
+        snprintf( rows[count].label, sizeof(rows[count].label), "%s", nx_box64_options[i].name );
+        box64_option_value( kv, nx_box64_options + i, &value,
+                            rows[count].value, sizeof(rows[count].value) );
+        rows[count].help = nx_box64_options[i].help;
+        rows[count].kind = UI_ROW_VALUE;
+        rows[count].adjustable = 1;
+        count++;
+    }
+    return count;
+}
+
+static void box64_options_menu( struct launcher *l, struct program *p )
+{
+    struct ui_row rows[NX_BOX64_OPTION_COUNT + 1];
+    int ids[NX_BOX64_OPTION_COUNT + 1];
+    struct ui_list list = {0};
+    struct launcher_kv kv;
+    char path[520];
+    int count, expanded = 0, i;
+
+    if (!launcher_sibling_path( p->path, ".box64.txt", path, sizeof(path) ) ||
+        !launcher_kv_load( &kv, path ))
+    {
+        ui_message( &l->ui, "Box64 options", "The options file is too large to edit." );
+        return;
+    }
+    for (;;)
+    {
+        enum ui_action action;
+        int set;
+
+        memset( rows, 0, sizeof(rows) );
+        count = box64_option_rows( rows, ids, 0, &kv, 0 );
+        set = box64_configured_count( &kv, 1 );
+        ids[count] = -1;
+        snprintf( rows[count].label, sizeof(rows[count].label), "Advanced flags" );
+        snprintf( rows[count].value, sizeof(rows[count].value), expanded ? "Hide (%d set)" : "Show (%d set)", set );
+        rows[count].help = "Compatibility and lower-level DynaRec controls supported by Wine-NX's embedded Box64 backend.";
+        rows[count].kind = UI_ROW_DROPDOWN;
+        rows[count].on = expanded;
+        count++;
+        if (expanded) count = box64_option_rows( rows, ids, count, &kv, 1 );
+        action = ui_list_run( &l->ui, &list, "Box64 options", p->title, rows, count, 1 );
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return;
+        i = ids[list.selection];
+        if (i < 0)
+        {
+            if (action == UI_ACTION_CHOOSE) expanded = !expanded;
+            continue;
+        }
+        else
+        {
+            const struct nx_box64_option *option = nx_box64_options + i;
+            char current_text[64], number[16];
+            long current_value;
+            int current = box64_option_value( &kv, option, &current_value,
+                                               current_text, sizeof(current_text) );
+            int next;
+
+            if (action == UI_ACTION_RESET) next = nx_box64_option_choice( option, option->default_value );
+            else
+            {
+                if (current < 0) current = nx_box64_option_choice( option, option->default_value );
+                next = (current + (action == UI_ACTION_LEFT ? option->value_count - 1 : 1)) % option->value_count;
+            }
+            snprintf( number, sizeof(number), "%d", option->values[next] );
+            if (!launcher_kv_set( &kv, option->name,
+                                  option->values[next] == option->default_value ? NULL : number ) ||
+                !launcher_kv_save( &kv, path ))
+            {
+                ui_message( &l->ui, "Box64 options", "The options could not be saved." );
+                if (!launcher_kv_load( &kv, path )) return;
+                continue;
+            }
+            load_program_settings( l, p );
+        }
+    }
+}
+
 /* Returns 1 when the program is to be started. */
 /* The sections of Game Settings, in the order they stand in the list. */
-enum program_section { SECTION_GENERAL, SECTION_GRAPHICS, SECTION_DIAGNOSTICS, SECTION_LIBRARY };
+enum program_section
+{
+    SECTION_GENERAL,
+    SECTION_GRAPHICS,
+#ifdef WINE_NX_LSFG
+    SECTION_FRAME_GENERATION,
+#endif
+    SECTION_DIAGNOSTICS,
+    SECTION_LIBRARY
+};
 
 static int program_menu( struct launcher *l, struct program *p, char *target, size_t size )
 {
-    static const char *const sections[] = { "General", "Graphics", "Diagnostics", "Library" };
+    static const char *const sections[] = { "General", "Graphics",
+#ifdef WINE_NX_LSFG
+                                            "Frame Generation",
+#endif
+                                            "Diagnostics", "Library" };
     /* Kept between openings, so a game returns to the section it was left in. */
     static int section;
     struct ui_row rows[PROGRAM_ROWS];
@@ -1965,16 +2349,38 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
     {
         const char *base = file_name( p->path );
         int in_library = find_program( l, p->path ) >= 0;
-        int x86 = p->machine == 0x014c, dxvk_beside, dxvk_installed;
+        int x86 = p->machine == 0x014c, x64 = p->machine == 0x8664, dxvk_beside, dxvk_installed;
+        int vkd3d_installed = vkd3d_release_installed( l->options->runtime_dir, p->machine,
+                                                     p->settings.vkd3d_version );
+#ifdef WINE_NX_LSFG
+        int lsfg_installed;
+#endif
+        const char *dxvk_dir = launcher_dxvk_directory( p->machine );
+        char dxvk_root[32] = "", vkd3d_root[32] = "";
         enum ui_action action;
         struct ui_row *row;
 
         snprintf( name, sizeof(name), "%.*s", (int)(strlen( base ) > 4 ? strlen( base ) - 4 : strlen( base )), base );
         snprintf( dir, sizeof(dir), "%s", p->path );
         parent_dir( dir );
-        snprintf( path, sizeof(path), "%s/d3d9.dll", dir );
+        snprintf( path, sizeof(path), "%s/%s", dir, x64 ? "d3d11.dll" : "d3d9.dll" );
         dxvk_beside = file_exists( path );
-        dxvk_installed = file_exists( LAUNCHER_DRIVE_C "/dxvk/d3d9.dll" );
+        if (x64)
+        {
+            snprintf( path, sizeof(path), "%s/dxgi.dll", dir );
+            dxvk_beside |= file_exists( path );
+            if (p->settings.dxvk)
+            {
+                snprintf( path, sizeof(path), "%s/d3d12.dll", dir );
+                dxvk_beside |= file_exists( path );
+                snprintf( path, sizeof(path), "%s/d3d12core.dll", dir );
+                dxvk_beside |= file_exists( path );
+            }
+        }
+        dxvk_installed = dxvk_dir && dxvk_release_installed( l->options->runtime_dir, p->machine,
+                                                             p->settings.dxvk_version );
+        dxvk_root_version( l->options->runtime_dir, p->machine, dxvk_root, sizeof(dxvk_root) );
+        vkd3d_root_version( l->options->runtime_dir, p->machine, vkd3d_root, sizeof(vkd3d_root) );
 
         count = 0;
 #define ADD_ROW(i, section, text, help_text) \
@@ -2005,14 +2411,14 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
         else snprintf( row->value, sizeof(row->value), "None" );
 
         ADD_ROW( ROW_VERBOSE, SECTION_DIAGNOSTICS, "Verbose traces",
-                 "Writes Wine's traces to wine-nx-runtime.log, which slows the program down. "
+                 "Writes Wine's traces to autorun_runtime.log, which slows the program down. "
                  "Global follows the setting in Settings (X on the library)." );
         row->adjustable = 1;
         snprintf( row->value, sizeof(row->value), "%s",
                   state_text( p->settings.verbose, l->options->verbose, "On", "Off", buffer, sizeof(buffer) ) );
 
         ADD_ROW( ROW_PROFILE, SECTION_DIAGNOSTICS, "Profiler",
-                 "Samples where every thread spends its time and writes [PROF] lines to wine-nx-runtime.log." );
+                 "Samples where every thread spends its time and writes [PROF] lines to autorun_runtime.log." );
         row->adjustable = 1;
         snprintf( row->value, sizeof(row->value), "%s",
                   state_text( p->settings.profile, l->options->profile, "On", "Off", buffer, sizeof(buffer) ) );
@@ -2025,27 +2431,100 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
                   state_text( p->settings.framebuffer, l->options->framebuffer, "Framebuffer", "Compositor",
                               buffer, sizeof(buffer) ) );
 
-        if (l->options->vulkan && x86)
+        if (l->options->vulkan && (x86 || x64))
         {
-            ADD_ROW( ROW_D3D9, SECTION_GRAPHICS, "Direct3D 9",
-                     "Wine draws Direct3D 9 with OpenGL. DXVK draws it with Vulkan: C:\\dxvk\\d3d9.dll is "
-                     "loaded instead of Wine's. A d3d9.dll next to the program is always loaded first." );
-            if (dxvk_beside)
-            {
-                row->disabled = 1;
-                snprintf( row->value, sizeof(row->value), "d3d9.dll next to the program" );
-            }
-            else if (!dxvk_installed && !p->settings.dxvk)
-            {
-                row->disabled = 1;
-                snprintf( row->value, sizeof(row->value), "Wine (no C:\\dxvk\\d3d9.dll)" );
-            }
-            else
-            {
-                row->adjustable = 1;
-                snprintf( row->value, sizeof(row->value), "%s", p->settings.dxvk ? "DXVK" : "Wine" );
-            }
+            ADD_ROW( ROW_D3D9, SECTION_GRAPHICS, "Direct3D renderer",
+                      "Wine uses its built-in renderer. DXVK + VKD3D uses Vulkan for Direct3D 9/10/11/12. "
+                     "Graphics DLLs next to the game have priority." );
+            row->adjustable = 1;
+            row->download = p->settings.dxvk && !dxvk_installed;
+            snprintf( row->value, sizeof(row->value), "%s%s%s",
+                      p->settings.dxvk ? "DXVK + VKD3D" : "Wine",
+                      p->settings.dxvk && !dxvk_installed ? " (download required)" : "",
+                      dxvk_beside ? " (app DLL first)" : "" );
+
+            ADD_ROW( ROW_VKD3D_VERSION, SECTION_GRAPHICS, "VKD3D version",
+                     "Choose an official VKD3D GitHub release." );
+            row->kind = UI_ROW_DROPDOWN;
+            row->download = !vkd3d_installed;
+            if (p->settings.vkd3d_version[0])
+                snprintf( row->value, sizeof(row->value), "%s", p->settings.vkd3d_version );
+            else if (vkd3d_root[0])
+                snprintf( row->value, sizeof(row->value), "%s", vkd3d_root );
+            else snprintf( row->value, sizeof(row->value), "Latest" );
+
+            ADD_ROW( ROW_DXVK_VERSION, SECTION_GRAPHICS, "DXVK version",
+                     "Choose an official DXVK GitHub release." );
+            row->kind = UI_ROW_DROPDOWN;
+            row->download = !dxvk_installed;
+            if (p->settings.dxvk_version[0])
+                snprintf( row->value, sizeof(row->value), "%s", p->settings.dxvk_version );
+            else if (dxvk_root[0])
+                snprintf( row->value, sizeof(row->value), "Latest (%s)", dxvk_root );
+            else snprintf( row->value, sizeof(row->value), "Latest" );
+            ADD_ROW( ROW_DXVK_HUD, SECTION_GRAPHICS, "DXVK HUD",
+                     "FPS shows only the frame rate. Compact shows the DirectX version, FPS and frame times. "
+                     "Full also shows the DXVK version, GPU, video memory and shader compiler activity. "
+                     "The DXVK HUD does not cover VKD3D's D3D12 rendering." );
+            row->kind = UI_ROW_DROPDOWN;
+            snprintf( row->value, sizeof(row->value), "%s", launcher_hud_labels[p->settings.dxvk_hud] );
+
+            ADD_ROW( ROW_FRAME_LIMIT, SECTION_GRAPHICS, "Frame rate limit",
+                     "Limits real game frames in Vulkan, DXVK and VKD3D. Off adds no cap. "
+                     "VSync and the game's own limit still apply." );
+            row->kind = UI_ROW_DROPDOWN;
+            snprintf( row->value, sizeof(row->value), "%s", launcher_frame_limit_labels[p->settings.frame_limit] );
+
+            ADD_ROW( ROW_VSYNC, SECTION_GRAPHICS, "VSync",
+                     "Synchronizes Vulkan, DXVK and VKD3D presentation to the display. LSFG-VK always uses synchronized presentation." );
+            row->kind = UI_ROW_SWITCH;
+            row->on = p->settings.vsync;
+            snprintf( row->value, sizeof(row->value), "%s", p->settings.vsync ? "Enabled" : "Disabled" );
         }
+
+#ifdef WINE_NX_LSFG
+        runtime_file( l, "lsfg/Lossless.dll", path, sizeof(path) );
+        lsfg_installed = file_exists( path );
+        if (!lsfg_installed) p->settings.lsfg_enabled = 0;
+        ADD_ROW( ROW_LSFG, SECTION_FRAME_GENERATION, "LSFG-VK (2x)",
+                 "Generates one frame between each pair of game frames for Vulkan, DXVK and VKD3D only. "
+                 "Output follows the physical display resolution and uses synchronized presentation regardless of "
+                 "the VSync setting." );
+        row->kind = UI_ROW_SWITCH;
+        row->disabled = !lsfg_installed;
+        row->on = p->settings.lsfg_enabled;
+        snprintf( row->value, sizeof(row->value), "%s",
+                  !lsfg_installed ? "Unavailable" : p->settings.lsfg_enabled ? "Enabled" : "Disabled" );
+
+        ADD_ROW( ROW_LSFG_DLL, SECTION_FRAME_GENERATION, "Lossless.dll",
+                 "Copy Lossless.dll to sdmc:/switch/wine/lsfg/Lossless.dll." );
+        row->kind = UI_ROW_INFO;
+        row->disabled = 1;
+        if (lsfg_installed)
+        {
+            snprintf( row->value, sizeof(row->value), "Installed" );
+            row->value_tone = UI_VALUE_SUCCESS;
+        }
+        else
+        {
+            snprintf( row->value, sizeof(row->value), "Not found" );
+            row->value_tone = UI_VALUE_DANGER;
+        }
+
+        ADD_ROW( ROW_LSFG_PERFORMANCE, SECTION_FRAME_GENERATION, "Performance Mode",
+                 "Uses LSFG's performance path. Disable it for the quality path, which costs more GPU time." );
+        row->kind = UI_ROW_SWITCH;
+        row->on = p->settings.lsfg_performance;
+        snprintf( row->value, sizeof(row->value), "%s",
+                  p->settings.lsfg_performance ? "Enabled" : "Disabled" );
+
+        ADD_ROW( ROW_LSFG_FLOW, SECTION_FRAME_GENERATION, "Motion Resolution",
+                 "Resolution used to estimate motion. Lower values reduce GPU work and memory use; generated output "
+                 "still follows the physical display resolution." );
+        row->kind = UI_ROW_DROPDOWN;
+        snprintf( row->value, sizeof(row->value), "%s",
+                  launcher_lsfg_flow_labels[p->settings.lsfg_flow] );
+#endif
 
         {
             enum launcher_address_space needs = launcher_program_address_space( p->path );
@@ -2053,7 +2532,9 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
             ADD_ROW( ROW_ADDRESS, SECTION_GRAPHICS, "Address space",
                      "What the game needs of the address space Horizon gives Autorun. A game linked for a "
                      "fixed address in the low 4 GB runs only under a forwarder made with 32 bits; the "
-                     "forwarder decides this, and a game that needs one it was not given is not started." );
+                     "forwarder decides this, and a game that needs one it was not given is not started. Any other "
+                     "game started from a 32-bit forwarder is sent to Autorun, where it has more memory, "
+                     "unless this is set to 32-bit." );
             row->adjustable = 1;
             if (p->settings.address_space >= 0)
                 snprintf( row->value, sizeof(row->value), "%s",
@@ -2084,12 +2565,12 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
             }
         }
 
-        if (x86)
+        if (x86 || x64)
         {
             ADD_ROW( ROW_BOX64, SECTION_DIAGNOSTICS, "Box64 options",
-                     "Options for the x86 translator, read from NAME.box64.txt next to the program." );
+                     "Per-game performance and compatibility flags for the Box64 translator." );
             launcher_sibling_path( p->path, ".box64.txt", path, sizeof(path) );
-            snprintf( row->value, sizeof(row->value), "%s", file_exists( path ) ? file_name( path ) : "None" );
+            box64_options_status( path, row->value, sizeof(row->value) );
         }
 
         if (in_library)
@@ -2197,9 +2678,84 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
         }
 
         case ROW_D3D9:
+            if (action != UI_ACTION_RESET && !p->settings.dxvk && !dxvk_installed)
+            {
+                graphics_release_menu( l, p, &list, 0 );
+                break;
+            }
             p->settings.dxvk = action == UI_ACTION_RESET ? 0 : !p->settings.dxvk;
             save_program_settings( l, p );
             break;
+
+        case ROW_VKD3D_VERSION:
+        case ROW_DXVK_VERSION:
+            if (action == UI_ACTION_RESET)
+            {
+                char *version = id == ROW_VKD3D_VERSION ? p->settings.vkd3d_version : p->settings.dxvk_version;
+                version[0] = 0;
+                save_program_settings( l, p );
+            }
+            else if (action == UI_ACTION_CHOOSE)
+                graphics_release_menu( l, p, &list, id == ROW_VKD3D_VERSION );
+            break;
+
+        case ROW_DXVK_HUD:
+        case ROW_FRAME_LIMIT:
+        {
+            int *value = id == ROW_DXVK_HUD ? &p->settings.dxvk_hud : &p->settings.frame_limit;
+            const char *const *labels = id == ROW_DXVK_HUD ? launcher_hud_labels : launcher_frame_limit_labels;
+            int choices = id == ROW_DXVK_HUD ? LAUNCHER_HUD_COUNT : LAUNCHER_FRAME_LIMIT_COUNT;
+            struct ui_row items[LAUNCHER_FRAME_LIMIT_COUNT] = {0};
+
+            if (action == UI_ACTION_RESET) *value = 0;
+            else if (action == UI_ACTION_CHOOSE)
+            {
+                for (i = 0; i < choices; i++)
+                    snprintf( items[i].label, sizeof(items[i].label), "%s", labels[i] );
+                int selected = ui_settings_dropdown( ui, &list, items, choices, *value );
+                if (selected < 0) break;
+                *value = selected;
+            }
+            else break;
+            save_program_settings( l, p );
+            break;
+        }
+
+        case ROW_VSYNC:
+        {
+            p->settings.vsync = action == UI_ACTION_RESET ? 1 : !p->settings.vsync;
+            save_program_settings( l, p );
+            break;
+        }
+
+#ifdef WINE_NX_LSFG
+        case ROW_LSFG:
+        case ROW_LSFG_PERFORMANCE:
+        {
+            int *value = id == ROW_LSFG ? &p->settings.lsfg_enabled : &p->settings.lsfg_performance;
+
+            *value = action == UI_ACTION_RESET ? id == ROW_LSFG_PERFORMANCE : !*value;
+            save_program_settings( l, p );
+            break;
+        }
+
+        case ROW_LSFG_FLOW:
+            if (action == UI_ACTION_RESET) p->settings.lsfg_flow = 1;
+            else if (action == UI_ACTION_CHOOSE)
+            {
+                struct ui_row items[3] = {0};
+                int selected;
+
+                for (i = 0; i < 3; i++)
+                    snprintf( items[i].label, sizeof(items[i].label), "%s", launcher_lsfg_flow_labels[i] );
+                selected = ui_settings_dropdown( ui, &list, items, 3, p->settings.lsfg_flow );
+                if (selected < 0) break;
+                p->settings.lsfg_flow = selected;
+            }
+            else break;
+            save_program_settings( l, p );
+            break;
+#endif
 
         case ROW_ADDRESS:
             /* Auto, then what the two answers are, so either can be forced. */
@@ -2234,8 +2790,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
         case ROW_BOX64:
             if (action != UI_ACTION_CHOOSE) break;
-            launcher_sibling_path( p->path, ".box64.txt", path, sizeof(path) );
-            show_file( l, "Box64 options", path, "This program uses the default Box64 options." );
+            box64_options_menu( l, p );
             break;
 
         case ROW_HIDE:
@@ -2273,6 +2828,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
                 save_library( l );
                 ui_toast( ui, "Added to the library", 1500 );
                 p = &l->programs[index];
+                enable_program_dxvk( l, p );
             }
             break;
         }
@@ -2285,8 +2841,9 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 
 enum settings_row
 {
-    SET_HIDDEN, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_CONTROLS, SET_STEAMGRIDDB,
-    SET_REOPEN, SET_FORWARDER, SET_MAKE_32BIT, SET_MAKE_MAIN,
+    SET_HIDDEN, SET_HIDE_MISSING, SET_DXVK_ON_ADD, SET_VERBOSE, SET_PROFILE, SET_WINDOWS,
+    SET_CONTROLS, SET_STEAMGRIDDB,
+    SET_UPDATE, SET_REOPEN, SET_FORWARDER, SET_MAKE_32BIT, SET_MAKE_MAIN,
     SET_CREDITS, SETTINGS_ROWS
 };
 
@@ -2351,6 +2908,7 @@ static void save_look( struct launcher *l )
     launcher_kv_set( &l->look, "columns", NULL );
     launcher_kv_set( &l->look, "rows", NULL );
     launcher_kv_set( &l->look, "show-hidden", l->show_hidden ? "1" : "0" );
+    launcher_kv_set( &l->look, "hide-missing", l->hide_missing ? "1" : NULL );
     launcher_kv_set( &l->look, "browse", l->browse_dir );
     runtime_file( l, "launcher.txt", path, sizeof(path) );
     launcher_kv_save( &l->look, path );
@@ -2362,9 +2920,11 @@ static const struct { const char *name, *value, *help; } credits[] =
     { "Wine", "WineHQ, LGPL-2.1+",
       "https://www.winehq.org\nThe Windows API, the loader, WoW64 and the Direct3D, OpenGL and Vulkan layers." },
     { "Box64", "ptitSeb, MIT",
-      "https://github.com/ptitSeb/box64\nRuns 32-bit x86 code: its interpreter and ARM64 dynarec are the WoW64 CPU." },
+      "https://github.com/ptitSeb/box64\nRuns x86 and x86-64 code through its interpreter and ARM64 dynarec." },
     { "DXVK", "Philip Rebohle, zlib",
-      "https://github.com/doitsujin/dxvk\nDirect3D 9 over Vulkan, for programs set to d3d9=dxvk." },
+      "https://github.com/doitsujin/dxvk\nDirect3D over Vulkan, for programs set to d3d=dxvk." },
+    { "VKD3D-Proton", "VKD3D-Proton contributors, LGPL-2.1",
+      "https://github.com/HansKristian-Work/vkd3d-proton\nDirect3D 12 over Vulkan." },
     { "Mesa", "Mesa3D, MIT",
       "https://mesa3d.org\nOpenGL through nvc0 and Vulkan through NVK on the Switch GPU." },
     { "mesa-switch", "danfromtico, NaGaa95 and others",
@@ -2700,10 +3260,13 @@ static void settings_menu( struct launcher *l )
         static const unsigned char row_section[SETTINGS_ROWS] =
         {
             [SET_HIDDEN] = SET_SECTION_LIBRARY,
+            [SET_HIDE_MISSING] = SET_SECTION_LIBRARY,
+            [SET_DXVK_ON_ADD] = SET_SECTION_LIBRARY,
             [SET_VERBOSE] = SET_SECTION_DEFAULTS, [SET_PROFILE] = SET_SECTION_DEFAULTS,
             [SET_WINDOWS] = SET_SECTION_DEFAULTS, [SET_CONTROLS] = SET_SECTION_DEFAULTS,
             [SET_STEAMGRIDDB] = SET_SECTION_ARTWORK,
             [SET_REOPEN] = SET_SECTION_SYSTEM,
+            [SET_UPDATE] = SET_SECTION_SYSTEM,
             [SET_FORWARDER] = SET_SECTION_SYSTEM, [SET_MAKE_32BIT] = SET_SECTION_SYSTEM,
             [SET_MAKE_MAIN] = SET_SECTION_SYSTEM,
             [SET_CREDITS] = SET_SECTION_SYSTEM,
@@ -2721,11 +3284,21 @@ static void settings_menu( struct launcher *l )
         rows[SET_HIDDEN].help = "Programs hidden from a game's own settings are listed again.";
         rows[SET_HIDDEN].kind = UI_ROW_SWITCH;
         rows[SET_HIDDEN].on = l->show_hidden;
+        snprintf( rows[SET_HIDE_MISSING].label, sizeof(rows[0].label), "Hide missing programs" );
+        snprintf( rows[SET_HIDE_MISSING].value, sizeof(rows[0].value), "%s", on_off[l->hide_missing] );
+        rows[SET_HIDE_MISSING].help = "Hide unavailable games. USB games return when the drive reconnects.";
+        rows[SET_HIDE_MISSING].kind = UI_ROW_SWITCH;
+        rows[SET_HIDE_MISSING].on = l->hide_missing;
+        snprintf( rows[SET_DXVK_ON_ADD].label, sizeof(rows[0].label), "Give a new game DXVK" );
+        snprintf( rows[SET_DXVK_ON_ADD].value, sizeof(rows[0].value), "%s", on_off[!!l->options->dxvk_on_add] );
+        rows[SET_DXVK_ON_ADD].kind = UI_ROW_SWITCH;
+        rows[SET_DXVK_ON_ADD].on = !!l->options->dxvk_on_add;
+        rows[SET_DXVK_ON_ADD].help = "New games use the bundled DXVK version until another version is selected.";
         snprintf( rows[SET_VERBOSE].label, sizeof(rows[0].label), "Verbose traces" );
         snprintf( rows[SET_VERBOSE].value, sizeof(rows[0].value), "%s", on_off[!!l->options->verbose] );
         rows[SET_VERBOSE].kind = UI_ROW_SWITCH;
         rows[SET_VERBOSE].on = !!l->options->verbose;
-        rows[SET_VERBOSE].help = "Wine's traces go to wine-nx-runtime.log for every program without its own setting.";
+        rows[SET_VERBOSE].help = "Wine's traces go to autorun_runtime.log for every program without its own setting.";
         snprintf( rows[SET_PROFILE].label, sizeof(rows[0].label), "Profiler" );
         snprintf( rows[SET_PROFILE].value, sizeof(rows[0].value), "%s", on_off[!!l->options->profile] );
         rows[SET_PROFILE].kind = UI_ROW_SWITCH;
@@ -2749,6 +3322,11 @@ static void settings_menu( struct launcher *l )
                   launcher_kv_get( &l->look, "steamgriddb-key", path, sizeof(path) ) && path[0] ? "Configured" : "Not set" );
         rows[SET_STEAMGRIDDB].help = "Used to automatically download the community's highest-rated square, portrait and hero artwork.";
         rows[SET_STEAMGRIDDB].adjustable = 0;
+        snprintf( rows[SET_UPDATE].label, sizeof(rows[0].label), "Check for update" );
+        rows[SET_UPDATE].kind = UI_ROW_ACTION;
+        rows[SET_UPDATE].adjustable = 0;
+        rows[SET_UPDATE].disabled = !l->update;
+        rows[SET_UPDATE].help = "Official Autorun releases, changelog and installation. Games and settings are preserved.";
         snprintf( rows[SET_REOPEN].label, sizeof(rows[0].label), "Return here when a program ends" );
         snprintf( rows[SET_REOPEN].value, sizeof(rows[0].value), "%s", on_off[!!l->options->reopen_launcher] );
         rows[SET_REOPEN].kind = UI_ROW_SWITCH;
@@ -2783,8 +3361,9 @@ static void settings_menu( struct launcher *l )
         snprintf( rows[SET_MAKE_MAIN].label, sizeof(rows[0].label), "Make an Autorun forwarder" );
         snprintf( rows[SET_MAKE_MAIN].value, sizeof(rows[0].value), "%s",
                   l->options->install_forwarder ? "Autorun" : "Unavailable" );
-        rows[SET_MAKE_MAIN].help = "Autorun itself on the home menu, in the address space the Homebrew Menu "
-                                   "gives it, so it opens without going through it. Only on an emuMMC.";
+        rows[SET_MAKE_MAIN].help = "Autorun itself on the home menu with the 39-bit address space required "
+                                   "by AMD64 programs. Games that need no 32-bit forwarder are sent to it "
+                                   "from one. Only on an emuMMC.";
         rows[SET_MAKE_MAIN].adjustable = 0;
         rows[SET_MAKE_MAIN].disabled = !l->options->install_forwarder;
         snprintf( rows[SET_CREDITS].label, sizeof(rows[0].label), "Credits" );
@@ -2807,12 +3386,18 @@ static void settings_menu( struct launcher *l )
         switch (i)
         {
         case SET_HIDDEN: l->show_hidden = !l->show_hidden; break;
+        case SET_HIDE_MISSING: l->hide_missing = !l->hide_missing; break;
         /* The runtime keeps these: it owns the settings file and writes every
          * one of them at once when the launcher closes. */
         case SET_VERBOSE: l->options->verbose = !l->options->verbose; break;
         case SET_PROFILE: l->options->profile = !l->options->profile; break;
         case SET_WINDOWS: l->options->framebuffer = !l->options->framebuffer; break;
+        case SET_DXVK_ON_ADD: l->options->dxvk_on_add = !l->options->dxvk_on_add; break;
         case SET_REOPEN: l->options->reopen_launcher = !l->options->reopen_launcher; break;
+        case SET_UPDATE:
+            if (action == UI_ACTION_CHOOSE) launcher_update_open( l->update );
+            ui_start_screen( ui );
+            break;
         case SET_CONTROLS:
             if (action != UI_ACTION_CHOOSE) break;
             /* Written where the runtime looks first, whichever of the two the
@@ -2836,7 +3421,7 @@ static void settings_menu( struct launcher *l )
             if (action == UI_ACTION_CHOOSE) make_forwarder( l, 32 );
             break;
         case SET_MAKE_MAIN:
-            if (action == UI_ACTION_CHOOSE) make_forwarder( l, 36 );
+            if (action == UI_ACTION_CHOOSE) make_forwarder( l, 39 );
             break;
 
         case SET_CREDITS:
@@ -2937,95 +3522,211 @@ static void join_path( char *out, size_t size, const char *dir, const char *name
     snprintf( out, size, "%s%s%s", dir, dir[strlen( dir ) - 1] == '/' ? "" : "/", name );
 }
 
-static int file_browser_pick( struct launcher *l, char *target, size_t size )
+static int directory_exists( const char *path )
 {
-    struct ui *ui = &l->ui;
-    char dir[512], came_from[256] = "", dos[512], path[512];
     struct stat st;
 
-    snprintf( dir, sizeof(dir), "%s", l->browse_dir );
-    if (stat( dir, &st ) || !S_ISDIR( st.st_mode )) snprintf( dir, sizeof(dir), "%s", LAUNCHER_DRIVE_C );
+    return !stat( path, &st ) && S_ISDIR( st.st_mode );
+}
+
+static int path_below( const char *path, const char *root )
+{
+    size_t length = strlen( root );
+
+    return !strncmp( path, root, length );
+}
+
+/* Choose the filesystem before showing any folders. The saved directory is
+ * kept within the chosen filesystem, but never skips this screen. */
+static int file_browser_storage( struct launcher *l, char *dir, size_t size )
+{
+    struct ui *ui = &l->ui;
+    static const char *const usb_paths[] = { "ums0:/", "ums1:/", "ums2:/", "ums3:/", "ums4:/" };
+    static const char *const usb_names[] = { "USB 1", "USB 2", "USB 3", "USB 4", "USB 5" };
+    struct wine_nx_launcher_usb_volume mounted[LAUNCHER_MAX_USB_VOLUMES];
+    int mounted_count, i;
 
     for (;;)
     {
         struct ui_list list = {0};
-        int count, has_up, rows, i, reload = 0;
+        struct ui_row rows[2] = {0};
+        enum ui_action action;
 
-        while (!read_dir( l, dir, &count ) && !is_root( dir )) parent_dir( dir );
-        snprintf( l->browse_dir, sizeof(l->browse_dir), "%s", dir );
-        has_up = !is_root( dir );
-        if (!launcher_dos_path( dir, dos, sizeof(dos) )) snprintf( dos, sizeof(dos), "%s", dir );
-
-        rows = 0;
-        if (has_up)
+        memset( mounted, 0, sizeof(mounted) );
+        if (l->options->list_usb)
+            mounted_count = l->options->list_usb( mounted, LAUNCHER_MAX_USB_VOLUMES );
+        else
         {
-            char parent[512], parent_dos[512];
-
-            snprintf( parent, sizeof(parent), "%s", dir );
-            parent_dir( parent );
-            memset( file_rows, 0, sizeof(file_rows[0]) );
-            snprintf( file_rows[0].label, sizeof(file_rows[0].label), "Up one folder" );
-            if (launcher_dos_path( parent, parent_dos, sizeof(parent_dos) ))
-                snprintf( file_rows[0].value, sizeof(file_rows[0].value), "%s", parent_dos );
-            rows = 1;
-        }
-        for (i = 0; i < count; i++, rows++)
-        {
-            struct ui_row *row = file_rows + rows;
-
-            memset( row, 0, sizeof(*row) );
-            snprintf( row->label, sizeof(row->label), "%s", files[i].name );
-            if (files[i].is_dir) snprintf( row->value, sizeof(row->value), "Folder" );
-            else if (!files[i].supported)
-            {
-                snprintf( row->value, sizeof(row->value), "Cannot run here" );
-                row->disabled = 1;
-            }
-            else snprintf( row->value, sizeof(row->value), "%s", files[i].machine == 0x014c ? "x86" : "ARM64" );
-            if (came_from[0] && !strcasecmp( files[i].name, came_from )) list.selection = rows;
-        }
-        if (!rows)
-        {
-            memset( file_rows, 0, sizeof(file_rows[0]) );
-            snprintf( file_rows[0].label, sizeof(file_rows[0].label), "No folders or programs here" );
-            file_rows[0].disabled = 1;
-            rows = 1;
-        }
-        /* A folder opens on its first entry; going up returns to the folder left. */
-        if (!came_from[0] && has_up && rows > 1) list.selection = 1;
-        came_from[0] = 0;
-
-        while (!reload)
-        {
-            enum ui_action action = ui_list_run( ui, &list, "Files", dos, file_rows, rows, 0 );
-            int index = list.selection - has_up;
-
-            if (action == UI_ACTION_QUIT) return 0;
-            if (action == UI_ACTION_BACK || (action == UI_ACTION_CHOOSE && index < 0))
-            {
-                if (!has_up)
+            mounted_count = 0;
+            for (i = 0; i < LAUNCHER_USB_DRIVES; i++)
+                if (directory_exists( usb_paths[i] ))
                 {
-                    save_look( l );
-                    return 0;
+                    snprintf( mounted[mounted_count].path, sizeof(mounted[mounted_count].path), "%s", usb_paths[i] );
+                    snprintf( mounted[mounted_count].label, sizeof(mounted[mounted_count].label), "%s", usb_names[i] );
+                    mounted[mounted_count++].drive = 'D' + i;
                 }
-                snprintf( came_from, sizeof(came_from), "%s", file_name( dir ) );
-                parent_dir( dir );
-                reload = 1;
-                break;
-            }
-            if (action != UI_ACTION_CHOOSE || index >= count) continue;
-            join_path( path, sizeof(path), dir, files[index].name );
-            launcher_log( "[LAUNCHER] Browser chose %s (%s)", path, files[index].is_dir ? "folder" : "program" );
-            if (files[index].is_dir)
+        }
+
+        snprintf( rows[0].label, sizeof(rows[0].label), "SD Card" );
+        snprintf( rows[0].value, sizeof(rows[0].value), "C: and Z:" );
+        snprintf( rows[1].label, sizeof(rows[1].label), "USB" );
+        if (mounted_count)
+            snprintf( rows[1].value, sizeof(rows[1].value), mounted_count == 1 ? "1 volume" : "%d volumes",
+                      mounted_count );
+        else
+            snprintf( rows[1].value, sizeof(rows[1].value), "Not connected" );
+
+        action = ui_list_run( ui, &list, "Add Game", "Choose storage", rows, 2, 0 );
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return 0;
+        if (action != UI_ACTION_CHOOSE) continue;
+        if (!list.selection)
+        {
+            if (path_below( l->browse_dir, "sdmc:/" ) && directory_exists( l->browse_dir ))
+                snprintf( dir, size, "%s", l->browse_dir );
+            else if (directory_exists( LAUNCHER_DRIVE_C ))
+                snprintf( dir, size, "%s", LAUNCHER_DRIVE_C );
+            else snprintf( dir, size, "sdmc:/" );
+            return 1;
+        }
+        if (list.selection == 1 && !mounted_count)
+        {
+            ui_message( ui, "USB", "No mounted USB volume was found. Connect a drive, then try again." );
+            continue;
+        }
+        if (list.selection == 1 && mounted_count == 1)
+        {
+            if (path_below( l->browse_dir, mounted[0].path ) && directory_exists( l->browse_dir ))
+                snprintf( dir, size, "%s", l->browse_dir );
+            else snprintf( dir, size, "%s", mounted[0].path );
+            return 1;
+        }
+        if (list.selection == 1)
+        {
+            struct ui_list volumes = {0};
+            enum ui_action volume_action;
+
+            for (i = 0; i < mounted_count; i++)
             {
-                snprintf( dir, sizeof(dir), "%s", path );
-                reload = 1;
+                memset( file_rows + i, 0, sizeof(file_rows[0]) );
+                snprintf( file_rows[i].label, sizeof(file_rows[i].label), "%s", mounted[i].label );
+                snprintf( file_rows[i].value, sizeof(file_rows[i].value), "%c:", mounted[i].drive );
             }
-            else
+            volume_action = ui_list_run( ui, &volumes, "USB", "Choose a volume", file_rows,
+                                         mounted_count, 0 );
+            if (volume_action == UI_ACTION_QUIT) return 0;
+            if (volume_action == UI_ACTION_BACK) continue;
+            if (volume_action != UI_ACTION_CHOOSE) continue;
+            if (path_below( l->browse_dir, mounted[volumes.selection].path ) && directory_exists( l->browse_dir ))
+                snprintf( dir, size, "%s", l->browse_dir );
+            else snprintf( dir, size, "%s", mounted[volumes.selection].path );
+            return 1;
+        }
+    }
+}
+
+static int file_browser_pick( struct launcher *l, char *target, size_t size )
+{
+    struct ui *ui = &l->ui;
+    char dir[512], came_from[256] = "", dos[512], path[512];
+
+    for (;;)
+    {
+        int choose_storage = 0;
+
+        if (!file_browser_storage( l, dir, sizeof(dir) ))
+        {
+            save_look( l );
+            return 0;
+        }
+        came_from[0] = 0;
+        while (!choose_storage)
+        {
+            struct ui_list list = {0};
+            int count, has_up, readable, rows, i, reload = 0;
+
+            while (!(readable = read_dir( l, dir, &count )) && !is_root( dir )) parent_dir( dir );
+            if (!readable)
             {
-                snprintf( target, size, "%s", path );
-                save_look( l );
-                return 1;
+                choose_storage = 1;
+                continue;
+            }
+            snprintf( l->browse_dir, sizeof(l->browse_dir), "%s", dir );
+            has_up = !is_root( dir );
+            if (!launcher_dos_path( dir, dos, sizeof(dos) )) snprintf( dos, sizeof(dos), "%s", dir );
+
+            rows = 0;
+            if (has_up)
+            {
+                char parent[512], parent_dos[512];
+
+                snprintf( parent, sizeof(parent), "%s", dir );
+                parent_dir( parent );
+                memset( file_rows, 0, sizeof(file_rows[0]) );
+                snprintf( file_rows[0].label, sizeof(file_rows[0].label), "Up one folder" );
+                if (launcher_dos_path( parent, parent_dos, sizeof(parent_dos) ))
+                    snprintf( file_rows[0].value, sizeof(file_rows[0].value), "%s", parent_dos );
+                rows = 1;
+            }
+            for (i = 0; i < count; i++, rows++)
+            {
+                struct ui_row *row = file_rows + rows;
+
+                memset( row, 0, sizeof(*row) );
+                snprintf( row->label, sizeof(row->label), "%s", files[i].name );
+                if (files[i].is_dir) snprintf( row->value, sizeof(row->value), "Folder" );
+                else if (!files[i].supported)
+                {
+                    snprintf( row->value, sizeof(row->value), "Cannot run here" );
+                    row->disabled = 1;
+                }
+                else snprintf( row->value, sizeof(row->value), "%s", launcher_machine_name( files[i].machine ) );
+                if (came_from[0] && !strcasecmp( files[i].name, came_from )) list.selection = rows;
+            }
+            if (!rows)
+            {
+                memset( file_rows, 0, sizeof(file_rows[0]) );
+                snprintf( file_rows[0].label, sizeof(file_rows[0].label), "No folders or programs here" );
+                file_rows[0].disabled = 1;
+                rows = 1;
+            }
+            /* A folder opens on its first entry; going up returns to the folder left. */
+            if (!came_from[0] && has_up && rows > 1) list.selection = 1;
+            came_from[0] = 0;
+
+            while (!reload)
+            {
+                enum ui_action action = ui_list_run( ui, &list, "Files", dos, file_rows, rows, 0 );
+                int index = list.selection - has_up;
+
+                if (action == UI_ACTION_QUIT) return 0;
+                if (action == UI_ACTION_BACK || (action == UI_ACTION_CHOOSE && index < 0))
+                {
+                    if (!has_up)
+                    {
+                        choose_storage = 1;
+                        break;
+                    }
+                    snprintf( came_from, sizeof(came_from), "%s", file_name( dir ) );
+                    parent_dir( dir );
+                    reload = 1;
+                    break;
+                }
+                if (action != UI_ACTION_CHOOSE) continue;
+                if (index < 0 || index >= count) continue;
+                join_path( path, sizeof(path), dir, files[index].name );
+                launcher_log( "[LAUNCHER] Browser chose %s (%s)", path,
+                              files[index].is_dir ? "folder" : "program" );
+                if (files[index].is_dir)
+                {
+                    snprintf( dir, sizeof(dir), "%s", path );
+                    reload = 1;
+                }
+                else
+                {
+                    snprintf( target, size, "%s", path );
+                    save_look( l );
+                    return 1;
+                }
             }
         }
     }
@@ -3091,6 +3792,7 @@ static int add_game( struct launcher *l )
         l->program_count--;
         return -1;
     }
+    enable_program_dxvk( l, &l->programs[index] );
     launcher_log( "[LAUNCHER] Added %s to the library", path );
     ui_toast( &l->ui, "Game added to the library", 1800 );
     return index;
@@ -3118,6 +3820,41 @@ static void rebuild_lists( struct launcher *l, int keep_index )
 {
     rebuild_visible( l, keep_index );
     rebuild_history( l, keep_index );
+}
+
+static int usb_program_path( const char *path )
+{
+    return !strncasecmp( path, "ums", 3 ) && path[3] >= '0' && path[3] <= '4' &&
+           path[4] == ':' && (path[5] == '/' || path[5] == '\\');
+}
+
+static int refresh_usb_programs( struct launcher *l )
+{
+    int changed = 0, i;
+
+    for (i = 0; i < l->program_count; i++)
+    {
+        struct program *p = l->programs + i;
+        unsigned short machine;
+        int available;
+
+        if (p->removed || !usb_program_path( p->path )) continue;
+        available = file_exists( p->path ) && !l->options->machine_of( p->path, &machine );
+        if (available == !p->missing) continue;
+        p->missing = !available;
+        if (available)
+        {
+            p->machine = machine;
+            p->resource_title[0] = 0;
+            launcher_pe_describe( p->path, 0, NULL, p->resource_title, sizeof(p->resource_title) );
+            load_program_settings( l, p );
+            if (!p->icon) p->icon_state = ICON_UNKNOWN;
+            if (!p->square_icon) p->square_state = ICON_UNKNOWN;
+            if (!p->hero_icon) p->hero_state = ICON_UNKNOWN;
+        }
+        changed++;
+    }
+    return changed;
 }
 
 static void show_library( struct launcher *l, int *home, struct ui *ui )
@@ -3369,6 +4106,22 @@ static int run_library( struct launcher *l, char *target, size_t size )
             if (!ui->running) return 0;
         }
         if (!ui->running) break;
+        if (SDL_AtomicCAS( &l->usb_changed, 1, 0 ))
+        {
+            int keep = current_index( l, home );
+            int changed = refresh_usb_programs( l );
+
+            if (changed)
+            {
+                char message[80];
+
+                rebuild_lists( l, keep );
+                snprintf( message, sizeof(message), changed == 1 ? "%d USB game refreshed" : "%d USB games refreshed",
+                          changed );
+                launcher_log( "[LAUNCHER] %s after a mount change", message );
+                ui_toast( ui, message, 1800 );
+            }
+        }
         l->icon_frame = l->icon_use;
         if (home) draw_home( l );
         else draw_library( l );
@@ -3392,6 +4145,7 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
     runtime_file( l, "launcher.txt", path, sizeof(path) );
     launcher_kv_load( &l->look, path );
     l->show_hidden = launcher_kv_get_int( &l->look, "show-hidden", 0 ) == 1;
+    l->hide_missing = launcher_kv_get_int( &l->look, "hide-missing", 0 ) == 1;
     if (!launcher_kv_get( &l->look, "browse", l->browse_dir, sizeof(l->browse_dir) ) || !l->browse_dir[0])
         snprintf( l->browse_dir, sizeof(l->browse_dir), "%s", LAUNCHER_DRIVE_C );
 
@@ -3427,6 +4181,8 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
     l->ui.header_status = header_status;
     l->ui.header_status_data = l;
     l->ui.footer_mark = footer_mark;
+    l->usb_event = SDL_RegisterEvents( 1 );
+    if (l->usb_event == (Uint32)-1) l->usb_event = SDL_USEREVENT;
 
     {
         SDL_RendererInfo info;
@@ -3472,7 +4228,15 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
 
         if (!strcasecmp( p->path, target ) || !strcasecmp( p->dos, target )) l->history_selection = i;
     }
+    if (!autorun_install_finish( options->runtime_dir ))
+        ui_toast( &l->ui, "The update recovery files could not be cleared.", 5000 );
+    l->update = launcher_update_create( &l->ui, options->runtime_dir, options->schedule_restart );
+    l->ui.background_tick = launcher_update_tick;
+    l->ui.background_data = l->update;
     ret = run_library( l, target, target_size );
+    l->ui.background_tick = NULL;
+    launcher_update_destroy( l->update );
+    l->update = NULL;
     for (i = 0, added = 0, missing = 0; i < l->program_count; i++)
     {
         added += l->programs[i].icon_state == ICON_READY;
@@ -3484,6 +4248,7 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
     for (i = 0; i < SYMBOL_COUNT; i++)
         if (l->symbols[i]) SDL_DestroyTexture( l->symbols[i] );
     if (l->logo) SDL_DestroyTexture( l->logo );
+    l->usb_event = 0;
     ui_quit( &l->ui );
     launcher_platform_font_release();
     return ret;

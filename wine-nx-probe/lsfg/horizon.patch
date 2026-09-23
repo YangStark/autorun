@@ -1,0 +1,1205 @@
+diff --git a/lsfg-vk-backend/include/lsfg-vk-backend/lsfgvk.hpp b/lsfg-vk-backend/include/lsfg-vk-backend/lsfgvk.hpp
+index eacb98e..5af9181 100644
+--- a/lsfg-vk-backend/include/lsfg-vk-backend/lsfgvk.hpp
++++ b/lsfg-vk-backend/include/lsfg-vk-backend/lsfgvk.hpp
+@@ -2,6 +2,8 @@
+ 
+ #pragma once
+ 
++#include <array>
++#include <cstddef>
+ #include <exception>
+ #include <filesystem>
+ #include <functional>
+@@ -11,6 +13,10 @@
+ #include <utility>
+ #include <vector>
+ 
++#include <vulkan/vulkan_core.h>
++
++namespace vk { class CommandBuffer; class Vulkan; }
++
+ namespace lsfgvk::backend {
+ 
+     class [[gnu::visibility("default")]] ContextImpl;
+@@ -18,6 +24,18 @@ namespace lsfgvk::backend {
+ 
+     using Context = ContextImpl;
+ 
++    /// Existing Vulkan objects owned by the embedding application. The backend
++    /// borrows every handle; it only owns resources it creates itself.
++    struct BorrowedDevice {
++        VkInstance instance{};
++        VkPhysicalDevice physicalDevice{};
++        VkDevice device{};
++        uint32_t queueFamilyIndex{};
++        VkQueue queue{};
++        PFN_vkGetInstanceProcAddr getInstanceProcAddr{};
++        std::optional<std::filesystem::path> pipelineCachePath{};
++    };
++
+     ///
+     /// Primitive exception class that deliveres a detailed error message
+     ///
+@@ -72,6 +90,14 @@ namespace lsfgvk::backend {
+             bool allowLowPrecision
+         );
+ 
++        /// Create an instance on an application-owned Vulkan device. This is
++        /// used by the Horizon port, where external-memory FDs do not exist.
++        Instance(
++            const BorrowedDevice& device,
++            const std::filesystem::path& shaderDllPath,
++            bool allowLowPrecision
++        );
++
+         ///
+         /// Open a frame generation context.
+         ///
+@@ -106,6 +132,14 @@ namespace lsfgvk::backend {
+             bool hdr, float flow, bool perf
+         );
+ 
++        /// Open a same-device context with backend-owned images.
++        Context& openLocalContext(
++            uint32_t width, uint32_t height,
++            bool hdr, float flow, bool perf,
++            size_t generatedFrameCount,
++            uint32_t transferQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED
++        );
++
+         ///
+         /// Schedule a new set of generated frames.
+         ///
+@@ -114,6 +148,9 @@ namespace lsfgvk::backend {
+         ///
+         void scheduleFrames(Context& context);
+ 
++        /// Record same-queue generation passes without intermediate submissions or CPU waits.
++        void recordFrame(Context& context, const vk::CommandBuffer& commandBuffer);
++
+         ///
+         /// Close a frame generation context
+         ///
+@@ -121,6 +158,11 @@ namespace lsfgvk::backend {
+         ///
+         void closeContext(const Context& context);
+ 
++        /// Accessors used by an in-process presentation bridge.
++        [[nodiscard]] const vk::Vulkan& vulkan() const;
++        [[nodiscard]] VkImage sourceImage(const Context& context, size_t index) const;
++        [[nodiscard]] VkImage destinationImage(const Context& context, size_t index) const;
++
+         // Non-copyable and non-movable
+         Instance(const Instance&) = delete;
+         Instance& operator=(const Instance&) = delete;
+diff --git a/lsfg-vk-backend/src/extraction/shader_registry.cpp b/lsfg-vk-backend/src/extraction/shader_registry.cpp
+index b9c65e6..8a6e50f 100644
+--- a/lsfg-vk-backend/src/extraction/shader_registry.cpp
++++ b/lsfg-vk-backend/src/extraction/shader_registry.cpp
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: GPL-3.0-or-later */
+ 
+ #include "shader_registry.hpp"
++#include "nvk_shaders.hpp"
+ #include "lsfg-vk-common/helpers/errors.hpp"
+ #include "lsfg-vk-common/vulkan/shader.hpp"
+ #include "lsfg-vk-common/vulkan/vulkan.hpp"
+@@ -16,6 +17,12 @@ using namespace lsfgvk;
+ using namespace lsfgvk::backend;
+ 
+ namespace {
++    template <size_t N>
++    std::vector<uint8_t> shaderBytes(const uint32_t (&words)[N]) {
++        const auto* begin = reinterpret_cast<const uint8_t*>(words);
++        return {begin, begin + sizeof(words)};
++    }
++
+     /// get the source code for a shader
+     const std::vector<uint8_t>& getShaderSource(uint32_t id, bool fp16, bool perf,
+             const std::unordered_map<uint32_t, std::vector<uint8_t>>& resources) {
+@@ -33,15 +40,19 @@ namespace {
+     }
+     /// patch the generate shader
+     void patchGenerateShader(std::vector<uint8_t>& data, bool hdr) {
++#ifdef __clang__
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wunknown-warning-option"
+ #pragma clang diagnostic ignored "-Wunsafe-buffer-usage-in-container"
++#endif
+         auto* _ptr = data.data();
+         const std::span<uint32_t> words(
+             reinterpret_cast<uint32_t*>(_ptr),
+             data.size() / sizeof(uint32_t)
+         );
++#ifdef __clang__
+ #pragma clang diagnostic pop
++#endif
+ 
+         const uint16_t SpvOpCapability = 17;
+         const uint16_t SpvOpTypeImage = 25;
+@@ -77,6 +88,15 @@ namespace {
+ 
+ ShaderRegistry backend::buildShaderRegistry(const vk::Vulkan& vk, bool fp16,
+         const std::unordered_map<uint32_t, std::vector<uint8_t>>& resources) {
++    const std::vector<uint8_t> mipmaps_data = shaderBytes(
++        embedded::kNvkMipmapLumaSpv);
++    const std::vector<uint8_t> mipmap_downsample_data = shaderBytes(
++        embedded::kNvkMipmapDownsampleSpv);
++    const std::vector<uint8_t> beta1_finalize_performance_data = shaderBytes(
++        embedded::kNvkBeta1FinalizePerformanceSpv);
++    const std::vector<uint8_t> beta1_finalize_quality_data = shaderBytes(
++        embedded::kNvkBeta1FinalizeQualitySpv);
++
+     // patch the generate shader
+     std::vector<uint8_t> generate_data = getShaderSource(256, fp16, false, resources);
+     std::vector<uint8_t> generate_data_hdr = generate_data;
+@@ -90,7 +110,9 @@ ShaderRegistry backend::buildShaderRegistry(const vk::Vulkan& vk, bool fp16,
+ 
+     return {
+ #define PERF false
+-        .mipmaps = SHADER(255, 1, 7, 1, 1),
++        .mipmaps = vk::Shader(vk, mipmaps_data, 1, 1, 1, 1),
++        .mipmap_downsample = vk::Shader(
++            vk, mipmap_downsample_data, 1, 1, 0, 1),
+         .generate = vk::Shader(vk, generate_data, 5, 1, 1, 2),
+         .generate_hdr = vk::Shader(vk, generate_data_hdr, 5, 1, 1, 2),
+         .quality = {
+@@ -105,7 +127,7 @@ ShaderRegistry backend::buildShaderRegistry(const vk::Vulkan& vk, bool fp16,
+                 SHADER(276, 2, 2, 0, 1),
+                 SHADER(277, 2, 2, 0, 1),
+                 SHADER(278, 2, 2, 0, 1),
+-                SHADER(279, 2, 6, 1, 1)
++                vk::Shader(vk, beta1_finalize_quality_data, 2, 1, 1, 1)
+             },
+             .gamma = {
+                 SHADER(257, 9, 3, 1, 2),
+@@ -141,7 +163,7 @@ ShaderRegistry backend::buildShaderRegistry(const vk::Vulkan& vk, bool fp16,
+                 SHADER(276, 2, 2, 0, 1),
+                 SHADER(277, 2, 2, 0, 1),
+                 SHADER(278, 2, 2, 0, 1),
+-                SHADER(279, 2, 6, 1, 1)
++                vk::Shader(vk, beta1_finalize_performance_data, 2, 1, 1, 1)
+             },
+             .gamma = {
+                 SHADER(257, 5, 3, 1, 2),
+diff --git a/lsfg-vk-backend/src/extraction/shader_registry.hpp b/lsfg-vk-backend/src/extraction/shader_registry.hpp
+index e2dcee8..bdc11db 100644
+--- a/lsfg-vk-backend/src/extraction/shader_registry.hpp
++++ b/lsfg-vk-backend/src/extraction/shader_registry.hpp
+@@ -22,6 +22,7 @@ namespace lsfgvk::backend {
+     /// shader registry struct
+     struct ShaderRegistry {
+         vk::Shader mipmaps;
++        vk::Shader mipmap_downsample;
+         vk::Shader generate, generate_hdr;
+         Shaders quality;
+         Shaders performance;
+diff --git a/lsfg-vk-backend/src/helpers/limits.cpp b/lsfg-vk-backend/src/helpers/limits.cpp
+index 32e5e00..b26bd00 100644
+--- a/lsfg-vk-backend/src/helpers/limits.cpp
++++ b/lsfg-vk-backend/src/helpers/limits.cpp
+@@ -12,14 +12,14 @@ using namespace lsfgvk::backend;
+ 
+ namespace {
+     const vk::Limits BASE_LIMITS{
+-        .sets = 51,
++        .sets = 62,
+         .uniform_buffers = 3,
+-        .samplers = 51,
+-        .sampled_images = 165,
++        .samplers = 62,
++        .sampled_images = 176,
+         .storage_images = 172
+     };
+     const vk::Limits BASE_LIMITS_PERF{
+-        .sampled_images = 91,
++        .sampled_images = 102,
+         .storage_images = 102
+     };
+     const vk::Limits GEN_LIMITS{
+diff --git a/lsfg-vk-backend/src/helpers/utils.cpp b/lsfg-vk-backend/src/helpers/utils.cpp
+index 1a8fab8..3417a20 100644
+--- a/lsfg-vk-backend/src/helpers/utils.cpp
++++ b/lsfg-vk-backend/src/helpers/utils.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "utils.hpp"
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
+@@ -23,8 +24,8 @@ ConstantBuffer backend::getDefaultConstantBuffer(
+ 
+ VkExtent2D backend::shift_extent(VkExtent2D extent, uint32_t i) {
+     return VkExtent2D{
+-        .width = extent.width >> i,
+-        .height = extent.height >> i
++        .width = std::max(1u, extent.width >> i),
++        .height = std::max(1u, extent.height >> i)
+     };
+ }
+ 
+diff --git a/lsfg-vk-backend/src/lsfgvk.cpp b/lsfg-vk-backend/src/lsfgvk.cpp
+index 2cb4dd1..6f88e04 100644
+--- a/lsfg-vk-backend/src/lsfgvk.cpp
++++ b/lsfg-vk-backend/src/lsfgvk.cpp
+@@ -32,7 +32,6 @@
+ #include <exception>
+ #include <filesystem>
+ #include <functional>
+-#include <iostream>
+ #include <memory>
+ #include <optional>
+ #include <stdexcept>
+@@ -67,6 +66,11 @@ namespace lsfgvk::backend {
+             const std::filesystem::path& shaderDllPath,
+             bool allowLowPrecision);
+ 
++        /// create on an application-owned Vulkan device
++        InstanceImpl(const BorrowedDevice& device,
++            const std::filesystem::path& shaderDllPath,
++            bool allowLowPrecision);
++
+         /// get the Vulkan instance
+         /// @return the Vulkan instance
+         [[nodiscard]] const auto& getVulkan() const { return this->vk; }
+@@ -102,10 +106,29 @@ namespace lsfgvk::backend {
+             std::pair<int, int> sourceFds, const std::vector<int>& destFds, int syncFd,
+             VkExtent2D extent, bool hdr, float flow, bool perf);
+ 
++        /// create a context with local, same-device resources
++        ContextImpl(const InstanceImpl& instance,
++            VkExtent2D extent, bool hdr, float flow, bool perf, size_t generatedFrameCount,
++            uint32_t transferQueueFamilyIndex);
++
+         /// schedule frames
+         /// (see lsfg-vk documentation)
+         void scheduleFrames();
++        void recordFrame(const vk::CommandBuffer& cmdbuf);
++
++        [[nodiscard]] VkImage sourceImage(size_t index) const {
++            return index ? this->sourceImages.second.handle() : this->sourceImages.first.handle();
++        }
++        [[nodiscard]] VkImage destinationImage(size_t index) const {
++            return this->destImages.at(index).handle();
++        }
+     private:
++        ContextImpl(const InstanceImpl& instance,
++            std::pair<vk::Image, vk::Image> sourceImages,
++            std::vector<vk::Image> destImages,
++            vk::TimelineSemaphore syncSemaphore,
++            VkExtent2D extent, bool hdr, float flow, bool perf);
++
+         std::pair<vk::Image, vk::Image> sourceImages;
+         std::vector<vk::Image> destImages;
+         vk::Image blackImage;
+@@ -191,6 +214,15 @@ Instance::Instance(
+     );
+ }
+ 
++Instance::Instance(
++        const BorrowedDevice& device,
++        const std::filesystem::path& shaderDllPath,
++        bool allowLowPrecision) {
++    this->m_impl = std::make_unique<InstanceImpl>(
++        device, shaderDllPath, allowLowPrecision
++    );
++}
++
+ namespace {
+     /// find the cache file path
+     std::filesystem::path findCacheFilePath() {
+@@ -218,6 +250,28 @@ namespace {
+             throw backend::error("Unable to initialize Vulkan", e);
+         }
+     }
++
++    /// wrap Vulkan handles owned by the embedding application
++    vk::Vulkan createBorrowedVulkan(const BorrowedDevice& device) {
++        if (!device.instance || !device.physicalDevice || !device.device ||
++                !device.queue || !device.getInstanceProcAddr)
++            throw backend::error("Incomplete borrowed Vulkan device");
++
++        try {
++            auto instanceFuncs = vk::initVulkanInstanceFuncs(
++                device.instance, device.getInstanceProcAddr, false);
++            auto deviceFuncs = vk::initVulkanDeviceFuncs(
++                instanceFuncs, device.device, true);
++            return {
++                device.instance, device.device, device.physicalDevice,
++                device.queueFamilyIndex, device.queue, false,
++                instanceFuncs, deviceFuncs,
++                std::nullopt, device.pipelineCachePath
++            };
++        } catch (const std::exception& e) {
++            throw backend::error("Unable to borrow Vulkan device", e);
++        }
++    }
+     /// build a shader registry
+     ShaderRegistry createShaderRegistry(vk::Vulkan& vk,
+             const std::filesystem::path& shaderDllPath,
+@@ -270,17 +324,42 @@ InstanceImpl::InstanceImpl(vk::PhysicalDeviceSelector selectPhysicalDevice,
+ #ifdef LSFGVK_TESTING_RENDERDOC
+     this->renderdoc = loadRenderDocIntegration();
+ #endif
+-    vk.persistPipelineCache(); // will silently fail
++}
++
++InstanceImpl::InstanceImpl(const BorrowedDevice& device,
++            const std::filesystem::path& shaderDllPath,
++            bool allowLowPrecision)
++        : vk(createBorrowedVulkan(device)),
++        shaders(createShaderRegistry(this->vk, shaderDllPath,
++            allowLowPrecision && vk.supportsFP16())) {
+ }
+ 
+ Context& Instance::openContext(std::pair<int, int> sourceFds, const std::vector<int>& destFds,
+         int syncFd, uint32_t width, uint32_t height,
+         bool hdr, float flow, bool perf) {
+     const VkExtent2D extent{ width, height };
+-    return *this->m_contexts.emplace_back(std::make_unique<ContextImpl>(*this->m_impl,
++    Context& context = *this->m_contexts.emplace_back(std::make_unique<ContextImpl>(*this->m_impl,
+         sourceFds, destFds, syncFd,
+         extent, hdr, flow, perf
+-    )).get();
++    ));
++
++    this->m_impl->getVulkan().persistPipelineCache();
++    return context;
++}
++
++Context& Instance::openLocalContext(uint32_t width, uint32_t height,
++        bool hdr, float flow, bool perf, size_t generatedFrameCount,
++        uint32_t transferQueueFamilyIndex) {
++    if (!generatedFrameCount)
++        throw backend::error("At least one generated frame is required");
++
++    const VkExtent2D extent{ width, height };
++    Context& context = *this->m_contexts.emplace_back(std::make_unique<ContextImpl>(*this->m_impl,
++        extent, hdr, flow, perf, generatedFrameCount, transferQueueFamilyIndex
++    ));
++
++    this->m_impl->getVulkan().persistPipelineCache();
++    return context;
+ }
+ 
+ namespace {
+@@ -316,11 +395,56 @@ namespace {
+             throw backend::error("Unable to import destination images", e);
+         }
+     }
++    /// create source images on the borrowed device
++    std::pair<vk::Image, vk::Image> createLocalSourceImages(const vk::Vulkan& vk,
++            VkExtent2D extent, VkFormat format, uint32_t transferQueueFamilyIndex) {
++        try {
++            std::vector<uint32_t> queueFamilies{vk.queuefamily()};
++            if (transferQueueFamilyIndex != VK_QUEUE_FAMILY_IGNORED &&
++                    transferQueueFamilyIndex != vk.queuefamily())
++                queueFamilies.push_back(transferQueueFamilyIndex);
++            const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT |
++                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++            return {
++                vk::Image(vk, extent, format, usage,
++                    std::nullopt, std::nullopt, queueFamilies),
++                vk::Image(vk, extent, format, usage,
++                    std::nullopt, std::nullopt, queueFamilies)
++            };
++        } catch (const std::exception& e) {
++            throw backend::error("Unable to create local source images", e);
++        }
++    }
++    /// create generated-frame images on the borrowed device
++    std::vector<vk::Image> createLocalDestinationImages(const vk::Vulkan& vk,
++            size_t count, VkExtent2D extent, VkFormat format,
++            uint32_t transferQueueFamilyIndex) {
++        try {
++            std::vector<uint32_t> queueFamilies{vk.queuefamily()};
++            if (transferQueueFamilyIndex != VK_QUEUE_FAMILY_IGNORED &&
++                    transferQueueFamilyIndex != vk.queuefamily())
++                queueFamilies.push_back(transferQueueFamilyIndex);
++            std::vector<vk::Image> images;
++            images.reserve(count);
++            const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT |
++                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++            for (size_t i = 0; i < count; ++i)
++                images.emplace_back(vk, extent, format, usage,
++                    std::nullopt, std::nullopt, queueFamilies);
++            return images;
++        } catch (const std::exception& e) {
++            throw backend::error("Unable to create local destination images", e);
++        }
++    }
+     /// create a black image
+     vk::Image createBlackImage(const vk::Vulkan& vk) {
+         try {
+             return{vk,
+-                { .width = 4, .height = 4 }
++                { .width = 4, .height = 4 },
++                VK_FORMAT_R8G8B8A8_UNORM,
++                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
++                    VK_IMAGE_USAGE_TRANSFER_DST_BIT
+             };
+         } catch (const std::exception& e) {
+             throw backend::error("Unable to create black image", e);
+@@ -400,17 +524,43 @@ namespace {
+ 
+ ContextImpl::ContextImpl(const InstanceImpl& instance,
+             std::pair<int, int> sourceFds, const std::vector<int>& destFds, int syncFd,
++            VkExtent2D extent, bool hdr, float flow, bool perf) : ContextImpl(
++        instance,
++        importImages(instance.getVulkan(), sourceFds,
++            extent, hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM),
++        importImages(instance.getVulkan(), destFds,
++            extent, hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM),
++        importTimelineSemaphore(instance.getVulkan(), syncFd),
++        extent, hdr, flow, perf) {
++}
++
++ContextImpl::ContextImpl(const InstanceImpl& instance,
++            VkExtent2D extent, bool hdr, float flow, bool perf,
++            size_t generatedFrameCount, uint32_t transferQueueFamilyIndex) : ContextImpl(
++        instance,
++        createLocalSourceImages(instance.getVulkan(), extent,
++            hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM,
++            transferQueueFamilyIndex),
++        createLocalDestinationImages(instance.getVulkan(), generatedFrameCount, extent,
++            hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM,
++            transferQueueFamilyIndex),
++        vk::TimelineSemaphore{},
++        extent, hdr, flow, perf) {
++}
++
++ContextImpl::ContextImpl(const InstanceImpl& instance,
++            std::pair<vk::Image, vk::Image> sourceImagesArg,
++            std::vector<vk::Image> destImagesArg,
++            vk::TimelineSemaphore syncSemaphoreArg,
+             VkExtent2D extent, bool hdr, float flow, bool perf) :
+-        sourceImages(importImages(instance.getVulkan(), sourceFds,
+-            extent, hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM)),
+-        destImages(importImages(instance.getVulkan(), destFds,
+-            extent, hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM)),
++        sourceImages(std::move(sourceImagesArg)),
++        destImages(std::move(destImagesArg)),
+         blackImage(createBlackImage(instance.getVulkan())),
+-        syncSemaphore(importTimelineSemaphore(instance.getVulkan(), syncFd)),
+-        prepassSemaphore(createPrepassSemaphore(instance.getVulkan())),
+-        cmdbufs(createCommandBuffers(instance.getVulkan(), destFds.size() + 1)),
++        syncSemaphore(std::move(syncSemaphoreArg)),
++        prepassSemaphore(syncSemaphore.valid() ? createPrepassSemaphore(instance.getVulkan()) : vk::TimelineSemaphore{}),
++        cmdbufs(createCommandBuffers(instance.getVulkan(), this->destImages.size() + 1)),
+         cmdbufFence(instance.getVulkan()),
+-        ctx(createCtx(instance, extent, hdr, flow, perf, destFds.size())),
++        ctx(createCtx(instance, extent, hdr, flow, perf, this->destImages.size())),
+         mipmaps(ctx, sourceImages),
+         alpha0{
+             Alpha0(ctx, mipmaps.getImages().at(0)),
+@@ -504,6 +654,8 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
+     // initialize all images
+     std::vector<VkImage> images{};
+     images.push_back(this->blackImage.handle());
++    for (const auto& image : this->destImages)
++        images.push_back(image.handle());
+     mipmaps.prepare(images);
+     for (size_t i = 0; i < 7; ++i) {
+         alpha0.at(i).prepare(images);
+@@ -544,6 +696,7 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
+     const vk::CommandBuffer cmdbuf{ctx.vk};
+     cmdbuf.begin(ctx.vk);
+     cmdbuf.insertBarriers(ctx.vk, barriers);
++    cmdbuf.clearImages(ctx.vk, images);
+     cmdbuf.end(ctx.vk);
+     cmdbuf.submit(ctx.vk); // wait for completion
+ }
+@@ -573,6 +726,8 @@ void Instance::scheduleFrames(Context& context) { // NOLINT (static)
+ }
+ 
+ void Context::scheduleFrames() {
++    if (!this->syncSemaphore.valid())
++        throw backend::error("Local contexts must use recordFrame");
+     // wait for previous pre-pass to complete
+     if (this->fidx && !this->cmdbufFence.wait(this->ctx.vk))
+         throw backend::error("Timeout waiting for previous frame to complete");
+@@ -626,6 +781,40 @@ void Context::scheduleFrames() {
+     this->fidx++;
+ }
+ 
++void Context::recordFrame(const vk::CommandBuffer& cmdbuf) {
++    cmdbuf.memoryBarrier(ctx.vk);
++    this->mipmaps.render(ctx.vk, cmdbuf, this->fidx);
++    for (size_t i = 0; i < 7; ++i) {
++        this->alpha0.at(6 - i).render(ctx.vk, cmdbuf);
++        this->alpha1.at(6 - i).render(ctx.vk, cmdbuf, this->fidx);
++    }
++    this->beta0.render(ctx.vk, cmdbuf, this->fidx);
++    this->beta1.render(ctx.vk, cmdbuf);
++
++    for (size_t i = 0; i < this->destImages.size(); ++i) {
++        const auto& pass = this->passes.at(i);
++        for (size_t j = 0; j < 7; ++j) {
++            pass.gamma0.at(j).render(ctx.vk, cmdbuf, this->fidx);
++            pass.gamma1.at(j).render(ctx.vk, cmdbuf);
++
++            if (j < 4) continue;
++            pass.delta0.at(j - 4).render(ctx.vk, cmdbuf, this->fidx);
++            pass.delta1.at(j - 4).render(ctx.vk, cmdbuf);
++        }
++        pass.generate->render(ctx.vk, cmdbuf, this->fidx);
++    }
++
++    this->fidx++;
++}
++
++void Instance::recordFrame(Context& context, const vk::CommandBuffer& commandBuffer) {
++    try {
++        context.recordFrame(commandBuffer);
++    } catch (const std::exception& e) {
++        throw backend::error("Unable to record frame-generation passes", e);
++    }
++}
++
+ void Instance::closeContext(const Context& context) {
+     auto it = std::ranges::find_if(this->m_contexts,
+         [context = &context](const std::unique_ptr<ContextImpl>& ctx) {
+@@ -641,6 +830,20 @@ void Instance::closeContext(const Context& context) {
+     this->m_contexts.erase(it);
+ }
+ 
++const vk::Vulkan& Instance::vulkan() const {
++    return this->m_impl->getVulkan();
++}
++
++VkImage Instance::sourceImage(const Context& context, size_t index) const {
++    if (index >= 2)
++        throw backend::error("source image index out of range");
++    return context.sourceImage(index);
++}
++
++VkImage Instance::destinationImage(const Context& context, size_t index) const {
++    return context.destinationImage(index);
++}
++
+ Instance::~Instance() = default;
+ 
+ // leaking shenanigans
+@@ -654,9 +857,7 @@ InstanceImpl::~InstanceImpl() {
+ 
+     try {
+         new vk::Vulkan(std::move(this->vk));
+-    } catch (...) {
+-        std::cerr << "lsfg-vk: failed to leak Vulkan instance\n";
+-    }
++    } catch (...) {}
+ 
+ }
+ 
+diff --git a/lsfg-vk-backend/src/shaderchains/beta1.cpp b/lsfg-vk-backend/src/shaderchains/beta1.cpp
+index 2499656..b20ded3 100644
+--- a/lsfg-vk-backend/src/shaderchains/beta1.cpp
++++ b/lsfg-vk-backend/src/shaderchains/beta1.cpp
+@@ -54,14 +54,30 @@ Beta1::Beta1(const Ctx& ctx,
+         .build(ctx.vk, ctx.pool, shaders.at(3)));
+     this->sets.emplace_back(ManagedShaderBuilder()
+         .sampleds(this->tempImages0)
+-        .storages(this->images)
++        .storage(this->images.at(0))
+         .sampler(ctx.bnbSampler)
+         .buffer(ctx.constantBuffer)
+         .build(ctx.vk, ctx.pool, shaders.at(4)));
+ 
+-    // store dispatch extents
++    // Build the smaller levels in separate dispatches.
++    this->downsampleSets.reserve(5);
++    for (size_t i = 0; i < 5; ++i) {
++        this->downsampleSets.emplace_back(ManagedShaderBuilder()
++            .sampled(this->images.at(i))
++            .storage(this->images.at(i + 1))
++            .sampler(ctx.bnbSampler)
++            .build(ctx.vk, ctx.pool,
++                ctx.shaders.get().mipmap_downsample));
++    }
++
++    // All four beta stages and the replacement downsampler use 8x8 groups.
+     this->dispatchExtent0 = backend::add_shift_extent(extent, 7, 3);
+-    this->dispatchExtent1 = backend::add_shift_extent(extent, 31, 5);
++    for (size_t i = 0; i < this->downsampleDispatchExtents.size(); ++i) {
++        const VkExtent2D outputExtent =
++            backend::shift_extent(extent, static_cast<uint32_t>(i + 1));
++        this->downsampleDispatchExtents.at(i) =
++            backend::add_shift_extent(outputExtent, 7, 3);
++    }
+ }
+ 
+ void Beta1::prepare(std::vector<VkImage>& images) const {
+@@ -74,8 +90,11 @@ void Beta1::prepare(std::vector<VkImage>& images) const {
+ }
+ 
+ void Beta1::render(const vk::Vulkan& vk, const vk::CommandBuffer& cmd) const {
+-    this->sets.at(0).dispatch(vk, cmd, this->dispatchExtent0);
+-    this->sets.at(1).dispatch(vk, cmd, this->dispatchExtent0);
+-    this->sets.at(2).dispatch(vk, cmd, this->dispatchExtent0);
+-    this->sets.at(3).dispatch(vk, cmd, this->dispatchExtent1);
++    for (size_t i = 0; i < this->sets.size(); ++i)
++        this->sets.at(i).dispatch(vk, cmd,
++            this->dispatchExtent0);
++
++    for (size_t i = 0; i < this->downsampleSets.size(); ++i)
++        this->downsampleSets.at(i).dispatch(
++            vk, cmd, this->downsampleDispatchExtents.at(i));
+ }
+diff --git a/lsfg-vk-backend/src/shaderchains/beta1.hpp b/lsfg-vk-backend/src/shaderchains/beta1.hpp
+index ea27918..b096816 100644
+--- a/lsfg-vk-backend/src/shaderchains/beta1.hpp
++++ b/lsfg-vk-backend/src/shaderchains/beta1.hpp
+@@ -8,6 +8,7 @@
+ #include "lsfg-vk-common/vulkan/image.hpp"
+ #include "lsfg-vk-common/vulkan/vulkan.hpp"
+ 
++#include <array>
+ #include <vector>
+ 
+ #include <vulkan/vulkan_core.h>
+@@ -42,7 +43,8 @@ namespace lsfgvk::backend {
+         std::vector<vk::Image> images;
+ 
+         std::vector<ManagedShader> sets;
++        std::vector<ManagedShader> downsampleSets;
+         VkExtent2D dispatchExtent0{};
+-        VkExtent2D dispatchExtent1{};
++        std::array<VkExtent2D, 5> downsampleDispatchExtents{};
+     };
+ }
+diff --git a/lsfg-vk-backend/src/shaderchains/mipmaps.cpp b/lsfg-vk-backend/src/shaderchains/mipmaps.cpp
+index 2f04669..da715d4 100644
+--- a/lsfg-vk-backend/src/shaderchains/mipmaps.cpp
++++ b/lsfg-vk-backend/src/shaderchains/mipmaps.cpp
+@@ -24,23 +24,40 @@ Mipmaps::Mipmaps(const Ctx& ctx,
+        this->images.emplace_back(ctx.vk,
+             backend::shift_extent(ctx.flowExtent, i), VK_FORMAT_R8_UNORM);
+ 
+-    // create descriptor sets for both input images
+-    this->sets.reserve(2);
+-    this->sets.emplace_back(ManagedShaderBuilder()
++    // Split the 32x32 reduction into 8x8 passes for NVK.
++    this->lumaSets.reserve(2);
++    this->lumaSets.emplace_back(ManagedShaderBuilder()
+         .sampled(sourceImages.first)
+-        .storages(this->images)
++        .storage(this->images.at(0))
+         .sampler(ctx.bnbSampler)
+         .buffer(ctx.constantBuffer)
+         .build(ctx.vk, ctx.pool, ctx.shaders.get().mipmaps));
+-    this->sets.emplace_back(ManagedShaderBuilder()
++    this->lumaSets.emplace_back(ManagedShaderBuilder()
+         .sampled(sourceImages.second)
+-        .storages(this->images)
++        .storage(this->images.at(0))
+         .sampler(ctx.bnbSampler)
+         .buffer(ctx.constantBuffer)
+         .build(ctx.vk, ctx.pool, ctx.shaders.get().mipmaps));
+ 
+-    // store dispatch extent
+-    this->dispatchExtent = backend::add_shift_extent(ctx.flowExtent, 63, 6);
++    this->downsampleSets.reserve(6);
++    for (size_t i = 0; i < 6; ++i) {
++        this->downsampleSets.emplace_back(ManagedShaderBuilder()
++            .sampled(this->images.at(i))
++            .storage(this->images.at(i + 1))
++            .sampler(ctx.bnbSampler)
++            .build(ctx.vk, ctx.pool,
++                ctx.shaders.get().mipmap_downsample));
++    }
++
++    // Both replacement shaders use an 8x8 local size.
++    this->lumaDispatchExtent =
++        backend::add_shift_extent(ctx.flowExtent, 7, 3);
++    for (size_t i = 0; i < this->downsampleDispatchExtents.size(); ++i) {
++        const VkExtent2D outputExtent =
++            backend::shift_extent(ctx.flowExtent, static_cast<uint32_t>(i + 1));
++        this->downsampleDispatchExtents.at(i) =
++            backend::add_shift_extent(outputExtent, 7, 3);
++    }
+ }
+ 
+ void Mipmaps::prepare(std::vector<VkImage>& images) const {
+@@ -48,6 +65,12 @@ void Mipmaps::prepare(std::vector<VkImage>& images) const {
+         images.push_back(img.handle());
+ }
+ 
+-void Mipmaps::render(const vk::Vulkan& vk, const vk::CommandBuffer& cmd, size_t idx) const {
+-    this->sets.at(idx % 2).dispatch(vk, cmd, this->dispatchExtent);
++void Mipmaps::render(const vk::Vulkan& vk, const vk::CommandBuffer& cmd,
++        size_t idx) const {
++    this->lumaSets.at(idx % 2).dispatch(
++        vk, cmd, this->lumaDispatchExtent);
++
++    for (size_t i = 0; i < this->downsampleSets.size(); ++i)
++        this->downsampleSets.at(i).dispatch(
++            vk, cmd, this->downsampleDispatchExtents.at(i));
+ }
+diff --git a/lsfg-vk-backend/src/shaderchains/mipmaps.hpp b/lsfg-vk-backend/src/shaderchains/mipmaps.hpp
+index 8c1f6a2..a722820 100644
+--- a/lsfg-vk-backend/src/shaderchains/mipmaps.hpp
++++ b/lsfg-vk-backend/src/shaderchains/mipmaps.hpp
+@@ -9,6 +9,7 @@
+ #include "lsfg-vk-common/vulkan/vulkan.hpp"
+ 
+ #include <cstddef>
++#include <array>
+ #include <vector>
+ 
+ #include <vulkan/vulkan_core.h>
+@@ -33,7 +34,8 @@ namespace lsfgvk::backend {
+         /// @param vk the vulkan instance
+         /// @param cmd command buffer
+         /// @param idx frame index
+-        void render(const vk::Vulkan& vk, const vk::CommandBuffer& cmd, size_t idx) const;
++        void render(const vk::Vulkan& vk, const vk::CommandBuffer& cmd,
++            size_t idx) const;
+ 
+         /// get the generated mipmap images
+         /// @return vector of images
+@@ -41,7 +43,9 @@ namespace lsfgvk::backend {
+     private:
+         std::vector<vk::Image> images;
+ 
+-        std::vector<ManagedShader> sets;
+-        VkExtent2D dispatchExtent{};
++        std::vector<ManagedShader> lumaSets;
++        std::vector<ManagedShader> downsampleSets;
++        VkExtent2D lumaDispatchExtent{};
++        std::array<VkExtent2D, 6> downsampleDispatchExtents{};
+     };
+ }
+diff --git a/lsfg-vk-common/include/lsfg-vk-common/helpers/pointers.hpp b/lsfg-vk-common/include/lsfg-vk-common/helpers/pointers.hpp
+index c202f43..b6700f0 100644
+--- a/lsfg-vk-common/include/lsfg-vk-common/helpers/pointers.hpp
++++ b/lsfg-vk-common/include/lsfg-vk-common/helpers/pointers.hpp
+@@ -91,6 +91,7 @@ namespace ls {
+         }
+ 
+         // operator overloads
++        explicit operator bool() const { return ptr != nullptr; }
+         T& operator*() const { return this->get(); }
+         T* operator->() const { return &this->get(); }
+ 
+diff --git a/lsfg-vk-common/include/lsfg-vk-common/vulkan/command_buffer.hpp b/lsfg-vk-common/include/lsfg-vk-common/vulkan/command_buffer.hpp
+index 0129238..fa3af23 100644
+--- a/lsfg-vk-common/include/lsfg-vk-common/vulkan/command_buffer.hpp
++++ b/lsfg-vk-common/include/lsfg-vk-common/vulkan/command_buffer.hpp
+@@ -70,6 +70,9 @@ namespace vk {
+         void copyBufferToImage(const vk::Vulkan& vk,
+             const vk::Buffer& buffer, const vk::Image& image) const;
+ 
++        void clearImages(const vk::Vulkan& vk, const std::vector<VkImage>& images) const;
++        void memoryBarrier(const vk::Vulkan& vk) const;
++
+         /// end recording commands
+         /// @param vk the vulkan instance
+         /// @throws ls::vulkan_error on failure
+diff --git a/lsfg-vk-common/include/lsfg-vk-common/vulkan/image.hpp b/lsfg-vk-common/include/lsfg-vk-common/vulkan/image.hpp
+index db38f01..517c364 100644
+--- a/lsfg-vk-common/include/lsfg-vk-common/vulkan/image.hpp
++++ b/lsfg-vk-common/include/lsfg-vk-common/vulkan/image.hpp
+@@ -6,6 +6,7 @@
+ #include "vulkan.hpp"
+ 
+ #include <optional>
++#include <vector>
+ 
+ #include <vulkan/vulkan_core.h>
+ 
+@@ -26,7 +27,8 @@ namespace vk {
+             VkFormat format = VK_FORMAT_R8G8B8A8_UNORM,
+             VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+             std::optional<int> importFd = std::nullopt,
+-            std::optional<int*> exportFd = std::nullopt);
++            std::optional<int*> exportFd = std::nullopt,
++            const std::vector<uint32_t>& queueFamilyIndices = {});
+ 
+         /// get the image handle
+         /// @return the image handle
+diff --git a/lsfg-vk-common/include/lsfg-vk-common/vulkan/timeline_semaphore.hpp b/lsfg-vk-common/include/lsfg-vk-common/vulkan/timeline_semaphore.hpp
+index c634377..24cf6cc 100644
+--- a/lsfg-vk-common/include/lsfg-vk-common/vulkan/timeline_semaphore.hpp
++++ b/lsfg-vk-common/include/lsfg-vk-common/vulkan/timeline_semaphore.hpp
+@@ -14,6 +14,8 @@ namespace vk {
+     /// vulkan timeline semaphore
+     class TimelineSemaphore {
+     public:
++        TimelineSemaphore() = default;
++        [[nodiscard]] bool valid() const { return static_cast<bool>(this->semaphore); }
+         /// create a timeline semaphore
+         /// @param vk the vulkan instance
+         /// @param initial initial value of the timeline semaphore
+diff --git a/lsfg-vk-common/include/lsfg-vk-common/vulkan/vulkan.hpp b/lsfg-vk-common/include/lsfg-vk-common/vulkan/vulkan.hpp
+index 18fe083..9d9cb21 100644
+--- a/lsfg-vk-common/include/lsfg-vk-common/vulkan/vulkan.hpp
++++ b/lsfg-vk-common/include/lsfg-vk-common/vulkan/vulkan.hpp
+@@ -66,6 +66,7 @@ namespace vk {
+         PFN_vkUnmapMemory UnmapMemory;
+         PFN_vkAllocateCommandBuffers AllocateCommandBuffers;
+         PFN_vkFreeCommandBuffers FreeCommandBuffers;
++        PFN_vkResetCommandBuffer ResetCommandBuffer;
+         PFN_vkBeginCommandBuffer BeginCommandBuffer;
+         PFN_vkEndCommandBuffer EndCommandBuffer;
+         PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
+@@ -167,17 +168,21 @@ namespace vk {
+         /// @param instance vulkan instance handle
+         /// @param device logical device handle
+         /// @param physdev physical device handle
++        /// @param queueFamilyIndex queue family already enabled by the application
++        /// @param queue queue already obtained by the application
++        /// @param fp16 whether shaderFloat16 was enabled on the borrowed device
+         /// @param instanceFuncs instance function pointers
+         /// @param deviceFuncs device function pointers
+-        /// @param isGraphical whether the device is graphical (rather than compute)
+         /// @param setLoaderData optional function to set loader data
+         /// @param cachefile optional path to pipeline cache file
+         /// @throws ls::vulkan_error on failure
+         Vulkan(VkInstance instance, VkDevice device,
+             VkPhysicalDevice physdev,
++            uint32_t queueFamilyIndex,
++            VkQueue queue,
++            bool fp16,
+             VulkanInstanceFuncs instanceFuncs,
+             VulkanDeviceFuncs deviceFuncs,
+-            bool isGraphical = true,
+             std::optional<PFN_vkSetDeviceLoaderData> setLoaderData = std::nullopt,
+             const std::optional<std::filesystem::path>& cachefile = std::nullopt);
+ 
+@@ -209,6 +214,8 @@ namespace vk {
+         /// get the compute queue
+         /// @return the compute queue handle
+         [[nodiscard]] const auto& queue() const { return this->computeQueue; }
++        /// get the queue-family index used by the command pool and queue
++        [[nodiscard]] uint32_t queuefamily() const { return this->queueFamilyIdx; }
+ 
+         /// check if fp16 is supported
+         /// @return true if fp16 is supported
+diff --git a/lsfg-vk-common/src/vulkan/command_buffer.cpp b/lsfg-vk-common/src/vulkan/command_buffer.cpp
+index cac4732..935881d 100644
+--- a/lsfg-vk-common/src/vulkan/command_buffer.cpp
++++ b/lsfg-vk-common/src/vulkan/command_buffer.cpp
+@@ -56,6 +56,9 @@ CommandBuffer::CommandBuffer(const vk::Vulkan& vk)
+         : commandBuffer(createCommandBuffer(vk)) {}
+ 
+ void CommandBuffer::begin(const vk::Vulkan& vk) const {
++    auto reset = vk.df().ResetCommandBuffer(*this->commandBuffer, 0);
++    if (reset != VK_SUCCESS)
++        throw ls::vulkan_error(reset, "vkResetCommandBuffer() failed");
+     const VkCommandBufferBeginInfo beginInfo = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+@@ -68,7 +71,7 @@ void CommandBuffer::begin(const vk::Vulkan& vk) const {
+ void CommandBuffer::insertBarriers(const vk::Vulkan& vk,
+         const std::vector<vk::Barrier>& barriers) const {
+     vk.df().CmdPipelineBarrier(*this->commandBuffer,
+-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+         0,
+         0, VK_NULL_HANDLE,
+         0, VK_NULL_HANDLE,
+@@ -107,7 +110,7 @@ void CommandBuffer::blitImage(const vk::Vulkan& vk,
+         std::pair<VkImage, VkImage> images, VkExtent2D extent,
+         const std::vector<vk::Barrier>& postBarriers) const {
+     vk.df().CmdPipelineBarrier(*this->commandBuffer,
+-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+         0,
+         0, VK_NULL_HANDLE,
+         0, VK_NULL_HANDLE,
+@@ -142,7 +145,7 @@ void CommandBuffer::blitImage(const vk::Vulkan& vk,
+     );
+ 
+     vk.df().CmdPipelineBarrier(*this->commandBuffer,
+-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+         0,
+         0, VK_NULL_HANDLE,
+         0, VK_NULL_HANDLE,
+@@ -193,6 +196,26 @@ void CommandBuffer::copyBufferToImage(const vk::Vulkan& vk,
+     );
+ }
+ 
++void CommandBuffer::memoryBarrier(const vk::Vulkan& vk) const {
++    const VkMemoryBarrier barrier{
++        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++        .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT
++    };
++    vk.df().CmdPipelineBarrier(*this->commandBuffer,
++        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++        0, 1, &barrier, 0, nullptr, 0, nullptr);
++}
++
++void CommandBuffer::clearImages(const vk::Vulkan& vk, const std::vector<VkImage>& images) const {
++    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++    const VkClearColorValue black{};
++    for (VkImage image : images)
++        vk.df().CmdClearColorImage(*this->commandBuffer, image,
++            VK_IMAGE_LAYOUT_GENERAL, &black, 1, &range);
++    memoryBarrier(vk);
++}
++
+ void CommandBuffer::end(const vk::Vulkan& vk) const {
+     auto res = vk.df().EndCommandBuffer(*this->commandBuffer);
+     if (res != VK_SUCCESS)
+@@ -210,13 +233,13 @@ void CommandBuffer::submit(const vk::Vulkan& vk,
+         waitSemaphores.push_back(waitTimelineSemaphore);
+ 
+     std::vector<uint64_t> waitValues(waitSemaphores.size(), 0);
+-    waitValues.back() = waitValue;
++    if (waitTimelineSemaphore) waitValues.back() = waitValue;
+ 
+     if (signalTimelineSemaphore)
+         signalSemaphores.push_back(signalTimelineSemaphore);
+ 
+     std::vector<uint64_t> signalValues(signalSemaphores.size(), 0);
+-    signalValues.back() = signalValue;
++    if (signalTimelineSemaphore) signalValues.back() = signalValue;
+ 
+     // create submit info
+     const VkTimelineSemaphoreSubmitInfo timelineInfo{
+@@ -227,10 +250,10 @@ void CommandBuffer::submit(const vk::Vulkan& vk,
+         .pSignalSemaphoreValues = signalValues.data()
+     };
+     std::vector<VkPipelineStageFlags> stages(waitSemaphores.size(),
+-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
++        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+     const VkSubmitInfo submitInfo{
+         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+-        .pNext = &timelineInfo,
++        .pNext = waitTimelineSemaphore || signalTimelineSemaphore ? &timelineInfo : nullptr,
+         .waitSemaphoreCount = static_cast<uint32_t>(waitSemaphores.size()),
+         .pWaitSemaphores = waitSemaphores.data(),
+         .pWaitDstStageMask = stages.data(),
+diff --git a/lsfg-vk-common/src/vulkan/image.cpp b/lsfg-vk-common/src/vulkan/image.cpp
+index 6eb45c4..42e1da4 100644
+--- a/lsfg-vk-common/src/vulkan/image.cpp
++++ b/lsfg-vk-common/src/vulkan/image.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <bitset>
+ #include <optional>
++#include <vector>
+ 
+ #include <vulkan/vulkan_core.h>
+ 
+@@ -16,8 +17,12 @@ namespace {
+     /// create a image
+     ls::owned_ptr<VkImage> createImage(const vk::Vulkan& vk,
+             VkExtent2D extent, VkFormat format, VkImageUsageFlags usage,
+-            bool external) {
++            bool external, const std::vector<uint32_t>& queueFamilyIndices) {
++        if (!extent.width || !extent.height)
++            throw ls::vulkan_error("image extent must be non-zero");
++
+         VkImage handle{};
++        const bool concurrent = queueFamilyIndices.size() > 1;
+ 
+         const VkExternalMemoryImageCreateInfo externalInfo{
+             .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+@@ -36,8 +41,12 @@ namespace {
+             .mipLevels = 1,
+             .arrayLayers = 1,
+             .samples = VK_SAMPLE_COUNT_1_BIT,
+-            .usage = usage,
+-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE
++            .usage = usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++            .sharingMode = concurrent ? VK_SHARING_MODE_CONCURRENT :
++                VK_SHARING_MODE_EXCLUSIVE,
++            .queueFamilyIndexCount = concurrent ?
++                static_cast<uint32_t>(queueFamilyIndices.size()) : 0,
++            .pQueueFamilyIndices = concurrent ? queueFamilyIndices.data() : nullptr
+         };
+         auto res = vk.df().CreateImage(vk.dev(), &imageInfo, VK_NULL_HANDLE, &handle);
+         if (res != VK_SUCCESS)
+@@ -155,10 +164,11 @@ Image::Image(const vk::Vulkan& vk,
+             VkFormat format,
+             VkImageUsageFlags usage,
+             std::optional<int> importFd,
+-            std::optional<int*> exportFd) :
++            std::optional<int*> exportFd,
++            const std::vector<uint32_t>& queueFamilyIndices) :
+         image(createImage(vk,
+             extent, format, usage,
+-            importFd.has_value() || exportFd.has_value()
++            importFd.has_value() || exportFd.has_value(), queueFamilyIndices
+         )),
+         memory(allocateMemory(vk,
+             *this->image,
+diff --git a/lsfg-vk-common/src/vulkan/vulkan.cpp b/lsfg-vk-common/src/vulkan/vulkan.cpp
+index 092b874..44d4fe2 100644
+--- a/lsfg-vk-common/src/vulkan/vulkan.cpp
++++ b/lsfg-vk-common/src/vulkan/vulkan.cpp
+@@ -13,9 +13,12 @@
+ #include <ios>
+ #include <optional>
+ #include <string>
++#include <system_error>
+ #include <vector>
+ 
++#ifndef __SWITCH__
+ #include <dlfcn.h>
++#endif
+ #include <vulkan/vk_layer.h>
+ #include <vulkan/vulkan_core.h>
+ 
+@@ -23,6 +26,7 @@ using namespace vk;
+ 
+ namespace {
+     /// load libvulkan.so.1 and return its handle
++#ifndef __SWITCH__
+     void* get_vulkan_handle() {
+         static void* handle{nullptr}; // NOLINT (const correctness)
+         if (handle) return handle;
+@@ -47,6 +51,11 @@ namespace {
+ 
+         return mpa;
+     }
++#else
++    PFN_vkGetInstanceProcAddr get_mpa() {
++        return vkGetInstanceProcAddr;
++    }
++#endif
+ }
+ 
+ namespace {
+@@ -59,6 +68,18 @@ namespace {
+         return func;
+     }
+ 
++    template<typename T>
++    T ipaAlias(PFN_vkGetInstanceProcAddr mpa, VkInstance instance,
++            const char* coreName, const char* extensionName) {
++        T func = reinterpret_cast<T>(mpa(instance, coreName));
++        if (!func)
++            func = reinterpret_cast<T>(mpa(instance, extensionName));
++        if (!func)
++            throw ls::vulkan_error("failed to get instance proc addr for " +
++                std::string(coreName));
++        return func;
++    }
++
+     /// create a vulkan instance
+     ls::owned_ptr<VkInstance> createInstance(
+             const std::string& appName, version appVersion,
+@@ -266,12 +287,17 @@ namespace {
+         if (cachefile && std::filesystem::exists(*cachefile))
+             readCacheFile(*cachefile, cache);
+ 
+-        const VkPipelineCacheCreateInfo pipelineCacheInfo{
++        VkPipelineCacheCreateInfo pipelineCacheInfo{
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+             .initialDataSize = cache.size(),
+             .pInitialData = cache.data()
+         };
+         auto res = fd.CreatePipelineCache(device, &pipelineCacheInfo, VK_NULL_HANDLE, &handle);
++        if (res != VK_SUCCESS && !cache.empty()) {
++            pipelineCacheInfo.initialDataSize = 0;
++            pipelineCacheInfo.pInitialData = nullptr;
++            res = fd.CreatePipelineCache(device, &pipelineCacheInfo, VK_NULL_HANDLE, &handle);
++        }
+         if (res != VK_SUCCESS)
+             throw ls::vulkan_error(res, "vkCreatePipelineCache() failed");
+ 
+@@ -293,13 +319,14 @@ VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceP
+             "vkEnumeratePhysicalDevices"),
+         .EnumerateDeviceExtensionProperties = ipa<PFN_vkEnumerateDeviceExtensionProperties>(mpa, i,
+             "vkEnumerateDeviceExtensionProperties"),
+-        .GetPhysicalDeviceProperties2 = ipa<PFN_vkGetPhysicalDeviceProperties2>(mpa, i,
+-            "vkGetPhysicalDeviceProperties2"),
++        .GetPhysicalDeviceProperties2 = ipaAlias<PFN_vkGetPhysicalDeviceProperties2>(mpa, i,
++            "vkGetPhysicalDeviceProperties2", "vkGetPhysicalDeviceProperties2KHR"),
+         .GetPhysicalDeviceQueueFamilyProperties =
+             ipa<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(mpa, i,
+                 "vkGetPhysicalDeviceQueueFamilyProperties"),
+         .GetPhysicalDeviceFeatures2 = graphical ?
+-            nullptr : ipa<PFN_vkGetPhysicalDeviceFeatures2>(mpa, i, "vkGetPhysicalDeviceFeatures2"),
++            nullptr : ipaAlias<PFN_vkGetPhysicalDeviceFeatures2>(mpa, i,
++                "vkGetPhysicalDeviceFeatures2", "vkGetPhysicalDeviceFeatures2KHR"),
+         .GetPhysicalDeviceMemoryProperties = ipa<PFN_vkGetPhysicalDeviceMemoryProperties>(mpa, i,
+             "vkGetPhysicalDeviceMemoryProperties"),
+         .CreateDevice = ipa<PFN_vkCreateDevice>(mpa, i, "vkCreateDevice"),
+@@ -333,6 +360,7 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
+         .AllocateCommandBuffers = dpa<PFN_vkAllocateCommandBuffers>(f, d,
+             "vkAllocateCommandBuffers"),
+         .FreeCommandBuffers = dpa<PFN_vkFreeCommandBuffers>(f, d, "vkFreeCommandBuffers"),
++        .ResetCommandBuffer = dpa<PFN_vkResetCommandBuffer>(f, d, "vkResetCommandBuffer"),
+         .BeginCommandBuffer = dpa<PFN_vkBeginCommandBuffer>(f, d, "vkBeginCommandBuffer"),
+         .EndCommandBuffer = dpa<PFN_vkEndCommandBuffer>(f, d, "vkEndCommandBuffer"),
+         .CmdPipelineBarrier = dpa<PFN_vkCmdPipelineBarrier>(f, d, "vkCmdPipelineBarrier"),
+@@ -376,11 +404,20 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
+         .CreateComputePipelines = dpa<PFN_vkCreateComputePipelines>(f, d, "vkCreateComputePipelines"),
+         .DestroyPipeline = dpa<PFN_vkDestroyPipeline>(f, d, "vkDestroyPipeline"),
+ 
+-        .SignalSemaphoreKHR = dpa<PFN_vkSignalSemaphoreKHR>(f, d, "vkSignalSemaphoreKHR"),
+-        .WaitSemaphoresKHR = dpa<PFN_vkWaitSemaphoresKHR>(f, d, "vkWaitSemaphoresKHR"),
+-        .GetMemoryFdKHR = dpa<PFN_vkGetMemoryFdKHR>(f, d, "vkGetMemoryFdKHR"),
+-        .ImportSemaphoreFdKHR = dpa<PFN_vkImportSemaphoreFdKHR>(f, d, "vkImportSemaphoreFdKHR"),
+-        .GetSemaphoreFdKHR = dpa<PFN_vkGetSemaphoreFdKHR>(f, d, "vkGetSemaphoreFdKHR"),
++        .SignalSemaphoreKHR = reinterpret_cast<PFN_vkSignalSemaphoreKHR>(
++            f.GetDeviceProcAddr(d, "vkSignalSemaphoreKHR") ?
++                f.GetDeviceProcAddr(d, "vkSignalSemaphoreKHR") :
++                f.GetDeviceProcAddr(d, "vkSignalSemaphore")),
++        .WaitSemaphoresKHR = reinterpret_cast<PFN_vkWaitSemaphoresKHR>(
++            f.GetDeviceProcAddr(d, "vkWaitSemaphoresKHR") ?
++                f.GetDeviceProcAddr(d, "vkWaitSemaphoresKHR") :
++                f.GetDeviceProcAddr(d, "vkWaitSemaphores")),
++        .GetMemoryFdKHR = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
++            f.GetDeviceProcAddr(d, "vkGetMemoryFdKHR")),
++        .ImportSemaphoreFdKHR = reinterpret_cast<PFN_vkImportSemaphoreFdKHR>(
++            f.GetDeviceProcAddr(d, "vkImportSemaphoreFdKHR")),
++        .GetSemaphoreFdKHR = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
++            f.GetDeviceProcAddr(d, "vkGetSemaphoreFdKHR")),
+ 
+         .CreateSwapchainKHR = graphical ?
+             dpa<PFN_vkCreateSwapchainKHR>(f, d, "vkCreateSwapchainKHR") : nullptr,
+@@ -438,23 +475,22 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
+ 
+ Vulkan::Vulkan(VkInstance instance, VkDevice device,
+         VkPhysicalDevice physdev,
++        uint32_t queueFamilyIndex,
++        VkQueue queue,
++        bool fp16,
+         VulkanInstanceFuncs instanceFuncs,
+         VulkanDeviceFuncs deviceFuncs,
+-        bool isGraphical,
+         std::optional<PFN_vkSetDeviceLoaderData> setLoaderData,
+         const std::optional<std::filesystem::path>& cachefile) :
+     instance(new VkInstance(instance)),
+     instance_funcs(instanceFuncs),
+     phys_dev(physdev),
+-    queueFamilyIdx(findQFI(this->instance_funcs, this->phys_dev,
+-        isGraphical ? VK_QUEUE_GRAPHICS_BIT : VK_QUEUE_COMPUTE_BIT)),
+-    fp16(false),
++    queueFamilyIdx(queueFamilyIndex),
++    fp16(fp16),
+     device(new VkDevice(device)),
+     setLoaderData(setLoaderData),
+     device_funcs(deviceFuncs),
+-    computeQueue(getQueue(this->device_funcs, *this->device,
+-        this->setLoaderData,
+-        this->queueFamilyIdx)),
++    computeQueue(queue),
+     cmdPool(createCommandPool(this->device_funcs,
+         *this->device,
+         this->queueFamilyIdx
+@@ -500,6 +536,14 @@ void Vulkan::persistPipelineCache() const noexcept {
+     if (res != VK_SUCCESS)
+         return;
+ 
++    const auto parent = this->cachefile->parent_path();
++    if (!parent.empty()) {
++        std::error_code error;
++        std::filesystem::create_directories(parent, error);
++        if (error)
++            return;
++    }
++
+     std::ofstream file(*this->cachefile, std::ios::binary | std::ios::trunc);
+     if (!file.is_open())
+         return;

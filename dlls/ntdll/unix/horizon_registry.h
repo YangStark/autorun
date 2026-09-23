@@ -725,7 +725,7 @@ static inline unsigned int horizon_reg_enum_value( const struct horizon_reg_key 
     if (len > name_bytes)
     {
         *namelen = name_bytes;
-        memcpy( data, value->name, name_bytes );
+        if (name_bytes) memcpy( data, value->name, name_bytes );
         memcpy( data + name_bytes, value->data, len - name_bytes );
     }
     else if (len)

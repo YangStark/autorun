@@ -426,6 +426,10 @@ struct range_entry
 
 static struct range_entry *free_ranges;
 static struct range_entry *free_ranges_end;
+#ifdef __SWITCH__
+static struct range_entry horizon_free_range_exclusions[2];
+static unsigned int horizon_free_range_exclusion_count;
+#endif
 
 
 static inline BOOL is_beyond_limit( const void *addr, size_t size, const void *limit )
@@ -1052,8 +1056,16 @@ extern const unixlib_entry_t wine_nx_ws2_32_unix_funcs[];
 extern const unixlib_entry_t wine_nx_crypt32_unix_funcs[];
 extern const unixlib_entry_t wine_nx_win32u_unix_funcs[];
 extern const unixlib_entry_t wine_nx_opengl32_unix_funcs[];
+extern const unixlib_entry_t wine_nx_audio_unix_funcs[];
+extern const unixlib_entry_t wine_nx_xinput_unix_funcs[];
+#ifdef WINE_NX_MESA_SWITCH
+extern const unixlib_entry_t wine_nx_winevulkan_unix_funcs[];
+#endif
 #ifdef WINE_NX_BOX64_INTERPRETER
 extern const unixlib_entry_t wine_nx_winebox64_unix_funcs[];
+#endif
+#ifdef WINE_NX_AMD64
+extern const unixlib_entry_t wine_nx_winebox64ec_unix_funcs[];
 #endif
 
 static const struct
@@ -1065,10 +1077,19 @@ static const struct
 #ifdef WINE_NX_BOX64_INTERPRETER
     { {'w','i','n','e','b','o','x','6','4','.','d','l','l',0}, wine_nx_winebox64_unix_funcs },
 #endif
+#ifdef WINE_NX_AMD64
+    { {'w','i','n','e','b','o','x','6','4','e','c','.','d','l','l',0}, wine_nx_winebox64ec_unix_funcs },
+#endif
     { {'w','s','2','_','3','2','.','d','l','l',0}, wine_nx_ws2_32_unix_funcs },
     { {'c','r','y','p','t','3','2','.','d','l','l',0}, wine_nx_crypt32_unix_funcs },
     { {'w','i','n','3','2','u','.','d','l','l',0}, wine_nx_win32u_unix_funcs },
     { {'o','p','e','n','g','l','3','2','.','d','l','l',0}, wine_nx_opengl32_unix_funcs },
+    { {'w','i','n','e','n','x','a','u','d','i','o','.','d','r','v',0}, wine_nx_audio_unix_funcs },
+    { {'x','i','n','p','u','t','1','_','3','.','d','l','l',0}, wine_nx_xinput_unix_funcs },
+    { {'x','i','n','p','u','t','1','_','4','.','d','l','l',0}, wine_nx_xinput_unix_funcs },
+#ifdef WINE_NX_MESA_SWITCH
+    { {'w','i','n','e','v','u','l','k','a','n','.','d','l','l',0}, wine_nx_winevulkan_unix_funcs },
+#endif
 };
 
 /* Tables for 32-bit DLLs under WoW64 (see ws2_32_unix_stub.c). Those modules
@@ -1431,6 +1452,58 @@ static void free_ranges_insert_view( struct file_view *view )
     VIRTUAL_DEBUG_DUMP_RANGES();
 }
 
+#ifdef __SWITCH__
+static void free_ranges_exclude( void *base, size_t size )
+{
+    void *range_base = ROUND_ADDR( base, granularity_mask );
+    void *range_end = ROUND_ADDR( (char *)base + size + granularity_mask, granularity_mask );
+    struct range_entry *range = free_ranges_lower_bound( range_base );
+
+    if (range != free_ranges_end && range->end <= range_base) range++;
+    while (range != free_ranges_end && range->base < range_end)
+    {
+        if (range->base < range_base && range->end > range_end)
+        {
+            struct range_entry *next = range + 1;
+
+            memmove( next + 1, next, (free_ranges_end - next) * sizeof(*next) );
+            free_ranges_end++;
+            assert( (char *)free_ranges_end - (char *)free_ranges <= view_block_size );
+            next->base = range_end;
+            next->end = range->end;
+            range->end = range_base;
+            break;
+        }
+        if (range->base < range_base)
+        {
+            range->end = range_base;
+            range++;
+        }
+        else if (range->end > range_end)
+        {
+            range->base = range_end;
+            break;
+        }
+        else
+        {
+            memmove( range, range + 1, (free_ranges_end - range - 1) * sizeof(*range) );
+            free_ranges_end--;
+        }
+    }
+    assert( free_ranges_end - free_ranges > 0 );
+}
+
+static void free_ranges_restore_exclusions(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < horizon_free_range_exclusion_count; i++)
+        free_ranges_exclude( horizon_free_range_exclusions[i].base,
+                             (char *)horizon_free_range_exclusions[i].end -
+                             (char *)horizon_free_range_exclusions[i].base );
+}
+#endif
+
 /***********************************************************************
  *           free_ranges_remove_view
  *
@@ -1505,6 +1578,9 @@ static void free_ranges_remove_view( struct file_view *view )
         range->base = view_base;
         range->end = view_end;
     }
+#ifdef __SWITCH__
+    free_ranges_restore_exclusions();
+#endif
     VIRTUAL_DEBUG_DUMP_RANGES();
 }
 
@@ -3367,7 +3443,13 @@ static void *get_host_addr_space_limit(void)
 static void alloc_arm64ec_map(void)
 {
     unsigned int status;
-    SIZE_T size = ((ULONG_PTR)address_space_limit + page_size) >> (page_shift + 3);  /* one bit per page */
+    ULONG_PTR limit = (ULONG_PTR)address_space_limit;
+    SIZE_T size;
+
+#ifdef __SWITCH__
+    limit = min( limit, (ULONG_PTR)host_addr_space_limit );
+#endif
+    size = (limit + page_size) >> (page_shift + 3);  /* one bit per page */
 
     size = ROUND_SIZE( 0, size, host_page_mask );
     status = map_view( &arm64ec_view, NULL, size, MEM_TOP_DOWN, VPROT_READ | VPROT_COMMITTED, 0, 0, 0 );
@@ -4326,6 +4408,9 @@ static void *alloc_virtual_heap( SIZE_T size )
  * only places there, the dynarec's code memory, and the region section anchors
  * are packed into. */
 #define HORIZON_NATIVE_STACKS ((ULONG_PTR)512 * 1024 * 1024)
+/* Where the whole address space is 4 GB the window also holds every code
+ * arena, two aliases apiece, and 512 MB of it ran the dynarec dry. */
+#define HORIZON_NATIVE_STACKS_4G ((ULONG_PTR)768 * 1024 * 1024)
 
 /* The window itself, for the runtime's own placements. */
 void *horizon_native_window_start = NULL;
@@ -4336,6 +4421,40 @@ void *horizon_native_window_end = NULL;
  * created, as Wine's preloader does on other hosts. These are PROT_NONE host
  * reservations, not guest views or committed RAM: Wine can allocate inside
  * them, and unmap_area restores the reservation when a guest view is freed. */
+/* Takes the kernel's thread-local pages out of the guest's reservations. The
+ * reservations are this process's bookkeeping, not kernel mappings, so the
+ * kernel sees them as free and puts a thread-local page wherever its random
+ * search lands when a new thread needs one -- which in a 32-bit address space
+ * is often inside memory the program has reserved. The Sims 2 reserved 4 MB,
+ * a page landed in it, committing the 4 MB then failed and the game wrote
+ * through the memory it did not get. The runtime creates the pages a process
+ * will ever need before the program starts (runtime.c) and this takes them
+ * out, so no allocation is ever handed one. A page inside a view the program
+ * already has is left alone and counted: nothing can move it. Returns how many
+ * were taken out, and how many were found below 4 GB. */
+unsigned int horizon_drop_thread_local_pages( unsigned int *found )
+{
+    unsigned long long page = 0;
+    unsigned int dropped = 0;
+    sigset_t sigset;
+
+    *found = 0;
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    while ((page = horizon_next_thread_local_page( page, (ULONG_PTR)limit_4g )))
+    {
+        (*found)++;
+        if (mmap_is_in_reserved_area( (void *)(ULONG_PTR)page, 0x1000 ) == 1 &&
+            !find_view_range( (void *)(ULONG_PTR)page, 0x1000 ))
+        {
+            remove_reserved_area( (void *)(ULONG_PTR)page, 0x1000 );
+            dropped++;
+        }
+        page += 0x1000;
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return dropped;
+}
+
 static void horizon_reserve_guest_address_space(void)
 {
     struct range_entry *range;
@@ -4363,7 +4482,23 @@ static void horizon_reserve_guest_address_space(void)
      * at random with 0x200 attempts, so the window does not have to be empty:
      * 96 threads, all Horizon allows, take a megabyte of kernel stack each,
      * and the code arenas are bounded. A region too small keeps half. */
-    stack_room = min( HORIZON_NATIVE_STACKS, ((ULONG_PTR)stack_end - (ULONG_PTR)stack_start) / 2 );
+    /* Half of the region, and five eighths of it where the whole address space
+     * is 4 GB. What the window has to hold decides it: thread stacks and
+     * section anchors everywhere, and on a 4 GB address space the dynarec's
+     * code memory as well, two aliases per arena, which ran out at 133 MB.
+     * A 36- or 39-bit address space has room above everything a 32-bit
+     * program can address, so code goes there instead and the three eighths
+     * stay the program's: Fallout New Vegas reserves its own memory low, and
+     * taking them left it unable to start. */
+    {
+        void *space_start, *space_limit;
+        ULONG_PTR region = (ULONG_PTR)stack_end - (ULONG_PTR)stack_start;
+
+        horizon_get_address_space_limits( &space_start, &space_limit );
+        stack_room = (ULONG_PTR)space_limit > limit_4g
+                     ? min( HORIZON_NATIVE_STACKS, region / 2 )
+                     : min( HORIZON_NATIVE_STACKS_4G, region / 8 * 5 );
+    }
     window_start = (char *)ROUND_ADDR( (ULONG_PTR)stack_end - stack_room, granularity_mask );
     /* horizon.c places section anchors in here itself rather than asking
      * libnx, whose search picks addresses at random. */
@@ -4399,6 +4534,17 @@ static void horizon_reserve_guest_address_space(void)
 }
 #endif
 
+
+#ifdef __SWITCH__
+static void cap_horizon_arm64ec_address_space(void)
+{
+    if (!is_arm64ec()) return;
+    address_space_limit = min( address_space_limit, host_addr_space_limit );
+    user_space_limit = min( user_space_limit, host_addr_space_limit );
+    working_set_limit = min( working_set_limit, host_addr_space_limit );
+}
+#endif
+
 /***********************************************************************
  *           virtual_init
  */
@@ -4431,6 +4577,7 @@ void virtual_init(void)
 #ifdef _WIN64
 #ifdef __SWITCH__
     horizon_get_address_space_limits( &address_space_start, &host_addr_space_limit );
+    cap_horizon_arm64ec_address_space();
 #else
     host_addr_space_limit = get_host_addr_space_limit();
 #endif
@@ -4484,31 +4631,42 @@ void virtual_init(void)
 #ifdef __SWITCH__
     {
         /* The kernel's heap and alias regions lie inside the address space but
-         * are not Wine's: the kernel refuses mappings there while a Horizon
-         * reservation accepts them, so a TEB or stack reserved over libnx's heap
-         * shares its pages with malloc. On a 32-bit address space they sit below
-         * 4 GiB among Wine's own allocations. System views keep the free-area
-         * search from offering them. A view costs a byte per page and a table
-         * per 4 GiB, so only the part below 4 GiB is covered; in the 39-bit
-         * layout the regions lie far above it and nothing changes. */
+         * are not Wine's. Keep low regions as system views so memory queries
+         * report them reserved. Exclude high regions only from the free-range
+         * search, since protection bytes for those large regions are wasteful. */
         void *starts[2];
         size_t sizes[2];
         struct file_view *view;
-        char *top = (char *)min( host_addr_space_limit, (void *)limit_4g );
         int i, count = horizon_get_kernel_regions( starts, sizes, 2 );
 
         for (i = 0; i < count; i++)
         {
             char *start = max( (char *)starts[i], (char *)address_space_start );
-            char *end = min( (char *)starts[i] + sizes[i], top );
+            char *end = min( (char *)starts[i] + sizes[i], (char *)host_addr_space_limit );
+            char *low_end;
 
             start = (char *)((UINT_PTR)start & ~page_mask);
             end = (char *)(((UINT_PTR)end + page_mask) & ~page_mask);
             if (start >= end) continue;
-            if (create_view( &view, start, end - start, VPROT_SYSTEM ))
-                horizon_trace( "[VA] could not keep Wine out of %p-%p", start, end );
-            else
-                horizon_trace( "[VA] kept Wine out of %p-%p", start, end );
+
+            low_end = min( end, (char *)limit_4g );
+            if (start < low_end)
+            {
+                if (create_view( &view, start, low_end - start, VPROT_SYSTEM ))
+                    horizon_trace( "[VA] could not keep Wine out of %p-%p", start, low_end );
+                else
+                    horizon_trace( "[VA] kept Wine out of %p-%p", start, low_end );
+            }
+            if (end > (char *)limit_4g)
+            {
+                char *high_start = max( start, (char *)limit_4g );
+
+                assert( horizon_free_range_exclusion_count < ARRAY_SIZE(horizon_free_range_exclusions) );
+                horizon_free_range_exclusions[horizon_free_range_exclusion_count].base = high_start;
+                horizon_free_range_exclusions[horizon_free_range_exclusion_count++].end = end;
+                free_ranges_exclude( high_start, end - high_start );
+                horizon_trace( "[VA] excluded kernel region %p-%p from free ranges", high_start, end );
+            }
         }
     }
 #endif
@@ -5595,6 +5753,38 @@ static NTSTATUS grow_thread_stack( char *page, struct thread_stack_info *stack_i
 }
 
 
+#ifdef __SWITCH__
+/* Writable executable memory stays executable until a write faults. A long
+ * sequential write, such as a file read into a PAGE_EXECUTE_READWRITE buffer,
+ * then takes a fault per page, so a fault on the page after the previous
+ * window makes a doubling window writable. virtual_mutex must be held. */
+static size_t exec_write_fault_size( char *page, BYTE vprot )
+{
+    static char *next_page;
+    static size_t window;
+    struct file_view *view = find_view( page, 0 );
+    size_t count;
+    char *end;
+
+    if (!view || (view->protect & VPROT_WRITEWATCH) || !is_vprot_exec_write( vprot ))
+    {
+        next_page = NULL;
+        return host_page_size;
+    }
+    window = page == next_page ? min( window * 2, 256 ) : 1;
+    end = (char *)view->base + view->size;
+    for (count = 1; count < window && page + count * host_page_size < end; count++)
+    {
+        BYTE next = get_host_page_vprot( page + count * host_page_size );
+
+        if (!(next & VPROT_COMMITTED) || !(next & VPROT_WRITEWATCH) || !is_vprot_exec_write( next )) break;
+    }
+    next_page = page + count * host_page_size;
+    return count * host_page_size;
+}
+#endif
+
+
 /***********************************************************************
  *           virtual_handle_fault
  */
@@ -5641,8 +5831,13 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
             }
             else
             {
-                set_page_vprot_bits( page, host_page_size, 0, VPROT_WRITEWATCH );
-                mprotect_range( page, host_page_size, 0, 0 );
+#ifdef __SWITCH__
+                size_t size = exec_write_fault_size( page, vprot );
+#else
+                size_t size = host_page_size;
+#endif
+                set_page_vprot_bits( page, size, 0, VPROT_WRITEWATCH );
+                mprotect_range( page, size, 0, 0 );
             }
         }
         /* ignore fault if page is writable now */
@@ -8107,7 +8302,16 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
 {
     unsigned int status;
 
-    if (virtual_check_buffer_for_read( buffer, size ))
+    if (!virtual_check_buffer_for_read( buffer, size ))
+    {
+        status = STATUS_PARTIAL_COPY;
+        size = 0;
+    }
+    else if (process == GetCurrentProcess())
+    {
+        if ((status = virtual_uninterrupted_write_memory( addr, buffer, size ))) size = 0;
+    }
+    else
     {
         SERVER_START_REQ( write_process_memory )
         {
@@ -8118,11 +8322,6 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
             size = reply->written;
         }
         SERVER_END_REQ;
-    }
-    else
-    {
-        status = STATUS_PARTIAL_COPY;
-        size = 0;
     }
     if (bytes_written) *bytes_written = size;
     return status;

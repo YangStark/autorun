@@ -72,11 +72,12 @@ int main(void)
     struct nx_audio_stream *s;
     unsigned int i, cycles, before;
     BOOL wrapped = FALSE;
-    nx_test_connect(&connect); assert(connect.priority == Priority_Preferred);
-    nx_create_stream(&create); assert(create.result == S_OK && channels == 2 && handle);
+    wine_nx_audio_unix_funcs[test_connect](&connect); assert(connect.priority == Priority_Preferred);
+    wine_nx_audio_unix_funcs[create_stream](&create); assert(create.result == S_OK && channels == 2 && handle);
     s = nx_stream(handle);
     get.stream = put.stream = handle;
-    nx_get_render_buffer(&get); assert(get.result == S_OK && data);
+    wine_nx_audio_unix_funcs[get_render_buffer](&get);
+    assert(get.result == S_OK && data && (UINT_PTR)data > 0xffffffffu);
     for (i = 0; i < total; i++) { ((short *)data)[i*2] = i; ((short *)data)[i*2+1] = -i; }
     nx_release_render_buffer(&put); assert(put.result == S_OK && s->held == total);
     startp.stream = handle; nx_start(&startp);
@@ -168,6 +169,44 @@ int main(void)
         release.stream = handle; release.timer_thread = NULL; nx_release_stream(&release);
         assert(release.result == S_OK);
     }
-    puts("Audio backend: DMA ownership, ordered playback, ring wrap, silence, reset, buffer errors and DirectSound's float format passed");
+    {
+        BYTE endpoint_buffer[256];
+        struct get_endpoint_ids_params endpoints =
+        {
+            .flow = eRender, .endpoints = (struct endpoint *)endpoint_buffer,
+            .size = sizeof(endpoint_buffer)
+        };
+        WCHAR driver[8] = {0xcccc};
+        UINT err = 0xcccc;
+        BOOL quit = FALSE;
+        struct notify_context notify = {.send_notify = TRUE};
+        struct midi_init_params midi_init_params = {.err = &err};
+        struct midi_out_message_params midi_out = {.msg = MODM_GETNUMDEVS, .err = &err, .notify = &notify};
+        struct midi_in_message_params midi_in = {.msg = MIDM_OPEN, .err = &err, .notify = &notify};
+        struct midi_notify_wait_params midi_wait = {.quit = &quit, .notify = &notify};
+        struct aux_message_params aux = {.msg = AUXDM_GETNUMDEVS, .err = &err};
+
+        assert((UINT_PTR)&endpoints > 0xffffffffu && (UINT_PTR)endpoint_buffer > 0xffffffffu);
+        wine_nx_audio_unix_funcs[get_endpoint_ids](&endpoints);
+        assert(endpoints.result == S_OK && endpoints.num == 1 && endpoints.size <= sizeof(endpoint_buffer));
+        wine_nx_audio_unix_funcs[midi_get_driver](driver);
+        assert(!driver[0]);
+        wine_nx_audio_unix_funcs[midi_init](&midi_init_params);
+        assert(!err);
+        wine_nx_audio_unix_funcs[midi_out_message](&midi_out);
+        assert(!err && !notify.send_notify);
+        notify.send_notify = TRUE;
+        wine_nx_audio_unix_funcs[midi_in_message](&midi_in);
+        assert(err == MMSYSERR_BADDEVICEID && !notify.send_notify);
+        notify.send_notify = TRUE;
+        wine_nx_audio_unix_funcs[midi_notify_wait](&midi_wait);
+        assert(quit && !notify.send_notify);
+        wine_nx_audio_unix_funcs[aux_message](&aux);
+        assert(!err);
+        aux.msg = AUXDM_GETDEVCAPS;
+        wine_nx_audio_unix_funcs[aux_message](&aux);
+        assert(err == MMSYSERR_BADDEVICEID);
+    }
+    puts("Audio backend: native table, 64-bit pointers, zero MIDI/aux devices, playback and formats passed");
     return 0;
 }

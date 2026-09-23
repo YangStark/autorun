@@ -165,7 +165,7 @@ assert 'Arch: i386\n' in readobj('--file-headers', sims2 / 'sims2-setup.exe')
 Copy the collection onto the card -- leave __Installer and Support behind, they
 are for a computer -- and run sims2-setup.exe once from the launcher. It writes
 what the release's own "Instalar Registros" batch file writes, with the card's
-paths, and says what it did in wine-nx-runtime.log as [SIMS2 SETUP] lines.
+paths, and says what it did in autorun_runtime.log as [SIMS2 SETUP] lines.
 Running it again is harmless.
 
 Where the packs go does not matter much. Each one is recognised by the
@@ -218,7 +218,7 @@ sims2-setup.exe before running it:
 # The card gets the file the launcher would have written, naming the Switch's
 # adapter the way DXVK reports it, at 720p. The game rewrites this file itself
 # once its own options are used, so the values are a starting point, not a rule.
-fallout = stage / 'drive_c/users/wine/Documents/My Games/FalloutNV'
+fallout = stage / 'drive_c/users/steamuser/Documents/My Games/FalloutNV'
 fallout.mkdir(parents=True, exist_ok=True)
 (fallout / 'FalloutPrefs.ini').write_bytes('\r\n'.join((
     '[Display]',
@@ -248,6 +248,7 @@ config.mkdir(parents=True, exist_ok=True)
   "windows-through-opengl": true,
   "vulkan-probe": false,
   "reopen-the-launcher-on-exit": true,
+  "dxvk-for-new-games": true,
   "hand-the-process-back-anyway": false,
   "gl-pinned-buffers-cached": true,
   "gl-clean-before-submit": true,
@@ -326,7 +327,7 @@ its own the game hands itself to FalloutNVLauncher.exe and closes, because the
 display it is told to use is not one it recognises, so the payload brings the
 settings file it would have written:
 
-    C:\\users\\wine\\Documents\\My Games\\FalloutNV\\FalloutPrefs.ini
+    C:\\users\\steamuser\\Documents\\My Games\\FalloutNV\\FalloutPrefs.ini
 
 It names the Switch's GPU as DXVK reports it, at 1280x720. The game rewrites
 that file once its own options are used; if it already holds settings worth
@@ -396,7 +397,7 @@ no-balance.txt and the rest -- and the first run moves each into settings.json
 and takes the file away, saying so in the log. A setting a newer build added is
 kept when an older one writes the file back.
 
-wine-nx-runtime.log holds the run. Its [PROGRESS] lines report OpenGL frames,
+autorun_runtime.log holds the run. Its [PROGRESS] lines report OpenGL frames,
 the time in eglSwapBuffers and in opengl32 calls, the megabytes Wine copies for
 32-bit buffer mappings (copy_mb), whether the GPU maps the program's own pages
 (pinned=1, or -1 with pin_rc when nvservices refused them), and the slowest

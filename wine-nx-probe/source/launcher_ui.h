@@ -86,7 +86,7 @@ struct ui
     SDL_Texture *glyphs[16];
 
     int animations;
-    SDL_Color background, text, dim, value, selection, panel, card, focus, danger;
+    SDL_Color background, text, dim, value, selection, panel, card, focus, success, danger;
 
     struct ui_text_entry cache[UI_TEXT_CACHE];
     unsigned int cache_use;
@@ -98,6 +98,8 @@ struct ui
     /* The mark the launcher puts in the corner, for the screens it does not
      * draw itself. Given header_status_data. */
     void (*footer_mark)( void *data );
+    void (*background_tick)( void *data );
+    void *background_data;
     /* Where the left of the clock and the battery came out, so that nothing a
      * screen draws on the right stands underneath them. */
     int status_left;
@@ -130,7 +132,8 @@ struct ui
     int running;
 
     char toast[160];
-    Uint32 toast_until;
+    Uint32 toast_since, toast_until;
+    int toast_notice;
 };
 
 int  ui_init( struct ui *ui, const void *font_data, size_t font_size, int animations );
@@ -198,6 +201,7 @@ void ui_footer( struct ui *ui, const struct ui_hint *hints, int count );
 void ui_hints_right( struct ui *ui, const struct ui_hint *hints, int count, int right, int y );
 void ui_fade( struct ui *ui );
 void ui_toast( struct ui *ui, const char *text, int milliseconds );
+void ui_notice( struct ui *ui, const char *text );
 void ui_draw_toast( struct ui *ui );
 /* Move the highlight toward target_y; returns where to draw it. */
 float ui_highlight( struct ui *ui, float target_y );
@@ -211,13 +215,18 @@ int  ui_confirm( struct ui *ui, const char *title, const char *text, const char 
 int  ui_ask( struct ui *ui, const char *title, const char *text, const struct ui_hint *hints, int count );
 /* A short list inside a modal. Returns the item chosen, or -1 for the way out. */
 int  ui_menu( struct ui *ui, const char *title, const char *const *items, int count, int selection );
+void ui_progress_begin( struct ui *ui );
+void ui_progress_update( struct ui *ui, const char *title, const char *status,
+                         unsigned long long current, unsigned long long total );
+void ui_progress_end( struct ui *ui );
 
 /* A list of settings rows. ui_list_run draws it and handles input until the
  * user acts on a row, then returns the action for the row at list->selection;
  * the caller changes what it must and calls it again. */
 /* How a settings row draws what it carries on the right: an arrow into a screen
- * of its own, a value the row itself changes, or a switch. */
-enum ui_row_kind { UI_ROW_ACTION, UI_ROW_VALUE, UI_ROW_SWITCH };
+ * of its own, a value the row itself changes, a switch, or read-only status. */
+enum ui_row_kind { UI_ROW_ACTION, UI_ROW_VALUE, UI_ROW_SWITCH, UI_ROW_DROPDOWN, UI_ROW_INFO };
+enum ui_value_tone { UI_VALUE_NORMAL, UI_VALUE_SUCCESS, UI_VALUE_DANGER };
 
 struct ui_row
 {
@@ -226,8 +235,10 @@ struct ui_row
     int disabled;
     int adjustable;     /* Left and Right change the value */
     int destructive;
+    int download;
     const char *help;   /* the line under the label, and what X shows */
     unsigned char kind; /* enum ui_row_kind, for ui_settings_run */
+    unsigned char value_tone;
     unsigned char on;   /* UI_ROW_SWITCH: which way it is set */
     unsigned char group;/* which section it belongs to */
 };
@@ -273,5 +284,7 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
 enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char *title, const char *context,
                                 const char *const *groups, int group_count,
                                 const struct ui_row *rows, int count, int can_reset, int *group );
+int ui_settings_dropdown( struct ui *ui, const struct ui_list *anchor,
+                          const struct ui_row *rows, int count, int selection );
 
 #endif

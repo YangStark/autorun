@@ -310,20 +310,20 @@ static BOOL parse_token(void)
                 if (len + 1 < sizeof(buffer)) buffer[len++] = c;
             if (c != '\n') fatal_error( "line too long\n" );
             buffer[len] = 0;
-            tok = strtok( buffer, " \t" );
+            tok = strtok( buffer, " \t\r" );
             if (!tok || strcmp( tok, "pragma" )) break;
-            tok = strtok( NULL, " \t" );
+            tok = strtok( NULL, " \t\r" );
             if (!tok || strcmp( tok, "xftmpl" )) break;
-            tok = strtok( NULL, " \t" );
+            tok = strtok( NULL, " \t\r" );
             if (!tok) break;
             if (!strcmp( tok, "name" ))
             {
-                tok = strtok( NULL, " \t" );
+                tok = strtok( NULL, " \t\r" );
                 if (tok && !option_inc_var_name) option_inc_var_name = xstrdup( tok );
             }
             else if (!strcmp( tok, "size" ))
             {
-                tok = strtok( NULL, " \t" );
+                tok = strtok( NULL, " \t\r" );
                 if (tok && !option_inc_size_name) option_inc_size_name = xstrdup( tok );
             }
             break;

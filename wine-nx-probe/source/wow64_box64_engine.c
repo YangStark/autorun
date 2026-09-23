@@ -11,6 +11,7 @@
 #include <switch/arm/counter.h>
 #endif
 #include "wow64_box64_engine.h"
+#include "amd64_box64_engine.h"
 #include "../../dlls/winebox64/cpuid.h"
 #include "box64context.h"
 #include "box64cpu.h"
@@ -24,8 +25,11 @@
 #include "x64_signals.h"
 #ifdef WINE_NX_BOX64_DYNAREC
 extern int wine_nx_box64_dynarec_init(void);
-extern void wine_nx_box64_dynarec_add_stop( uint32_t address );
+extern void wine_nx_box64_dynarec_add_stop( uintptr_t address );
 extern void wine_nx_box64_dynarec_add_gate( uint32_t address );
+extern void wine_nx_box64_invalidate( uintptr_t address, size_t size, int destroy );
+
+_Static_assert( offsetof(x64emu_t, win64_teb) == 3104, "Box64 host TLS offset changed" );
 
 static inline uint64_t current_x18(void)
 {
@@ -44,14 +48,17 @@ struct nx_engine
 #endif
     const struct wine_nx_wow64_gates *gates;
     const struct wine_nx_wow64_host *host;
+    const struct wine_nx_amd64_host *amd64_host;
     void *opaque;
-    ULONG fs_base, completion;
-    ULONG code_page; /* page of the last checked instruction fetch; 1 = none */
+    ULONG_PTR fs_base, gs_base, completion, address_limit;
+    ULONG_PTR code_page; /* page of the last checked instruction fetch; 1 = none */
     ULONGLONG remaining, executed;
     NTSTATUS status;
     pthread_mutex_t *held_mutex;
     int dynarec;    /* running under Box64's dynarec (EmuRun) rather than Run */
+    int is32bits;
     I386_CONTEXT *context;          /* the run's context, which unix calls publish to */
+    AMD64_CONTEXT *amd64_context;
     struct nx_engine *previous;     /* active_engine outside the run */
     unsigned int native_fpcr;       /* the host's FPCR, restored for unix calls */
     int context_replaced;           /* a unix call in EmuRun replaced the context */
@@ -75,17 +82,55 @@ ULONGLONG wine_nx_box64_executed_total, wine_nx_box64_runs_total;
  * later bytes on it are read directly. A page unmapped meanwhile faults inside
  * Run and unwinds through the same boundary as an operand fault. Checked reads
  * are Wine __TRY frames on Horizon and cost far more than the instruction. */
-static NTSTATUS fetch_code_byte( struct nx_engine *engine, ULONG address, unsigned char *byte )
+static BOOL guest_address_valid( const struct nx_engine *engine, ULONG_PTR address, SIZE_T size )
+{
+    return address < engine->address_limit && size <= engine->address_limit - address;
+}
+
+static NTSTATUS read_guest( struct nx_engine *engine, ULONG_PTR address, void *buffer, SIZE_T size )
+{
+    if (!guest_address_valid( engine, address, size )) return STATUS_ACCESS_VIOLATION;
+    if (engine->is32bits) return engine->host->read( engine->opaque, address, buffer, size );
+    return engine->amd64_host->read( engine->opaque, address, buffer, size );
+}
+
+static BOOL amd64_stop_address( const struct nx_engine *engine, ULONG_PTR address )
+{
+    return !engine->is32bits &&
+           ((engine->completion && address == engine->completion) ||
+            engine->amd64_host->is_native( engine->opaque, address ));
+}
+
+int wine_nx_box64_translate_allowed( uintptr_t address )
+{
+    struct nx_engine *engine = active_engine;
+    unsigned char opcode;
+    unsigned int prefix;
+
+    if (!engine || engine->is32bits) return 1;
+    if (amd64_stop_address( engine, address )) return 0;
+    for (prefix = 0; prefix < 15; prefix++)
+    {
+        if (read_guest( engine, address + prefix, &opcode, 1 )) return 1;
+        if (opcode != 0x26 && opcode != 0x2e && opcode != 0x36 && opcode != 0x3e &&
+            opcode != 0x64 && opcode != 0x65 && opcode != 0x66 && opcode != 0x67 &&
+            opcode != 0xf0 && opcode != 0xf2 && opcode != 0xf3 &&
+            (opcode < 0x40 || opcode > 0x4f)) break;
+    }
+    return opcode != 0x62 && opcode != 0xc4 && opcode != 0xc5;
+}
+
+static NTSTATUS fetch_code_byte( struct nx_engine *engine, ULONG_PTR address, unsigned char *byte )
 {
     NTSTATUS status;
 
-    if ((address & ~0xfffu) == engine->code_page)
+    if ((address & ~(uintptr_t)0xfff) == engine->code_page)
     {
         *byte = *(volatile const unsigned char *)(uintptr_t)address;
         return STATUS_SUCCESS;
     }
-    if ((status = engine->host->read( engine->opaque, address, byte, 1 ))) return status;
-    engine->code_page = address & ~0xfffu;
+    if ((status = read_guest( engine, address, byte, 1 ))) return status;
+    engine->code_page = address & ~(uintptr_t)0xfff;
     return STATUS_SUCCESS;
 }
 static box64context_t core_context = { .mutex_lock = PTHREAD_MUTEX_INITIALIZER };
@@ -94,6 +139,7 @@ box64context_t *my_context = &core_context;
  * features before the corresponding context and exception paths are supported. */
 box64env_t box64env;
 int box64_wine = 1;
+int box64_is32bits = 1;
 int box64_unittest_mode;
 uint8_t box64_rdtsc_shift;
 
@@ -116,6 +162,17 @@ static void stop_fault( x64emu_t *emu, ULONG address, ULONG access )
     fault_access = access;
     stop_engine( emu, STATUS_ACCESS_VIOLATION );
 }
+
+uint32_t wine_nx_box64_guest_protection( uintptr_t address )
+{
+    if (!active_engine) return address <= UINT32_MAX ? 5 : 0;
+    if (!guest_address_valid( active_engine, address, 1 )) return 0;
+    return amd64_stop_address( active_engine, address ) ? 1 : 5;
+}
+
+#ifndef WINE_NX_BOX64_DYNAREC
+uint32_t getProtection_fast( uintptr_t addr ) { return wine_nx_box64_guest_protection( addr ); }
+#endif
 
 static void stop_engine( x64emu_t *emu, NTSTATUS status )
 {
@@ -179,20 +236,16 @@ static void recover_translated_state( x64emu_t *emu, ULONG_PTR pc, const unsigne
 BOOL wine_nx_box64_handle_fault( ULONG_PTR address, ULONG access, ULONG_PTR pc,
                                  const unsigned long long *x )
 {
-    if (!active_engine || address > 0xffffffffu) return FALSE;
+    if (!active_engine || !guest_address_valid( active_engine, address, 1 )) return FALSE;
 #ifdef WINE_NX_BOX64_DYNAREC
     extern void *current_helper;
+    extern int fillblock_active;
 
     /* A compiler can read past the code the guest will actually execute.
-     * Follow Box64's signal handler: discard the unfinished block while its
-     * helper is alive, then return through the compiler's recovery frame.
-     * It releases the translator lock and falls back to the interpreter.
-     * A real operand/fetch fault there still exits through the guest boundary.
-     * The lock alone is insufficient: hash validation also runs under it,
-     * outside FillBlock64's live recovery frame. */
-    if (active_engine->held_mutex == &core_context.mutex_dyndump && current_helper)
+     * Enter Box64's FillBlock recovery while its jump buffer is live. The lock
+     * alone is insufficient: hash validation also runs under it. */
+    if (active_engine->held_mutex == &core_context.mutex_dyndump && current_helper && fillblock_active)
     {
-        extern void CancelBlock64(int);
         extern void cancelFillBlock(void);
 #ifdef __SWITCH__
         extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
@@ -207,18 +260,19 @@ BOOL wine_nx_box64_handle_fault( ULONG_PTR address, ULONG access, ULONG_PTR pc,
             wine_nx_runtime_trace( msg );
         }
 #endif
-        CancelBlock64( 0 );
         cancelFillBlock();
     }
     /* The guest's own fault, which its exception handlers are to see: in
      * translated code the x86 state is in the native registers, as Box64's
      * copyUCTXreg2Emu takes it, and the instruction is the one the block maps
      * the native pc to. */
-    if (x && active_engine->dynarec) recover_translated_state( &active_engine->emu, pc, x );
+    if (active_engine->is32bits && x && active_engine->dynarec)
+        recover_translated_state( &active_engine->emu, pc, x );
 #else
     (void)pc; (void)x;  /* the interpreter keeps each instruction's state as it goes */
 #endif
-    stop_fault( &active_engine->emu, address, access );
+    if (active_engine->is32bits) stop_fault( &active_engine->emu, address, access );
+    stop_engine( &active_engine->emu, STATUS_ACCESS_VIOLATION );
     return TRUE;
 }
 
@@ -242,6 +296,15 @@ int wine_nx_box64_mutex_lock( pthread_mutex_t *mutex )
     return ret;
 }
 
+#ifdef WINE_NX_BOX64_DYNAREC
+/* Whether this thread is the translator: a purge frees blocks, which only the
+ * holder of Box64's translator lock may do without taking it again. */
+int wine_nx_box64_holds_translator_lock(void)
+{
+    return active_engine && active_engine->held_mutex == &core_context.mutex_dyndump;
+}
+#endif
+
 int wine_nx_box64_mutex_unlock( pthread_mutex_t *mutex )
 {
     int ret = pthread_mutex_unlock( mutex );
@@ -259,10 +322,17 @@ int wine_nx_box64_before_instruction( x64emu_t *emu, uintptr_t pc )
     unsigned int prefix;
     NTSTATUS status;
     emu->ip.q[0] = pc;
-    if (emu->segs[_CS] != 0x23) stop_engine( emu, STATUS_NOT_SUPPORTED );
-    if (pc > 0xffffffffu) stop_fault( emu, 0xffffffffu, 8 );
-    if (pc == engine->gates->syscall || pc == engine->gates->unix_call ||
-        (engine->completion && pc == engine->completion))
+    if ((engine->is32bits && emu->segs[_CS] != 0x23) ||
+        (!engine->is32bits && emu->segs[_CS] != 0x33))
+        stop_engine( emu, STATUS_NOT_SUPPORTED );
+    if (!guest_address_valid( engine, pc, 1 ))
+    {
+        if (engine->is32bits) stop_fault( emu, pc > UINT32_MAX ? UINT32_MAX : pc, 8 );
+        stop_engine( emu, STATUS_ACCESS_VIOLATION );
+    }
+    if ((engine->is32bits &&
+         (pc == engine->gates->syscall || pc == engine->gates->unix_call ||
+          (engine->completion && pc == engine->completion))) || amd64_stop_address( engine, pc ))
     {
         /* Box64's EmuRun would only ask for the next block again: end the run. */
         if (engine->dynarec) stop_engine( emu, STATUS_SUCCESS );
@@ -274,17 +344,24 @@ int wine_nx_box64_before_instruction( x64emu_t *emu, uintptr_t pc )
      * executing them, including when an instruction has legacy prefixes. */
     for (prefix = 0; prefix < 15; ++prefix)
     {
-        if (pc + prefix > 0xffffffffu) stop_fault( emu, 0xffffffffu, 8 );
+        if (!guest_address_valid( engine, pc, prefix + 1 ))
+        {
+            if (engine->is32bits)
+                stop_fault( emu, pc + prefix > UINT32_MAX ? UINT32_MAX : pc + prefix, 8 );
+            stop_engine( emu, STATUS_ACCESS_VIOLATION );
+        }
         status = fetch_code_byte( engine, pc + prefix, &opcode );
         if (status == STATUS_ACCESS_VIOLATION) stop_fault( emu, pc + prefix, 8 );
         if (status) stop_engine( emu, status );
         if (opcode != 0x26 && opcode != 0x2e && opcode != 0x36 && opcode != 0x3e &&
             opcode != 0x64 && opcode != 0x65 && opcode != 0x66 && opcode != 0x67 &&
-            opcode != 0xf0 && opcode != 0xf2 && opcode != 0xf3) break;
+            opcode != 0xf0 && opcode != 0xf2 && opcode != 0xf3 &&
+            (engine->is32bits || opcode < 0x40 || opcode > 0x4f)) break;
     }
     if (prefix == 15) stop_engine( emu, STATUS_ILLEGAL_INSTRUCTION );
     /* VEX (AVX) is not advertised; LES/LDS share these opcodes in 32-bit mode. */
-    if (opcode == 0xc4 || opcode == 0xc5) stop_engine( emu, STATUS_NOT_SUPPORTED );
+    if (opcode == 0xc4 || opcode == 0xc5 || (!engine->is32bits && opcode == 0x62))
+        stop_engine( emu, STATUS_NOT_SUPPORTED );
     --engine->remaining;
     ++engine->executed;
     return 0;
@@ -295,9 +372,14 @@ void CheckExec( x64emu_t *emu, uintptr_t pc )
     struct nx_engine *engine = (struct nx_engine *)emu;
     unsigned char byte;
     NTSTATUS status;
-    if (pc > 0xffffffffu) stop_fault( emu, 0xffffffffu, 8 );
-    if (pc == engine->gates->syscall || pc == engine->gates->unix_call ||
-        (engine->completion && pc == engine->completion)) return;
+    if (!guest_address_valid( engine, pc, 1 ))
+    {
+        if (engine->is32bits) stop_fault( emu, pc > UINT32_MAX ? UINT32_MAX : pc, 8 );
+        stop_engine( emu, STATUS_ACCESS_VIOLATION );
+    }
+    if ((engine->is32bits &&
+         (pc == engine->gates->syscall || pc == engine->gates->unix_call ||
+          (engine->completion && pc == engine->completion))) || amd64_stop_address( engine, pc )) return;
     status = fetch_code_byte( engine, pc, &byte );
     if (status == STATUS_ACCESS_VIOLATION) stop_fault( emu, pc, 8 );
     if (status) stop_engine( emu, status );
@@ -317,7 +399,11 @@ void EmitInterruption( x64emu_t *emu, int num, void *addr )
 {
     (void)num; (void)addr; stop_engine( emu, STATUS_ILLEGAL_INSTRUCTION );
 }
-void EmuX64Syscall( void *emu ) { stop_engine( emu, STATUS_NOT_SUPPORTED ); }
+void EmuX64Syscall( void *emu )
+{
+    struct nx_engine *engine = emu;
+    stop_engine( emu, engine->is32bits ? STATUS_NOT_SUPPORTED : STATUS_EMULATION_SYSCALL );
+}
 void EmuX86Syscall( void *emu ) { stop_engine( emu, STATUS_NOT_SUPPORTED ); }
 void EmuInt3( void *emu, void *addr ) { (void)addr; stop_engine( emu, STATUS_BREAKPOINT ); }
 void *EmuFork( void *emu, int type )
@@ -325,6 +411,12 @@ void *EmuFork( void *emu, int type )
     (void)type; stop_engine( emu, STATUS_NOT_SUPPORTED ); return NULL;
 }
 void *getAlternate( void *address ) { return address; }
+uintptr_t getAlternateJump( void *address, int is32bits )
+{
+    (void)address; (void)is32bits; return 0;
+}
+void *getAlternateData( void *address ) { (void)address; return (void *)-1LL; }
+void setAlternateData( void *address, void *data ) { (void)address; (void)data; }
 int GetTID(void) { return 0; } /* interpreter diagnostics only */
 void PrintfFtrace( int prefix, const char *format, ... )
 {
@@ -335,8 +427,10 @@ void PrintfFtrace( int prefix, const char *format, ... )
 void *GetSegmentBase( void *opaque, uint32_t selector )
 {
     struct nx_engine *engine = opaque;
-    if (selector == engine->emu.segs[_FS]) return (void *)(uintptr_t)engine->fs_base;
-    if (selector == engine->emu.segs[_GS]) return NULL;
+    if (engine->is32bits && selector == engine->emu.segs[_FS]) return (void *)engine->fs_base;
+    if (!engine->is32bits && selector == engine->emu.segs[_GS]) return (void *)engine->gs_base;
+    if (selector == engine->emu.segs[_FS]) return (void *)engine->fs_base;
+    if (selector == engine->emu.segs[_GS]) return (void *)engine->gs_base;
     stop_engine( opaque, STATUS_NOT_SUPPORTED );
     return NULL;
 }
@@ -344,11 +438,15 @@ void *GetSeg43Base( void *emu ) { stop_engine( emu, STATUS_NOT_SUPPORTED ); retu
 
 /* The CPU identity is shared with winebox64 (dlls/winebox64/cpuid.h), so CPUID,
  * IsProcessorFeaturePresent and GetSystemInfo describe the same processor. */
-void my_cpuid( x64emu_t *emu, uint32_t leaf )
+void my_cpuid( x64emu_t *emu )
 {
+    struct nx_engine *engine = (struct nx_engine *)emu;
     static const char vendor[12] = {'G','e','n','u','i','n','e','I','n','t','e','l'};
-    static const char brand[48] = "Wine-NX Box64 i386 interpreter";
+    static const char brand32[48] = "Wine-NX Box64 i386 interpreter";
+    static const char brand64[48] = "Wine-NX Box64 AMD64 engine";
+    const char *brand = engine->is32bits ? brand32 : brand64;
     uint32_t regs[4] = {0}; /* eax, ebx, ecx, edx */
+    uint32_t leaf = emu->regs[_AX].dword[0];
 
     switch (leaf)
     {
@@ -365,6 +463,9 @@ void my_cpuid( x64emu_t *emu, uint32_t leaf )
         break;
     case 0x80000000:
         regs[0] = 0x80000004;
+        break;
+    case 0x80000001:
+        if (!engine->is32bits) regs[3] = 1u << 29;
         break;
     case 0x80000002: case 0x80000003: case 0x80000004:
         memcpy( regs, brand + (leaf - 0x80000002) * 16, 16 );
@@ -474,6 +575,98 @@ static NTSTATUS export_context( struct nx_engine *engine, I386_CONTEXT *ctx )
     return STATUS_SUCCESS;
 }
 
+static void import_fpu_amd64( x64emu_t *emu, const AMD64_CONTEXT *ctx )
+{
+    unsigned int logical, top = (ctx->FltSave.StatusWord >> 11) & 7;
+
+    emu->cw.x16 = ctx->FltSave.ControlWord;
+    emu->sw.x16 = ctx->FltSave.StatusWord;
+    emu->top = top;
+    emu->fpu_tags = TAGS_EMPTY;
+    emu->fpu_stack = 0;
+    emu->mxcsr.x32 = ctx->MxCsr;
+    for (logical = 0; logical < 8; logical++)
+    {
+        unsigned int physical = (top + logical) & 7;
+
+        if (!(ctx->FltSave.TagWord & (1u << physical))) continue;
+        emu->fpu_tags &= ~(UINT64_C(3) << (logical * 2));
+        LD2D( (void *)&ctx->FltSave.FloatRegisters[logical], &emu->x87[physical].d );
+        fpu_ld80_clear( emu, logical );
+        emu->fpu_stack++;
+    }
+    memcpy( emu->xmm, ctx->FltSave.XmmRegisters, sizeof(emu->xmm) );
+}
+
+static void export_fpu_amd64( x64emu_t *emu, AMD64_CONTEXT *ctx )
+{
+    unsigned int logical, top = emu->top & 7;
+    BYTE tags = 0;
+
+    emu->sw.f.F87_TOP = top;
+    ctx->FltSave.ControlWord = emu->cw.x16;
+    ctx->FltSave.StatusWord = emu->sw.x16;
+    ctx->FltSave.MxCsr = ctx->MxCsr = emu->mxcsr.x32;
+    for (logical = 0; logical < 8; logical++)
+    {
+        unsigned int physical;
+
+        if ((emu->fpu_tags >> (logical * 2)) & 3) continue;
+        physical = (top + logical) & 7;
+        tags |= 1u << physical;
+        D2LD( &emu->x87[physical].d, &ctx->FltSave.FloatRegisters[logical] );
+    }
+    ctx->FltSave.TagWord = tags;
+    memcpy( ctx->FltSave.XmmRegisters, emu->xmm, sizeof(emu->xmm) );
+}
+
+static NTSTATUS import_context_amd64( struct nx_engine *engine, const AMD64_CONTEXT *ctx )
+{
+    x64emu_t *emu = &engine->emu;
+
+    if ((WORD)ctx->SegCs != 0x33 ||
+        (ctx->ContextFlags & CONTEXT_AMD64_XSTATE) == CONTEXT_AMD64_XSTATE)
+        return STATUS_NOT_SUPPORTED;
+    emu->regs[_AX].q[0] = ctx->Rax; emu->regs[_BX].q[0] = ctx->Rbx;
+    emu->regs[_CX].q[0] = ctx->Rcx; emu->regs[_DX].q[0] = ctx->Rdx;
+    emu->regs[_SI].q[0] = ctx->Rsi; emu->regs[_DI].q[0] = ctx->Rdi;
+    emu->regs[_SP].q[0] = ctx->Rsp; emu->regs[_BP].q[0] = ctx->Rbp;
+    emu->regs[_R8].q[0] = ctx->R8; emu->regs[_R9].q[0] = ctx->R9;
+    emu->regs[_R10].q[0] = ctx->R10; emu->regs[_R11].q[0] = ctx->R11;
+    emu->regs[_R12].q[0] = ctx->R12; emu->regs[_R13].q[0] = ctx->R13;
+    emu->regs[_R14].q[0] = ctx->R14; emu->regs[_R15].q[0] = ctx->R15;
+    emu->ip.q[0] = ctx->Rip; emu->eflags.x64 = ctx->EFlags;
+    emu->df = d_none;
+    emu->segs[_CS] = ctx->SegCs; emu->segs[_SS] = ctx->SegSs;
+    emu->segs[_DS] = ctx->SegDs; emu->segs[_ES] = ctx->SegEs;
+    emu->segs[_FS] = ctx->SegFs; emu->segs[_GS] = ctx->SegGs;
+    emu->segs_offs[_FS] = engine->fs_base;
+    emu->segs_offs[_GS] = engine->gs_base;
+    import_fpu_amd64( emu, ctx );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS export_context_amd64( struct nx_engine *engine, AMD64_CONTEXT *ctx )
+{
+    x64emu_t *emu = &engine->emu;
+
+    UpdateFlags( emu );
+    ctx->Rax = emu->regs[_AX].q[0]; ctx->Rbx = emu->regs[_BX].q[0];
+    ctx->Rcx = emu->regs[_CX].q[0]; ctx->Rdx = emu->regs[_DX].q[0];
+    ctx->Rsi = emu->regs[_SI].q[0]; ctx->Rdi = emu->regs[_DI].q[0];
+    ctx->Rsp = emu->regs[_SP].q[0]; ctx->Rbp = emu->regs[_BP].q[0];
+    ctx->R8 = emu->regs[_R8].q[0]; ctx->R9 = emu->regs[_R9].q[0];
+    ctx->R10 = emu->regs[_R10].q[0]; ctx->R11 = emu->regs[_R11].q[0];
+    ctx->R12 = emu->regs[_R12].q[0]; ctx->R13 = emu->regs[_R13].q[0];
+    ctx->R14 = emu->regs[_R14].q[0]; ctx->R15 = emu->regs[_R15].q[0];
+    ctx->Rip = emu->ip.q[0]; ctx->EFlags = emu->eflags.x64;
+    ctx->SegCs = emu->segs[_CS]; ctx->SegSs = emu->segs[_SS];
+    ctx->SegDs = emu->segs[_DS]; ctx->SegEs = emu->segs[_ES];
+    ctx->SegFs = emu->segs[_FS]; ctx->SegGs = emu->segs[_GS];
+    export_fpu_amd64( emu, ctx );
+    return STATUS_SUCCESS;
+}
+
 #ifdef WINE_NX_BOX64_DYNAREC
 /* For [PROGRESS]: unix calls made without leaving Box64's EmuRun. */
 unsigned int wine_nx_box64_inline_unix_calls;
@@ -563,9 +756,17 @@ int wine_nx_box64_stop_at( x64emu_t *emu, uintptr_t pc )
     struct nx_engine *engine = (struct nx_engine *)emu;
 
     if (!engine->dynarec) return 0;
+    if (!engine->is32bits) return amd64_stop_address( engine, pc );
     if (pc == engine->gates->unix_call && engine->host->unix_call) return !inline_unix_call( engine );
     return pc == engine->gates->syscall || pc == engine->gates->unix_call ||
            (engine->completion && pc == engine->completion);
+}
+
+int wine_nx_box64_link_stop_at( x64emu_t *emu, uintptr_t pc )
+{
+    struct nx_engine *engine = (struct nx_engine *)emu;
+
+    return engine->dynarec && amd64_stop_address( engine, pc );
 }
 #endif
 
@@ -585,6 +786,13 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
     int use_dynarec;
 #endif
     if (executed) *executed = 0;
+#ifdef WINE_NX_BOX64_DYNAREC
+    {
+        /* Every return from a gate moves the dynarec's purge clock on. */
+        extern void wine_nx_box64_purge_clock( void );
+        wine_nx_box64_purge_clock();
+    }
+#endif
     if (!context || !gates || !host || !host->read || !gates->syscall ||
         !gates->unix_call || gates->syscall == gates->unix_call || !budget ||
         completion_pc == gates->syscall || completion_pc == gates->unix_call)
@@ -604,6 +812,7 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
     __atomic_add_fetch( &wine_nx_box64_live_engines, 1, __ATOMIC_RELAXED );
     engine->gates = gates; engine->host = host; engine->opaque = opaque;
     engine->context = context; engine->previous = previous;
+    engine->is32bits = 1; engine->address_limit = UINT64_C(0x100000000);
     engine->fs_base = fs_base; engine->completion = completion_pc; engine->remaining = budget;
     engine->code_page = 1;
     engine->emu.context = &core_context;
@@ -623,10 +832,7 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
         status = import_context( engine, context );
         if (status) break;
 #ifdef WINE_NX_BOX64_DYNAREC
-        /* Box64 maps guest R8 to x18, which holds the TEB on Switch. A 32-bit
-         * guest never uses R8, so parking the TEB there keeps x18 intact
-         * through the prolog, helper calls and the epilog. */
-        engine->emu.regs[_R8].q[0] = current_x18();
+        engine->emu.win64_teb = current_x18();
 #endif
         fegetenv( &native_fenv );
 #ifdef WINE_NX_BOX64_DYNAREC
@@ -672,6 +878,95 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
             break;
         status = wine_nx_wow64_dispatch_gate( context, gates, host, opaque );
         if (status) break;
+    }
+    if (executed) *executed = engine->executed;
+    __atomic_add_fetch( &wine_nx_box64_executed_total, engine->executed, __ATOMIC_RELAXED );
+    __atomic_add_fetch( &wine_nx_box64_runs_total, 1, __ATOMIC_RELAXED );
+    if (slot < NX_CACHED_ENGINES) cached_engine_busy[slot] = 0;
+    else free( engine );
+    __atomic_sub_fetch( &wine_nx_box64_live_engines, 1, __ATOMIC_RELAXED );
+    return status;
+}
+
+NTSTATUS wine_nx_box64_run_amd64( AMD64_CONTEXT *context, ULONG_PTR gs_base,
+                                 struct wine_nx_amd64_state *state,
+                                 const struct wine_nx_amd64_host *host, void *opaque,
+                                 ULONG_PTR completion, ULONGLONG budget, ULONGLONG *executed )
+{
+    static uint32_t parity[8] = {0x96696996,0x69969669,0x69969669,0x96696996,
+                                0x69969669,0x96696996,0x96696996,0x69969669};
+    struct nx_engine *engine, *previous = active_engine;
+    NTSTATUS status;
+    fenv_t native_fenv;
+    unsigned int slot;
+    int i;
+#ifdef WINE_NX_BOX64_DYNAREC
+    int use_dynarec;
+#endif
+
+    if (executed) *executed = 0;
+    if (!context || !state || !host || !host->read || !host->is_native ||
+        !host->address_limit || !budget ||
+        gs_base >= host->address_limit || (completion && completion >= host->address_limit))
+        return STATUS_INVALID_PARAMETER;
+    for (slot = 0; slot < NX_CACHED_ENGINES && cached_engine_busy[slot]; slot++) continue;
+    if (slot < NX_CACHED_ENGINES)
+    {
+        cached_engine_busy[slot] = 1;
+        engine = &cached_engines[slot];
+        memset( engine, 0, offsetof( struct nx_engine, emu.scratch ) );
+        memset( &engine->emu.scratch[N_SCRATCH], 0,
+                sizeof(*engine) - offsetof( struct nx_engine, emu.scratch[N_SCRATCH] ) );
+    }
+    else if (!(engine = calloc( 1, sizeof(*engine) ))) return STATUS_NO_MEMORY;
+    __atomic_add_fetch( &wine_nx_box64_live_engines, 1, __ATOMIC_RELAXED );
+    engine->amd64_host = host; engine->opaque = opaque; engine->amd64_context = context;
+    engine->previous = previous; engine->gs_base = gs_base; engine->completion = completion;
+    engine->address_limit = host->address_limit; engine->remaining = budget; engine->code_page = 1;
+    engine->emu.context = &core_context;
+    engine->emu.x64emu_parity_tab = parity;
+    for (i = 0; i < 16; ++i) engine->emu.sbiidx[i] = &engine->emu.regs[i];
+    engine->emu.sbiidx[4] = &engine->emu.zero;
+    reset_fpu( &engine->emu );
+#ifdef WINE_NX_BOX64_DYNAREC
+    use_dynarec = wine_nx_box64_dynarec_init();
+    if (completion) wine_nx_box64_invalidate( completion, 1, 1 );
+#endif
+    status = import_context_amd64( engine, context );
+    memcpy( engine->emu.mmx, state->mmx, sizeof(state->mmx) );
+    if (!status)
+    {
+#ifdef WINE_NX_BOX64_DYNAREC
+        engine->emu.win64_teb = current_x18();
+#endif
+        fegetenv( &native_fenv );
+#ifdef WINE_NX_BOX64_DYNAREC
+        engine->native_fpcr = __builtin_aarch64_get_fpcr();
+#endif
+        active_engine = engine;
+#ifdef __SWITCH__
+        if (!setjmp( engine->escape ))
+#else
+        if (!sigsetjmp( engine->escape, 1 ))
+#endif
+        {
+#ifdef WINE_NX_BOX64_DYNAREC
+            engine->dynarec = use_dynarec;
+            if (use_dynarec) DynaRun( &engine->emu );
+            else
+#endif
+            Run( &engine->emu, 0 );
+        }
+        active_engine = previous;
+        if (engine->held_mutex)
+        {
+            pthread_mutex_unlock( engine->held_mutex );
+            engine->held_mutex = NULL;
+        }
+        fesetenv( &native_fenv );
+        status = export_context_amd64( engine, context );
+        memcpy( state->mmx, engine->emu.mmx, sizeof(state->mmx) );
+        if (engine->status) status = engine->status;
     }
     if (executed) *executed = engine->executed;
     __atomic_add_fetch( &wine_nx_box64_executed_total, engine->executed, __ATOMIC_RELAXED );

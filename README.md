@@ -64,12 +64,14 @@ with **Settings -> System -> Make an Autorun forwarder** and start it from there
 
 ## Adding games
 
-> **Warning:** You must copy `d3d9.dll` from the dxvk folder into all game folders.
-
 1. Copy the game's folder into `switch/wine/drive_c` on the SD card. That
    folder is the game's `C:` drive.
 2. In Autorun, press **+** -> **Add game** and choose the game's `.exe`.
 3. Press **A** to play.
+
+Adding a game enables DXVK, which draws Direct3D games through the Switch's
+Vulkan driver. To keep new games on WineD3D, turn off **Settings -> Give a new
+game DXVK**.
 
 **WarCraft III** needs a one-time setup, which Autorun includes: run
 `C:\WarCraft III Setup\war3-setup.exe` once before playing. Its folder has a
@@ -79,7 +81,7 @@ with **Settings -> System -> Make an Autorun forwarder** and start it from there
 
 Some games read a settings file that their own installer or launcher normally
 writes, and refuse to start without it. Autorun ships those files, in the same
-place Windows keeps them: `switch/wine/drive_c/users/wine/Documents` on the
+place Windows keeps them: `switch/wine/drive_c/users/steamuser/Documents` on the
 card, which a game sees as its Documents folder.
 
 **Fallout: New Vegas** is one. With no settings of its own it decides it does
@@ -96,6 +98,11 @@ A few older games only work when loaded at fixed low memory addresses - Need for
 Speed Underground 2 and Halo are two. Autorun notices when a game needs this and
 offers to set it up: **Settings -> System -> Make a 32-bit forwarder** adds an
 "Autorun 32-bit" icon to the HOME menu. Start those games from that icon.
+
+It works the other way too: a game that does not need it is sent from "Autorun
+32-bit" to the Autorun icon (made with **Make an Autorun forwarder**), since in
+32 bits large games run out of memory and close. To keep a game in "Autorun
+32-bit" anyway, set **Address space** to 32-bit in its options.
 
 ## Using the launcher
 
@@ -139,10 +146,14 @@ or W A S D. Games with controller support see an Xbox 360 controller.
 
 ## If something goes wrong
 
-Every run leaves two logs in `switch/wine` on the SD card:
+Every run leaves its logs in `switch/wine/logs` on the SD card:
 
-- `wine-nx-runtime.log` - the last run, whatever it was.
-- `game-NAME.log` - the last run of that game, kept per game.
+- `autorun_runtime.log` - the last run, whatever it was.
+- `NAME.log` - the last run of that game, kept per game. A run with verbose
+  traces or the profiler on gets its own file, such as `NAME_verbose.log` or
+  `NAME_verbose_profiler.log`, so it doesn't replace the plain one.
+- `stdout.txt`, `stderr.txt` and `stdin.txt` - the program's standard output,
+  error and input. What a program writes to them is also in its log.
 
 When reporting a problem, include the game's log and say what you saw. Turning
 on **Verbose traces** in the game's options gives more detail, at some speed

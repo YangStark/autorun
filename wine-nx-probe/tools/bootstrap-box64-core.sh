@@ -2,7 +2,7 @@
 set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 vendor="$root/vendor/box64"
-revision=dae0917c47b4edd8956f314210417a20fd225c4b
+revision=2f130fab1d6e1a4ee8a71dc60cfdfcc839ad192a
 if [ ! -d "$vendor/.git" ]; then
     if [ -e "$vendor" ]; then
         echo "Refusing to overwrite $vendor" >&2

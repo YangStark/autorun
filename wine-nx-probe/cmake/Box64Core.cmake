@@ -1,4 +1,4 @@
-# Box64 v0.4.0 execution core only. No ELF loader, Linux syscalls, or wrappers.
+# Box64 v0.4.4 execution core only. No ELF loader, Linux syscalls, or wrappers.
 #
 #   wine_nx_add_box64_core(<target> [DYNAREC])
 #
@@ -22,7 +22,7 @@ function(wine_nx_add_box64_core target)
     set(root "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../vendor/box64")
     execute_process(COMMAND git -C "${root}" rev-parse HEAD
         OUTPUT_VARIABLE revision OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE result)
-    if(NOT result EQUAL 0 OR NOT revision STREQUAL "dae0917c47b4edd8956f314210417a20fd225c4b")
+    if(NOT result EQUAL 0 OR NOT revision STREQUAL "2f130fab1d6e1a4ee8a71dc60cfdfcc839ad192a")
         message(FATAL_ERROR "Run wine-nx-probe/tools/bootstrap-box64-core.sh first")
     endif()
     execute_process(COMMAND git -C "${root}" status --porcelain
@@ -41,6 +41,7 @@ function(wine_nx_add_box64_core target)
         x64run_private.c x64primop.c x87emu_private.c x64compstrings.c
         x64shaext.c x64emu.c)
     list(TRANSFORM sources PREPEND "${root}/src/emu/")
+    list(APPEND sources "${root}/src/tools/bitutils.c")
 
     # Keep the vendored revision untouched. The only interpreter change is a
     # before-fetch hook; assert its insertion point against the pinned source.
@@ -55,11 +56,24 @@ function(wine_nx_add_box64_core target)
     set(generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-x64run.c")
     file(WRITE "${generated}" "${run_source}")
 
+    file(READ "${root}/src/emu/x64emu_private.h" emu_header)
+    wine_nx_box64_patch(emu_header
+        "    #ifdef _WIN32\n    uint64_t    win64_teb;\n    #endif"
+        "    #if defined(_WIN32) || defined(WINE_NX_BOX64_X18_TLS)\n    uint64_t    win64_teb;\n    #endif"
+        "host TLS storage")
+    string(PREPEND emu_header "#include <stdint.h>\n")
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Generic")
+        string(PREPEND emu_header "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n")
+    endif()
+    set(emu_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-x64emu_private.h")
+    file(WRITE "${emu_generated}" "${emu_header}")
+
     # Settings shared by the core and the per-pass dynarec objects.
     add_library(${target}-settings INTERFACE)
     target_include_directories(${target}-settings SYSTEM INTERFACE "${root}/src/include" "${root}/src"
         "${root}/src/emu" "${root}/src/wrapped/generated")
-    target_compile_definitions(${target}-settings INTERFACE ARM64 CONFIG_64BIT STATICBUILD)
+    target_compile_definitions(${target}-settings INTERFACE ARM64 CONFIG_64BIT STATICBUILD
+        WINE_NX_BOX64_X18_TLS)
     target_compile_options(${target}-settings INTERFACE -ffixed-x18)
     if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
         target_include_directories(${target}-settings SYSTEM INTERFACE
@@ -73,19 +87,7 @@ function(wine_nx_add_box64_core target)
         pthread_mutex_lock=wine_nx_box64_mutex_lock
         pthread_mutex_unlock=wine_nx_box64_mutex_unlock)
 
-    add_library(${target} STATIC ${sources} "${generated}")
-    target_link_libraries(${target} PUBLIC ${target}-settings)
-    target_compile_definitions(${target} PRIVATE ${private_definitions})
-    target_compile_options(${target} PRIVATE ${private_options})
-
-    if(NOT core_DYNAREC)
-        return()
-    endif()
-
-    if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
-        # Newlib has no glibc jump-buffer layout or POSIX signal context.
-        # The Horizon exception boundary owns recovery; retain real setjmp
-        # storage for Box64's internal control flow without Linux ABI types.
+    if(core_DYNAREC AND CMAKE_SYSTEM_NAME STREQUAL "Generic")
         file(READ "${root}/src/include/os.h" os_source)
         wine_nx_box64_patch(os_source "#define LongJmp longjmp"
             "#define LongJmp(a, b) longjmp((a)->state, b)" "Horizon longjmp")
@@ -95,7 +97,27 @@ function(wine_nx_add_box64_core target)
             "#define JUMPBUFF struct wine_nx_jump_buffer" "Horizon jump buffer")
         set(os_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-os.h")
         file(WRITE "${os_generated}" "${os_source}")
-        target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:C>:-include${os_generated}>")
+    endif()
+
+    add_library(${target} STATIC ${sources} "${generated}")
+    target_link_libraries(${target} PUBLIC ${target}-settings)
+    target_compile_definitions(${target} PRIVATE ${private_definitions})
+    target_compile_options(${target} PRIVATE ${private_options})
+    if(os_generated)
+        target_compile_options(${target} PRIVATE
+            "$<$<COMPILE_LANGUAGE:C>:-include${os_generated}>"
+            "$<$<COMPILE_LANGUAGE:C>:-include${emu_generated}>")
+    else()
+        target_compile_options(${target} PRIVATE
+            "$<$<COMPILE_LANGUAGE:C>:-include${emu_generated}>")
+    endif()
+    set_source_files_properties(
+        "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../source/wow64_box64_engine.c"
+        "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../source/wow64_box64_dynarec.c"
+        PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:C>:-include${emu_generated}>")
+
+    if(NOT core_DYNAREC)
+        return()
     endif()
 
     # ARM64 dynarec: the same file set Box64's CMakeLists.txt uses for
@@ -106,8 +128,8 @@ function(wine_nx_add_box64_core target)
     list(REMOVE_ITEM dynarec_sources "${root}/src/dynarec/dynablock.c")
     file(READ "${root}/src/dynarec/dynablock.c" dynablock_source)
     wine_nx_box64_patch(dynablock_source
-        "        //if (db->always_test) SchedYield(); // just calm down...\n        uint32_t hash = X31_hash_code(db->x64_addr, db->x64_size);"
-        "        //if (db->always_test) SchedYield(); // just calm down...\n        extern unsigned int wine_nx_box64_block_tests;\n        __atomic_add_fetch(&wine_nx_box64_block_tests, 1, __ATOMIC_RELAXED);\n        uint32_t hash = X31_hash_code(db->x64_addr, db->x64_size);"
+        "        //if (db->always_test) SchedYield(); // just calm down...\n        uint32_t hash = X31_hash_code((void*)db->x64_readaddr, db->x64_size);"
+        "        //if (db->always_test) SchedYield(); // just calm down...\n        extern unsigned int wine_nx_box64_block_tests;\n        __atomic_add_fetch(&wine_nx_box64_block_tests, 1, __ATOMIC_RELAXED);\n        uint32_t hash = X31_hash_code((void*)db->x64_readaddr, db->x64_size);"
         "count block validations")
     # CALLRET marks a block's return sites ARCH_UDF when the block may have
     # changed and ARCH_NOP once it is checked, in place: through the writable
@@ -115,6 +137,16 @@ function(wine_nx_add_box64_core target)
     # block dirty also flushes the caches, as every other rewrite does; a
     # stale fetch would run the NOP and return into changed code unchecked.
     string(PREPEND dynablock_source "void* DynarecMapWritableAddress(void* addr);\n")
+    # Translation is not free: the passes that decide how large a block will be
+    # run before it asks the arenas for room. Once the last code memory object
+    # is full every entry into untranslated code translated it again, threw the
+    # work away and interpreted it -- the main thread of The Sims 2 spent all
+    # of its time in the translator. A block that already exists is still
+    # returned; only new ones are refused, and those are interpreted.
+    wine_nx_box64_patch(dynablock_source
+        "        return block;\n    }\n\n    #ifndef WIN32"
+        "        return block;\n    }\n    {\n        extern int wine_nx_box64_code_room(void);\n        if(!wine_nx_box64_code_room())\n            return NULL;\n    }\n\n    #ifndef WIN32"
+        "no translation without room for the block")
     # Every system call and unix call ends at a gate, which is on a page the
     # dynarec may not translate. Box64 finds that out only after taking the
     # global translator lock, twice per gate (LinkNext, then EmuRun), so every
@@ -124,14 +156,8 @@ function(wine_nx_add_box64_core target)
         "    pthread_sigmask(SIG_BLOCK, &critical_prot, &old_sig);\n    if(need_lock) {"
         "    if((getProtection_fast(addr)&req_prot)!=req_prot)\n        return NULL;\n    pthread_sigmask(SIG_BLOCK, &critical_prot, &old_sig);\n    if(need_lock) {"
         "refuse untranslatable pages before the translator lock")
-    wine_nx_box64_patch(dynablock_source
-        "                *(uint32_t*)(db->block+db->callrets[i].offs) = ARCH_UDF;\n        }\n        #endif\n    }\n}"
-        "                *(uint32_t*)(db->block+db->callrets[i].offs) = ARCH_UDF;\n            ClearCache(db->block, db->size);\n        }\n        #endif\n    }\n}"
-        "flush callret marks of dirty blocks")
     wine_nx_box64_patch(dynablock_source "*(uint32_t*)(db->block+db->callrets[i].offs)"
         "*(uint32_t*)DynarecMapWritableAddress(db->block+db->callrets[i].offs)" "callret site writes")
-    wine_nx_box64_patch(dynablock_source "*(uint32_t*)(db_new->block+db_new->callrets[i].offs)"
-        "*(uint32_t*)DynarecMapWritableAddress(db_new->block+db_new->callrets[i].offs)" "callret site writes on switch")
     set(dynablock_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-dynablock.c")
     file(WRITE "${dynablock_generated}" "${dynablock_source}")
     list(APPEND dynarec_sources "${dynablock_generated}")
@@ -144,11 +170,15 @@ function(wine_nx_add_box64_core target)
     # A gate or the run's completion address ends the run before the block
     # lookup: otherwise it fails, and the interpreter starts only for its hook
     # to stop the run again and unwind with longjmp.
-    wine_nx_box64_patch(dispatch_source "            dynablock_t* block = (skip)?NULL:DBGetBlock(emu, R_RIP, 1, is32bits);"
-        "            extern int wine_nx_box64_stop_at(x64emu_t* emu, uintptr_t pc);\n            if(wine_nx_box64_stop_at(emu, R_RIP))\n                break;\n            dynablock_t* block = (skip)?NULL:DBGetBlock(emu, R_RIP, 1, is32bits);"
+    wine_nx_box64_patch(dispatch_source "            dynablock_t* block = (skip || ACCESS_FLAG(F_TF))?NULL:fastDBGetBlock(emu, R_RIP, 1, is32bits);"
+        "            extern int wine_nx_box64_stop_at(x64emu_t* emu, uintptr_t pc);\n            if(wine_nx_box64_stop_at(emu, R_RIP))\n                break;\n            dynablock_t* block = (skip || ACCESS_FLAG(F_TF))?NULL:fastDBGetBlock(emu, R_RIP, 1, is32bits);"
         "end runs at gates without a block lookup")
-    wine_nx_box64_patch(dispatch_source "                native_prolog(emu, block->block);"
-        "                extern unsigned long long wine_nx_box64_native_entries;\n                __atomic_add_fetch(&wine_nx_box64_native_entries, 1, __ATOMIC_RELAXED);\n                native_prolog(emu, block->block);" "count native dispatch entries")
+    wine_nx_box64_patch(dispatch_source
+        "void* LinkNext(x64emu_t* emu, uintptr_t addr, void* x2, uintptr_t* x3)\n{\n    int is32bits = (R_CS == 0x23);"
+        "void* LinkNext(x64emu_t* emu, uintptr_t addr, void* x2, uintptr_t* x3)\n{\n    extern int wine_nx_box64_link_stop_at(x64emu_t*, uintptr_t);\n    if(wine_nx_box64_link_stop_at(emu, addr)) return native_epilog;\n    int is32bits = (R_CS == 0x23);"
+        "end AMD64 runs before linking native targets")
+    wine_nx_box64_patch(dispatch_source "                } else\n                    native_prolog(emu, jblock);"
+        "                } else {\n                    extern unsigned long long wine_nx_box64_native_entries;\n                    __atomic_add_fetch(&wine_nx_box64_native_entries, 1, __ATOMIC_RELAXED);\n                    native_prolog(emu, jblock);\n                }" "count native dispatch entries")
     set(dispatch_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-dynarec.c")
     file(WRITE "${dispatch_generated}" "${dispatch_source}")
     list(APPEND dynarec_sources "${dispatch_generated}")
@@ -181,6 +211,26 @@ function(wine_nx_add_box64_core target)
         dynarec_arm64_avx_f3_0f38.c updateflags_arm64_pass.c)
     list(TRANSFORM pass_sources PREPEND "${root}/src/dynarec/arm64/")
     list(APPEND pass_sources "${root}/src/dynarec/dynarec_native_pass.c")
+
+    list(REMOVE_ITEM pass_sources "${root}/src/dynarec/dynarec_native_pass.c")
+    file(READ "${root}/src/dynarec/dynarec_native_pass.c" pass_source)
+    wine_nx_box64_patch(pass_source
+        "    while(ok) {\n        #if STEP == 0"
+        "    while(ok) {\n        #if STEP == 0\n        extern int wine_nx_box64_translate_allowed(uintptr_t);\n        if(!is32bits && !wine_nx_box64_translate_allowed(addr)) {\n            need_epilog = 1;\n            break;\n        }"
+        "stop AMD64 blocks before unsupported vector prefixes")
+    set(pass_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-dynarec_native_pass.c")
+    file(WRITE "${pass_generated}" "${pass_source}")
+    list(APPEND pass_sources "${pass_generated}")
+
+    list(REMOVE_ITEM pass_sources "${root}/src/dynarec/arm64/dynarec_arm64_helper.c")
+    file(READ "${root}/src/dynarec/arm64/dynarec_arm64_helper.c" helper_source)
+    wine_nx_box64_patch(helper_source
+        "    #ifdef _WIN32\n    LDRx_U12(xR8, xEmu, offsetof(x64emu_t, win64_teb));\n    #endif"
+        "    #if defined(_WIN32) || defined(WINE_NX_BOX64_X18_TLS)\n    LDRx_U12(xR8, xEmu, offsetof(x64emu_t, win64_teb));\n    #endif"
+        "restore host TLS for helper calls")
+    set(helper_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-dynarec_arm64_helper.c")
+    file(WRITE "${helper_generated}" "${helper_source}")
+    list(APPEND pass_sources "${helper_generated}")
     # CALLRET pushes a native return pair for each CALL and pops it at the RET.
     # Pairs of calls that never return stay until a RET misses or the block
     # exits, which on Linux is a growing 8 MB stack, but a Wine thread here has
@@ -207,12 +257,26 @@ function(wine_nx_add_box64_core target)
         "    block->actual_block = DynarecMapExecutableAddress(block->actual_block);\n    block->block = DynarecMapExecutableAddress(block->block);\n    block->jmpnext = DynarecMapExecutableAddress(block->jmpnext);\n")
 
     file(READ "${root}/src/dynarec/dynarec_native.c" native_source)
+    # Marking a block's instructions alive recursed once an instruction, and a
+    # block of MAX_INSTS wants far more stack than the 1 MB a Wine thread has;
+    # FalloutNV died there with 16 bytes of stack left. The same edges are
+    # walked from an explicit stack: an index is stacked only as it is marked,
+    # so the block's own instruction count bounds it, and FillBlock already
+    # holds the translator lock the neighbouring static arrays rely on.
+    wine_nx_box64_patch(native_source
+        "static void recurse_mark_alive(dynarec_native_t* dyn, int i)\n{\n    if(dyn->insts[i].x64.alive)\n        return;\n    dyn->insts[i].x64.alive = 1;\n    if(dyn->insts[i].x64.jmp && dyn->insts[i].x64.jmp_insts!=-1)\n        recurse_mark_alive(dyn, dyn->insts[i].x64.jmp_insts);\n    if(i<dyn->size-1 && dyn->insts[i].x64.has_next)\n        recurse_mark_alive(dyn, i+1);\n}"
+        "static int static_alive[MAX_INSTS+2];\nstatic void recurse_mark_alive(dynarec_native_t* dyn, int i)\n{\n    int top = 0;\n    if(dyn->insts[i].x64.alive)\n        return;\n    dyn->insts[i].x64.alive = 1;\n    static_alive[top++] = i;\n    while(top) {\n        i = static_alive[--top];\n        if(dyn->insts[i].x64.jmp && dyn->insts[i].x64.jmp_insts!=-1) {\n            int jmpto = dyn->insts[i].x64.jmp_insts;\n            if(!dyn->insts[jmpto].x64.alive) {\n                dyn->insts[jmpto].x64.alive = 1;\n                static_alive[top++] = jmpto;\n            }\n        }\n        if(i<dyn->size-1 && dyn->insts[i].x64.has_next && !dyn->insts[i+1].x64.alive) {\n            dyn->insts[i+1].x64.alive = 1;\n            static_alive[top++] = i+1;\n        }\n    }\n}"
+        "walk alive marks without recursion")
+    wine_nx_box64_patch(native_source
+        "    uint32_t prot = getProtection_fast(addr);"
+        "    extern int wine_nx_box64_translate_allowed(uintptr_t);\n    if(!is32bits && !wine_nx_box64_translate_allowed(addr)) return NULL;\n    uint32_t prot = getProtection_fast(addr);"
+        "refuse AMD64 blocks beginning with unsupported vector prefixes")
     wine_nx_box64_patch(native_source "void ClearCache(void* start, size_t len)\n{\n#if defined(ARM64)"
         "${split_map_decl}void ClearCache(void* start, size_t len)\n{\n    DynarecMapClearCache(start, len);\n#if 0"
         "dynarec_native.c ClearCache")
     wine_nx_box64_patch(native_source
-        "    ClearCache(actual_p+sizeof(void*), 3*sizeof(void*));   // need to clear the cache before execution...\n    return block;\n}"
-        "    ClearCache(actual_p+sizeof(void*), 3*sizeof(void*));   // need to clear the cache before execution...\n${to_exec}    return block;\n}"
+        "    ClearCache(actual_p+sizeof(void*), JMPNEXT_SIZE-sizeof(void*));   // need to clear the cache before execution...\n    return block;\n}"
+        "    ClearCache(actual_p+sizeof(void*), JMPNEXT_SIZE-sizeof(void*));   // need to clear the cache before execution...\n${to_exec}    return block;\n}"
         "dynarec_native.c CreateEmptyBlock")
     wine_nx_box64_patch(native_source
         "    redundant_helper = current_helper = NULL;\n    //block->done = 1;\n    return block;\n}"
@@ -223,8 +287,8 @@ function(wine_nx_add_box64_core target)
     # guest memory, and wine_nx_box64_invalidate frees or marks the blocks
     # there; otherwise blocks link directly. The largest block size bounds how
     # far before a range a block may start.
-    wine_nx_box64_patch(native_source "    //block->x64_addr = (void*)start;\n    block->x64_size = end-start;"
-        "    //block->x64_addr = (void*)start;\n    block->x64_size = end-start;\n    { extern void wine_nx_box64_note_block_size(size_t); wine_nx_box64_note_block_size(block->x64_size); }"
+    wine_nx_box64_patch(native_source "            //block->x64_addr = (void*)start;\n            block->x64_size = end-start;"
+        "            //block->x64_addr = (void*)start;\n            block->x64_size = end-start;\n            { extern void wine_nx_box64_note_block_size(size_t); wine_nx_box64_note_block_size(block->x64_size); }"
         "record the largest block size")
     wine_nx_box64_patch(native_source "*(uint32_t*)(block->block+block->callrets[i].offs)"
         "*(uint32_t*)DynarecMapWritableAddress(block->block+block->callrets[i].offs)" "always-dirty callret site marks")
@@ -240,6 +304,18 @@ function(wine_nx_add_box64_core target)
         "updateflags_arm64.c block pointers")
     set(flags_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-updateflags_arm64.c")
     file(WRITE "${flags_generated}" "${flags_source}")
+
+    list(REMOVE_ITEM asm_sources
+        "${root}/src/dynarec/arm64/arm64_epilog.S"
+        "${root}/src/dynarec/arm64/arm64_next.S")
+    foreach(asm_name arm64_epilog arm64_next)
+        file(READ "${root}/src/dynarec/arm64/${asm_name}.S" asm_source)
+        wine_nx_box64_patch(asm_source "#ifdef _WIN32"
+            "#if defined(_WIN32) || defined(WINE_NX_BOX64_X18_TLS)" "${asm_name} host TLS restore")
+        set(asm_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-${asm_name}.S")
+        file(WRITE "${asm_generated}" "${asm_source}")
+        list(APPEND asm_sources "${asm_generated}")
+    endforeach()
 
     target_compile_definitions(${target}-settings INTERFACE DYNAREC SAVE_MEM WINE_NX_BOX64_DYNAREC)
     # Generated copies still include their neighbours by relative path.
@@ -261,7 +337,11 @@ function(wine_nx_add_box64_core target)
         target_compile_definitions(${target}-pass${step} PRIVATE STEP=${step} ${private_definitions})
         target_compile_options(${target}-pass${step} PRIVATE ${private_options})
         if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
-            target_compile_options(${target}-pass${step} PRIVATE "-include${os_generated}")
+            target_compile_options(${target}-pass${step} PRIVATE
+                "-include${os_generated}" "-include${emu_generated}")
+        else()
+            target_compile_options(${target}-pass${step} PRIVATE
+                "$<$<COMPILE_LANGUAGE:C>:-include${emu_generated}>")
         endif()
         target_include_directories(${target}-pass${step} PRIVATE "${root}/src/dynarec" "${root}/src/dynarec/arm64")
         target_sources(${target} PRIVATE $<TARGET_OBJECTS:${target}-pass${step}>)

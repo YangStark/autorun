@@ -8,6 +8,6 @@ flags="-std=gnu11 -Wall -Wextra -Werror -D__WINESRC__ -DWINE_UNIX_LIB -D_WIN64 -
 "${CC:-clang}" $flags -I"$root/include" "$root/wine-nx-probe/tests/registry_server.c" -o "$build/registry_server"
 "$build/registry_server"
 "${CC:-clang}" $flags -I"$root/wine-nx-probe/tests/audio-shims" -I"$root/include" \
-    -I"$root/wine-nx-probe/build-wine-wow64-pe/include" \
+    -I"${WINE_NX_PE_BUILD_DIR:-$root/wine-nx-probe/build-wine-wow64-pe}/include" \
     "$root/wine-nx-probe/tests/audio_backend.c" -o "$build/audio"
 "$build/audio"

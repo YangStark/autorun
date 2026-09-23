@@ -23,6 +23,7 @@
 #include "unix_private.h"
 #include "horizon_private.h"
 #include "launcher.h"
+#include "autorun_install.h"
 #include "forwarder.h"
 #include "launcher_list.h"
 #include "launcher_settings.h"
@@ -31,6 +32,13 @@
 #include "compositor.h"
 #include "std_stream_lines.h"
 #include "thread_profile.h"
+#include "dxvk_releases.h"
+#ifdef WINE_NX_MESA_SWITCH
+#include "graphics_config.h"
+#endif
+#ifdef WINE_NX_LSFG
+#include "lsfg_config.h"
+#endif
 
 /* The sampler finds an x86 context through these without Wine's headers. */
 C_ASSERT( FIELD_OFFSET( TEB, TlsSlots[WOW64_TLS_CPURESERVED] ) == NX_PROF_TEB_CPU_AREA );
@@ -50,13 +58,23 @@ u32 __nx_exception_ignoredebug = 1;
 #define WINE_ROOT "sdmc:/switch/wine"
 #define WINE_DRIVE_C WINE_ROOT "/drive_c"
 #define WINE_SYSTEM_DIR WINE_DRIVE_C "/windows/system32"
+/* The profile shell32 resolves: it ignores %USERPROFILE% and builds every
+ * CSIDL_Type_User folder as ProfilesDirectory + GetUserNameW(), which this
+ * Wine answers "steamuser" (dlls/advapi32/advapi.c). A profile under any
+ * other name leaves SHGetFolderPath failing the folder-exists check, and a
+ * game that does not test the result builds its path from an empty string. */
+#define WINE_USER_DIR WINE_DRIVE_C "/users/steamuser"
 #define RUNTIME_DIR WINE_ROOT
+/* Every log the runtime writes, and the program's standard handles. */
+#define RUNTIME_LOGS RUNTIME_DIR "/logs"
 /* Everything a person sets, in one place. */
 #define CONFIG_DIR  RUNTIME_DIR "/config"
 #define CONFIG_FILE CONFIG_DIR "/settings.json"
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
-#ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-218"
+#ifdef WINE_NX_AMD64
+#define WINE_NX_RUNTIME_BUILD "nx-amd64-box64-3"
+#elif defined(WINE_NX_BOX64_DYNAREC)
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-223"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -75,10 +93,13 @@ extern const char *wine_nx_loader_last_open_path(void);
 extern NTSTATUS wine_nx_loader_last_open_status(void);
 extern const char *wine_nx_loader_last_export_diag(void);
 extern int wine_nx_sd_cache_install(void);
+#ifdef WINE_NX_USB_STORAGE
+extern int wine_nx_usb_list( struct wine_nx_launcher_usb_volume *volumes, int max );
+#endif
 
 static FILE *log_file;
 /* A second copy, kept from the moment a program starts. The next run of the
- * launcher opens wine-nx-runtime.log afresh and what the program did is gone
+ * launcher opens autorun_runtime.log afresh and what the program did is gone
  * with it, so a program's own log is a file of its own, which only the next
  * run of that same program writes over. */
 static FILE *game_log_file;
@@ -308,8 +329,11 @@ static void log_line( const char *fmt, ... )
 
 /* A program's own log, kept from the moment it is about to start: everything
  * the runtime has said so far, and everything it says from here. The launcher's
- * next run opens wine-nx-runtime.log afresh, and without this the run that
+ * next run opens autorun_runtime.log afresh, and without this the run that
  * mattered is gone before it can be read off the card. */
+extern int wine_nx_runtime_verbose;
+static int runtime_profile;
+
 static void open_game_log( const char *target )
 {
     char path[512], name[128];
@@ -331,14 +355,18 @@ static void open_game_log( const char *target )
     }
     name[i] = 0;
     if ((len = strlen( name )) > 4 && !strcasecmp( name + len - 4, ".exe" )) name[len - 4] = 0;
-    snprintf( path, sizeof(path), "%s/game-%s.log", RUNTIME_DIR, name );
+    /* Beside the runtime's own log, named after the program and the diagnostics
+     * the run had on, so a verbose or profiled run does not replace the plain
+     * one it is being compared with: Sims2EP9.log, Sims2EP9_verbose_profiler.log. */
+    snprintf( path, sizeof(path), "%s/%s%s%s.log", RUNTIME_LOGS, name,
+              wine_nx_runtime_verbose ? "_verbose" : "", runtime_profile ? "_profiler" : "" );
 
     pthread_mutex_lock( &log_mutex );
     fflush( log_file );
     if ((game_log_file = fopen( path, "w" )))
     {
         /* What was said before this point, so the file stands on its own. */
-        if ((sofar = fopen( RUNTIME_DIR "/wine-nx-runtime.log", "r" )))
+        if ((sofar = fopen( RUNTIME_LOGS "/autorun_runtime.log", "r" )))
         {
             char chunk[4096];
             size_t got;
@@ -399,9 +427,10 @@ int wine_nx_runtime_verbose;
 /* The sampling profiler's [PROF] lines (thread_profile.c): sdmc:/switch/wine/profile.txt
  * containing 1, which the launcher's X toggles like Y does verbose.txt. */
 static int runtime_profile;
-/* Set by d3d9=dxvk in the program's own settings (launcher_settings.h): its DLL
- * path looks in C:\dxvk before system32, so DXVK's d3d9.dll loads in place of Wine's. */
-static int runtime_d3d9_dxvk;
+static int runtime_dxvk;
+static int runtime_dxvk_hud;
+static char runtime_vkd3d_version[32];
+static char runtime_dxvk_version[32];
 
 /* libdrm_nouveau's switch for CPU-cacheable pinned GPU memory, cleared by
  * sdmc:/switch/wine/gl-uncached.txt containing 1. */
@@ -1041,8 +1070,8 @@ struct std_stream
 
 static struct std_stream std_streams[] =
 {
-    { .path = RUNTIME_DIR "/stdout.txt", .tag = "STDOUT" },
-    { .path = RUNTIME_DIR "/stderr.txt", .tag = "STDERR" },
+    { .path = RUNTIME_LOGS "/stdout.txt", .tag = "STDOUT" },
+    { .path = RUNTIME_LOGS "/stderr.txt", .tag = "STDERR" },
 };
 static pthread_mutex_t std_stream_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -1122,14 +1151,17 @@ static void runtime_report_interpreter(void)
         /* Without verbose traces a white screen says nothing about whether a
          * program is still loading, computing or drawing. Every 10 seconds, if
          * anything changed: completed file reads and the time inside NtReadFile,
-         * read requests to the SD card, their time and the reads the cache
-         * served, system calls, frames shown and dynarec entries. */
+         * the bytes they returned, read requests to the SD card, their time,
+         * the bytes they brought back, the reads the cache served and what it
+         * is holding, system calls, frames shown and dynarec entries. */
         extern unsigned int wine_nx_file_reads __attribute__((weak));
         extern unsigned long long wine_nx_file_read_100ns __attribute__((weak));
         extern unsigned int wine_nx_syscalls __attribute__((weak));
         extern unsigned int wine_nx_audio_underruns __attribute__((weak));
         extern unsigned int wine_nx_sd_reads, wine_nx_sd_hits;
-        extern unsigned long long wine_nx_sd_read_ns;
+        extern unsigned long long wine_nx_sd_read_ns, wine_nx_sd_bytes;
+        extern unsigned long long wine_nx_file_read_bytes __attribute__((weak));
+        extern unsigned int wine_nx_sd_cache_mb( void );
         extern unsigned int wine_nx_gl_swaps __attribute__((weak)), wine_nx_gl_calls __attribute__((weak));
         extern unsigned int wine_nx_vk_presents __attribute__((weak));
         extern unsigned int wine_nx_gl_persistent_failures __attribute__((weak));
@@ -1160,7 +1192,7 @@ static void runtime_report_interpreter(void)
         unsigned long long read_ms = &wine_nx_file_read_100ns
                                      ? __atomic_load_n( &wine_nx_file_read_100ns, __ATOMIC_RELAXED ) / 10000 : 0;
         unsigned int syscalls = &wine_nx_syscalls ? __atomic_load_n( &wine_nx_syscalls, __ATOMIC_RELAXED ) : 0;
-        char native[256] = "", gl[512] = "", audio[32] = "", systop[64] = "";
+        char native[384] = "", gl[512] = "", audio[32] = "", systop[64] = "";
 
         if (!start) start = now;
         if (++calls % 2) return;
@@ -1207,8 +1239,16 @@ static void runtime_report_interpreter(void)
             extern unsigned int wine_nx_box64_callret_clean, wine_nx_box64_callret_dirty;
             extern unsigned int wine_nx_box64_translator_locks, wine_nx_box64_inline_unix_calls;
             extern uint64_t wine_nx_box64_dynarec_bytes, wine_nx_box64_arena_bytes;
+            extern uint64_t wine_nx_box64_code_translated;
+            extern unsigned int wine_nx_box64_purges, wine_nx_box64_purged_blocks;
+            extern unsigned long long wine_nx_box64_purged_bytes, wine_nx_box64_purge_ns;
+            /* code_mb is the translated code held now over the code memory the
+             * kernel gave, and code_all_mb every byte ever translated: apart
+             * they say how much of an arena is blocks the run still uses and
+             * how much passed through it. */
             snprintf( native, sizeof(native), " native_entries=%llu block_tests=%u invalidations=%u marked_lookups=%u"
-                      " callret_clean=%u callret_dirty=%u translator_locks=%u inline_unix=%u code_mb=%llu/%llu",
+                      " callret_clean=%u callret_dirty=%u translator_locks=%u inline_unix=%u code_mb=%llu/%llu"
+                      " code_all_mb=%llu purged=%u/%u/%lluMB/%llums",
                       __atomic_load_n( &wine_nx_box64_native_entries, __ATOMIC_RELAXED ),
                       __atomic_load_n( &wine_nx_box64_block_tests, __ATOMIC_RELAXED ),
                       __atomic_load_n( &wine_nx_box64_invalidations, __ATOMIC_RELAXED ),
@@ -1218,7 +1258,13 @@ static void runtime_report_interpreter(void)
                       __atomic_load_n( &wine_nx_box64_translator_locks, __ATOMIC_RELAXED ),
                       __atomic_load_n( &wine_nx_box64_inline_unix_calls, __ATOMIC_RELAXED ),
                       (unsigned long long)(__atomic_load_n( &wine_nx_box64_dynarec_bytes, __ATOMIC_RELAXED ) >> 20),
-                      (unsigned long long)(wine_nx_box64_arena_bytes >> 20) );
+                      (unsigned long long)(wine_nx_box64_arena_bytes >> 20),
+                      (unsigned long long)(__atomic_load_n( &wine_nx_box64_code_translated, __ATOMIC_RELAXED ) >> 20),
+                      /* purges, the blocks they gave back, those blocks' size and the time spent */
+                      __atomic_load_n( &wine_nx_box64_purges, __ATOMIC_RELAXED ),
+                      __atomic_load_n( &wine_nx_box64_purged_blocks, __ATOMIC_RELAXED ),
+                      __atomic_load_n( &wine_nx_box64_purged_bytes, __ATOMIC_RELAXED ) >> 20,
+                      __atomic_load_n( &wine_nx_box64_purge_ns, __ATOMIC_RELAXED ) / 1000000 );
         }
 #endif
         /* OpenGL: frames swapped and the time in eglSwapBuffers, calls into opengl32's unix
@@ -1275,12 +1321,20 @@ static void runtime_report_interpreter(void)
         unsigned long long heap_size = (unsigned long long)(fake_heap_end - fake_heap_start);
         unsigned long long heap_free = heap.fordblks + (heap_size > heap.arena ? heap_size - heap.arena : 0);
 
-        log_line( "[PROGRESS] %llus reads=%u read_ms=%llu sd_reads=%u sd_ms=%llu cache_hits=%u syscalls=%u "
+        /* read_mb is what the program asked for and sd_mb what the card gave:
+         * apart they say whether a run is reading a lot or reading the same
+         * bytes again, which the request counts alone cannot. cache_mb is what
+         * the cache holds, which follows the heap the game leaves free. */
+        log_line( "[PROGRESS] %llus reads=%u read_ms=%llu read_mb=%llu sd_reads=%u sd_ms=%llu sd_mb=%llu "
+                  "cache_hits=%u cache_mb=%u syscalls=%u "
                   "frames=%u heap_used_mb=%llu heap_free_mb=%llu%s%s%s%s",
                   (unsigned long long)(armTicksToNs( now - start ) / 1000000000ull), reads, read_ms,
+                  &wine_nx_file_read_bytes
+                      ? __atomic_load_n( &wine_nx_file_read_bytes, __ATOMIC_RELAXED ) >> 20 : 0,
                   __atomic_load_n( &wine_nx_sd_reads, __ATOMIC_RELAXED ),
                   __atomic_load_n( &wine_nx_sd_read_ns, __ATOMIC_RELAXED ) / 1000000,
-                  __atomic_load_n( &wine_nx_sd_hits, __ATOMIC_RELAXED ), syscalls, frames,
+                  __atomic_load_n( &wine_nx_sd_bytes, __ATOMIC_RELAXED ) >> 20,
+                  __atomic_load_n( &wine_nx_sd_hits, __ATOMIC_RELAXED ), wine_nx_sd_cache_mb(), syscalls, frames,
                   (unsigned long long)heap.uordblks >> 20, heap_free >> 20, systop, native, gl, audio );
         {
             extern void wine_nx_thread_report( void );
@@ -1349,7 +1403,7 @@ static int read_bool_file( const char *path )
 static struct wine_nx_config runtime_config;
 static int runtime_config_moved;  /* a setting was found in the file it used to be */
 /* Read at the start, wanted on the way out, when the card may be busy. */
-static int runtime_loader_anyway, runtime_reopen_launcher;
+static int runtime_loader_anyway, runtime_reopen_launcher, runtime_dxvk_on_add;
 
 /* A setting, with the file it used to be for a card written by an earlier
  * build. The file is read only when the settings file has nothing to say, and
@@ -1454,7 +1508,7 @@ static unsigned int close_handle_object( HANDLE handle )
     return status;
 }
 
-static unsigned int runtime_init_process_done(void)
+static unsigned int runtime_init_process_done( BOOL *suspend )
 {
     unsigned int status;
 
@@ -1463,6 +1517,7 @@ static unsigned int runtime_init_process_done(void)
         req->teb = wine_server_client_ptr( NtCurrentTeb() );
         req->peb = wine_server_client_ptr( NtCurrentTeb()->Peb );
         status = wine_server_call( req );
+        if (suspend) *suspend = !status && reply->suspend;
     }
     SERVER_END_REQ;
 
@@ -1535,8 +1590,9 @@ static int target_to_dos_path( const char *target, char *dos_path, size_t size )
         return 1;
     }
 
-    /* A file on the card: C: is drive_c and Z: the card's root, as file.c maps them. */
-    if (!strncmp( target, "sdmc:", 5 )) return launcher_dos_path( target, dos_path, size );
+    /* A file on the card or a USB drive, as file.c maps them. */
+    if (!strncmp( target, "sdmc:", 5 ) || !strncmp( target, "ums", 3 ))
+        return launcher_dos_path( target, dos_path, size );
     ret = snprintf( dos_path, size, "C:\\%s", path_basename( target ) );
 
     if (ret <= 0 || (size_t)ret >= size) return 0;
@@ -1574,15 +1630,25 @@ static void put_process_string( WCHAR **cursor, UNICODE_STRING *string, const ch
 }
 
 /* Minimal environment (sorted, NUL-separated; the literal's own terminator
- * ends the block). Console programs and Wine's DLLs look these up. */
+ * ends the block). Console programs and Wine's DLLs look these up. The user
+ * profile is where programs keep saves and settings, and where DXVK keeps
+ * its shader cache (LOCALAPPDATA); its directories are made at start-up. */
 static const char runtime_environment[] =
+    "APPDATA=C:\\users\\steamuser\\AppData\\Roaming\0"
+    "DXVK_CONFIG_FILE=C:\\users\\steamuser\\AppData\\Local\\Autorun\\dxvk.conf\0"
+    "DXVK_HUD=0\0"
+    "HOMEDRIVE=C:\0"
+    "HOMEPATH=\\users\\steamuser\0"
+    "LOCALAPPDATA=C:\\users\\steamuser\\AppData\\Local\0"
     "PATH=C:\\windows\\system32;C:\\windows\0"
     "SystemDrive=C:\0"
     "SystemRoot=C:\\windows\0"
     "TEMP=C:\\windows\\temp\0"
     "TMP=C:\\windows\\temp\0"
-    "WINE_D3D_CONFIG=cs_spin_count=64,explicit_buffer_flush=1\0"
-    "windir=C:\\windows\0";
+    "USERNAME=steamuser\0"
+    "USERPROFILE=C:\\users\\steamuser\0"
+    "windir=C:\\windows\0"
+    "WINE_D3D_CONFIG=cs_spin_count=64,explicit_buffer_flush=1\0";
 
 /* Horizon has no console device: the standard handles are files next to the
  * runtime, copied into this log when the process exits. */
@@ -1610,15 +1676,38 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     char cmdline[1024], args_buf[896], args_path[512];
     size_t chars, size, i;
     WCHAR *cursor;
-    const char *cmdline_str;
+    const char *cmdline_str, *dxvk_hud = launcher_hud_values[runtime_dxvk_hud];
+    char dxvk_dir[96], vkd3d_dir[96], vkd3d_path[104] = "", graphics_path[208] = "";
+    int dxvk_path = launcher_dxvk_version_directory( main_image_info.Machine, runtime_dxvk_version,
+                                                     dxvk_dir, sizeof(dxvk_dir) );
 
     if (!target_to_dos_path( target, dos_path, dos_path_size )) return NULL;
     dos_dirname( dos_path, current_dir, sizeof(current_dir) );
     snprintf( nt_path, sizeof(nt_path), "\\??\\%s", dos_path );
-    /* DXVK's d3d9.dll in C:\dxvk comes before Wine's in system32; one next to
-     * the program still comes first. */
+    if (runtime_dxvk &&
+        launcher_vkd3d_version_directory( main_image_info.Machine, runtime_vkd3d_version,
+                                          vkd3d_dir, sizeof(vkd3d_dir) ) &&
+        vkd3d_release_installed( RUNTIME_DIR, main_image_info.Machine, runtime_vkd3d_version ))
+    {
+        snprintf( vkd3d_path, sizeof(vkd3d_path), "C:\\%s;", vkd3d_dir );
+        log_line( "[VKD3D] payload C:\\%s; application-local DLLs take priority", vkd3d_dir );
+    }
+    /* Keep native DXVK DLLs separate for each guest architecture. */
+    if (runtime_dxvk && dxvk_path &&
+        dxvk_release_installed( RUNTIME_DIR, main_image_info.Machine, runtime_dxvk_version ))
+    {
+        snprintf( graphics_path, sizeof(graphics_path), "%sC:\\%s;", vkd3d_path, dxvk_dir );
+        if (runtime_dxvk_version[0])
+            log_line( "[DXVK] %s payload C:\\%s (version %s); application-local DLLs take priority",
+                      main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64 ? "AMD64" : "x86", dxvk_dir,
+                      runtime_dxvk_version );
+        else
+            log_line( "[DXVK] %s bundled payload C:\\%s; application-local DLLs take priority",
+                      main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64 ? "AMD64" : "x86", dxvk_dir );
+    }
+    else if (runtime_dxvk) log_line( "[DXVK] selected payload is not installed; using Wine Direct3D" );
     snprintf( dll_path, sizeof(dll_path), "%s;%sC:\\windows\\system32;C:\\windows;C:\\",
-              current_dir, runtime_d3d9_dxvk ? "C:\\dxvk;" : "" );
+              current_dir, graphics_path );
     /* The current directory ends in a backslash, as RtlSetCurrentDirectory_U
      * stores it; relative paths are appended to it directly. */
     if ((chars = strlen( current_dir )) && current_dir[chars - 1] != '\\' && chars + 1 < sizeof(current_dir))
@@ -1638,7 +1727,8 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
         struct launcher_kv kv;
         int own = -1;
 
-        if (target[1] != ':' && launcher_settings_path( target, settings_path, sizeof(settings_path) ) &&
+        if (target[1] != ':' &&
+            launcher_program_settings_path( RUNTIME_DIR, target, settings_path, sizeof(settings_path) ) &&
             launcher_kv_load( &kv, settings_path ) && kv.size)
         {
             launcher_settings_read( &kv, &settings );
@@ -1681,7 +1771,7 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     chars += strlen( cmdline_str ) + 1;
     chars += strlen( dos_path ) + 1;
     chars += strlen( nt_path ) + 1;
-    chars += sizeof(runtime_environment);
+    chars += sizeof(runtime_environment) + strlen( graphics_path ) + strlen( dxvk_hud ) - 1;
     size = sizeof(*params) + chars * sizeof(WCHAR);
 
     if (!(params = calloc( 1, size ))) return NULL;
@@ -1703,14 +1793,30 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     put_process_string( &cursor, &params->WindowTitle, dos_path );
     put_process_string( &cursor, main_nt_name, nt_path );
     params->Environment = cursor;
-    for (i = 0; i < sizeof(runtime_environment); i++)
-        *cursor++ = (unsigned char)runtime_environment[i];
-    params->EnvironmentSize = sizeof(runtime_environment) * sizeof(WCHAR);
+    for (const char *entry = runtime_environment; *entry; entry += strlen( entry ) + 1)
+    {
+        const char *value = entry;
 
-    params->hStdInput = runtime_open_std_file( RUNTIME_DIR "/stdin.txt", GENERIC_READ, FILE_OPEN_IF );
-    params->hStdOutput = runtime_open_std_file( RUNTIME_DIR "/stdout.txt", GENERIC_WRITE, FILE_OVERWRITE_IF );
-    params->hStdError = runtime_open_std_file( RUNTIME_DIR "/stderr.txt", GENERIC_WRITE, FILE_OVERWRITE_IF );
-    log_line( "[STDIO] stdin=%p stdout=%p stderr=%p (" RUNTIME_DIR "/std*.txt)",
+        if (!runtime_dxvk && !strncmp( entry, "DXVK_", 5 )) continue;
+        if (!strncmp( entry, "DXVK_HUD=", 9 ))
+        {
+            for (i = 0; i < 9; i++) *cursor++ = (unsigned char)*value++;
+            value = dxvk_hud;
+        }
+        if (!strncmp( entry, "PATH=", 5 ))
+        {
+            for (i = 0; i < 5; i++) *cursor++ = (unsigned char)*value++;
+            for (i = 0; graphics_path[i]; i++) *cursor++ = (unsigned char)graphics_path[i];
+        }
+        do *cursor++ = (unsigned char)*value; while (*value++);
+    }
+    *cursor++ = 0;
+    params->EnvironmentSize = (cursor - (WCHAR *)params->Environment) * sizeof(WCHAR);
+
+    params->hStdInput = runtime_open_std_file( RUNTIME_LOGS "/stdin.txt", GENERIC_READ, FILE_OPEN_IF );
+    params->hStdOutput = runtime_open_std_file( RUNTIME_LOGS "/stdout.txt", GENERIC_WRITE, FILE_OVERWRITE_IF );
+    params->hStdError = runtime_open_std_file( RUNTIME_LOGS "/stderr.txt", GENERIC_WRITE, FILE_OVERWRITE_IF );
+    log_line( "[STDIO] stdin=%p stdout=%p stderr=%p (" RUNTIME_LOGS "/std*.txt)",
               params->hStdInput, params->hStdOutput, params->hStdError );
     horizon_mark_std_stream( params->hStdOutput, 1 );
     horizon_mark_std_stream( params->hStdError, 2 );
@@ -1779,6 +1885,7 @@ static unsigned int map_pe_image( const char *path, void **module, SIZE_T *view_
     {
         status = NtMapViewOfSection( section, NtCurrentProcess(), module, 0, 0, NULL,
                                      view_size, ViewShare, 0, PAGE_EXECUTE_READ );
+        if (status == STATUS_IMAGE_NOT_AT_BASE) status = STATUS_SUCCESS;
         close_handle_object( section );
     }
     close_handle_object( file );
@@ -2109,6 +2216,9 @@ static NTSTATUS runtime_target_machine( const char *path, USHORT *machine )
 #ifdef WINE_NX_BOX64_INTERPRETER
             || (nt.file.Machine == IMAGE_FILE_MACHINE_I386 && nt.magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
 #endif
+#ifdef WINE_NX_AMD64
+            || (nt.file.Machine == IMAGE_FILE_MACHINE_AMD64 && nt.magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+#endif
            ) { *machine = nt.file.Machine; status = STATUS_SUCCESS; }
     }
     fclose( file );
@@ -2224,6 +2334,80 @@ static NTSTATUS runtime_start_wow64( void *module, void *entry,
 }
 #endif
 
+#ifdef WINE_NX_AMD64
+static NTSTATUS runtime_create_registry_path( const char *path, HANDLE *key )
+{
+    WCHAR key_name[256];
+    UNICODE_STRING name = {0};
+    OBJECT_ATTRIBUTES attr;
+    HANDLE next;
+    NTSTATUS status;
+    size_t i, length = strlen( path );
+
+    *key = NULL;
+    if (!length || path[0] != '\\') return STATUS_OBJECT_PATH_SYNTAX_BAD;
+    if (length >= ARRAY_SIZE(key_name)) return STATUS_NAME_TOO_LONG;
+    for (i = 0; i <= length; i++) key_name[i] = (unsigned char)path[i];
+    name.Buffer = key_name;
+    name.MaximumLength = sizeof(key_name);
+
+    for (i = 1; i <= length; i++)
+    {
+        WCHAR end = key_name[i];
+
+        if (end && end != '\\') continue;
+        key_name[i] = 0;
+        name.Length = i * sizeof(WCHAR);
+        InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, NULL, NULL );
+        /* Persistent, like the key on Windows: a volatile parent created here
+         * would refuse every non-volatile key later made below Software\Microsoft. */
+        status = NtCreateKey( &next, KEY_CREATE_SUB_KEY | KEY_SET_VALUE, &attr, 0, NULL,
+                              REG_OPTION_NON_VOLATILE, NULL );
+        key_name[i] = end;
+        if (status) return status;
+        if (!end)
+        {
+            *key = next;
+            return STATUS_SUCCESS;
+        }
+        NtClose( next );
+    }
+    return STATUS_OBJECT_PATH_SYNTAX_BAD;
+}
+
+static NTSTATUS runtime_prepare_arm64ec(void)
+{
+    static const char key_path[] = "\\Registry\\Machine\\Software\\Microsoft\\Wow64\\amd64";
+    static const WCHAR cpu_name[] = {'w','i','n','e','b','o','x','6','4','e','c','.','d','l','l',0};
+    UNICODE_STRING value = {0};
+    HMODULE ntdll = NULL;
+    HANDLE key;
+    SIZE_T size;
+    NTSTATUS status;
+    TEB *teb = NtCurrentTeb();
+    extern NTSTATUS wine_nx_prepare_arm64ec_ntdll( HMODULE );
+
+    status = runtime_create_registry_path( key_path, &key );
+    log_line( "[AMD64] CPU registry status=%08x", status );
+    if (status) return status;
+    status = NtSetValueKey( key, &value, 0, REG_SZ, cpu_name, sizeof(cpu_name) );
+    NtClose( key );
+    if (status) return status;
+
+    wine_nx_load_apiset_dll();
+    status = map_pe_image( WINE_SYSTEM_DIR "/ntdll.dll", (void **)&ntdll, &size );
+    if (!status) status = virtual_relocate_module( ntdll );
+    if (!status) status = wine_nx_prepare_arm64ec_ntdll( ntdll );
+    log_line( "[AMD64] ARM64EC ntdll=%p status=%08x", ntdll, status );
+    if (status) return status;
+    status = init_thread_stack( teb, 0, main_image_info.MaximumStackSize, main_image_info.CommittedStackSize );
+    if (status) return status;
+    log_line( "[AMD64] loader ready: TEB=%p stack=%p CPU area=%p", teb, teb->Tib.StackBase,
+              teb->ChpeV2CpuAreaInfo );
+    return STATUS_SUCCESS;
+}
+#endif
+
 static int runtime_describe_image( void *module, SIZE_T size, void **entry )
 {
     IMAGE_NT_HEADERS64 *nt = runtime_nt_headers( module );
@@ -2264,6 +2448,13 @@ static int runtime_describe_image( void *module, SIZE_T size, void **entry )
     main_image_info.ImageFileSize = IMAGE_FIELD(SizeOfImage);
     main_image_info.CheckSum = IMAGE_FIELD(CheckSum);
 
+    /* The dynarec sizes its first code arena from this: the heap has a large
+     * block to give now, and will not have one later (wow64_box64_dynarec.c). */
+    {
+        extern size_t wine_nx_box64_image_size __attribute__((weak));
+
+        if (&wine_nx_box64_image_size) wine_nx_box64_image_size = size;
+    }
     log_line( "[IMAGE] base=%p size=0x%lx preferred=0x%llx entry_rva=0x%x machine=0x%x",
               module, (unsigned long)size,
               (unsigned long long)IMAGE_FIELD(ImageBase),
@@ -2283,9 +2474,21 @@ static int runtime_describe_image( void *module, SIZE_T size, void **entry )
                       "It needs Wine-NX started through a 32-bit forwarder.",
                       (unsigned long long)IMAGE_FIELD(ImageBase), module );
     }
-    log_line( "[IMAGE] subsystem=%u dll_char=0x%x imports=0x%x/0x%x sections=%u",
-              IMAGE_FIELD(Subsystem), IMAGE_FIELD(DllCharacteristics),
-              imports->VirtualAddress, imports->Size, nt->FileHeader.NumberOfSections );
+    /* Whether this program is tied to its own address: one that is not can run
+     * outside a 32-bit forwarder, where the address space is 512 GB instead of
+     * 4 GB and the dynarec has room for all the code it translates. */
+    {
+        const IMAGE_DATA_DIRECTORY *relocs = guest32 ?
+            &nt32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] :
+            &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+
+        log_line( "[IMAGE] subsystem=%u dll_char=0x%x imports=0x%x/0x%x sections=%u relocs=0x%x/0x%x (%s)",
+                  IMAGE_FIELD(Subsystem), IMAGE_FIELD(DllCharacteristics),
+                  imports->VirtualAddress, imports->Size, nt->FileHeader.NumberOfSections,
+                  relocs->VirtualAddress, relocs->Size,
+                  relocs->Size ? "can be moved: the 32-bit forwarder is not needed for it"
+                               : "cannot be moved: it needs the 32-bit forwarder" );
+    }
     return 1;
 #undef IMAGE_FIELD
 }
@@ -2722,6 +2925,12 @@ static jmp_buf quit_jump;
 static int quit_jump_ready;
 static char own_nro[512];
 
+static int launcher_schedule_restart(void)
+{
+    return envHasNextLoad() && R_SUCCEEDED( envSetNextLoad( RUNTIME_DIR "/wine-nx-runtime.nro",
+                                                           RUNTIME_DIR "/wine-nx-runtime.nro" ) );
+}
+
 /* Called wherever a thread can leave off what it is doing. Never returns while
  * a quit is under way: the thread it is called on ends, or, for the one that
  * started the program, unwinds to main. */
@@ -2819,6 +3028,104 @@ void wine_nx_leave_process( const char *why )
 /* Every thread the program left has to end before the loader takes over. Waits
  * for them, closes what the runtime opened, and asks the loader for this
  * program again, with no arguments, which is what opens the launcher. */
+/***********************************************************************
+ * Thread-local pages
+ *
+ * The kernel keeps each thread's local storage in a page it maps itself, eight
+ * threads to a page, and places a new page at random in the code region when a
+ * new thread finds no free slot. The program's memory is reserved in this
+ * process's bookkeeping only, so to the kernel it is free, and on a 32-bit
+ * address space the random search often lands in it: The Sims 2 had a page put
+ * in the middle of 4 MB it had reserved, could not commit the 4 MB, and wrote
+ * through them anyway. An empty page is given back and a new thread takes a
+ * slot in an existing page first, so once the program's image is mapped
+ * placeholder threads fill every slot the process can have, one per page stays
+ * behind to keep its page, and those pages are taken out of the program's
+ * reservations. Threads made later take slots in pages already out of its way.
+ */
+#define TLS_PLACEHOLDERS_MAX 96   /* Horizon's thread limit for an application */
+
+static Thread tls_threads[TLS_PLACEHOLDERS_MAX];
+static unsigned long long tls_page[TLS_PLACEHOLDERS_MAX];
+static unsigned char tls_keep[TLS_PLACEHOLDERS_MAX];
+static unsigned int tls_count;
+static UEvent tls_trimmed, tls_released;
+
+static void tls_placeholder( void *arg )
+{
+    unsigned int index = (unsigned int)(uintptr_t)arg;
+
+    __atomic_store_n( &tls_page[index], (unsigned long long)(uintptr_t)armGetTls() & ~0xfffull,
+                      __ATOMIC_RELEASE );
+    waitSingle( waiterForUEvent( &tls_trimmed ), UINT64_MAX );
+    if (!__atomic_load_n( &tls_keep[index], __ATOMIC_ACQUIRE )) return;
+    waitSingle( waiterForUEvent( &tls_released ), UINT64_MAX );
+}
+
+static void hold_thread_local_pages( void )
+{
+    extern unsigned int horizon_drop_thread_local_pages( unsigned int *found );
+    unsigned int i, j, kept = 0, found = 0, dropped;
+    Result rc = 0;
+
+    ueventCreate( &tls_trimmed, false );
+    ueventCreate( &tls_released, false );
+    for (i = 0; i < TLS_PLACEHOLDERS_MAX; i++)
+    {
+        /* 0x3b, the lowest priority an application may give a thread on cores
+         * 0 to 2 -- 0x3f is core 3's, and build 238 was refused all 96. All
+         * they do is wait. Their stacks are libnx's, mapped where it keeps
+         * stacks, clear of the program's memory. */
+        if (R_FAILED( rc = threadCreate( &tls_threads[i], tls_placeholder, (void *)(uintptr_t)i, NULL, 0x2000, 0x3b, -2 ) ))
+            break;
+        if (R_FAILED( threadStart( &tls_threads[i] ) ))
+        {
+            threadClose( &tls_threads[i] );
+            break;
+        }
+        while (!__atomic_load_n( &tls_page[i], __ATOMIC_ACQUIRE )) svcSleepThread( 100000 );
+    }
+    tls_count = i;
+    for (i = 0; i < tls_count; i++)
+    {
+        for (j = 0; j < i; j++)
+            if (tls_keep[j] && tls_page[j] == tls_page[i]) break;
+        if (j == i)
+        {
+            tls_keep[i] = 1;
+            kept++;
+        }
+    }
+    ueventSignal( &tls_trimmed );
+    for (i = 0; i < tls_count; i++)
+    {
+        if (tls_keep[i]) continue;
+        threadWaitForExit( &tls_threads[i] );
+        threadClose( &tls_threads[i] );
+    }
+    dropped = horizon_drop_thread_local_pages( &found );
+    log_line( "[TLS] %u placeholder threads (the next refused: rc=%#x), %u kept to hold a thread-local page "
+              "each; of %u such pages below 4 GB, %u were inside the program's reserved memory and were taken "
+              "out of it", tls_count, rc, kept, found, dropped );
+}
+
+/* Before the loader takes the process back: the placeholders' stacks are on
+ * the heap it resets. */
+static void release_thread_local_pages( void )
+{
+    unsigned int i;
+
+    if (!tls_count) return;
+    ueventSignal( &tls_released );
+    for (i = 0; i < tls_count; i++)
+    {
+        if (!tls_keep[i]) continue;
+        threadWaitForExit( &tls_threads[i] );
+        threadClose( &tls_threads[i] );
+    }
+    tls_count = 0;
+}
+
 static int return_to_launcher( void )
 {
     int i, still_lent = 0;
@@ -2834,6 +3141,7 @@ static int return_to_launcher( void )
     }
     wine_nx_compositor_stop();
     wine_nx_profile_stop();
+    release_thread_local_pages();
     /* Mesa's worker threads outlive the program that made work for them. */
     run_closing_step( stop_mesa_workers, 5, "ending the graphics library's worker threads" );
     for (i = 0; i < 200 && wine_nx_threads_other(); i++) svcSleepThread( 10000000LL );
@@ -3051,7 +3359,7 @@ static unsigned int launcher_install_forwarder( int bits, const char *name, unsi
         .args = NULL,
         .name = name,
         .author = "ticoverse.com",
-        .address_space = bits == 32 ? WINE_NX_SPACE_32BIT_NO_ALIAS : WINE_NX_SPACE_36BIT,
+        .address_space = bits == 32 ? WINE_NX_SPACE_32BIT_NO_ALIAS : WINE_NX_SPACE_39BIT,
         .icon = bits == 32 ? wine_nx_icon_32bit : wine_nx_icon_any,
         .icon_size = bits == 32 ? wine_nx_icon_32bit_size : wine_nx_icon_any_size,
     };
@@ -3063,6 +3371,12 @@ static unsigned int launcher_install_forwarder( int bits, const char *name, unsi
     log_line( "[LAUNCHER] %d-bit forwarder %016llx: rc=0x%x%s%s", bits,
               id ? *id : 0ull, rc, rc && step && *step ? " at " : "", rc && step && *step ? *step : "" );
     return rc;
+}
+
+static unsigned long long launcher_forwarder_id( int bits )
+{
+    return wine_nx_forwarder_title_id( own_nro, NULL, bits == 32 ? WINE_NX_SPACE_32BIT_NO_ALIAS
+                                                                  : WINE_NX_SPACE_39BIT );
 }
 
 /* Whether an application is still installed. The records alone answer it, so
@@ -3145,7 +3459,25 @@ int main( int argc, char **argv )
     mkdir( WINE_DRIVE_C "/windows", 0777 );
     mkdir( WINE_DRIVE_C "/windows/temp", 0777 );
     mkdir( WINE_SYSTEM_DIR, 0777 );
-    log_file = fopen( RUNTIME_DIR "/wine-nx-runtime.log", "w" );
+    mkdir( WINE_DRIVE_C "/users", 0777 );
+    mkdir( WINE_USER_DIR, 0777 );
+    mkdir( WINE_USER_DIR "/AppData", 0777 );
+    mkdir( WINE_USER_DIR "/AppData/Local", 0777 );
+    mkdir( WINE_USER_DIR "/AppData/LocalLow", 0777 );
+    mkdir( WINE_USER_DIR "/AppData/Roaming", 0777 );
+    /* SHGetFolderPath refuses a folder that is not there unless the caller
+     * asked for it to be created, and a game that ignores that failure reads
+     * its settings from the drive root instead. These are the per-user folders
+     * shell32 marks KFDF_PRECREATE and a Wine prefix comes with. */
+    mkdir( WINE_USER_DIR "/Desktop", 0777 );
+    mkdir( WINE_USER_DIR "/Documents", 0777 );
+    mkdir( WINE_USER_DIR "/Downloads", 0777 );
+    mkdir( WINE_USER_DIR "/Music", 0777 );
+    mkdir( WINE_USER_DIR "/Pictures", 0777 );
+    mkdir( WINE_USER_DIR "/Saved Games", 0777 );
+    mkdir( WINE_USER_DIR "/Videos", 0777 );
+    mkdir( RUNTIME_LOGS, 0777 );
+    log_file = fopen( RUNTIME_LOGS "/autorun_runtime.log", "w" );
     if (log_file)
     {
         setvbuf( log_file, log_file_buffer, _IOFBF, sizeof(log_file_buffer) );
@@ -3162,12 +3494,48 @@ int main( int argc, char **argv )
      * like one from the new one. */
     log_line( "[BUILD] %s from %s (address space %d bits)", WINE_NX_RUNTIME_BUILD, own_nro,
               runtime_address_space_bits() );
+    {
+        int recovered = autorun_install_recover( RUNTIME_DIR, strstr( own_nro, "/updates/previous.nro" ) != NULL );
+        if (recovered < 0)
+        {
+            wine_nx_console_quiet = 0;
+            PadState pad;
+            log_line( "[UPDATE] Recovery failed. Restore switch/wine/updates/previous.nro before starting a game. Press + to close." );
+            padConfigureInput( 1, HidNpadStyleSet_NpadStandard );
+            padInitializeDefault( &pad );
+            while (appletMainLoop())
+            {
+                padUpdate( &pad );
+                if (padGetButtonsDown( &pad ) & HidNpadButton_Plus) break;
+                consoleUpdate( NULL );
+                svcSleepThread( 16000000 );
+            }
+            consoleExit( NULL );
+            leave_cleanly();
+            return 0;
+        }
+        if (recovered == 2)
+        {
+            log_line( "[UPDATE] Restored the previous runtime; restarting" );
+            if (!launcher_schedule_restart()) log_line( "[UPDATE] Restart Autorun from the HOME menu" );
+            consoleExit( NULL );
+            leave_cleanly();
+            return 0;
+        }
+    }
     /* The launcher can access SteamGridDB before a game is selected. */
     log_memory_map( "start-up" );
     log_line( "[MAP] start-up: %d regions the loader already had lent", loader_lent_count );
     wine_nx_runtime_network_init();
     log_lent_memory( "the network" );
 
+#ifdef WINE_NX_USB_STORAGE
+    {
+        extern void wine_nx_usb_start(void);
+
+        wine_nx_usb_start();
+    }
+#endif
     mkdir( CONFIG_DIR, 0777 );
     wine_nx_config_load( &runtime_config, CONFIG_FILE );
     autorun = config_bool( "run-the-chosen-program", 0, "run-entry.txt", 0 );
@@ -3199,6 +3567,7 @@ int main( int argc, char **argv )
     /* Both are wanted on the way out, when the card is a poor thing to ask. */
     runtime_loader_anyway = config_bool( "hand-the-process-back-anyway", 0, "loader-anyway.txt", 0 );
     runtime_reopen_launcher = config_bool( "reopen-the-launcher-on-exit", 1, "reload-launcher.txt", 0 );
+    runtime_dxvk_on_add = wine_nx_config_bool( &runtime_config, "dxvk-for-new-games", 1 );
     if (runtime_config_moved && wine_nx_config_save( &runtime_config, CONFIG_FILE ))
         log_line( "[CONFIG] settings written to %s", CONFIG_FILE );
 #ifdef WINE_NX_MESA_SWITCH
@@ -3216,6 +3585,13 @@ int main( int argc, char **argv )
             wine_nx_vulkan_probe();
             log_lent_memory( "the Vulkan probe" );
         }
+    }
+#endif
+#ifdef WINE_NX_USB_STORAGE
+    {
+        extern void wine_nx_usb_wait(void);
+
+        wine_nx_usb_wait();
     }
 #endif
     /* A launcher in another forwarder sent this game here, because it needs the
@@ -3253,13 +3629,19 @@ int main( int argc, char **argv )
             .emummc = runtime_on_emummc(),
             .build = WINE_NX_RUNTIME_BUILD,
             .machine_of = launcher_machine,
+#ifdef WINE_NX_USB_STORAGE
+            .list_usb = wine_nx_usb_list,
+#endif
             .address_space_bits = runtime_address_space_bits(),
-        .reopen_launcher = runtime_reopen_launcher,
+            .reopen_launcher = runtime_reopen_launcher,
+            .dxvk_on_add = runtime_dxvk_on_add,
             .title_id = runtime_title_id(),
             .list_titles = launcher_titles,
             .launch_title = launcher_launch_title,
             .title_installed = launcher_title_installed,
             .install_forwarder = launcher_install_forwarder,
+            .forwarder_id = launcher_forwarder_id,
+            .schedule_restart = envHasNextLoad() ? launcher_schedule_restart : NULL,
 #ifdef WINE_NX_MESA_SWITCH
             .vulkan = 1,
 #endif
@@ -3301,6 +3683,8 @@ int main( int argc, char **argv )
         wine_nx_config_set_bool( &runtime_config, "windows-through-opengl", !options.framebuffer );
         wine_nx_config_set_bool( &runtime_config, "reopen-the-launcher-on-exit", options.reopen_launcher );
         runtime_reopen_launcher = options.reopen_launcher;
+        wine_nx_config_set_bool( &runtime_config, "dxvk-for-new-games", options.dxvk_on_add );
+        runtime_dxvk_on_add = options.dxvk_on_add;
         wine_nx_config_save( &runtime_config, CONFIG_FILE );
         if (!chosen)
         {
@@ -3322,7 +3706,18 @@ int main( int argc, char **argv )
         struct launcher_kv kv;
         char settings_path[520];
 
-        if (target[1] != ':' && launcher_settings_path( target, settings_path, sizeof(settings_path) ) &&
+        runtime_dxvk = 0;
+        runtime_dxvk_hud = 0;
+#ifdef WINE_NX_MESA_SWITCH
+        wine_nx_graphics_configure( 0, 1 );
+#endif
+#ifdef WINE_NX_LSFG
+        wine_nx_lsfg_configure( 0, 1, 1 );
+#endif
+        runtime_vkd3d_version[0] = 0;
+        runtime_dxvk_version[0] = 0;
+        if (target[1] != ':' &&
+            launcher_program_settings_path( RUNTIME_DIR, target, settings_path, sizeof(settings_path) ) &&
             launcher_kv_load( &kv, settings_path ) && kv.size)
         {
             launcher_settings_read( &kv, &settings );
@@ -3330,14 +3725,54 @@ int main( int argc, char **argv )
             if (settings.profile >= 0) runtime_profile = settings.profile;
             if (settings.framebuffer >= 0) wine_nx_compositor_mode = !settings.framebuffer;
 #ifdef WINE_NX_MESA_SWITCH
-            runtime_d3d9_dxvk = settings.dxvk;
+            runtime_dxvk = settings.dxvk;
+            runtime_dxvk_hud = settings.dxvk_hud;
+            wine_nx_graphics_configure( launcher_frame_limits[settings.frame_limit], settings.vsync );
+#ifdef WINE_NX_LSFG
+            wine_nx_lsfg_configure( settings.lsfg_enabled, settings.lsfg_performance, settings.lsfg_flow );
 #endif
-            log_line( "[SETTINGS] %s: verbose %s, profiler %s, windows %s, Direct3D 9 %s", settings_path,
+            memcpy( runtime_vkd3d_version, settings.vkd3d_version, sizeof(runtime_vkd3d_version) );
+            memcpy( runtime_dxvk_version, settings.dxvk_version, sizeof(runtime_dxvk_version) );
+            if (runtime_dxvk)
+            {
+                struct launcher_kv graphics;
+
+                mkdir( WINE_USER_DIR "/AppData/Local/Autorun", 0777 );
+                if (!launcher_dxvk_config( &settings, graphics.text, sizeof(graphics.text) ))
+                    return return_to_launcher();
+                {
+                    struct launcher_kv game;
+                    char game_conf[520], *slash;
+
+                    snprintf( game_conf, sizeof(game_conf), "%s", target );
+                    if ((slash = strrchr( game_conf, '/' )) &&
+                        (size_t)(slash + 1 - game_conf) + sizeof("dxvk.conf") <= sizeof(game_conf))
+                    {
+                        strcpy( slash + 1, "dxvk.conf" );
+                        if (launcher_kv_load( &game, game_conf ) && game.size)
+                            log_line( launcher_dxvk_config_add( graphics.text, sizeof(graphics.text),
+                                                                game.text, game.size )
+                                      ? "[DXVK] %s read after the launcher's settings"
+                                      : "[DXVK] %s left out: too large", game_conf );
+                    }
+                }
+                graphics.size = strlen( graphics.text );
+                if (!launcher_kv_save( &graphics, WINE_USER_DIR "/AppData/Local/Autorun/dxvk.conf" ))
+                {
+                    log_line( "[DXVK] could not write graphics settings" );
+                    return return_to_launcher();
+                }
+                log_line( "[DXVK] HUD %s, frame limit %s, VSync %s",
+                          launcher_hud_labels[settings.dxvk_hud], launcher_frame_limit_labels[settings.frame_limit],
+                          settings.vsync ? "on" : "off" );
+            }
+#endif
+            log_line( "[SETTINGS] %s: verbose %s, profiler %s, windows %s, Direct3D %s", settings_path,
                       settings.verbose < 0 ? "global" : settings.verbose ? "on" : "off",
                       settings.profile < 0 ? "global" : settings.profile ? "on" : "off",
                       settings.framebuffer < 0 ? "global" : settings.framebuffer ? "framebuffer" : "compositor",
 #ifdef WINE_NX_MESA_SWITCH
-                      settings.dxvk ? "DXVK from C:\\dxvk" : "Wine" );
+                      settings.dxvk ? "DXVK + VKD3D" : "Wine" );
 #else
                       settings.dxvk ? "Wine (DXVK needs the Vulkan runtime)" : "Wine" );
 #endif
@@ -3347,7 +3782,7 @@ int main( int argc, char **argv )
     open_game_log( target );
     log_line( "wine-nx-runtime: generic Wine ntdll PE loader path" );
     log_line( "[BUILD] %s", WINE_NX_RUNTIME_BUILD );
-    log_line( "[SDCACHE] %s", sd_cache ? "sdmc reads cached: 128 KB chunks, 8 per file, 32 MB in all"
+    log_line( "[SDCACHE] %s", sd_cache ? "sdmc reads cached: 128 KB chunks, 8 per file, 32 to 192 MB in all"
                                       : "no sdmc device; reads are not cached" );
     log_line( "[INIT] verbose traces %s (verbose.txt)", wine_nx_runtime_verbose ? "on" : "off" );
     log_line( "[INIT] profiler %s (profile.txt)", runtime_profile ? "on" : "off" );
@@ -3367,6 +3802,19 @@ int main( int argc, char **argv )
         park_forever();
     }
     main_image_info.Machine = target_machine;
+#ifdef WINE_NX_AMD64
+    if (target_machine == IMAGE_FILE_MACHINE_AMD64)
+    {
+        void *start, *end;
+
+        horizon_get_address_space_limits( &start, &end );
+        if ((ULONG_PTR)end < 0x8000000000ULL)
+        {
+            log_line( "[FAIL] AMD64 requires the 39-bit forwarder; current address space %p-%p", start, end );
+            park_forever();
+        }
+    }
+#endif
     wine_nx_runtime_platform_init();
     log_line( "[INIT] Wine paths/unix bridge ready" );
     virtual_init();
@@ -3421,11 +3869,16 @@ int main( int argc, char **argv )
 
     server_init_process();
     log_line( "[INIT] server process initialized" );
-    status = runtime_init_process_done();
-    if (status)
+#ifdef WINE_NX_AMD64
+    if (target_machine != IMAGE_FILE_MACHINE_AMD64)
+#endif
     {
-        log_line( "[FAIL] init_process_done status=%08x", status );
-        park_forever();
+        status = runtime_init_process_done( NULL );
+        if (status)
+        {
+            log_line( "[FAIL] init_process_done status=%08x", status );
+            park_forever();
+        }
     }
 
     status = map_pe_image( target, &module, &view_size );
@@ -3435,6 +3888,9 @@ int main( int argc, char **argv )
         park_forever();
     }
 
+    /* With the image mapped, so no thread-local page can be put where it has
+     * to go, and before the program runs or makes a thread of its own. */
+    hold_thread_local_pages();
     if (runtime_describe_image( module, view_size, &entry ))
     {
         params = runtime_create_process_params( target, &main_nt_name, dos_path, sizeof(dos_path) );
@@ -3446,6 +3902,24 @@ int main( int argc, char **argv )
         runtime_init_peb_process( teb, module, params );
         log_line( "[PEB] image=%s nt=\\??\\%s", dos_path, dos_path );
 
+#ifdef WINE_NX_AMD64
+        if (target_machine == IMAGE_FILE_MACHINE_AMD64)
+        {
+            BOOL suspend = FALSE;
+            extern void wine_nx_start_arm64ec_thread( PRTL_THREAD_START_ROUTINE, void *, BOOL, TEB * );
+
+            status = runtime_prepare_arm64ec();
+            if (!status) status = runtime_init_process_done( &suspend );
+            log_line( "[AMD64] startup status=%08x", status );
+            if (!status && autorun)
+            {
+                svcSetThreadPriority( CUR_THREAD_HANDLE, 0x3b );
+                wine_nx_thread_register( 'w', HandleToULong( teb->ClientId.UniqueThread ), teb );
+                wine_nx_start_arm64ec_thread( (PRTL_THREAD_START_ROUTINE)entry, teb->Peb, suspend, teb );
+            }
+            park_forever();
+        }
+#endif
 #ifdef WINE_NX_BOX64_INTERPRETER
         if (target_machine == IMAGE_FILE_MACHINE_I386)
         {

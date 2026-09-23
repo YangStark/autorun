@@ -47,6 +47,7 @@
 # include <sys/statvfs.h>
 #endif
 #ifdef __SWITCH__
+# include <sys/iosupport.h>
 # include <sys/statvfs.h>
 #endif
 #ifdef HAVE_SYS_SYSCALL_H
@@ -4195,9 +4196,16 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
     if (prefix_len == 2 && prefix[1] == ':')
     {
         const char *drive_root = NULL;
+        char usb_root[] = "ums0:";
 
         if (prefix[0] == 'c') drive_root = "sdmc:/switch/wine/drive_c";
         else if (prefix[0] == 'z') drive_root = "sdmc:";
+        else if (prefix[0] >= 'd' && prefix[0] <= 'h')
+        {
+            /* USB volumes as the runtime mounts them: D: is ums0:, E: is ums1:. */
+            usb_root[3] = '0' + prefix[0] - 'd';
+            if (FindDevice( usb_root ) >= 0) drive_root = usb_root;
+        }
 
         if (drive_root)
         {
@@ -6919,6 +6927,7 @@ static NTSTATUS cancel_async_file_read( HANDLE handle, IO_STATUS_BLOCK *io )
 extern unsigned long long horizon_interrupt_time(void);
 unsigned int wine_nx_file_reads;
 unsigned long long wine_nx_file_read_100ns;
+unsigned long long wine_nx_file_read_bytes;
 #endif
 
 /******************************************************************************
@@ -7123,6 +7132,7 @@ err:
             __atomic_add_fetch( &wine_nx_file_reads, 1, __ATOMIC_RELAXED );
             __atomic_add_fetch( &wine_nx_file_read_100ns, horizon_interrupt_time() - wine_nx_read_start,
                                 __ATOMIC_RELAXED );
+            __atomic_add_fetch( &wine_nx_file_read_bytes, (unsigned long long)total, __ATOMIC_RELAXED );
             if (&wine_nx_runtime_trace && &wine_nx_runtime_verbose && wine_nx_runtime_verbose &&
                 __atomic_fetch_add( &read_traces, 1, __ATOMIC_RELAXED ) < 256)
             {

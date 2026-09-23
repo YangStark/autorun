@@ -2443,6 +2443,7 @@ esac
 dnl *** Check for modules to disable by default
 
 enable_winebox64=${enable_winebox64:-no}
+enable_winebox64ec=${enable_winebox64ec:-no}
 
 enable_vcruntime140_1=${enable_vcruntime140_1:-x86_64,arm64ec,aarch64}
 
@@ -3497,6 +3498,7 @@ WINE_CONFIG_MAKEFILE(dlls/wnaspi32)
 WINE_CONFIG_MAKEFILE(dlls/wofutil)
 WINE_CONFIG_MAKEFILE(dlls/wow32)
 WINE_CONFIG_MAKEFILE(dlls/winebox64)
+WINE_CONFIG_MAKEFILE(dlls/winebox64ec)
 WINE_CONFIG_MAKEFILE(dlls/wow64)
 WINE_CONFIG_MAKEFILE(dlls/wow64cpu)
 WINE_CONFIG_MAKEFILE(dlls/wow64win)

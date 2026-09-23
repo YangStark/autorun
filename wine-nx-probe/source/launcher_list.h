@@ -9,21 +9,34 @@
 #include <stddef.h>
 #include <string.h>
 #include <strings.h>
-
 #include <stdio.h>
 
+static inline const char *launcher_machine_name( unsigned short machine )
+{
+    switch (machine)
+    {
+    case 0x014c: return "x86";
+    case 0x8664: return "x64";
+    case 0xaa64: return "ARM64";
+    default: return "Unknown";
+    }
+}
 #define LAUNCHER_MAX_ENTRIES 256
 #define LAUNCHER_DRIVE_C "sdmc:/switch/wine/drive_c"
+/* USB volumes ums0: to ums4: are D: to H:; programs are looked for in their Wine folder. */
+#define LAUNCHER_USB_DRIVES 5
+#define LAUNCHER_USB_PROGRAMS "Wine"
 
 struct launcher_entry
 {
-    char path[512];          /* sdmc:/switch/wine/drive_c/... */
+    char path[512];          /* sdmc:/switch/wine/drive_c/... or ums0:/Wine/... */
     char dos[256];           /* C:\... */
     unsigned short machine;  /* IMAGE_FILE_MACHINE_* */
 };
 
-/* The DOS path of a file on the card, as Wine-NX's drives map it (dlls/ntdll/unix/file.c):
- * C: is drive_c and Z: the card's root. Returns 0 for a path elsewhere or too long. */
+/* The DOS path of a file, as Wine-NX's drives map it (dlls/ntdll/unix/file.c): C: is
+ * drive_c, Z: the card's root and D: to H: the USB volumes. Returns 0 for a path elsewhere
+ * or too long. */
 static inline int launcher_dos_path( const char *path, char *out, size_t size )
 {
     size_t drive_c_len = strlen( LAUNCHER_DRIVE_C ), len;
@@ -39,6 +52,12 @@ static inline int launcher_dos_path( const char *path, char *out, size_t size )
     else if (!strncmp( path, "sdmc:/", 6 ) || !strcmp( path, "sdmc:" ))
     {
         letter = 'Z';
+        rest = path + 5;
+    }
+    else if (!strncmp( path, "ums", 3 ) && path[3] >= '0' && path[3] < '0' + LAUNCHER_USB_DRIVES &&
+             path[4] == ':' && (!path[5] || path[5] == '/'))
+    {
+        letter = 'D' + path[3] - '0';
         rest = path + 5;
     }
     else return 0;

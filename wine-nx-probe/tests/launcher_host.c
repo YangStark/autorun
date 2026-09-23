@@ -26,6 +26,8 @@
 #include "launcher.h"
 #include "launcher_catalog.h"
 #include "launcher_ui.h"
+#include "launcher_update.h"
+#include "dxvk_releases.h"
 
 static char script[256][300];
 static int script_count, script_pos, wait_frames, frames;
@@ -33,6 +35,16 @@ static char prompt_text[512];
 static int prompt_set;
 static const char *font_path;
 static unsigned char *font_data;
+
+struct launcher_update *launcher_update_create( struct ui *ui, const char *root, int (*restart)(void) )
+{
+    (void)ui; (void)root; (void)restart;
+    return NULL;
+}
+void launcher_update_tick( void *update ) { (void)update; }
+void launcher_update_open( struct launcher_update *update ) { (void)update; }
+void launcher_update_destroy( struct launcher_update *update ) { (void)update; }
+int autorun_install_finish( const char *root ) { (void)root; return 1; }
 
 int launcher_platform_font( const void **data, size_t *size )
 {
@@ -73,6 +85,62 @@ int launcher_platform_status( int *hour, int *minute, int *battery, int *chargin
 void wine_nx_runtime_trace( const char *msg )
 {
     printf( "%s\n", msg );
+}
+
+enum dxvk_result dxvk_release_catalog( const char *runtime_dir, struct dxvk_release *releases,
+                                       int max_releases, int *count, int refresh, int *cached )
+{
+    (void)runtime_dir; (void)releases; (void)max_releases; (void)refresh; (void)cached;
+    *count = 0;
+    return DXVK_NOT_FOUND;
+}
+
+enum dxvk_result dxvk_install_release( const char *runtime_dir, const struct dxvk_release *release,
+                                       dxvk_progress_callback progress, void *opaque )
+{
+    (void)runtime_dir; (void)release; (void)progress; (void)opaque;
+    return DXVK_IO_ERROR;
+}
+
+int dxvk_release_installed( const char *runtime_dir, unsigned short machine, const char *version )
+{
+    (void)runtime_dir; (void)machine; (void)version;
+    return 0;
+}
+
+int dxvk_root_version( const char *runtime_dir, unsigned short machine, char *version, size_t size )
+{
+    (void)runtime_dir; (void)machine;
+    if (size) version[0] = 0;
+    return 0;
+}
+
+const char *dxvk_result_message( enum dxvk_result result )
+{
+    (void)result;
+    return "DXVK is unavailable in the host launcher test.";
+}
+
+enum dxvk_result vkd3d_release_catalog( const char *runtime_dir, struct dxvk_release *releases,
+                                       int max_releases, int *count, int refresh, int *cached )
+{
+    return dxvk_release_catalog( runtime_dir, releases, max_releases, count, refresh, cached );
+}
+
+enum dxvk_result vkd3d_install_release( const char *runtime_dir, const struct dxvk_release *release,
+                                       dxvk_progress_callback progress, void *opaque )
+{
+    return dxvk_install_release( runtime_dir, release, progress, opaque );
+}
+
+int vkd3d_release_installed( const char *runtime_dir, unsigned short machine, const char *version )
+{
+    return dxvk_release_installed( runtime_dir, machine, version );
+}
+
+int vkd3d_root_version( const char *runtime_dir, unsigned short machine, char *version, size_t size )
+{
+    return dxvk_root_version( runtime_dir, machine, version, size );
 }
 
 static int machine_of( const char *path, unsigned short *machine )
@@ -294,6 +362,29 @@ static unsigned int install_forwarder( int bits, const char *name, unsigned long
     return 0x4A8;
 }
 
+/* The forwarders the console has, when LAUNCHER_HOST_TITLES names them (ids in
+ * hex, any separator): without it the launcher is told nothing can be opened. */
+static const char *installed_titles;
+
+static int title_installed( unsigned long long id )
+{
+    char text[20];
+
+    snprintf( text, sizeof(text), "%016llX", id );
+    return installed_titles && strstr( installed_titles, text );
+}
+
+static int launch_title( unsigned long long id )
+{
+    printf( "launch_title %016llX\n", id );
+    return 1;
+}
+
+static unsigned long long forwarder_id( int bits )
+{
+    return bits == 32 ? 0x0500000000032000ull : 0x0500000000039000ull;
+}
+
 int main( int argc, char **argv )
 {
     struct wine_nx_launcher_options options = { .runtime_dir = "sdmc:/switch/wine", .build = "nx-host-test",
@@ -321,6 +412,12 @@ int main( int argc, char **argv )
     if (argc > 3 && !strcmp( argv[3], "--carousel-fixture" )) carousel_fixture();
     else if (argc > 3) snprintf( target, sizeof(target), "%s", argv[3] );
 
+    if ((installed_titles = getenv( "LAUNCHER_HOST_TITLES" )))
+    {
+        options.launch_title = launch_title;
+        options.title_installed = title_installed;
+        options.forwarder_id = forwarder_id;
+    }
     ui_present_hook = on_frame;
     chosen = wine_nx_launcher_run( &options, target, sizeof(target) );
     printf( "launcher returned %d target '%s' verbose %d profile %d framebuffer %d after %d frames\n",

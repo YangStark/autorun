@@ -1,12 +1,17 @@
-/* Wine-NX PE32 window timer test. No CRT; kernel32, user32 and ntdll imports.
+/* Wine-NX PE window timer test. No CRT; kernel32, user32 and ntdll imports.
  * Exit 42 means all groups passed; 0x100 | mask reports failing groups:
  * 1=thread timer, 2=window timer, 4=TIMERPROC, 8=kill and replace,
  * 16=coalescing. Detail codes are printed before exit. */
 #include <windows.h>
 #include <winternl.h>
 
-__declspec(dllimport) NTSTATUS NTAPI NtDisplayString( const UNICODE_STRING *str );
-__declspec(dllimport) NTSTATUS NTAPI NtTerminateProcess( HANDLE process, NTSTATUS status );
+#ifdef _WIN64
+#define PE_TEST_PREFIX "[PE64 TEST] "
+#else
+#define PE_TEST_PREFIX "[PE32 TEST] "
+#endif
+
+#include "pe_test_io.h"
 
 static void report( const char *label, DWORD code )
 {
@@ -14,7 +19,7 @@ static void report( const char *label, DWORD code )
     WCHAR text[160];
     UNICODE_STRING str;
     unsigned int n = 0, i;
-    const char *prefix = "[PE32 TEST] ";
+    const char *prefix = PE_TEST_PREFIX;
     while (*prefix) text[n++] = *prefix++;
     while (*label && n < 120) text[n++] = *label++;
     text[n++] = ' '; text[n++] = '0'; text[n++] = 'x';
@@ -22,7 +27,7 @@ static void report( const char *label, DWORD code )
     text[n] = 0;
     str.Buffer = text; str.Length = n * sizeof(WCHAR);
     str.MaximumLength = (n + 1) * sizeof(WCHAR);
-    NtDisplayString( &str );
+    pe_test_display_string( &str );
 }
 
 static HWND test_window;
@@ -165,6 +170,6 @@ void __stdcall start(void)
     report( result ? "FAIL coalescing" : "PASS coalescing", result ); if (result) mask |= 16;
     report( "stray timer messages", stray_ticks );
     report( mask ? "FAIL combined mask" : "PASS ALL", mask );
-    NtTerminateProcess( (HANDLE)-1, mask ? 0x100 | mask : 42 );
+    pe_test_terminate( mask ? 0x100 | mask : 42 );
     for (;;) {}
 }

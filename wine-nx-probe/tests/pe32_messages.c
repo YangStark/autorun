@@ -1,4 +1,4 @@
-/* Wine-NX PE32 message queue test. No CRT; kernel32, user32 and ntdll imports.
+/* Wine-NX PE message queue test. No CRT; kernel32, user32 and ntdll imports.
  * Exit 42 means all groups passed; 0x100 | mask reports failing groups:
  * 1=cross-thread SendMessage, 2=SendMessageTimeout, 4=SendNotifyMessage,
  * 8=nested send, 16=ReplyMessage, 32=SendMessageCallback,
@@ -7,8 +7,13 @@
 #include <windows.h>
 #include <winternl.h>
 
-__declspec(dllimport) NTSTATUS NTAPI NtDisplayString( const UNICODE_STRING *str );
-__declspec(dllimport) NTSTATUS NTAPI NtTerminateProcess( HANDLE process, NTSTATUS status );
+#ifdef _WIN64
+#define PE_TEST_PREFIX "[PE64 TEST] "
+#else
+#define PE_TEST_PREFIX "[PE32 TEST] "
+#endif
+
+#include "pe_test_io.h"
 
 static void report( const char *label, DWORD code )
 {
@@ -16,7 +21,7 @@ static void report( const char *label, DWORD code )
     WCHAR text[160];
     UNICODE_STRING str;
     unsigned int n = 0, i;
-    const char *prefix = "[PE32 TEST] ";
+    const char *prefix = PE_TEST_PREFIX;
     while (*prefix) text[n++] = *prefix++;
     while (*label && n < 120) text[n++] = *label++;
     text[n++] = ' '; text[n++] = '0'; text[n++] = 'x';
@@ -24,7 +29,7 @@ static void report( const char *label, DWORD code )
     text[n] = 0;
     str.Buffer = text; str.Length = n * sizeof(WCHAR);
     str.MaximumLength = (n + 1) * sizeof(WCHAR);
-    NtDisplayString( &str );
+    pe_test_display_string( &str );
 }
 
 static HWND a_window, b_window;
@@ -208,7 +213,7 @@ void __stdcall start(void)
     if (!a_window || !thread || WaitForSingleObject( b_ready, 10000 ) != WAIT_OBJECT_0 || !b_window)
     {
         report( "FAIL setup", GetLastError() );
-        NtTerminateProcess( (HANDLE)-1, 0x1ff );
+        pe_test_terminate( 0x1ff );
     }
 
     report( "BEGIN SendMessage to another thread", 0 );
@@ -259,7 +264,10 @@ void __stdcall start(void)
     report( "BEGIN clipboard", 0 ); result = test_clipboard();
     report( result ? "FAIL clipboard" : "PASS clipboard", result ); if (result) mask |= 512;
 
+    DestroyWindow( a_window );
+    CloseHandle( thread );
+    CloseHandle( b_ready );
     report( mask ? "FAIL combined mask" : "PASS ALL", mask );
-    NtTerminateProcess( (HANDLE)-1, mask ? 0x100 | mask : 42 );
+    pe_test_terminate( mask ? 0x100 | mask : 42 );
     for (;;) {}
 }

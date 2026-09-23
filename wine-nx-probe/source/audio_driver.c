@@ -6,5 +6,5 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
     (void)instance; (void)reason; (void)reserved;
     return TRUE;
 }
-/* An export directory lets the native loader identify the 32-bit module. */
+/* The export directory supplies the module identity for Unix-call lookup. */
 __declspec(dllexport) void WINAPI WineNXAudioDriver(void) {}

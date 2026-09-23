@@ -1,4 +1,4 @@
-/* Wine-NX PE32 thread lifecycle acceptance test. CRT-free; kernel32/ntdll only.
+/* Wine-NX PE thread lifecycle acceptance test. CRT-free; kernel32/ntdll only.
  * Runs the functional groups, then:
  *   exit      - return vs ExitThread, STILL_ACTIVE, joins that wait for the real
  *               end, wait-any/all, OpenThread, closed handles, thread times,
@@ -8,7 +8,7 @@
  *               callbacks), dynamic TLS, critical sections, SRW locks, a
  *               condition-variable barrier, recursive mutexes, semaphores and
  *               INIT_ONCE, joined with exit codes verified;
- *   reuse     - TEBs and 32-bit stacks are recycled rather than leaked.
+ *   reuse     - TEBs and stacks are recycled rather than leaked.
  * Exit 42 means everything passed; 0x100 | mask reports failed groups:
  * 1=time 2=heap 4=TLS 8=file 16=exit 32=suspended 64=rounds 128=reuse.
  * Command line "rounds=N" overrides the default round count. */
@@ -31,10 +31,10 @@ __attribute__((section(".CRT$XLA"))) PIMAGE_TLS_CALLBACK __xl_a = 0;
 __attribute__((section(".CRT$XLZ"))) PIMAGE_TLS_CALLBACK __xl_z = 0;
 static void NTAPI tls_callback( void *module, DWORD reason, void *reserved );
 __attribute__((section(".CRT$XLB"))) PIMAGE_TLS_CALLBACK tls_callback_entry = tls_callback;
-__attribute__((used)) const IMAGE_TLS_DIRECTORY32 _tls_used =
+__attribute__((used)) const IMAGE_TLS_DIRECTORY _tls_used =
 {
-    (DWORD)(ULONG_PTR)&_tls_start, (DWORD)(ULONG_PTR)&_tls_end, (DWORD)(ULONG_PTR)&_tls_index,
-    (DWORD)(ULONG_PTR)(&__xl_a + 1), 0, 0
+    (ULONG_PTR)&_tls_start, (ULONG_PTR)&_tls_end, (ULONG_PTR)&_tls_index,
+    (ULONG_PTR)(&__xl_a + 1), 0, 0
 };
 
 #define TLS_SEED 0x5eed1234u
@@ -42,7 +42,7 @@ static _Thread_local DWORD tls_seeded = TLS_SEED;
 static _Thread_local DWORD tls_zeroed;
 static volatile LONG tls_attaches, tls_detaches, tls_bad_template;
 
-/* MinGW's TEB type is the documented stub; use the TEB32 layout directly. */
+/* MinGW's TEB type is the documented stub; use the native layout directly. */
 static NT_TIB *current_tib(void)
 {
     return (NT_TIB *)NtCurrentTeb();
@@ -50,7 +50,11 @@ static NT_TIB *current_tib(void)
 
 static BOOL have_static_tls(void)
 {
-    return ((void **)NtCurrentTeb())[0x2c / sizeof(void *)] != NULL; /* ThreadLocalStoragePointer */
+#ifdef _WIN64
+    return *(void **)((char *)NtCurrentTeb() + 0x58) != NULL;
+#else
+    return *(void **)((char *)NtCurrentTeb() + 0x2c) != NULL;
+#endif
 }
 
 static void NTAPI tls_callback( void *module, DWORD reason, void *reserved )
@@ -167,7 +171,7 @@ static DWORD test_exit(void)
     CloseHandle( h[0] );
     ResetEvent( gate );
 
-    /* ExitThread from a nested frame: full 32-bit code, nothing after it runs. */
+    /* ExitThread from a nested frame; nothing after it runs. */
     h[0] = CreateThread( NULL, 0, exit_thread_worker, (void *)0x42, 0, NULL );
     CHECK( 16, h[0], 13 );
     SetEvent( gate );
@@ -549,6 +553,6 @@ done:
     report( "elapsed seconds", (GetTickCount() - begin) / 1000 );
     report( mask ? "FAIL combined mask" : "PASS ALL", mask ? mask : 0 );
     if (fail_detail) report( "first failing detail", fail_detail );
-    NtTerminateProcess( (HANDLE)-1, mask ? 0x100 | mask : 42 );
+    pe_test_terminate( mask ? 0x100 | mask : 42 );
     for (;;) {}
 }

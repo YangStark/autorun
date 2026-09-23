@@ -1609,6 +1609,7 @@ enable_wnaspi32
 enable_wofutil
 enable_wow32
 enable_winebox64
+enable_winebox64ec
 enable_wow64
 enable_wow64cpu
 enable_wow64win
@@ -23009,6 +23010,7 @@ esac
 
 
 enable_winebox64=${enable_winebox64:-no}
+enable_winebox64ec=${enable_winebox64ec:-no}
 
 enable_vcruntime140_1=${enable_vcruntime140_1:-x86_64,arm64ec,aarch64}
 
@@ -24058,6 +24060,7 @@ wine_fn_config_makefile dlls/wnaspi32 enable_wnaspi32
 wine_fn_config_makefile dlls/wofutil enable_wofutil
 wine_fn_config_makefile dlls/wow32 enable_wow32
 wine_fn_config_makefile dlls/winebox64 enable_winebox64
+wine_fn_config_makefile dlls/winebox64ec enable_winebox64ec
 wine_fn_config_makefile dlls/wow64 enable_wow64
 wine_fn_config_makefile dlls/wow64cpu enable_wow64cpu
 wine_fn_config_makefile dlls/wow64win enable_wow64win

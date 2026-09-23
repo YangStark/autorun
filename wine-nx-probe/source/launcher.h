@@ -9,11 +9,19 @@
 /* An application installed on the console. The launcher shows these so a
  * forwarder made with another address space can be chosen. */
 #define LAUNCHER_MAX_TITLES 96
+#define LAUNCHER_MAX_USB_VOLUMES 5
 
 struct wine_nx_launcher_title
 {
     unsigned long long id;
     char name[128];
+};
+
+struct wine_nx_launcher_usb_volume
+{
+    char path[40];
+    char label[128];
+    char drive;
 };
 
 struct wine_nx_launcher_options
@@ -26,7 +34,8 @@ struct wine_nx_launcher_options
     const char *build;
     /* 0 with the program's IMAGE_FILE_MACHINE_* when this runtime can start it. */
     int (*machine_of)( const char *path, unsigned short *machine );
-    int vulkan;                /* the runtime has Vulkan, so DXVK's d3d9 can run */
+    int (*list_usb)( struct wine_nx_launcher_usb_volume *volumes, int max );
+    int vulkan;                /* the runtime has Vulkan for DXVK */
     /* How wide an address space Horizon gave this process: 32 when the low 4 GB
      * is all of it, 36 or 39 when it reaches beyond, 0 when it could not be
      * read. The title that started the process fixes it, so a program that needs
@@ -42,22 +51,28 @@ struct wine_nx_launcher_options
     /* Whether an application is still installed: the one named as the 32-bit
      * forwarder may have been deleted since it was named. */
     int (*title_installed)( unsigned long long id );
-    /* Build a forwarder for this program and install it. bits is 32 or 36;
+    int (*schedule_restart)(void);
+    /* Build a forwarder for this program and install it. bits is 32 or 39;
      * returns 0, leaving step pointing at what failed otherwise. */
     unsigned int (*install_forwarder)( int bits, const char *name, unsigned long long *id, const char **step );
+    /* The id install_forwarder gives the forwarder it makes with these bits,
+     * to find one made before the launcher kept its id. May be NULL. */
+    unsigned long long (*forwarder_id)( int bits );
     /* The global settings on entry, as the user left them on return. The
      * runtime keeps them; the launcher only says what they became. */
     int verbose;
     int profile;
     int framebuffer;
     int reopen_launcher;  /* come back here when a program ends, rather than to the menu */
+    int dxvk_on_add;      /* a game added to the library starts with DXVK enabled */
 };
 
 /* Show the launcher. Returns 1 with the chosen program's path in target, or 0
  * when the user quits. target on entry preselects a program. */
 int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target, size_t target_size );
+void wine_nx_launcher_usb_changed(void);
 
-/* A line in wine-nx-runtime.log (runtime.c). */
+/* A line in autorun_runtime.log (runtime.c). */
 void wine_nx_runtime_trace( const char *msg );
 
 /* What launcher_platform_status found. */

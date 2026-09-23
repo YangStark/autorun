@@ -3,10 +3,19 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "windef.h"
-#include "winbase.h"
-#include "xinput.h"
-#include "../../dlls/xinput1_3/nx_pad.h"
+#include "../source/xinput_unix.c"
+
+static int mock_connected;
+static u64 mock_buttons, mock_tick;
+static HidAnalogStickState mock_sticks[2];
+
+void padConfigureInput(int count, int style) { assert(count == 1 && style == HidNpadStyleSet_NpadStandard); }
+void padInitializeDefault(PadState *pad) { (void)pad; }
+void padUpdate(PadState *pad) { (void)pad; }
+int padIsConnected(PadState *pad) { (void)pad; return mock_connected; }
+HidAnalogStickState padGetStickPos(PadState *pad, int index) { (void)pad; return mock_sticks[index]; }
+u64 padGetButtons(PadState *pad) { (void)pad; return mock_buttons; }
+u64 armGetSystemTick(void) { return mock_tick; }
 
 int main(void)
 {
@@ -51,6 +60,30 @@ int main(void)
     /* Unix call parameters have no pointers: 32-bit and 64-bit layouts agree. */
     assert( sizeof(struct nx_xinput_state_params) == 24 && sizeof(struct nx_xinput_vibration_params) == 12 );
 
-    puts( "XInput Switch pad: positional face buttons, d-pad, shoulders, triggers, sticks and call layout passed" );
+    {
+        struct nx_xinput_state_params state = {0};
+        struct nx_xinput_vibration_params vibration = {0};
+
+        assert((UINT_PTR)&state > 0xffffffffu);
+        assert(wine_nx_xinput_unix_count == nx_xinput_funcs_count);
+        assert(wine_nx_xinput_wow64_unix_count == nx_xinput_funcs_count);
+        mock_connected = 1;
+        mock_buttons = NX_PAD_B | NX_PAD_ZR;
+        mock_sticks[0] = (HidAnalogStickState){123, -456};
+        mock_sticks[1] = (HidAnalogStickState){789, -1234};
+        mock_tick = 0x100000001ull;
+        wine_nx_xinput_unix_funcs[nx_xinput_get_state](&state);
+        assert(state.connected && state.state.Gamepad.wButtons == XINPUT_GAMEPAD_A);
+        assert(state.state.Gamepad.bRightTrigger == 255 && state.state.Gamepad.sThumbLX == 123);
+        assert(wine_nx_xinput_last_poll == mock_tick);
+        wine_nx_xinput_unix_funcs[nx_xinput_set_state](&vibration);
+        assert(vibration.connected);
+        state.index = 1;
+        state.connected = 1;
+        wine_nx_xinput_unix_funcs[nx_xinput_get_state](&state);
+        assert(!state.connected);
+    }
+
+    puts( "XInput Switch pad: mapping, native and WoW64 tables, 64-bit call pointer and layout passed" );
     return 0;
 }

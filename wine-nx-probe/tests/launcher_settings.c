@@ -66,7 +66,7 @@ static void test_settings( const char *dir )
 {
     struct launcher_settings settings, back;
     struct launcher_kv kv;
-    char path[512];
+    char path[768], other[768], config[512];
 
     assert( launcher_settings_path( "sdmc:/switch/wine/drive_c/nfsu2/SPEED2.EXE", path, sizeof(path) ) );
     assert( !strcmp( path, "sdmc:/switch/wine/drive_c/nfsu2/SPEED2.wine-nx.txt" ) );
@@ -85,27 +85,81 @@ static void test_settings( const char *dir )
     launcher_settings_read( &kv, &settings );
     assert( settings.address_space == 0 );
 
+    load_text( &kv, "d3d=wine\nd3d9=dxvk\n" );
+    launcher_settings_read( &kv, &settings );
+    assert( settings.dxvk == 0 );
+    load_text( &kv, "d3d=DXVK\ndxvk-version=2.7.1\n" );
+    launcher_settings_read( &kv, &settings );
+    assert( settings.dxvk == 1 && !strcmp( settings.dxvk_version, "2.7.1" ) );
+    load_text( &kv, "d3d=DXVK\ndxvk-version=../../bad\n" );
+    launcher_settings_read( &kv, &settings );
+    assert( settings.dxvk == 1 && !settings.dxvk_version[0] );
+    assert( launcher_dxvk_version_valid( "3.1.1" ) && launcher_dxvk_version_valid( "2.0-rc1" ) );
+    assert( !launcher_dxvk_version_valid( "" ) && !launcher_dxvk_version_valid( "../3.1" ) &&
+            !launcher_dxvk_version_valid( "3.1/other" ) );
+    assert( launcher_dxvk_version_selectable( "1.0" ) && launcher_dxvk_version_selectable( "3.1.1" ) );
+    assert( !launcher_dxvk_version_selectable( "0.96" ) && !launcher_dxvk_version_selectable( "bad" ) );
+    assert( !strcmp( launcher_dxvk_directory( 0x014c ), "dxvk" ) );
+    assert( !strcmp( launcher_dxvk_directory( 0x8664 ), "dxvk64" ) );
+    assert( !launcher_dxvk_directory( 0xaa64 ) && !launcher_dxvk_directory( 0 ) );
+    assert( LAUNCHER_HUD_COUNT == 4 );
+    assert( !strcmp( launcher_hud_values[2], "api,fps,frametimes" ) );
+    assert( !strcmp( launcher_hud_values[3],
+                     "version,api,devinfo,fps,memory,frametimes,compiler" ) );
+    load_text( &kv, "dxvk-hud=api,fps,frametimes\n" );
+    launcher_settings_read( &kv, &settings );
+    assert( settings.dxvk_hud == 2 );
+    load_text( &kv, "dxvk-hud=version,api,devinfo,fps,memory,frametimes,compiler\n" );
+    launcher_settings_read( &kv, &settings );
+    assert( settings.dxvk_hud == 3 );
+    settings.dxvk_hud = LAUNCHER_HUD_COUNT;
+    assert( !launcher_settings_write( &kv, &settings ) );
+    settings.dxvk_hud = 0;
+    assert( LAUNCHER_FRAME_LIMIT_COUNT == 8 );
+    assert( launcher_dxvk_config( &settings, config, sizeof(config) ) );
+    /* A game's own dxvk.conf follows, so its lines win; one without a final
+     * newline gets one, and one that does not fit is refused whole. */
+    {
+        char with_game[256];
+        static const char game[] = "d3d9.maxAvailableMemory = 512";
+
+        assert( launcher_dxvk_config( &settings, with_game, sizeof(with_game) ) );
+        assert( launcher_dxvk_config_add( with_game, sizeof(with_game), game, sizeof(game) - 1 ) );
+        assert( strstr( with_game, "d3d9.presentInterval" ) < strstr( with_game, "d3d9.maxAvailableMemory = 512\n" ) );
+        assert( with_game[strlen( with_game ) - 1] == '\n' );
+        assert( launcher_dxvk_config_add( with_game, sizeof(with_game), "", 0 ) );
+        assert( !launcher_dxvk_config_add( with_game, strlen( with_game ) + 8, game, sizeof(game) - 1 ) );
+    }
+    assert( strstr( config, "dxgi.syncInterval = 1" ) );
+    assert( launcher_settings_write( &kv, &settings ) && !strstr( kv.text, "frame-limit=" ) );
+    assert( launcher_dxvk_version_directory( 0x8664, "2.7.1", path, sizeof(path) ) &&
+            !strcmp( path, "dxvk64\\versions\\2.7.1" ) );
+    assert( launcher_dxvk_version_directory( 0x014c, "", path, sizeof(path) ) && !strcmp( path, "dxvk" ) );
+    assert( !launcher_dxvk_version_directory( 0x8664, "../bad", path, sizeof(path) ) );
+
     snprintf( path, sizeof(path), "%s/game.wine-nx.txt", dir );
     load_text( &kv, "# written by hand\n" );
     memset( &settings, 0, sizeof(settings) );
     settings.own_controls = settings.address_space = -1;
+    settings.vsync = settings.lsfg_performance = settings.lsfg_flow = 1;
     strcpy( settings.title, "Need for Speed" );
     settings.hidden = 1;
     settings.verbose = -1;
     settings.profile = 1;
     settings.framebuffer = 0;
     settings.dxvk = 1;
+    strcpy( settings.dxvk_version, "2.7.1" );
     assert( launcher_settings_write( &kv, &settings ) && launcher_kv_save( &kv, path ) );
     assert( launcher_kv_load( &kv, path ) );
-    assert( !strcmp( kv.text, "# written by hand\ntitle=Need for Speed\nhidden=1\nprofile=1\nwindows=compositor\nd3d9=dxvk\n" ) );
+    assert( !strcmp( kv.text, "# written by hand\ntitle=Need for Speed\nhidden=1\nprofile=1\nwindows=compositor\nd3d=dxvk\ndxvk-version=2.7.1\n" ) );
     launcher_settings_read( &kv, &back );
     assert( !strcmp( back.title, settings.title ) && back.hidden == 1 && back.verbose == -1 && back.profile == 1 );
-    assert( back.framebuffer == 0 && back.dxvk == 1 );
+    assert( back.framebuffer == 0 && back.dxvk == 1 && !strcmp( back.dxvk_version, "2.7.1" ) );
 
     /* Back to the global settings: only the comment stays; without it the file goes. */
     memset( &settings, 0, sizeof(settings) );
-    settings.verbose = settings.profile = settings.framebuffer = settings.own_controls =
-        settings.address_space = -1;
+    settings.verbose = settings.profile = settings.framebuffer = settings.own_controls = settings.address_space = -1;
+    settings.vsync = settings.lsfg_performance = settings.lsfg_flow = 1;
     assert( launcher_settings_write( &kv, &settings ) && !strcmp( kv.text, "# written by hand\n" ) );
     assert( launcher_kv_save( &kv, path ) && !access( path, F_OK ) );
     load_text( &kv, "" );
@@ -116,6 +170,15 @@ static void test_settings( const char *dir )
 
     snprintf( path, sizeof(path), "%s/missing.txt", dir );
     assert( launcher_kv_load( &kv, path ) && kv.size == 0 );
+
+    assert( launcher_settings_on_usb( "ums0:/Games/Test/Game.EXE" ) );
+    assert( !launcher_settings_on_usb( "sdmc:/switch/wine/drive_c/Game.EXE" ) );
+    assert( launcher_program_settings_path( dir, "ums0:/Games/Test/Game.EXE", path, sizeof(path) ) );
+    assert( launcher_program_settings_path( dir, "UMS0:\\games\\test\\game.exe", other, sizeof(other) ) );
+    assert( !strcmp( path, other ) );
+    assert( strstr( path, "/program-settings/" ) );
+    assert( launcher_program_settings_path( dir, "sdmc:/Games/Test/Game.EXE", path, sizeof(path) ) );
+    assert( !strcmp( path, "sdmc:/Games/Test/Game.wine-nx.txt" ) );
 }
 
 int main(void)

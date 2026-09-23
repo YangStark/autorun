@@ -1,14 +1,13 @@
 /* Copyright 2026 Wine-NX contributors. LGPL-2.1-or-later.
  * With sdmc:/switch/wine/vulkan-probe.txt containing 1, report what the
  * loaderless NVK from build-mesa-switch.sh offers on this console, as [NXVK]
- * lines: the instance, the GPU, each requirement of DXVK's d3d9 baseline
- * profile (VP_DXVK_requirements.json in DXVK), what Wine needs to map Vulkan
- * memory for 32-bit programs, and whether a device can be created. */
+ * lines: the instance, GPU, DXVK requirements and feature-enabled device. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <vulkan/vulkan.h>
+#include "dxvk_requirements.h"
 
 void wine_nx_runtime_trace( const char *msg );
 void wine_nx_vulkan_probe( void );
@@ -66,8 +65,8 @@ static unsigned int report( const char *group, const struct requirement *reqs, u
             len += snprintf( names + len, sizeof(names) - len, "%s%s", missing ? " " : "", reqs[i].name );
         missing++;
     }
-    if (missing) vk_log( "[NXVK] d3d9 baseline %s: %u of %u missing: %s", group, missing, count, names );
-    else vk_log( "[NXVK] d3d9 baseline %s: all %u present", group, count );
+    if (missing) vk_log( "[NXVK] DXVK 3.1.1 %s: %u of %u missing: %s", group, missing, count, names );
+    else vk_log( "[NXVK] DXVK 3.1.1 %s: all %u present", group, count );
     return missing;
 }
 
@@ -85,6 +84,7 @@ static void probe_gpu( VkPhysicalDevice gpu )
     VkPhysicalDeviceMaintenance6FeaturesKHR m6 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR };
     VkPhysicalDeviceRobustness2FeaturesEXT r2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT };
     VkPhysicalDeviceDepthClipEnableFeaturesEXT dc = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT };
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT tf = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT };
     VkPhysicalDeviceFeatures2 features = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f13 };
     const VkPhysicalDeviceFeatures *f = &features.features;
     const VkPhysicalDeviceLimits *limits = &props.properties.limits;
@@ -92,7 +92,7 @@ static void probe_gpu( VkPhysicalDevice gpu )
     VkQueueFamilyProperties families[8];
     VkExtensionProperties *ext;
     uint32_t ext_count = 0, family_count = 8, family, i, v;
-    int has_m5, has_m6, has_r2, has_dc, has_host;
+    int has_m5, has_m6, has_r2, has_dc, has_host, has_tf;
     unsigned int missing = 0;
     char heaps[256] = "";
     VkDevice device;
@@ -107,6 +107,7 @@ static void probe_gpu( VkPhysicalDevice gpu )
     has_r2 = has_extension( ext, ext_count, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME );
     has_dc = has_extension( ext, ext_count, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME );
     has_host = has_extension( ext, ext_count, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME );
+    has_tf = has_extension( ext, ext_count, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME );
 
     /* Only structures of extensions the device has may be chained. */
     if (has_host) { host.pNext = props.pNext; props.pNext = &host; }
@@ -114,6 +115,7 @@ static void probe_gpu( VkPhysicalDevice gpu )
     if (has_m6) { m6.pNext = features.pNext; features.pNext = &m6; }
     if (has_r2) { r2.pNext = features.pNext; features.pNext = &r2; }
     if (has_dc) { dc.pNext = features.pNext; features.pNext = &dc; }
+    if (has_tf) { tf.pNext = features.pNext; features.pNext = &tf; }
     p_vkGetPhysicalDeviceProperties2( gpu, &props );
     p_vkGetPhysicalDeviceFeatures2( gpu, &features );
     p_vkGetPhysicalDeviceMemoryProperties( gpu, &memory );
@@ -136,7 +138,7 @@ static void probe_gpu( VkPhysicalDevice gpu )
     {
         const struct requirement version[] =
         {
-            { "apiVersion>=1.3.204", v >= VK_MAKE_API_VERSION( 0, 1, 3, 204 ) },
+            { "apiVersion>=1.3", v >= VK_API_VERSION_1_3 },
         };
         const struct requirement extensions[] =
         {
@@ -145,45 +147,31 @@ static void probe_gpu( VkPhysicalDevice gpu )
             { VK_KHR_MAINTENANCE_6_EXTENSION_NAME, has_m6 },
             { VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME, has_dc },
             { VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, has_r2 },
+            { VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME, has_tf },
+            { VK_KHR_SWAPCHAIN_EXTENSION_NAME, has_extension( ext, ext_count, VK_KHR_SWAPCHAIN_EXTENSION_NAME ) },
         };
         const struct requirement feature_list[] =
         {
-            FEATURE(f, robustBufferAccess), FEATURE(f, fragmentStoresAndAtomics), FEATURE(f, samplerAnisotropy),
-            FEATURE(f, shaderInt16), FEATURE(f, shaderSampledImageArrayDynamicIndexing), FEATURE(f, geometryShader),
-            FEATURE(f, imageCubeArray), FEATURE(f, depthClamp), FEATURE(f, depthBiasClamp), FEATURE(f, fillModeNonSolid),
-            FEATURE(f, sampleRateShading), FEATURE(f, shaderClipDistance), FEATURE(f, shaderCullDistance),
-            FEATURE(f, textureCompressionBC), FEATURE(f, occlusionQueryPrecise), FEATURE(f, independentBlend),
-            FEATURE(f, fullDrawIndexUint32), FEATURE(f, shaderImageGatherExtended),
-            FEATURE(&f11, multiview), FEATURE(&f11, storageBuffer16BitAccess), FEATURE(&f11, shaderDrawParameters),
-            FEATURE(&f12, uniformBufferStandardLayout), FEATURE(&f12, subgroupBroadcastDynamicId),
-            FEATURE(&f12, imagelessFramebuffer), FEATURE(&f12, separateDepthStencilLayouts), FEATURE(&f12, hostQueryReset),
-            FEATURE(&f12, timelineSemaphore), FEATURE(&f12, shaderSubgroupExtendedTypes), FEATURE(&f12, vulkanMemoryModel),
-            FEATURE(&f12, vulkanMemoryModelDeviceScope), FEATURE(&f12, bufferDeviceAddress),
-            FEATURE(&f12, storageBuffer8BitAccess), FEATURE(&f12, shaderInt8), FEATURE(&f12, descriptorIndexing),
-            FEATURE(&f12, descriptorBindingSampledImageUpdateAfterBind),
-            FEATURE(&f12, descriptorBindingUpdateUnusedWhilePending), FEATURE(&f12, descriptorBindingPartiallyBound),
-            FEATURE(&f12, runtimeDescriptorArray), FEATURE(&f12, samplerMirrorClampToEdge),
-            FEATURE(&f13, robustImageAccess), FEATURE(&f13, shaderTerminateInvocation),
-            FEATURE(&f13, shaderZeroInitializeWorkgroupMemory), FEATURE(&f13, synchronization2),
-            FEATURE(&f13, shaderIntegerDotProduct), FEATURE(&f13, maintenance4), FEATURE(&f13, pipelineCreationCacheControl),
-            FEATURE(&f13, subgroupSizeControl), FEATURE(&f13, computeFullSubgroups),
-            FEATURE(&f13, shaderDemoteToHelperInvocation), FEATURE(&f13, inlineUniformBlock), FEATURE(&f13, dynamicRendering),
+#define X(member) FEATURE(f, member),
+            NX_DXVK_FEATURES_10(X)
+            NX_DXVK_FL11_FEATURES(X)
+#undef X
+#define X(member) FEATURE(&f11, member),
+            NX_DXVK_FEATURES_11(X)
+#undef X
+#define X(member) FEATURE(&f12, member),
+            NX_DXVK_FEATURES_12(X)
+#undef X
+#define X(member) FEATURE(&f13, member),
+            NX_DXVK_FEATURES_13(X)
+#undef X
             FEATURE(&m5, maintenance5), FEATURE(&m6, maintenance6), FEATURE(&r2, nullDescriptor),
             FEATURE(&r2, robustBufferAccess2), FEATURE(&dc, depthClipEnable),
+            FEATURE(&tf, transformFeedback), FEATURE(&tf, geometryStreams),
         };
         const struct requirement limit_list[] =
         {
             LIMIT(limits, maxPushConstantsSize, 256u),
-            LIMIT(&props11, maxMultiviewViewCount, 6u),
-            LIMIT(&props11, maxMultiviewInstanceIndex, 134217727u),
-            LIMIT(&props12, maxTimelineSemaphoreValueDifference, 2147483647u),
-            LIMIT(&props13, maxBufferSize, 1073741824u),
-            LIMIT(&props13, maxInlineUniformBlockSize, 256u),
-            LIMIT(&props13, maxPerStageDescriptorInlineUniformBlocks, 4u),
-            LIMIT(&props13, maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks, 4u),
-            LIMIT(&props13, maxDescriptorSetInlineUniformBlocks, 4u),
-            LIMIT(&props13, maxDescriptorSetUpdateAfterBindInlineUniformBlocks, 4u),
-            LIMIT(&props13, maxInlineUniformTotalSize, 4u),
         };
 
         missing += report( "version", version, sizeof(version) / sizeof(version[0]) );
@@ -191,8 +179,9 @@ static void probe_gpu( VkPhysicalDevice gpu )
         missing += report( "features", feature_list, sizeof(feature_list) / sizeof(feature_list[0]) );
         missing += report( "limits", limit_list, sizeof(limit_list) / sizeof(limit_list[0]) );
     }
-    vk_log( "[NXVK] DXVK d3d9 baseline %s", missing ? "NOT met" : "met" );
+    vk_log( "[NXVK] DXVK 3.1.1 / D3D11 FL11_0 required capabilities %s", missing ? "NOT met" : "met" );
     free( ext );
+    if (missing) return;
 
     p_vkGetPhysicalDeviceQueueFamilyProperties( gpu, &family_count, families );
     for (family = 0; family < family_count; family++)
@@ -204,22 +193,55 @@ static void probe_gpu( VkPhysicalDevice gpu )
     }
     {
         float priority = 1.0f;
+        const char *enabled_extensions[] = { VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME,
+            VK_KHR_MAINTENANCE_5_EXTENSION_NAME, VK_KHR_MAINTENANCE_6_EXTENSION_NAME,
+            VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+            VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME, VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+        VkPhysicalDeviceFeatures enabled = {0};
+        VkPhysicalDeviceVulkan11Features e11 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
+        VkPhysicalDeviceVulkan12Features e12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &e11 };
+        VkPhysicalDeviceVulkan13Features e13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = &e12 };
+        VkPhysicalDeviceMaintenance5FeaturesKHR em5 = { .sType = m5.sType, .pNext = &e13, .maintenance5 = VK_TRUE };
+        VkPhysicalDeviceMaintenance6FeaturesKHR em6 = { .sType = m6.sType, .pNext = &em5, .maintenance6 = VK_TRUE };
+        VkPhysicalDeviceDepthClipEnableFeaturesEXT edc = { .sType = dc.sType, .pNext = &em6, .depthClipEnable = VK_TRUE };
+        VkPhysicalDeviceRobustness2FeaturesEXT er2 = { .sType = r2.sType, .pNext = &edc,
+            .robustBufferAccess2 = VK_TRUE, .nullDescriptor = VK_TRUE };
+        VkPhysicalDeviceTransformFeedbackFeaturesEXT etf = { .sType = tf.sType, .pNext = &er2,
+            .transformFeedback = VK_TRUE, .geometryStreams = VK_TRUE };
         VkDeviceQueueCreateInfo queue = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                           .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &priority };
         VkDeviceCreateInfo info = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-                                    .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue };
+                                    .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue,
+                                    .pNext = &etf, .pEnabledFeatures = &enabled,
+                                    .enabledExtensionCount = sizeof(enabled_extensions) / sizeof(enabled_extensions[0]),
+                                    .ppEnabledExtensionNames = enabled_extensions };
+#define X(member) enabled.member = VK_TRUE;
+        NX_DXVK_FEATURES_10(X)
+        NX_DXVK_FL11_FEATURES(X)
+#undef X
+#define X(member) e11.member = VK_TRUE;
+        NX_DXVK_FEATURES_11(X)
+#undef X
+#define X(member) e12.member = VK_TRUE;
+        NX_DXVK_FEATURES_12(X)
+#undef X
+#define X(member) e13.member = VK_TRUE;
+        NX_DXVK_FEATURES_13(X)
+#undef X
 
         res = p_vkCreateDevice( gpu, &info, NULL, &device );
-        vk_log( "[NXVK] vkCreateDevice with a graphics queue (family %u of %u): %d", family, family_count, res );
+        vk_log( "[NXVK] DXVK 3.1.1 feature-enabled vkCreateDevice (family %u of %u): %d", family, family_count, res );
         if (res == VK_SUCCESS) p_vkDestroyDevice( device, NULL );
     }
 }
 
 void wine_nx_vulkan_probe( void )
 {
+    const char *surface_extension = VK_KHR_SURFACE_EXTENSION_NAME;
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "Wine-NX",
                               .apiVersion = VK_API_VERSION_1_3 };
-    VkInstanceCreateInfo info = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
+    VkInstanceCreateInfo info = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
+                                 .enabledExtensionCount = 1, .ppEnabledExtensionNames = &surface_extension };
     VkExtensionProperties *ext = NULL;
     VkPhysicalDevice gpus[4];
     uint32_t version = 0, ext_count = 0, gpu_count = 4, i;
