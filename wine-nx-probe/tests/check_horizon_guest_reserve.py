@@ -140,6 +140,35 @@ static int munmap(void *ptr, size_t size)
 '''
 fixture += block('static void *alloc_free_area_in_range(')
 fixture += block('static void unmap_area(')
+fixture += block('static void mmap_remove_reserved_area(')
+fixture += r'''
+/* The thread-local pages the kernel has, as the test places them, and one
+ * view the program already has. Wine's remove_reserved_area also unmaps the
+ * host reservation, which this fixture does not model. */
+#include <pthread.h>
+#include <signal.h>
+struct file_view;
+static pthread_mutex_t virtual_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void server_enter_uninterrupted_section( pthread_mutex_t *m, sigset_t *s ) { (void)s; pthread_mutex_lock(m); }
+static void server_leave_uninterrupted_section( pthread_mutex_t *m, sigset_t *s ) { (void)s; pthread_mutex_unlock(m); }
+static unsigned long long tls_pages[8];
+static unsigned int tls_page_count;
+static uintptr_t view_start, view_end;
+static unsigned long long horizon_next_thread_local_page( unsigned long long addr, unsigned long long limit )
+{
+    unsigned long long best = 0;
+    unsigned int i;
+    for (i = 0; i < tls_page_count; i++)
+        if (tls_pages[i] >= addr && tls_pages[i] < limit && (!best || tls_pages[i] < best)) best = tls_pages[i];
+    return best;
+}
+static struct file_view *find_view_range( const void *addr, size_t size )
+{
+    return (uintptr_t)addr < view_end && view_start < (uintptr_t)addr + size ? (struct file_view *)1 : NULL;
+}
+static void remove_reserved_area( void *addr, size_t size ) { mmap_remove_reserved_area( addr, size ); }
+'''
+fixture += block('unsigned int horizon_drop_thread_local_pages(')
 fixture += r'''
 static void cleanup(void)
 {
@@ -288,8 +317,48 @@ int main(void)
     assert(!mmap_is_in_reserved_area((void *)0x100000000ull, 0x1000));
     assert(!mmap_is_in_reserved_area((void *)stack_lo, 0x1000));
     cleanup();
+    /* The kernel's thread-local pages: one put in the middle of the guest's
+     * reservation, one in the native window and one inside a view the program
+     * already has. Only the first is taken out; its neighbours stay reserved,
+     * and no allocation handed out afterwards covers it. The Sims 2 was given
+     * 4 MB with such a page inside, could not commit it and crashed. */
+    host_addr_space_limit = (void *)0x100000000ull;
+    free_ranges_end = free_ranges + 2;
+    stack_lo = 0x200000;
+    stack_hi = 0x40000000;
+    horizon_reserve_guest_address_space();
+    {
+        const unsigned long long inside = 0x4644000, window = (uintptr_t)horizon_native_window_start + 0x10000;
+        const unsigned long long viewed = 0x9100000;
+        struct alloc_area big = {.size = 0x400000, .align_mask = 0xffff};
+        unsigned int found = 0, dropped, i;
+
+        assert(mmap_is_in_reserved_area((void *)(uintptr_t)inside, 0x1000) == 1);
+        tls_pages[0] = inside;
+        tls_pages[1] = window;
+        tls_pages[2] = viewed;
+        tls_page_count = 3;
+        view_start = 0x9000000;
+        view_end = 0x9400000;
+        dropped = horizon_drop_thread_local_pages(&found);
+        assert(found == 3 && dropped == 1);
+        assert(!mmap_is_in_reserved_area((void *)(uintptr_t)inside, 0x1000));
+        assert(mmap_is_in_reserved_area((void *)(uintptr_t)(inside - 0x1000), 0x1000) == 1);
+        assert(mmap_is_in_reserved_area((void *)(uintptr_t)(inside + 0x1000), 0x1000) == 1);
+        assert(mmap_is_in_reserved_area((void *)(uintptr_t)viewed, 0x1000) == 1);
+        for (i = 0; i < 64; i++)
+        {
+            char *p = alloc_free_area_in_range(&big, (char *)0x10000, (char *)0x18000000);
+            if (!p || p == MAP_FAILED) break;
+            assert((uintptr_t)p + big.size <= inside || (uintptr_t)p > inside);
+        }
+        assert(i > 4);
+        tls_page_count = 0;
+        view_start = view_end = 0;
+    }
+    cleanup();
     puts("Horizon guest reservation: native stacks within kernel limits, query failure, guest "
-         "allocation/reuse, Most Wanted's reservation and large address spaces passed");
+         "allocation/reuse, Most Wanted's reservation, large address spaces and thread-local pages passed");
 }
 '''
 with tempfile.TemporaryDirectory() as tmp:

@@ -3019,6 +3019,104 @@ void wine_nx_leave_process( const char *why )
 /* Every thread the program left has to end before the loader takes over. Waits
  * for them, closes what the runtime opened, and asks the loader for this
  * program again, with no arguments, which is what opens the launcher. */
+/***********************************************************************
+ * Thread-local pages
+ *
+ * The kernel keeps each thread's local storage in a page it maps itself, eight
+ * threads to a page, and places a new page at random in the code region when a
+ * new thread finds no free slot. The program's memory is reserved in this
+ * process's bookkeeping only, so to the kernel it is free, and on a 32-bit
+ * address space the random search often lands in it: The Sims 2 had a page put
+ * in the middle of 4 MB it had reserved, could not commit the 4 MB, and wrote
+ * through them anyway. An empty page is given back and a new thread takes a
+ * slot in an existing page first, so once the program's image is mapped
+ * placeholder threads fill every slot the process can have, one per page stays
+ * behind to keep its page, and those pages are taken out of the program's
+ * reservations. Threads made later take slots in pages already out of its way.
+ */
+#define TLS_PLACEHOLDERS_MAX 96   /* Horizon's thread limit for an application */
+
+static Thread tls_threads[TLS_PLACEHOLDERS_MAX];
+static unsigned long long tls_page[TLS_PLACEHOLDERS_MAX];
+static unsigned char tls_keep[TLS_PLACEHOLDERS_MAX];
+static unsigned int tls_count;
+static UEvent tls_trimmed, tls_released;
+
+static void tls_placeholder( void *arg )
+{
+    unsigned int index = (unsigned int)(uintptr_t)arg;
+
+    __atomic_store_n( &tls_page[index], (unsigned long long)(uintptr_t)armGetTls() & ~0xfffull,
+                      __ATOMIC_RELEASE );
+    waitSingle( waiterForUEvent( &tls_trimmed ), UINT64_MAX );
+    if (!__atomic_load_n( &tls_keep[index], __ATOMIC_ACQUIRE )) return;
+    waitSingle( waiterForUEvent( &tls_released ), UINT64_MAX );
+}
+
+static void hold_thread_local_pages( void )
+{
+    extern unsigned int horizon_drop_thread_local_pages( unsigned int *found );
+    unsigned int i, j, kept = 0, found = 0, dropped;
+    Result rc = 0;
+
+    ueventCreate( &tls_trimmed, false );
+    ueventCreate( &tls_released, false );
+    for (i = 0; i < TLS_PLACEHOLDERS_MAX; i++)
+    {
+        /* 0x3b, the lowest priority an application may give a thread on cores
+         * 0 to 2 -- 0x3f is core 3's, and build 238 was refused all 96. All
+         * they do is wait. Their stacks are libnx's, mapped where it keeps
+         * stacks, clear of the program's memory. */
+        if (R_FAILED( rc = threadCreate( &tls_threads[i], tls_placeholder, (void *)(uintptr_t)i, NULL, 0x2000, 0x3b, -2 ) ))
+            break;
+        if (R_FAILED( threadStart( &tls_threads[i] ) ))
+        {
+            threadClose( &tls_threads[i] );
+            break;
+        }
+        while (!__atomic_load_n( &tls_page[i], __ATOMIC_ACQUIRE )) svcSleepThread( 100000 );
+    }
+    tls_count = i;
+    for (i = 0; i < tls_count; i++)
+    {
+        for (j = 0; j < i; j++)
+            if (tls_keep[j] && tls_page[j] == tls_page[i]) break;
+        if (j == i)
+        {
+            tls_keep[i] = 1;
+            kept++;
+        }
+    }
+    ueventSignal( &tls_trimmed );
+    for (i = 0; i < tls_count; i++)
+    {
+        if (tls_keep[i]) continue;
+        threadWaitForExit( &tls_threads[i] );
+        threadClose( &tls_threads[i] );
+    }
+    dropped = horizon_drop_thread_local_pages( &found );
+    log_line( "[TLS] %u placeholder threads (the next refused: rc=%#x), %u kept to hold a thread-local page "
+              "each; of %u such pages below 4 GB, %u were inside the program's reserved memory and were taken "
+              "out of it", tls_count, rc, kept, found, dropped );
+}
+
+/* Before the loader takes the process back: the placeholders' stacks are on
+ * the heap it resets. */
+static void release_thread_local_pages( void )
+{
+    unsigned int i;
+
+    if (!tls_count) return;
+    ueventSignal( &tls_released );
+    for (i = 0; i < tls_count; i++)
+    {
+        if (!tls_keep[i]) continue;
+        threadWaitForExit( &tls_threads[i] );
+        threadClose( &tls_threads[i] );
+    }
+    tls_count = 0;
+}
+
 static int return_to_launcher( void )
 {
     int i, still_lent = 0;
@@ -3034,6 +3132,7 @@ static int return_to_launcher( void )
     }
     wine_nx_compositor_stop();
     wine_nx_profile_stop();
+    release_thread_local_pages();
     /* Mesa's worker threads outlive the program that made work for them. */
     run_closing_step( stop_mesa_workers, 5, "ending the graphics library's worker threads" );
     for (i = 0; i < 200 && wine_nx_threads_other(); i++) svcSleepThread( 10000000LL );
@@ -3772,6 +3871,9 @@ int main( int argc, char **argv )
         park_forever();
     }
 
+    /* With the image mapped, so no thread-local page can be put where it has
+     * to go, and before the program runs or makes a thread of its own. */
+    hold_thread_local_pages();
     if (runtime_describe_image( module, view_size, &entry ))
     {
         params = runtime_create_process_params( target, &main_nt_name, dos_path, sizeof(dos_path) );

@@ -11977,6 +11977,25 @@ BOOL horizon_get_stack_region( void **start, void **limit )
     return TRUE;
 }
 
+/* The next page at or after addr, below limit, that the kernel holds threads'
+ * local storage in, or 0. The kernel places those pages itself, at random in
+ * the code region, whenever a new thread finds no free slot in the ones it
+ * has; libnx's reservations mean nothing to it. */
+unsigned long long horizon_next_thread_local_page( unsigned long long addr, unsigned long long limit )
+{
+    MemoryInfo info;
+    u32 page_info;
+
+    while (addr < limit)
+    {
+        if (R_FAILED( svcQueryMemory( &info, &page_info, addr ) )) return 0;
+        if (info.type == MemType_ThreadLocal) return info.addr > addr ? info.addr : addr;
+        if (info.addr + info.size <= addr) return 0;  /* the last block wraps */
+        addr = info.addr + info.size;
+    }
+    return 0;
+}
+
 void horizon_get_address_space_limits( void **start, void **limit )
 {
     u64 base = 0, size = 0;

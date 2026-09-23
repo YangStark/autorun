@@ -4421,6 +4421,40 @@ void *horizon_native_window_end = NULL;
  * created, as Wine's preloader does on other hosts. These are PROT_NONE host
  * reservations, not guest views or committed RAM: Wine can allocate inside
  * them, and unmap_area restores the reservation when a guest view is freed. */
+/* Takes the kernel's thread-local pages out of the guest's reservations. The
+ * reservations are this process's bookkeeping, not kernel mappings, so the
+ * kernel sees them as free and puts a thread-local page wherever its random
+ * search lands when a new thread needs one -- which in a 32-bit address space
+ * is often inside memory the program has reserved. The Sims 2 reserved 4 MB,
+ * a page landed in it, committing the 4 MB then failed and the game wrote
+ * through the memory it did not get. The runtime creates the pages a process
+ * will ever need before the program starts (runtime.c) and this takes them
+ * out, so no allocation is ever handed one. A page inside a view the program
+ * already has is left alone and counted: nothing can move it. Returns how many
+ * were taken out, and how many were found below 4 GB. */
+unsigned int horizon_drop_thread_local_pages( unsigned int *found )
+{
+    unsigned long long page = 0;
+    unsigned int dropped = 0;
+    sigset_t sigset;
+
+    *found = 0;
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    while ((page = horizon_next_thread_local_page( page, (ULONG_PTR)limit_4g )))
+    {
+        (*found)++;
+        if (mmap_is_in_reserved_area( (void *)(ULONG_PTR)page, 0x1000 ) == 1 &&
+            !find_view_range( (void *)(ULONG_PTR)page, 0x1000 ))
+        {
+            remove_reserved_area( (void *)(ULONG_PTR)page, 0x1000 );
+            dropped++;
+        }
+        page += 0x1000;
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return dropped;
+}
+
 static void horizon_reserve_guest_address_space(void)
 {
     struct range_entry *range;
