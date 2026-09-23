@@ -1142,14 +1142,17 @@ static void runtime_report_interpreter(void)
         /* Without verbose traces a white screen says nothing about whether a
          * program is still loading, computing or drawing. Every 10 seconds, if
          * anything changed: completed file reads and the time inside NtReadFile,
-         * read requests to the SD card, their time and the reads the cache
-         * served, system calls, frames shown and dynarec entries. */
+         * the bytes they returned, read requests to the SD card, their time,
+         * the bytes they brought back, the reads the cache served and what it
+         * is holding, system calls, frames shown and dynarec entries. */
         extern unsigned int wine_nx_file_reads __attribute__((weak));
         extern unsigned long long wine_nx_file_read_100ns __attribute__((weak));
         extern unsigned int wine_nx_syscalls __attribute__((weak));
         extern unsigned int wine_nx_audio_underruns __attribute__((weak));
         extern unsigned int wine_nx_sd_reads, wine_nx_sd_hits;
-        extern unsigned long long wine_nx_sd_read_ns;
+        extern unsigned long long wine_nx_sd_read_ns, wine_nx_sd_bytes;
+        extern unsigned long long wine_nx_file_read_bytes __attribute__((weak));
+        extern unsigned int wine_nx_sd_cache_mb( void );
         extern unsigned int wine_nx_gl_swaps __attribute__((weak)), wine_nx_gl_calls __attribute__((weak));
         extern unsigned int wine_nx_vk_presents __attribute__((weak));
         extern unsigned int wine_nx_gl_persistent_failures __attribute__((weak));
@@ -1295,12 +1298,20 @@ static void runtime_report_interpreter(void)
         unsigned long long heap_size = (unsigned long long)(fake_heap_end - fake_heap_start);
         unsigned long long heap_free = heap.fordblks + (heap_size > heap.arena ? heap_size - heap.arena : 0);
 
-        log_line( "[PROGRESS] %llus reads=%u read_ms=%llu sd_reads=%u sd_ms=%llu cache_hits=%u syscalls=%u "
+        /* read_mb is what the program asked for and sd_mb what the card gave:
+         * apart they say whether a run is reading a lot or reading the same
+         * bytes again, which the request counts alone cannot. cache_mb is what
+         * the cache holds, which follows the heap the game leaves free. */
+        log_line( "[PROGRESS] %llus reads=%u read_ms=%llu read_mb=%llu sd_reads=%u sd_ms=%llu sd_mb=%llu "
+                  "cache_hits=%u cache_mb=%u syscalls=%u "
                   "frames=%u heap_used_mb=%llu heap_free_mb=%llu%s%s%s%s",
                   (unsigned long long)(armTicksToNs( now - start ) / 1000000000ull), reads, read_ms,
+                  &wine_nx_file_read_bytes
+                      ? __atomic_load_n( &wine_nx_file_read_bytes, __ATOMIC_RELAXED ) >> 20 : 0,
                   __atomic_load_n( &wine_nx_sd_reads, __ATOMIC_RELAXED ),
                   __atomic_load_n( &wine_nx_sd_read_ns, __ATOMIC_RELAXED ) / 1000000,
-                  __atomic_load_n( &wine_nx_sd_hits, __ATOMIC_RELAXED ), syscalls, frames,
+                  __atomic_load_n( &wine_nx_sd_bytes, __ATOMIC_RELAXED ) >> 20,
+                  __atomic_load_n( &wine_nx_sd_hits, __ATOMIC_RELAXED ), wine_nx_sd_cache_mb(), syscalls, frames,
                   (unsigned long long)heap.uordblks >> 20, heap_free >> 20, systop, native, gl, audio );
         {
             extern void wine_nx_thread_report( void );
@@ -3606,7 +3617,7 @@ int main( int argc, char **argv )
     open_game_log( target );
     log_line( "wine-nx-runtime: generic Wine ntdll PE loader path" );
     log_line( "[BUILD] %s", WINE_NX_RUNTIME_BUILD );
-    log_line( "[SDCACHE] %s", sd_cache ? "sdmc reads cached: 128 KB chunks, 8 per file, 32 MB in all"
+    log_line( "[SDCACHE] %s", sd_cache ? "sdmc reads cached: 128 KB chunks, 8 per file, 32 to 192 MB in all"
                                       : "no sdmc device; reads are not cached" );
     log_line( "[INIT] verbose traces %s (verbose.txt)", wine_nx_runtime_verbose ? "on" : "off" );
     log_line( "[INIT] profiler %s (profile.txt)", runtime_profile ? "on" : "off" );

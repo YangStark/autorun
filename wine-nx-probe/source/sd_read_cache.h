@@ -9,9 +9,13 @@
  * keeps a few aligned chunks: a read inside one is a copy, a miss reads the
  * whole chunk in one request, and the least recently used chunk is replaced.
  *
- * Only files opened read-only are cached. Opening a path for writing stops
- * caching of every open file with that path, and a file opened while a writer
- * has its path open is not cached. The caller locks around these functions.
+ * A file is cached whatever it was opened for, and a write to a path throws
+ * away what every open file with that path holds (sd_cache_written), so the
+ * next read of it goes to the card. Refusing to cache anything opened for
+ * writing instead left The Sims 2 reading almost all of its packages from the
+ * card one kilobyte at a time: it opens them for writing and then only reads.
+ * A writer that cannot be recorded, whose writes would go unnoticed, still
+ * stops the cache for good. The caller locks around these functions.
  */
 #ifndef WINE_NX_SD_READ_CACHE_H
 #define WINE_NX_SD_READ_CACHE_H
@@ -24,6 +28,8 @@
 #define SD_CACHE_LINES  8             /* chunks kept per file */
 #define SD_CACHE_DIRECT (64 * 1024)   /* reads this large go straight to the file */
 #define SD_CACHE_BYPASS (-2)          /* sd_cache_read found no memory: read directly */
+#define SD_CACHE_POOL_MIN 256         /* 32 MB, the chunks every game gets */
+#define SD_CACHE_POOL_MAX 1536        /* 192 MB, when a game leaves that much heap free */
 
 struct sd_cache_line
 {
@@ -40,10 +46,17 @@ struct sd_cache_line
  * Sims 2 keeps hundreds of packages open, filled the pool in its first
  * seconds, and read every other package from the card for the rest of the
  * run -- about eight reads a chunk while there was room, then 149,000 card
- * reads in five minutes. held lists the lines holding a chunk. */
+ * reads in five minutes. held lists the lines holding a chunk.
+ *
+ * max is how many chunks the pool may hold, and the runtime moves it with the
+ * heap the game leaves free (sd_cache.c): 32 MB is little next to a collection
+ * whose packages are read all run long, and The Sims 2 plays with about a
+ * gigabyte of the heap untouched. cap is what held can list, so max can grow
+ * without the list moving. */
 struct sd_cache_pool
 {
     unsigned int used, max;        /* chunks allocated for all files, and the limit */
+    unsigned int cap;              /* how many held can list; max never passes it */
     unsigned long long clock;      /* counts every chunk read, across files */
     struct sd_cache_line **held;   /* the lines holding a chunk, used of them */
 };
@@ -94,6 +107,26 @@ static inline struct sd_cache_line *sd_cache_oldest( struct sd_cache_pool *pool 
     for (i = 0; i < pool->used; i++)
         if (!oldest || pool->held[i]->used_at < oldest->used_at) oldest = pool->held[i];
     return oldest;
+}
+
+/* Give chunks back, the one read longest ago first, until the pool holds no
+ * more than max. The runtime lowers max as the game's own allocations take
+ * the heap: a cache that kept its chunks would be taking memory from the
+ * program it is there to speed up. */
+static inline void sd_cache_trim( struct sd_cache_pool *pool )
+{
+    while (pool->used > pool->max)
+    {
+        struct sd_cache_line *old = sd_cache_oldest( pool );
+
+        if (!old) break;
+        free( old->data );
+        old->data = NULL;
+        old->start = -1;
+        old->len = 0;
+        old->lru = 0;
+        sd_cache_held_remove( pool, old );
+    }
 }
 
 struct sd_cache_file
@@ -214,7 +247,8 @@ static inline long long sd_cache_read( struct sd_cache_file *file, struct sd_cac
             }
             else if (!line->data)
             {
-                if (!pool->held && !(pool->held = calloc( pool->max, sizeof(*pool->held) )))
+                if (!pool->held &&
+                    !(pool->held = calloc( pool->cap ? pool->cap : pool->max, sizeof(*pool->held) )))
                     return done ? (long long)done : SD_CACHE_BYPASS;
                 if (!(line->data = malloc( SD_CACHE_CHUNK )))
                     return done ? (long long)done : SD_CACHE_BYPASS;
@@ -279,6 +313,14 @@ static inline void sd_cache_forget_path( struct sd_cache_file *list, struct sd_c
     }
 }
 
+/* Bytes went to this path: what every open file with it holds may be out of
+ * date, and is dropped. They stay cached, and read the card again. */
+static inline void sd_cache_written( struct sd_cache_file *list, struct sd_cache_pool *pool, const char *path )
+{
+    for (; list; list = list->next)
+        if (sd_cache_same_path( list->path, path )) sd_cache_drop( list, pool );
+}
+
 /* Record an open file. Returns NULL without memory. */
 static inline struct sd_cache_file *sd_cache_opened( struct sd_cache_file **list, struct sd_cache_pool *pool,
                                                      void *key, const char *path, int writable )
@@ -293,17 +335,10 @@ static inline struct sd_cache_file *sd_cache_opened( struct sd_cache_file **list
     }
     file->key = key;
     file->writable = writable;
-    file->cacheable = !writable;
+    file->cacheable = 1;
+    /* What a writer of this path left behind is not what this open will read. */
     for (other = *list; other; other = other->next)
-    {
-        if (!sd_cache_same_path( other->path, path )) continue;
-        if (other->writable) file->cacheable = 0;
-        if (writable)
-        {
-            other->cacheable = 0;
-            sd_cache_drop( other, pool );
-        }
-    }
+        if (other->writable && sd_cache_same_path( other->path, path )) sd_cache_drop( other, pool );
     file->next = *list;
     *list = file;
     return file;

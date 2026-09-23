@@ -182,6 +182,7 @@ static void test_open_files(void)
     struct sd_cache_pool pool = { .max = 64 };
     struct fake_file f = make_file( 1000 );
     struct sd_cache_file *list = NULL, *reader, *writer, *late, *after, *lang;
+    unsigned int before;
     char buf[10];
 
     assert( sd_cache_same_path( grf, "/switch//wine/drive_c/openttd/baseset/openttd.grf/" ) );
@@ -192,25 +193,37 @@ static void test_open_files(void)
     assert( reader && reader->cacheable && !reader->writable );
     assert( cached_read( reader, &pool, &f, 0, buf, sizeof(buf) ) == 10 && pool.used == 1 );
 
-    /* A writer of the same file stops caching of the open reader. */
+    /* A file opened for writing is cached too: The Sims 2 opens its packages
+     * that way and reads them. Opening it drops what a writer left. */
     writer = sd_cache_opened( &list, &pool, (void *)2, "/switch/wine/drive_c/openttd/baseset/openttd.grf", 1 );
-    assert( writer && !writer->cacheable && !reader->cacheable && !reader->lines[0].data && !pool.used );
+    assert( writer && writer->cacheable && writer->writable );
+    assert( reader->cacheable && reader->lines[0].data && pool.used == 1 );
+    assert( cached_read( writer, &pool, &f, 0, buf, sizeof(buf) ) == 10 && pool.used == 2 );
 
-    /* A reader opened while the writer is open is not cached either. */
+    /* Writing to the path throws away what every open file with it holds, and
+     * the next read goes back to the card for the bytes that were written. */
+    sd_cache_written( list, &pool, grf );
+    assert( !pool.used && reader->cacheable && writer->cacheable );
+    memset( f.data, 0x77, 16 );
+    before = f.requests;
+    assert( cached_read( reader, &pool, &f, 0, buf, sizeof(buf) ) == 10 );
+    assert( f.requests == before + 1 && buf[0] == 0x77 );
+
+    /* A reader opened while the writer is open is cached as well. */
     late = sd_cache_opened( &list, &pool, (void *)3, grf, 0 );
-    assert( late && !late->cacheable );
+    assert( late && late->cacheable );
     sd_cache_closed( &list, &pool, (void *)2 );
     assert( !sd_cache_find( list, (void *)2 ) && sd_cache_find( list, (void *)3 ) == late );
 
-    /* After the writer closes, a new reader is cached. */
     after = sd_cache_opened( &list, &pool, (void *)4, grf, 0 );
     assert( after && after->cacheable );
 
     /* Renaming or removing a path forgets it. */
     lang = sd_cache_opened( &list, &pool, (void *)5, "sdmc:/switch/wine/drive_c/openttd/lang/english.lng", 0 );
-    assert( cached_read( lang, &pool, &f, 0, buf, sizeof(buf) ) == 10 && pool.used == 1 );
+    before = pool.used;
+    assert( cached_read( lang, &pool, &f, 0, buf, sizeof(buf) ) == 10 && pool.used == before + 1 );
     sd_cache_forget_path( list, &pool, "sdmc:/switch/wine/drive_c/openttd/lang/ENGLISH.LNG" );
-    assert( !lang->cacheable && !pool.used && after->cacheable );
+    assert( !lang->cacheable && pool.used == before && after->cacheable );
 
     sd_cache_closed( &list, &pool, (void *)1 );
     sd_cache_closed( &list, &pool, (void *)3 );
@@ -277,6 +290,52 @@ static void test_many_open_files(void)
     free( f.data );
 }
 
+/* The pool is sized from the heap the game leaves free, so max moves while
+ * files are open: growing must let new chunks in without the held list moving,
+ * and shrinking must give chunks back, the ones read longest ago first. */
+static void test_pool_resized(void)
+{
+    struct sd_cache_pool pool = { .max = 2, .cap = 8 };
+    struct fake_file f = make_file( 16LL * SD_CACHE_CHUNK );
+    struct sd_cache_file files[6];
+    struct sd_cache_line **held;
+    unsigned int i, before;
+    char buf[10];
+
+    memset( files, 0, sizeof(files) );
+    for (i = 0; i < 6; i++) files[i].cacheable = 1;
+    /* Two chunks is the whole pool: the third file takes the oldest chunk. */
+    for (i = 0; i < 3; i++) assert( cached_read( &files[i], &pool, &f, i * SD_CACHE_CHUNK, buf, 10 ) == 10 );
+    assert( pool.used == 2 && !holding( &files[0] ) );
+    held = pool.held;
+
+    pool.max = 6;  /* the game gave memory back */
+    for (i = 3; i < 6; i++) assert( cached_read( &files[i], &pool, &f, i * SD_CACHE_CHUNK, buf, 10 ) == 10 );
+    assert( pool.used == 5 && pool.held == held );  /* room for all five, same list */
+    before = f.requests;
+    assert( cached_read( &files[5], &pool, &f, 5 * SD_CACHE_CHUNK + 4, buf, 10 ) == 10 );
+    assert( f.requests == before && !memcmp( buf, f.data + 5 * SD_CACHE_CHUNK + 4, 10 ) );
+
+    pool.max = 2;  /* the game took it back */
+    sd_cache_trim( &pool );
+    assert( pool.used == 2 );
+    /* files[4] and files[5] were read last, so they keep their chunks. */
+    assert( holding( &files[4] ) == 1 && holding( &files[5] ) == 1 );
+    assert( !holding( &files[1] ) && !holding( &files[2] ) && !holding( &files[3] ) );
+    before = f.requests;
+    assert( cached_read( &files[5], &pool, &f, 5 * SD_CACHE_CHUNK + 8, buf, 10 ) == 10 );
+    assert( f.requests == before && !memcmp( buf, f.data + 5 * SD_CACHE_CHUNK + 8, 10 ) );
+    /* A file whose chunk went reads it again, and gets the right bytes. */
+    assert( cached_read( &files[1], &pool, &f, SD_CACHE_CHUNK + 12, buf, 10 ) == 10 );
+    assert( f.requests == before + 1 && !memcmp( buf, f.data + SD_CACHE_CHUNK + 12, 10 ) );
+
+    pool.max = 0;  /* nothing at all: every chunk goes back */
+    sd_cache_trim( &pool );
+    assert( !pool.used && !pool.held );
+    for (i = 0; i < 6; i++) sd_cache_drop( &files[i], &pool );
+    free( f.data );
+}
+
 int main(void)
 {
     test_sprite_reads();
@@ -285,8 +344,10 @@ int main(void)
     test_failures_and_memory();
     test_oldest_across_files();
     test_many_open_files();
+    test_pool_resized();
     test_open_files();
     puts( "SD read cache: sprite reads, end of file, least recently used, failures, a full pool taking the "
-          "oldest chunk of any file, 300 open files and open files passed" );
+          "oldest chunk of any file, 300 open files, a pool that grows and shrinks with the free heap, "
+          "and open files a program writes to passed" );
     return 0;
 }
