@@ -2483,16 +2483,17 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
             snprintf( row->value, sizeof(row->value), "%s", p->settings.vsync ? "Enabled" : "Disabled" );
 
             ADD_ROW( ROW_UPSCALING, SECTION_GRAPHICS, "Upscaling",
-                     "Spatial upscaling method when running below native display resolution. "
-                     "FSR 1.0 reconstructs sharp edges with adaptive sharpening. "
-                     "Integer provides crisp nearest-neighbor pixel art scaling." );
+                     "How a Vulkan or DXVK game drawing fewer pixels than the screen is enlarged. FSR 1.0 is "
+                     "AMD's edge-aware upscaler with sharpening. Integer enlarges by whole steps with square "
+                     "pixels for pixel art, leaving wider black bars." );
             row->kind = UI_ROW_DROPDOWN;
             snprintf( row->value, sizeof(row->value), "%s", launcher_upscaling_labels[p->settings.upscaling] );
 
             if (p->settings.upscaling == 1)
             {
                 ADD_ROW( ROW_UPSCALING_SHARPNESS, SECTION_GRAPHICS, "FSR Sharpness",
-                         "Contrast-adaptive sharpening strength applied to upscaled edges." );
+                         "How strongly FSR's second pass (RCAS) sharpens the enlarged picture. 0% leaves it "
+                         "as the first pass drew it." );
                 row->kind = UI_ROW_DROPDOWN;
                 snprintf( row->value, sizeof(row->value), "%s", launcher_sharpness_labels[p->settings.upscaling_sharpness] );
             }

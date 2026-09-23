@@ -118,7 +118,9 @@ The touchscreen works everywhere too.
 
 **A game's options (Y)** - mark it as a favorite or hide it, change its title,
 give it command-line arguments, download its artwork, pick how its graphics are
-drawn (Direct3D 9 through Wine or DXVK), and give it its own controls.
+drawn (Direct3D 9 through Wine or DXVK), how a picture smaller than the screen is
+enlarged (FSR 1.0, or whole-pixel steps for pixel art), and give it its own
+controls.
 
 **Settings (−)** - show hidden games, the controls every game uses by default,
 a [SteamGridDB](https://www.steamgriddb.com) API key for artwork, returning to
