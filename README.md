@@ -141,10 +141,14 @@ or W A S D. Games with controller support see an Xbox 360 controller.
 
 ## If something goes wrong
 
-Every run leaves two logs in `switch/wine` on the SD card:
+Every run leaves its logs in `switch/wine/logs` on the SD card:
 
-- `wine-nx-runtime.log` - the last run, whatever it was.
-- `game-NAME.log` - the last run of that game, kept per game.
+- `autorun_runtime.log` - the last run, whatever it was.
+- `NAME.log` - the last run of that game, kept per game. A run with verbose
+  traces or the profiler on gets its own file, such as `NAME_verbose.log` or
+  `NAME_verbose_profiler.log`, so it doesn't replace the plain one.
+- `stdout.txt`, `stderr.txt` and `stdin.txt` - the program's standard output,
+  error and input. What a program writes to them is also in its log.
 
 When reporting a problem, include the game's log and say what you saw. Turning
 on **Verbose traces** in the game's options gives more detail, at some speed

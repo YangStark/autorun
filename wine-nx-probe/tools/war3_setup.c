@@ -21,7 +21,7 @@
  *   before and after devenum, because its filters need devenum's monikers.
  *   blizzard.ax, the game's video decoder, is registered by the game itself.
  *
- * Each step is reported to wine-nx-runtime.log as a [WAR3 SETUP] line; the
+ * Each step is reported to autorun_runtime.log as a [WAR3 SETUP] line; the
  * exit code is 0 when every step that matters worked. Running it again is
  * harmless. */
 #include <windows.h>

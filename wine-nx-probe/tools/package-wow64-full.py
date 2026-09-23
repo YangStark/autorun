@@ -165,7 +165,7 @@ assert 'Arch: i386\n' in readobj('--file-headers', sims2 / 'sims2-setup.exe')
 Copy the collection onto the card -- leave __Installer and Support behind, they
 are for a computer -- and run sims2-setup.exe once from the launcher. It writes
 what the release's own "Instalar Registros" batch file writes, with the card's
-paths, and says what it did in wine-nx-runtime.log as [SIMS2 SETUP] lines.
+paths, and says what it did in autorun_runtime.log as [SIMS2 SETUP] lines.
 Running it again is harmless.
 
 Where the packs go does not matter much. Each one is recognised by the
@@ -397,7 +397,7 @@ no-balance.txt and the rest -- and the first run moves each into settings.json
 and takes the file away, saying so in the log. A setting a newer build added is
 kept when an older one writes the file back.
 
-wine-nx-runtime.log holds the run. Its [PROGRESS] lines report OpenGL frames,
+autorun_runtime.log holds the run. Its [PROGRESS] lines report OpenGL frames,
 the time in eglSwapBuffers and in opengl32 calls, the megabytes Wine copies for
 32-bit buffer mappings (copy_mb), whether the GPU maps the program's own pages
 (pinned=1, or -1 with pin_rc when nvservices refused them), and the slowest

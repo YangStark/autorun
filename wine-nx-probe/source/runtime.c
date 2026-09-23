@@ -65,6 +65,8 @@ u32 __nx_exception_ignoredebug = 1;
  * game that does not test the result builds its path from an empty string. */
 #define WINE_USER_DIR WINE_DRIVE_C "/users/steamuser"
 #define RUNTIME_DIR WINE_ROOT
+/* Every log the runtime writes, and the program's standard handles. */
+#define RUNTIME_LOGS RUNTIME_DIR "/logs"
 /* Everything a person sets, in one place. */
 #define CONFIG_DIR  RUNTIME_DIR "/config"
 #define CONFIG_FILE CONFIG_DIR "/settings.json"
@@ -97,7 +99,7 @@ extern int wine_nx_usb_list( struct wine_nx_launcher_usb_volume *volumes, int ma
 
 static FILE *log_file;
 /* A second copy, kept from the moment a program starts. The next run of the
- * launcher opens wine-nx-runtime.log afresh and what the program did is gone
+ * launcher opens autorun_runtime.log afresh and what the program did is gone
  * with it, so a program's own log is a file of its own, which only the next
  * run of that same program writes over. */
 static FILE *game_log_file;
@@ -327,8 +329,11 @@ static void log_line( const char *fmt, ... )
 
 /* A program's own log, kept from the moment it is about to start: everything
  * the runtime has said so far, and everything it says from here. The launcher's
- * next run opens wine-nx-runtime.log afresh, and without this the run that
+ * next run opens autorun_runtime.log afresh, and without this the run that
  * mattered is gone before it can be read off the card. */
+extern int wine_nx_runtime_verbose;
+static int runtime_profile;
+
 static void open_game_log( const char *target )
 {
     char path[512], name[128];
@@ -350,14 +355,18 @@ static void open_game_log( const char *target )
     }
     name[i] = 0;
     if ((len = strlen( name )) > 4 && !strcasecmp( name + len - 4, ".exe" )) name[len - 4] = 0;
-    snprintf( path, sizeof(path), "%s/game-%s.log", RUNTIME_DIR, name );
+    /* Beside the runtime's own log, named after the program and the diagnostics
+     * the run had on, so a verbose or profiled run does not replace the plain
+     * one it is being compared with: Sims2EP9.log, Sims2EP9_verbose_profiler.log. */
+    snprintf( path, sizeof(path), "%s/%s%s%s.log", RUNTIME_LOGS, name,
+              wine_nx_runtime_verbose ? "_verbose" : "", runtime_profile ? "_profiler" : "" );
 
     pthread_mutex_lock( &log_mutex );
     fflush( log_file );
     if ((game_log_file = fopen( path, "w" )))
     {
         /* What was said before this point, so the file stands on its own. */
-        if ((sofar = fopen( RUNTIME_DIR "/wine-nx-runtime.log", "r" )))
+        if ((sofar = fopen( RUNTIME_LOGS "/autorun_runtime.log", "r" )))
         {
             char chunk[4096];
             size_t got;
@@ -1061,8 +1070,8 @@ struct std_stream
 
 static struct std_stream std_streams[] =
 {
-    { .path = RUNTIME_DIR "/stdout.txt", .tag = "STDOUT" },
-    { .path = RUNTIME_DIR "/stderr.txt", .tag = "STDERR" },
+    { .path = RUNTIME_LOGS "/stdout.txt", .tag = "STDOUT" },
+    { .path = RUNTIME_LOGS "/stderr.txt", .tag = "STDERR" },
 };
 static pthread_mutex_t std_stream_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -1804,10 +1813,10 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     *cursor++ = 0;
     params->EnvironmentSize = (cursor - (WCHAR *)params->Environment) * sizeof(WCHAR);
 
-    params->hStdInput = runtime_open_std_file( RUNTIME_DIR "/stdin.txt", GENERIC_READ, FILE_OPEN_IF );
-    params->hStdOutput = runtime_open_std_file( RUNTIME_DIR "/stdout.txt", GENERIC_WRITE, FILE_OVERWRITE_IF );
-    params->hStdError = runtime_open_std_file( RUNTIME_DIR "/stderr.txt", GENERIC_WRITE, FILE_OVERWRITE_IF );
-    log_line( "[STDIO] stdin=%p stdout=%p stderr=%p (" RUNTIME_DIR "/std*.txt)",
+    params->hStdInput = runtime_open_std_file( RUNTIME_LOGS "/stdin.txt", GENERIC_READ, FILE_OPEN_IF );
+    params->hStdOutput = runtime_open_std_file( RUNTIME_LOGS "/stdout.txt", GENERIC_WRITE, FILE_OVERWRITE_IF );
+    params->hStdError = runtime_open_std_file( RUNTIME_LOGS "/stderr.txt", GENERIC_WRITE, FILE_OVERWRITE_IF );
+    log_line( "[STDIO] stdin=%p stdout=%p stderr=%p (" RUNTIME_LOGS "/std*.txt)",
               params->hStdInput, params->hStdOutput, params->hStdError );
     horizon_mark_std_stream( params->hStdOutput, 1 );
     horizon_mark_std_stream( params->hStdError, 2 );
@@ -3461,7 +3470,8 @@ int main( int argc, char **argv )
     mkdir( WINE_USER_DIR "/Pictures", 0777 );
     mkdir( WINE_USER_DIR "/Saved Games", 0777 );
     mkdir( WINE_USER_DIR "/Videos", 0777 );
-    log_file = fopen( RUNTIME_DIR "/wine-nx-runtime.log", "w" );
+    mkdir( RUNTIME_LOGS, 0777 );
+    log_file = fopen( RUNTIME_LOGS "/autorun_runtime.log", "w" );
     if (log_file)
     {
         setvbuf( log_file, log_file_buffer, _IOFBF, sizeof(log_file_buffer) );

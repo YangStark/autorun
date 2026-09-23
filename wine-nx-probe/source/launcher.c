@@ -2354,14 +2354,14 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
         else snprintf( row->value, sizeof(row->value), "None" );
 
         ADD_ROW( ROW_VERBOSE, SECTION_DIAGNOSTICS, "Verbose traces",
-                 "Writes Wine's traces to wine-nx-runtime.log, which slows the program down. "
+                 "Writes Wine's traces to autorun_runtime.log, which slows the program down. "
                  "Global follows the setting in Settings (X on the library)." );
         row->adjustable = 1;
         snprintf( row->value, sizeof(row->value), "%s",
                   state_text( p->settings.verbose, l->options->verbose, "On", "Off", buffer, sizeof(buffer) ) );
 
         ADD_ROW( ROW_PROFILE, SECTION_DIAGNOSTICS, "Profiler",
-                 "Samples where every thread spends its time and writes [PROF] lines to wine-nx-runtime.log." );
+                 "Samples where every thread spends its time and writes [PROF] lines to autorun_runtime.log." );
         row->adjustable = 1;
         snprintf( row->value, sizeof(row->value), "%s",
                   state_text( p->settings.profile, l->options->profile, "On", "Off", buffer, sizeof(buffer) ) );
@@ -3239,7 +3239,7 @@ static void settings_menu( struct launcher *l )
         snprintf( rows[SET_VERBOSE].value, sizeof(rows[0].value), "%s", on_off[!!l->options->verbose] );
         rows[SET_VERBOSE].kind = UI_ROW_SWITCH;
         rows[SET_VERBOSE].on = !!l->options->verbose;
-        rows[SET_VERBOSE].help = "Wine's traces go to wine-nx-runtime.log for every program without its own setting.";
+        rows[SET_VERBOSE].help = "Wine's traces go to autorun_runtime.log for every program without its own setting.";
         snprintf( rows[SET_PROFILE].label, sizeof(rows[0].label), "Profiler" );
         snprintf( rows[SET_PROFILE].value, sizeof(rows[0].value), "%s", on_off[!!l->options->profile] );
         rows[SET_PROFILE].kind = UI_ROW_SWITCH;

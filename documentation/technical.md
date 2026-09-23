@@ -7,8 +7,9 @@ as the CPU backend, and ARM64 programs natively. The Wine server, memory
 management, exceptions and the display and input drivers are reimplemented for
 Horizon and run inside the same process.
 
-The project was renamed; files, logs and code identifiers still say `wine-nx`
-(`wine-nx-runtime.nro`, `wine-nx-runtime.log`, `WINE_NX_RUNTIME_BUILD`).
+The project was renamed; files and code identifiers still say `wine-nx`
+(`wine-nx-runtime.nro`, `WINE_NX_RUNTIME_BUILD`). The runtime's log is
+`logs/autorun_runtime.log`.
 
 For players, see the [README](../README.md).
 
@@ -129,8 +130,13 @@ programs. Application-local graphics DLLs have priority. Existing
 
 ## Logs
 
-Each run writes `wine-nx-runtime.log`, and a copy named after the program,
-`game-NAME.log`. Its first lines include `[BUILD]`, the runtime version, worth
+Everything the runtime writes is in `switch/wine/logs`. Each run writes
+`autorun_runtime.log`, and a copy named after the program: `NAME.log`, with
+`_verbose` and `_profiler` added to the name when those were on, so a
+diagnostic run keeps its own file. The program's standard handles are
+`stdin.txt`, `stdout.txt` and `stderr.txt` there, and verbose runs add
+`horizon-trace.log`. A log's first lines include `[BUILD]`, the runtime
+version, worth
 checking before reading anything else. `[PROGRESS]` lines report every 10
 seconds: frames, OpenGL and system call rates, memory and translation counters.
 Its reading figures tell a slow load apart from a busy one: `reads`/`read_mb`
@@ -224,7 +230,7 @@ The runtime's version is `WINE_NX_RUNTIME_BUILD` in
 `wine-nx-probe/build-switch-wow64-dynarec`. Other packagers in
 `wine-nx-probe/tools` stage single programs over the full payload (OpenTTD,
 Quake III's engine, WarCraft III's setup, the Direct3D 9, OpenGL and audio
-tests). `package-wow64-dll-overlay.py --log wine-nx-runtime.log` builds the
+tests). `package-wow64-dll-overlay.py --log autorun_runtime.log` builds the
 i386 DLLs a run reported missing, with everything they import, as an overlay
 zip.
 

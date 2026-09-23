@@ -11797,7 +11797,7 @@ void horizon_trace( const char *fmt, ... )
     /* Each verbose line reopens the separate trace file on the SD card. */
     if (!&wine_nx_runtime_verbose || !wine_nx_runtime_verbose) return;
     pthread_mutex_lock( &lock );
-    if ((f = fopen( "sdmc:/switch/wine/horizon-trace.log", "a" )))
+    if ((f = fopen( "sdmc:/switch/wine/logs/horizon-trace.log", "a" )))
     {
         __builtin_va_start( args, fmt );
         vfprintf( f, fmt, args );

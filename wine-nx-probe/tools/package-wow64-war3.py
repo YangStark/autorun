@@ -114,7 +114,7 @@ while queue:
    game down a lot.
 
 What the setup program does, each step as a [WAR3 SETUP] line in
-wine-nx-runtime.log, ending with "done, all steps worked":
+autorun_runtime.log, ending with "done, all steps worked":
 - Sets the game to 1280x720, 32-bit colour, 60 Hz. The Switch screen, where the
   pointer and the touchscreen are, is always 1280x720; at another resolution the
   game's menus do not line up with them (no highlight, clicks landing elsewhere).

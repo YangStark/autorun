@@ -31,7 +31,7 @@
  *   release's to copy, nobody else having it to give away, and registering a
  *   codec that is not there costs nothing.
  *
- * Each step is reported to wine-nx-runtime.log as a [SIMS2 SETUP] line; the
+ * Each step is reported to autorun_runtime.log as a [SIMS2 SETUP] line; the
  * exit code is 0 when every step worked. Running it again is harmless. */
 #include <windows.h>
 #include <winternl.h>
