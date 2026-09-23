@@ -2210,6 +2210,21 @@ struct horizon_accept_hardware_message_request
     unsigned int hw_id;
 };
 
+struct horizon_get_key_state_request
+{
+    struct horizon_server_request_header header;
+    int async;
+    int key;
+    char pad[4];
+};
+
+struct horizon_get_key_state_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned char state;
+    char pad[7];
+};
+
 struct horizon_hardware_msg_data
 {
     unsigned long long info;
@@ -7517,6 +7532,40 @@ static unsigned int horizon_server_queue_raw_mouse_locked( struct horizon_user_w
     return HORIZON_STATUS_SUCCESS;
 }
 
+/* Whether a key message is still waiting for the program to take it. The
+ * thread's key state then follows those messages, and is not brought up to
+ * the desktop's: server/queue.c locks it while hardware messages are being
+ * processed. */
+static int horizon_server_key_messages_pending_locked( void )
+{
+    struct horizon_input_message *queued;
+
+    for (queued = horizon_input_messages; queued; queued = queued->next)
+        if (queued->device == HORIZON_IMDT_KEYBOARD && !queued->raw_keyboard &&
+            queued->msg >= HORIZON_KBD_WM_KEYDOWN && queued->msg <= HORIZON_KBD_WM_SYSKEYUP)
+            return 1;
+    return 0;
+}
+
+/* server/queue.c: sync_input_keystate. The thread's state takes the keys
+ * that changed on the desktop since it last did, keeping what the thread set
+ * for itself (SetKeyboardState) for the others. */
+static unsigned char horizon_input_desktop_keystate[256];
+
+static void horizon_server_sync_keystate_locked( struct horizon_input_shm *input,
+                                                 const struct horizon_desktop_shm *desktop )
+{
+    unsigned int i;
+
+    if (horizon_server_key_messages_pending_locked()) return;
+    for (i = 0; i < 256; i++)
+    {
+        if (horizon_input_desktop_keystate[i] == desktop->keystate[i]) continue;
+        input->keystate[i] = horizon_input_desktop_keystate[i] = desktop->keystate[i];
+    }
+    input->keystate_serial = desktop->keystate_serial;
+}
+
 static void horizon_server_remove_input_message_locked( struct horizon_input_message *message )
 {
     struct horizon_input_message **ptr;
@@ -7616,10 +7665,14 @@ static int horizon_server_handle_send_keyboard( struct horizon_server_connection
             status = horizon_server_queue_key_locked( focus, event.message, event.vkey, event.lparam,
                                                       desktop->cursor.x, desktop->cursor.y, time, kbd->info,
                                                       event.data_flags, NULL );
+        /* The desktop's state is the asynchronous one and changes now; the
+         * thread's changes as the program takes each key message
+         * (accept_hardware_message), as server/queue.c keeps it: Shift sent
+         * down, A down and up and Shift up together must still find Shift
+         * down when TranslateMessage makes a character of the A. */
         horizon_keyboard_update_state( desktop->keystate, event.message, event.vkey, 0xc0 );
-        horizon_keyboard_update_state( input->keystate, event.message, event.vkey, 0x80 );
-        input->keystate_serial++;
         desktop->keystate_serial++;
+        horizon_server_sync_keystate_locked( input, desktop );
 
         if (raw_target)
         {
@@ -7847,6 +7900,27 @@ static int horizon_server_handle_accept_hardware_message( struct horizon_server_
         struct horizon_input_message *queued = *ptr;
 
         if (queued->id != request->hw_id) continue;
+        /* The thread's key state follows the key messages it has taken
+         * (server/queue.c: release_hardware_message). */
+        if (queued->device == HORIZON_IMDT_KEYBOARD && !queued->raw_keyboard &&
+            queued->msg >= HORIZON_KBD_WM_KEYDOWN && queued->msg <= HORIZON_KBD_WM_SYSKEYUP)
+        {
+            struct horizon_input_shm *input = horizon_server_input_shared_locked();
+            struct horizon_obj_locator desktop_locator;
+            struct horizon_desktop_shm *desktop = horizon_server_desktop_shared_locked( &desktop_locator );
+
+            *ptr = queued->next;
+            if (horizon_input_messages_tail == &queued->next) horizon_input_messages_tail = ptr;
+            if (input)
+            {
+                horizon_keyboard_update_state( input->keystate, queued->msg, (unsigned int)queued->wparam, 0x80 );
+                input->keystate_serial++;
+                if (desktop) horizon_server_sync_keystate_locked( input, desktop );
+                horizon_server_flush_input_locked();
+            }
+            free( queued );
+            break;
+        }
         *ptr = queued->next;
         if (horizon_input_messages_tail == &queued->next) horizon_input_messages_tail = ptr;
         free( queued );
@@ -7855,6 +7929,42 @@ static int horizon_server_handle_accept_hardware_message( struct horizon_server_
     horizon_server_refresh_queues_locked();
     pthread_mutex_unlock( &horizon_server_objects_mutex );
     return horizon_server_write_status( connection->reply_fd, HORIZON_STATUS_SUCCESS );
+}
+
+/* server/queue.c: get_key_state. GetAsyncKeyState reads the desktop's state
+ * and clears its pressed-since bit; GetKeyState the thread's, brought up to
+ * the desktop's unless key messages are still to be taken. */
+static int horizon_server_handle_get_key_state( struct horizon_server_connection *connection,
+                                                const unsigned char *message )
+{
+    const struct horizon_get_key_state_request *request = (const void *)message;
+    struct horizon_get_key_state_reply reply;
+    struct horizon_obj_locator desktop_locator;
+    struct horizon_desktop_shm *desktop;
+    struct horizon_input_shm *input;
+
+    memset( &reply, 0, sizeof(reply) );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(input = horizon_server_input_shared_locked()) ||
+        !(desktop = horizon_server_desktop_shared_locked( &desktop_locator )))
+        reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else if (request->async)
+    {
+        reply.state = desktop->keystate[request->key & 0xff];
+        desktop->keystate[request->key & 0xff] &= ~0x40;
+        desktop->keystate_serial++;
+        horizon_server_flush_session_range_locked(
+            desktop_locator.offset,
+            offsetof( struct horizon_shared_object, shm ) + sizeof(struct horizon_desktop_shm) );
+    }
+    else
+    {
+        horizon_server_sync_keystate_locked( input, desktop );
+        reply.state = input->keystate[request->key & 0xff];
+        horizon_server_flush_input_locked();
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
 }
 
 static int horizon_server_handle_get_thread_input( struct horizon_server_connection *connection )
@@ -13940,6 +14050,9 @@ static void *horizon_server_thread( void *param )
             break;
         case HORIZON_REQ_SET_CURSOR:
             status = horizon_server_handle_set_cursor( connection, message );
+            break;
+        case HORIZON_REQ_GET_KEY_STATE:
+            status = horizon_server_handle_get_key_state( connection, message );
             break;
         default:
             WARN( "unimplemented Horizon server request %d size %u reply_size %u.\n",
