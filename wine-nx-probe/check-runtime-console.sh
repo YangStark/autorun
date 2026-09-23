@@ -33,6 +33,8 @@ flags="-std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-f
 "$build/box64_code_arena"
 "${CC:-clang}" $flags "$root/wine-nx-probe/tests/horizon_registry.c" -o "$build/registry"
 "$build/registry"
+"${CC:-clang}" $flags "$root/wine-nx-probe/tests/registry_paths.c" -o "$build/registry_paths"
+"$build/registry_paths"
 "${CC:-clang}" $flags "$root/wine-nx-probe/tests/horizon_read_redirect.c" -o "$build/read_redirect"
 "$build/read_redirect"
 "${CC:-clang}" $flags "$root/wine-nx-probe/tests/horizon_object_dirs.c" -o "$build/object_dirs"

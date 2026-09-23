@@ -51,7 +51,9 @@ runtime; the full package now ships the Mesa 26 one.
 - **Wine on Horizon.** An in-process Wine server
   (`dlls/ntdll/unix/horizon*.c|h`) covers files (with Windows sharing modes),
   directories, sync objects, threads and user APCs, the registry
-  (`system.reg`/`user.reg` on the card, plus `config/classes.reg`), message
+  (`registry/system.reg` and `registry/user.reg` on the card, over the classes
+  the payload ships in `config/classes.reg`; hives an earlier build left in
+  `switch/wine` itself are moved there on the first start), message
   queues, timers, the clipboard, raw input, object directories and sections,
   including sections with no file whose views share their pages.
 - **Sockets.** Overlapped Winsock on I/O completion ports: pending
