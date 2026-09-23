@@ -169,6 +169,8 @@ subprocess.run([str(toolchain / 'i686-w64-mingw32-clang'), '-Os', '-Wall', '-Wex
                 '-Wl,--dynamicbase', '-o', str(sims2 / 'sims2-setup.exe'),
                 str(tools / 'sims2_setup.c'), '-ladvapi32', '-lkernel32', '-lntdll'], check=True)
 assert 'Arch: i386\n' in readobj('--file-headers', sims2 / 'sims2-setup.exe')
+# DXVK's settings for the game, which the setup copies beside each executable.
+shutil.copy2(tools / 'sims2/dxvk.conf', sims2 / 'dxvk.conf')
 (sims2 / 'README.txt').write_text('''The Sims 2 Ultimate Collection
 ==============================
 
@@ -183,6 +185,16 @@ executable in its TSBin, not by the name of the folder around it, so a release
 that calls them Base and EP1-EP9 and one that spells out "The Sims 2 Nightlife"
 both work, and the collection may keep a folder of its own around them. Put
 sims2-setup.exe's folder beside the packs, or beside the folder holding them.
+
+The setup also copies dxvk.conf from its folder into each pack's TSBin, next to
+the executable. It holds the game to 512 MB of video memory: DXVK's own profile
+for The Sims 2 reports 2 GB, and on the Switch the game fills the shared 1.5 GB
+and crashes. A dxvk.conf already in TSBin is left as it is.
+
+It also sets the game's own Graphics Rules.sgr (TSData\\Res\\Config in each pack)
+for the Switch's 1280x720 screen: in its screen resolution option every default
+becomes 1280x720, and a maximum below that is raised to it. Nothing else in the
+file changes, and the file as it was is kept as Graphics Rules.sgr.original.
 
 The game is the newest expansion's executable, TSBin\\Sims2EP9.exe. It has no
 relocations and is linked for 0x400000, so it needs a 32-bit forwarder, and
