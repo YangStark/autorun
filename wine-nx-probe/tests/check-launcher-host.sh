@@ -58,6 +58,13 @@ clang -std=gnu11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-
 # sdl2-compat looks for SDL3 next to the program, not in Homebrew's lib folder.
 ln -s /opt/homebrew/lib/libSDL3.0.dylib "$build/libSDL3.dylib"
 
+# The floating keyboard: what its buttons and taps send, and its picture.
+clang -std=gnu11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+    -I "$probe/source" $(sdl2-config --cflags) -I/opt/homebrew/include \
+    "$probe/tests/osk.c" "$probe/source/osk.c" \
+    $(sdl2-config --libs) -L/opt/homebrew/lib -lSDL2_ttf -lpng -o "$build/osk"
+"$build/osk" "$font" "$shots"
+
 card="$build/card/sdmc:"
 mkdir -p "$card/switch/wine/drive_c/openttd" "$card/games/deep/er/still"
 ln -s "$drive_c/notepad.exe" "$drive_c/7zr.exe" "$card/switch/wine/drive_c/"

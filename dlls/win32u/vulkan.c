@@ -50,6 +50,9 @@ static pthread_mutex_t present_lock = PTHREAD_MUTEX_INITIALIZER;
 #ifdef WINE_NX_LSFG
 #include "../../wine-nx-probe/source/lsfg.h"
 #endif
+#ifdef __SWITCH__
+#include "../../wine-nx-probe/source/osk.h"
+#endif
 
 /* The Upscaling setting a scaled swapchain is made with: 0 bilinear, 1 FSR 1.0
  * (EASU then RCAS, tools/fshack_*.comp), 2 whole-pixel steps with nearest
@@ -279,6 +282,13 @@ static const char *debugstr_vkextent2d( const VkExtent2D *ext )
 struct swapchain
 {
     struct vulkan_swapchain obj;
+#ifdef __SWITCH__
+    /* The floating keyboard's copy into the host images (nx_osk_present). */
+    VkFormat nx_format;
+    VkExtent2D nx_extent;
+    BOOL nx_osk_usable;
+    struct nx_osk_overlay *nx_osk;
+#endif
 #ifdef WINE_NX_MESA_SWITCH
     uint64_t nx_last_present;
     VkPresentModeKHR nx_present_mode;
@@ -305,6 +315,10 @@ struct swapchain
     BOOL fsr;                /* pipeline is EASU, and rcas_pipeline follows it */
     VkPipeline rcas_pipeline;
 };
+
+#ifdef __SWITCH__
+static void nx_osk_free( struct vulkan_device *device, struct nx_osk_overlay *osk );
+#endif
 
 static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
 {
@@ -3044,6 +3058,18 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         }
     }
 #endif
+#ifdef __SWITCH__
+    /* The floating keyboard is copied into the images the screen shows. */
+    swapchain->nx_format = create_info_host.imageFormat;
+    swapchain->nx_extent = create_info_host.imageExtent;
+    if ((capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+        (swapchain->nx_format == VK_FORMAT_B8G8R8A8_UNORM || swapchain->nx_format == VK_FORMAT_B8G8R8A8_SRGB ||
+         swapchain->nx_format == VK_FORMAT_R8G8B8A8_UNORM || swapchain->nx_format == VK_FORMAT_R8G8B8A8_SRGB))
+    {
+        create_info_host.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        swapchain->nx_osk_usable = TRUE;
+    }
+#endif
 #ifdef WINE_NX_LSFG
     lsfg = wine_nx_lsfg_prepare_swapchain( instance->host.instance, physical_device->host.physical_device,
                                           &create_info_host );
@@ -3139,6 +3165,13 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
         free( swapchain->fs_hack_images );
     }
 
+#ifdef __SWITCH__
+    if (swapchain->nx_osk)
+    {
+        device->p_vkDeviceWaitIdle( device->host.device );
+        nx_osk_free( device, swapchain->nx_osk );
+    }
+#endif
     device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
     instance->p_remove_object( instance, &swapchain->obj.obj );
 
@@ -3627,6 +3660,226 @@ done:
 }
 #endif
 
+#ifdef __SWITCH__
+/* The floating keyboard (wine-nx-probe/source/osk.c), copied into the image
+ * about to be shown, on the present's own queue: after everything drawn into
+ * it, before the presentation engine takes it. Each image has its own staging
+ * buffer, command buffer and semaphore. An image only comes back to the
+ * program once it has been shown, which is after the copy into it finished,
+ * so its buffer is free to fill again by then. */
+struct nx_osk_image
+{
+    VkCommandBuffer cmd;
+    VkSemaphore done;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    void *pixels;
+    unsigned int generation;
+};
+
+struct nx_osk_overlay
+{
+    uint32_t count, family;
+    VkImage *images;
+    struct nx_osk_image *per;
+    VkCommandPool pool;
+    int x, y, width, height;   /* what the command buffers copy, and where */
+    BOOL failed;
+};
+
+static void nx_osk_release( struct vulkan_device *device, struct nx_osk_overlay *osk )
+{
+    uint32_t i;
+
+    for (i = 0; osk->per && i < osk->count; i++)
+    {
+        struct nx_osk_image *per = &osk->per[i];
+
+        device->p_vkDestroySemaphore( device->host.device, per->done, NULL );
+        device->p_vkDestroyBuffer( device->host.device, per->buffer, NULL );
+        device->p_vkFreeMemory( device->host.device, per->memory, NULL );
+    }
+    if (osk->pool) device->p_vkDestroyCommandPool( device->host.device, osk->pool, NULL );
+    osk->pool = VK_NULL_HANDLE;
+    memset( osk->per, 0, osk->count * sizeof(*osk->per) );
+    osk->width = osk->height = 0;
+}
+
+static void nx_osk_free( struct vulkan_device *device, struct nx_osk_overlay *osk )
+{
+    nx_osk_release( device, osk );
+    free( osk->per );
+    free( osk->images );
+    free( osk );
+}
+
+static VkResult nx_osk_record( struct vulkan_device *device, struct nx_osk_overlay *osk, uint32_t i )
+{
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VkImageMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    VkBufferImageCopy region = {0};
+    VkCommandBuffer cmd = osk->per[i].cmd;
+
+    begin.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+    device->p_vkBeginCommandBuffer( cmd, &begin );
+    /* Whatever wrote the image before, in this queue or waited for, is done:
+     * the program's frame stays, the keyboard goes over it. */
+    barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = osk->images[i];
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = barrier.subresourceRange.layerCount = 1;
+    device->p_vkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    0, 0, NULL, 0, NULL, 1, &barrier );
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset.x = osk->x;
+    region.imageOffset.y = osk->y;
+    region.imageExtent.width = osk->width;
+    region.imageExtent.height = osk->height;
+    region.imageExtent.depth = 1;
+    device->p_vkCmdCopyBufferToImage( cmd, osk->per[i].buffer, osk->images[i],
+                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region );
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = 0;
+    device->p_vkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                    0, 0, NULL, 0, NULL, 1, &barrier );
+    return device->p_vkEndCommandBuffer( cmd );
+}
+
+/* Buffers, command buffers and semaphores for a keyboard of that size there,
+ * made again when it moves, grows or the queue family changes. */
+static BOOL nx_osk_prepare( struct vulkan_device *device, struct swapchain *swapchain, uint32_t family,
+                            const struct wine_nx_osk_frame *frame )
+{
+    struct vulkan_physical_device *physical_device = device->physical_device;
+    struct nx_osk_overlay *osk = swapchain->nx_osk;
+    VkPhysicalDeviceMemoryProperties props;
+    uint32_t i, t;
+
+    if (!osk)
+    {
+        if (!(osk = swapchain->nx_osk = calloc( 1, sizeof(*osk) ))) return FALSE;
+        if (device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain, &osk->count, NULL ) ||
+            !(osk->images = calloc( osk->count, sizeof(*osk->images) )) ||
+            !(osk->per = calloc( osk->count, sizeof(*osk->per) )) ||
+            device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain, &osk->count, osk->images ))
+            osk->failed = TRUE;
+    }
+    if (osk->failed) return FALSE;
+    if (osk->pool && osk->family == family && osk->x == frame->x && osk->y == frame->y &&
+        osk->width == frame->width && osk->height == frame->height)
+        return TRUE;
+
+    if (osk->pool) device->p_vkDeviceWaitIdle( device->host.device );
+    nx_osk_release( device, osk );
+    physical_device->instance->p_vkGetPhysicalDeviceMemoryProperties( physical_device->host.physical_device, &props );
+    {
+        VkCommandPoolCreateInfo pool_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+
+        pool_info.queueFamilyIndex = family;
+        if (device->p_vkCreateCommandPool( device->host.device, &pool_info, NULL, &osk->pool )) goto failed;
+    }
+    osk->family = family;
+    osk->x = frame->x;
+    osk->y = frame->y;
+    osk->width = frame->width;
+    osk->height = frame->height;
+    for (i = 0; i < osk->count; i++)
+    {
+        struct nx_osk_image *per = &osk->per[i];
+        VkBufferCreateInfo buffer_info = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        VkMemoryAllocateInfo alloc = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        VkCommandBufferAllocateInfo cmd_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        VkSemaphoreCreateInfo semaphore_info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        VkMemoryRequirements req;
+
+        buffer_info.size = (VkDeviceSize)frame->width * frame->height * 4;
+        buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        if (device->p_vkCreateBuffer( device->host.device, &buffer_info, NULL, &per->buffer )) goto failed;
+        device->p_vkGetBufferMemoryRequirements( device->host.device, per->buffer, &req );
+        for (t = 0; t < props.memoryTypeCount; t++)
+            if ((req.memoryTypeBits & (1u << t)) &&
+                (props.memoryTypes[t].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                    (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                break;
+        if (t == props.memoryTypeCount) goto failed;
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = t;
+        if (device->p_vkAllocateMemory( device->host.device, &alloc, NULL, &per->memory ) ||
+            device->p_vkBindBufferMemory( device->host.device, per->buffer, per->memory, 0 ) ||
+            device->p_vkMapMemory( device->host.device, per->memory, 0, buffer_info.size, 0, &per->pixels ) ||
+            device->p_vkCreateSemaphore( device->host.device, &semaphore_info, NULL, &per->done ))
+            goto failed;
+        cmd_info.commandPool = osk->pool;
+        cmd_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmd_info.commandBufferCount = 1;
+        if (device->p_vkAllocateCommandBuffers( device->host.device, &cmd_info, &per->cmd ) ||
+            nx_osk_record( device, osk, i ))
+            goto failed;
+    }
+    nx_vk_trace( "[NXVK] floating keyboard %dx%d at %d,%d on %u images", frame->width, frame->height,
+                 frame->x, frame->y, osk->count );
+    return TRUE;
+
+failed:
+    ERR( "could not set up the floating keyboard's copy\n" );
+    nx_vk_trace( "[NXVK] floating keyboard: could not set up its copy into the swapchain images" );
+    nx_osk_release( device, osk );
+    osk->failed = TRUE;
+    return FALSE;
+}
+
+/* The keyboard over the image this present shows, when it is up. The present
+ * then waits for the copy, which waits for what the present waited for. */
+static void nx_osk_present( struct vulkan_queue *queue, VkPresentInfoKHR *present_info,
+                            const VkSwapchainKHR *client_swapchains, struct mempool *pool )
+{
+    struct vulkan_device *device = queue->device;
+    VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    struct wine_nx_osk_frame frame;
+    struct nx_osk_image *per;
+    struct swapchain *swapchain;
+    VkPipelineStageFlags *stages;
+    uint32_t index, i;
+
+    if (present_info->swapchainCount != 1) return;
+    swapchain = swapchain_from_handle( client_swapchains[0] );
+    if (!swapchain->nx_osk_usable) return;
+    if (!wine_nx_osk_frame( swapchain->nx_extent.width, swapchain->nx_extent.height, &frame )) return;
+    if (frame.x < 0 || frame.y < 0 || frame.x + frame.width > (int)swapchain->nx_extent.width ||
+        frame.y + frame.height > (int)swapchain->nx_extent.height)
+        return;
+    if (!nx_osk_prepare( device, swapchain, queue->info.queueFamilyIndex, &frame )) return;
+    index = present_info->pImageIndices[0];
+    if (index >= swapchain->nx_osk->count) return;
+    per = &swapchain->nx_osk->per[index];
+    if (per->generation != frame.generation &&
+        !(per->generation = wine_nx_osk_copy( swapchain->nx_extent.width, swapchain->nx_extent.height, per->pixels,
+                                              frame.width * 4, swapchain->nx_format == VK_FORMAT_R8G8B8A8_UNORM ||
+                                                               swapchain->nx_format == VK_FORMAT_R8G8B8A8_SRGB )))
+        return;  /* hidden meanwhile */
+
+    if (!(stages = mem_alloc( pool, sizeof(*stages) * (present_info->waitSemaphoreCount + 1) ))) return;
+    for (i = 0; i < present_info->waitSemaphoreCount; i++) stages[i] = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    submit.waitSemaphoreCount = present_info->waitSemaphoreCount;
+    submit.pWaitSemaphores = present_info->pWaitSemaphores;
+    submit.pWaitDstStageMask = stages;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &per->cmd;
+    submit.signalSemaphoreCount = 1;
+    submit.pSignalSemaphores = &per->done;
+    if (device->p_vkQueueSubmit( queue->host.queue, 1, &submit, VK_NULL_HANDLE )) return;
+    present_info->waitSemaphoreCount = 1;
+    present_info->pWaitSemaphores = &per->done;
+}
+#endif
+
 static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentInfoKHR *client_present_info )
 {
     VkPresentInfoKHR *present_info = (VkPresentInfoKHR *)client_present_info; /* cast away const, it has been copied in the thunks */
@@ -3729,6 +3982,9 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     }
 
     pthread_mutex_lock( &present_lock );
+#ifdef __SWITCH__
+    nx_osk_present( queue, present_info, client_swapchains, &pool );
+#endif
 #ifdef WINE_NX_MESA_SWITCH
     if (present_info->swapchainCount)
     {

@@ -146,6 +146,24 @@ or W A S D. Games with controller support see an Xbox 360 controller.
 
 **Hold + and − together for a second** to close a game.
 
+**Minus + right stick click** opens the on-screen keyboard over the game (it
+also opens by itself when a text field is selected; **Settings -> On-screen
+keyboard** turns that off). It types like a real keyboard, one key at a time,
+so names and chat boxes can be edited:
+
+| On the keyboard | Does |
+|---|---|
+| D-pad, left stick | Move between keys |
+| **A**, or tap a key | Press it |
+| **B** | Backspace |
+| **Y** / **X** | Space / Shift for the next key |
+| **L**, **R** | Cursor left, right |
+| **+** | Enter |
+| **ZL**, **ZR** | Keyboard to the top, back to the bottom |
+| **−** | Close it |
+
+While it is open, the game gets no controller input.
+
 ## If something goes wrong
 
 Every run leaves its logs in `switch/wine/logs` on the SD card:

@@ -30,6 +30,7 @@
 #include "config_json.h"
 #include "pointer_cursor.h"
 #include "compositor.h"
+#include "osk.h"
 #include "std_stream_lines.h"
 #include "thread_profile.h"
 #include "dxvk_releases.h"
@@ -709,39 +710,55 @@ void wine_nx_cursor_show( int visible )
     wine_nx_compositor_cursor( x, y, visible );
 }
 
-/* The win32u Switch driver opens Horizon's on-screen keyboard for a window
- * that wants text (dlls/win32u/winnx_drv.c: wine_nx_drv_ShowSoftwareKeyboard,
- * reached through NtUserShowSoftwareKeyboard or, unless keyboard-on-text-focus
- * turns it off, automatically when an edit-like control gets focus).
- * initial and out are UTF-8; out holds what the player typed, or is left
- * untouched (and 0 returned) if they cancelled. Blocks the calling (guest)
- * thread, same as launcher_platform_prompt uses for the launcher's own UI. */
-/* Set for the applet's duration; wine_nx_pointer_poll below skips touching
- * the controller while it is set. Horizon gives the applet the foreground
- * for as long as it is up, and polling padUpdate/hidGetTouchScreenStates out
- * from under it while its own blocking call is waiting on exactly that
- * looks to be why input stayed dead after the keyboard closed on hardware:
- * not a stuck HID session, just our own unrelated poll never letting it
- * settle back to this program. */
-int wine_nx_swkbd_active;
-
-int wine_nx_show_keyboard( const char *header, const char *initial, char *out, size_t out_size )
+/* The floating keyboard (osk.c) draws its labels with the console's own font,
+ * which stays mapped for as long as the service is open. */
+int wine_nx_osk_font( const void **data, size_t *size )
 {
-    SwkbdConfig keyboard;
-    Result rc;
+    static int opened;
+    PlFontData font;
 
-    if (!out_size) return 0;
-    if (R_FAILED( swkbdCreate( &keyboard, 0 ) )) return 0;
-    swkbdConfigMakePresetDefault( &keyboard );
-    swkbdConfigSetHeaderText( &keyboard, header );
-    swkbdConfigSetGuideText( &keyboard, header );
-    swkbdConfigSetInitialText( &keyboard, initial );
-    swkbdConfigSetStringLenMax( &keyboard, out_size - 1 < 500 ? out_size - 1 : 500 );
-    __atomic_store_n( &wine_nx_swkbd_active, 1, __ATOMIC_RELEASE );
-    rc = swkbdShow( &keyboard, out, out_size );
-    __atomic_store_n( &wine_nx_swkbd_active, 0, __ATOMIC_RELEASE );
-    swkbdClose( &keyboard );
-    return R_SUCCEEDED( rc );
+    if (!opened && R_FAILED( plInitialize( PlServiceType_User ) )) return 0;
+    opened = 1;
+    if (R_FAILED( plGetSharedFontByType( &font, PlSharedFontType_Standard ) ) || !font.address) return 0;
+    *data = font.address;
+    *size = font.size;
+    return 1;
+}
+
+/* The controller's buttons as the floating keyboard reads them. */
+static unsigned int osk_buttons( u64 held )
+{
+    static const struct { u64 button; unsigned int osk; } map[] =
+    {
+        { HidNpadButton_Up, OSK_UP }, { HidNpadButton_Down, OSK_DOWN },
+        { HidNpadButton_Left, OSK_LEFT }, { HidNpadButton_Right, OSK_RIGHT },
+        { HidNpadButton_A, OSK_A }, { HidNpadButton_B, OSK_B }, { HidNpadButton_X, OSK_X },
+        { HidNpadButton_Y, OSK_Y }, { HidNpadButton_L, OSK_L }, { HidNpadButton_R, OSK_R },
+        { HidNpadButton_ZL, OSK_ZL }, { HidNpadButton_ZR, OSK_ZR }, { HidNpadButton_Plus, OSK_PLUS },
+        { HidNpadButton_Minus, OSK_MINUS }, { HidNpadButton_StickL, OSK_STICKL },
+        { HidNpadButton_StickR, OSK_STICKR },
+    };
+    unsigned int bits = 0, i;
+
+    for (i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+        if (held & map[i].button) bits |= map[i].osk;
+    return bits;
+}
+
+/* What the controller held at the last poll, so a keyboard opened by a
+ * program (NtUserShowSoftwareKeyboard, or a text field taking focus) does not
+ * take the A that clicked the field for a key. */
+static unsigned int osk_last_held;
+
+uint64_t wine_nx_osk_clock( void )
+{
+    return armTicksToNs( armGetSystemTick() );
+}
+
+void wine_nx_keyboard_open( void )
+{
+    if (!wine_nx_osk_visible()) log_line( "[OSK] opened by the program" );
+    wine_nx_osk_show( 1, __atomic_load_n( &osk_last_held, __ATOMIC_RELAXED ) );
 }
 
 /* Buttons reported by wine_nx_pointer_poll(). */
@@ -812,16 +829,6 @@ unsigned short wine_nx_pad_keys[WINE_NX_KEY_COUNT] =
  * competes with what the program reads there itself. */
 unsigned int wine_nx_pad_key_state;
 
-/* Minus and the right stick click, updated unconditionally even while
- * wine_nx_pad_key_state above is zeroed for an XInput reader: the on-screen
- * keyboard hotkey is a system-level shortcut, not something a program reads
- * back and would double up on, so it stays live no matter how the program
- * gets its input. Same bit positions as wine_nx_pad_key_state so ProcessEvents
- * can use one mask without hardcoding the enum order above. */
-unsigned int wine_nx_swkbd_hotkey_state;
-const unsigned int wine_nx_pad_key_minus_bit = 1u << WINE_NX_KEY_MINUS;
-const unsigned int wine_nx_pad_key_stickr_bit = 1u << WINE_NX_KEY_STICKR;
-
 /* When a program last read the controller through XInput (xinput_unix.c). */
 extern u64 wine_nx_xinput_last_poll;
 
@@ -834,27 +841,18 @@ void wine_nx_request_quit( const char *why );
 /* One mouse for win32u, in native 1280x720 display coordinates: the right
  * analog stick moves the cursor, A holds the left button and B the right,
  * and a touchscreen contact puts the cursor under the finger with the left
- * button held.  Returns nonzero when the position changed. wine_nx_swkbd_active
- * (above, wine_nx_show_keyboard) skips this entirely while the on-screen
- * keyboard applet is up, for both this thread's polling and the background
- * one (wine_nx_input_thread). */
+ * button held.  Returns nonzero when the position changed. While the floating
+ * keyboard is up (osk.c) the controller works it instead, and a finger on it
+ * is not the program's. */
 int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
 {
     HidTouchScreenState touch = {0};
     HidAnalogStickState stick;
     unsigned int pressed = 0;
-    u64 now, held, xinput_poll;
-    int moved, gamepad, leave = 0;
-
-    if (__atomic_load_n( &wine_nx_swkbd_active, __ATOMIC_ACQUIRE ))
-    {
-        pthread_mutex_lock( &wine_nx_pointer_mutex );
-        *x = (int)wine_nx_pointer.x;
-        *y = (int)wine_nx_pointer.y;
-        *buttons = 0;
-        pthread_mutex_unlock( &wine_nx_pointer_mutex );
-        return 0;
-    }
+    u64 now, held, all_held, xinput_poll;
+    int moved, gamepad, leave = 0, keyboard = 0, on_keyboard = 0;
+    static int osk_combo;
+    static u64 osk_swallowed;
 
     pthread_mutex_lock( &wine_nx_pointer_mutex );
     if (!wine_nx_pointer_ready)
@@ -869,14 +867,55 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
     }
     padUpdate( &wine_nx_pad );
     now = armGetSystemTick();
-    held = padGetButtons( &wine_nx_pad );
+    held = all_held = padGetButtons( &wine_nx_pad );
     stick = padGetStickPos( &wine_nx_pad, 1 );
     /* A program reading the controller through XInput gets it whole: no keys,
      * clicks or cursor come from it meanwhile. The touchscreen still points. */
     xinput_poll = wine_nx_xinput_last_poll;
     gamepad = xinput_poll && (xinput_poll >= now || armTicksToNs( now - xinput_poll ) < 1000000000ull);
     moved = 0;
-    if (hidGetTouchScreenStates( &touch, 1 ) && touch.count > 0)
+    /* The floating keyboard: Minus and the right stick click open it, and
+     * while it is up the buttons, the d-pad and the left stick are its. The
+     * buttons held when it goes away stay away from the program until they
+     * are let go, so the Minus that closed it does not also press Tab. */
+    {
+        const u64 combo = HidNpadButton_Minus | HidNpadButton_StickR;
+        unsigned int bits = osk_buttons( held );
+
+        if ((held & combo) == combo && !osk_combo && !wine_nx_osk_visible())
+        {
+            wine_nx_osk_show( 1, bits );
+            log_line( "[OSK] opened with Minus and the right stick" );
+        }
+        osk_combo = (held & combo) == combo;
+        __atomic_store_n( &osk_last_held, bits, __ATOMIC_RELAXED );
+        if (wine_nx_osk_visible())
+        {
+            HidAnalogStickState left = padGetStickPos( &wine_nx_pad, 0 );
+            int touching = hidGetTouchScreenStates( &touch, 1 ) && touch.count > 0;
+
+            on_keyboard = wine_nx_osk_input( bits, left.x, left.y, touching,
+                                             touching ? (int)touch.touches[0].x : 0,
+                                             touching ? (int)touch.touches[0].y : 0, armTicksToNs( now ) );
+            keyboard = 1;
+            osk_swallowed = held;
+        }
+        else osk_swallowed &= held;
+        held &= ~osk_swallowed;
+        /* The window compositor draws only when told; the Vulkan and OpenGL
+         * presents look for themselves. */
+        {
+            static unsigned int drawn_generation;
+            unsigned int now_generation = wine_nx_osk_generation();
+
+            if (now_generation != drawn_generation)
+            {
+                drawn_generation = now_generation;
+                wine_nx_compositor_redraw();
+            }
+        }
+    }
+    if (!on_keyboard && hidGetTouchScreenStates( &touch, 1 ) && touch.count > 0)
     {
         if (wine_nx_device_mode[WINE_NX_DEVICE_TOUCH] == WINE_NX_POINTS)
         {
@@ -910,7 +949,7 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
     }
     /* The left stick points as well when it is set to, so a game played with
      * the mouse alone has both of them for it. */
-    if (!gamepad && wine_nx_device_mode[WINE_NX_DEVICE_LEFT] == WINE_NX_POINTS)
+    if (!gamepad && !keyboard && wine_nx_device_mode[WINE_NX_DEVICE_LEFT] == WINE_NX_POINTS)
     {
         HidAnalogStickState left = padGetStickPos( &wine_nx_pad, 0 );
 
@@ -919,7 +958,7 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
     }
     /* And the d-pad, which has no tilt to speak of: a direction held is the
      * stick pushed the whole way. */
-    if (!gamepad && wine_nx_device_mode[WINE_NX_DEVICE_DPAD] == WINE_NX_POINTS)
+    if (!gamepad && !keyboard && wine_nx_device_mode[WINE_NX_DEVICE_DPAD] == WINE_NX_POINTS)
     {
         int dpad_x = 0, dpad_y = 0;
 
@@ -983,9 +1022,7 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
             if (wine_nx_touch_dx < -WINE_NX_TOUCH_STEP) keys |= 1u << WINE_NX_KEY_TLEFT;
             if (wine_nx_touch_dx >  WINE_NX_TOUCH_STEP) keys |= 1u << WINE_NX_KEY_TRIGHT;
         }
-        __atomic_store_n( &wine_nx_swkbd_hotkey_state,
-                          keys & (wine_nx_pad_key_minus_bit | wine_nx_pad_key_stickr_bit), __ATOMIC_RELAXED );
-        if (gamepad) keys = 0;
+        if (gamepad || keyboard) keys = 0;
         __atomic_store_n( &wine_nx_pad_key_state, keys, __ATOMIC_RELAXED );
     }
     *x = (int)wine_nx_pointer.x;
@@ -999,7 +1036,7 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
         static u64 chord_since;
         const u64 chord = HidNpadButton_Plus | HidNpadButton_Minus;
 
-        if ((held & chord) != chord) chord_since = 0;
+        if ((all_held & chord) != chord) chord_since = 0;
         else if (!chord_since) chord_since = now;
         else if (armTicksToNs( now - chord_since ) >= WINE_NX_QUIT_CHORD_NS) leave = 1;
     }

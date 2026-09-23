@@ -74,6 +74,14 @@ runtime; the full package now ships the Mesa 26 one.
 - **Audio.** `winenxaudio.drv` plays through audout, for mmdevapi and DirectSound.
 - **Input.** The touchscreen, the controller as a mouse or as a keyboard with
   per-game mappings, and XInput, which sees player 1 as an Xbox 360 controller.
+- **On-screen keyboard.** `source/osk.c` is a keyboard drawn over the program
+  that sends virtual keys one at a time, with scan codes, through the display
+  driver (Minus + right stick, or `NtUserShowSoftwareKeyboard` / a text field
+  taking focus). Horizon's keyboard applet only returns a finished string, so
+  fields a game draws itself could not be edited. Its picture is copied into
+  the Vulkan swapchain image before present (`dlls/win32u/vulkan.c`), blitted
+  into the back buffer before `eglSwapBuffers` (`winnx_opengl.c`), or drawn as
+  the compositor's top layer; the controller is its while it is up.
 - **Memory.** Fixed-base games such as NFSU2 need a 32-bit address space:
   launch the NRO through a forwarder made with "32-bit, no alias", which the
   launcher can install itself and which also raises the memory limit to 2 GiB.
