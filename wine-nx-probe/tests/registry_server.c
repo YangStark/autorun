@@ -172,6 +172,35 @@ static void reload(void)
     horizon_registry.root = NULL;
     assert(!horizon_registry_init());
 }
+/* Defaults repair incomplete hives while preserving explicit persisted values. */
+static void test_documents_parsing(void)
+{
+    static const unsigned short path[] = u"Software\\Classes\\CLSID\\{450d8fba-ad25-11d0-98a8-0800361b1103}\\ShellFolder";
+    static const unsigned short name[] = u"WantsForParsing";
+    static const unsigned short empty[] = u"", custom[] = u"existing";
+    struct horizon_reg_key *key;
+
+    check_value(machine_key(), path, sizeof(path) - 2, name, sizeof(name) - 2,
+                HORIZON_REG_SZ, empty, sizeof(empty));
+    key = open_key(machine_key(), path, sizeof(path) - 2);
+    assert(key);
+    assert(!horizon_reg_set_value(&horizon_registry, key, name, sizeof(name) - 2,
+                                 HORIZON_REG_SZ, custom, sizeof(custom)));
+    horizon_reg_release(&horizon_registry, key);
+    horizon_registry_flush();
+    reload();
+    check_value(machine_key(), path, sizeof(path) - 2, name, sizeof(name) - 2,
+                HORIZON_REG_SZ, custom, sizeof(custom));
+    key = open_key(machine_key(), path, sizeof(path) - 2);
+    assert(key);
+    assert(!horizon_reg_delete(&horizon_registry, key));
+    horizon_reg_release(&horizon_registry, key);
+    horizon_registry_flush();
+    reload();
+    check_value(machine_key(), path, sizeof(path) - 2, name, sizeof(name) - 2,
+                HORIZON_REG_SZ, empty, sizeof(empty));
+    puts("My Documents parsing: fresh defaults, existing values and incomplete hives passed");
+}
 static void read_file(const char *path, char *buffer, size_t size)
 {
     FILE *file = fopen(path, "rb");
@@ -372,6 +401,7 @@ int main(void)
     assert(!horizon_registry_flush_key(key));
     for(i=0;i<handle_count;i++) horizon_server_free_object(handles[i].object);
     test_batching();
+    test_documents_parsing();
     test_save_and_load();
     puts("Registry server: protocol layouts, HKCU identity, COM/audio seeds, truncated replies, notifications and saved hives passed");
     return 0;
