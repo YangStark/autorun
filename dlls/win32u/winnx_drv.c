@@ -42,6 +42,7 @@ extern int   wine_nx_pointer_take( int *x, int *y, unsigned int *buttons, unsign
 extern void  wine_nx_pointer_set_pos( int x, int y );
 extern void  wine_nx_pointer_follow( int x, int y );
 extern int   wine_nx_pointer_take_motion( int *dx, int *dy );
+extern int   wine_nx_pointer_take_wheel( void );
 extern int   wine_nx_pointer_take_placed( void );
 extern void  wine_nx_cursor_show( int visible );
 extern void  wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
@@ -775,7 +776,7 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
     unsigned int buttons, pressed, released;
     DWORD first, second;
     BOOL moved, keys, placed, stepped;
-    int x, y, dx, dy;
+    int x, y, dx, dy, wheel;
 
     (void)mask;
     wine_nx_fb_present();
@@ -789,6 +790,17 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
     if (placed || first) wine_nx_send_mouse( x, y, (placed ? MOUSEEVENTF_MOVE : 0) | first );
     if (stepped) wine_nx_send_mouse_motion( dx, dy );
     if (second) wine_nx_send_mouse( x, y, second );
+    wheel = wine_nx_pointer_take_wheel();
+    if (wheel)
+    {
+        INPUT input = {0};
+
+        input.type = INPUT_MOUSE;
+        input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+        input.mi.mouseData = (DWORD)(wheel * WHEEL_DELTA);
+        NtUserSendHardwareInput( 0, 0, &input, 0 );
+        nxdrv_trace( "[NXINPUT] wheel steps=%d delta=%d", wheel, wheel * WHEEL_DELTA, 0, 0 );
+    }
     if (moved || placed || stepped)
     {
         POINT pos;
@@ -820,7 +832,7 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
     keys |= wine_nx_send_keyboard_keys();
     wine_nx_update_cursor();
     wine_nx_fb_present();
-    return moved || first || keys;
+    return moved || first || keys || wheel;
 }
 
 /**********************************************************************

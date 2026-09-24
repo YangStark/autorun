@@ -477,6 +477,8 @@ static u64 wine_nx_pointer_tick;
 static int wine_nx_pointer_ready;
 /* What the polls saw since the last wine_nx_pointer_take(). */
 static struct pointer_buttons wine_nx_pointer_buttons;
+/* Physical wheel detents awaiting delivery, guarded by the pointer mutex. */
+static int64_t wine_nx_pointer_wheel;
 static int wine_nx_pointer_moved;
 /* A touch points at a place, and the place is what Wine is given. */
 static int wine_nx_pointer_placed;
@@ -1012,6 +1014,13 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
             if (!keyboard)
             {
                 moved |= pointer_cursor_move_relative( &wine_nx_pointer, state->delta_x, state->delta_y );
+                wine_nx_pointer_wheel += state->wheel_delta_y;
+                if (state->wheel_delta_y)
+                {
+                    static unsigned int logged_wheel;
+                    if (logged_wheel++ < 8)
+                        log_line( "[NXINPUT] physical wheel y=%d", (int)state->wheel_delta_y );
+                }
                 if (state->buttons & HidMouseButton_Left) mouse_buttons |= WINE_NX_POINTER_LEFT;
                 if (state->buttons & HidMouseButton_Right) mouse_buttons |= WINE_NX_POINTER_RIGHT;
                 pointer_buttons_update( &wine_nx_pointer_buttons, pressed | mouse_buttons );
@@ -1139,6 +1148,20 @@ int wine_nx_pointer_take_placed( void )
     wine_nx_pointer_placed = 0;
     pthread_mutex_unlock( &wine_nx_pointer_mutex );
     return placed;
+}
+
+/* Windows wheel messages carry a signed 16-bit delta, 120 per detent.
+ * Keep any excess for the next event pump rather than wrapping the delta. */
+int wine_nx_pointer_take_wheel( void )
+{
+    int steps;
+
+    pthread_mutex_lock( &wine_nx_pointer_mutex );
+    steps = wine_nx_pointer_wheel > 273 ? 273 :
+            wine_nx_pointer_wheel < -273 ? -273 : (int)wine_nx_pointer_wheel;
+    wine_nx_pointer_wheel -= steps;
+    pthread_mutex_unlock( &wine_nx_pointer_mutex );
+    return steps;
 }
 
 int wine_nx_pointer_take( int *x, int *y, unsigned int *buttons, unsigned int *pressed, unsigned int *released )
