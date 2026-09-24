@@ -32,6 +32,8 @@
 #endif
 
 #include "launcher.h"
+extern void wine_nx_startup_mark( const char *, int ) __attribute__((weak));
+
 #ifdef WINE_NX_HAS_EMBEDDED_LOGO
 #include "forwarder.h"
 #endif
@@ -1659,10 +1661,16 @@ static int confirm_forwarder( struct launcher *l, int bits )
 }
 
 /* Build it, say where it went wrong if it did, and name it as the 32-bit one. */
+static const char *forwarder_name( struct launcher *l, int bits )
+{
+    if (l->options->nro_path && strstr( l->options->nro_path, "/autorun-usb-mouse-test/" ))
+        return bits == 32 ? "Autorun Mouse Stable 32-bit" : "Autorun Mouse Stable";
+    return bits == 32 ? "Autorun 32-bit" : "Autorun";
+}
+
 static int install_forwarder( struct launcher *l, int bits, unsigned long long *id )
 {
-    static const char *const names[] = { "Autorun 32-bit", "Autorun" };
-    const char *name = names[bits == 32 ? 0 : 1];
+    const char *name = forwarder_name( l, bits );
     struct ui *ui = &l->ui;
     const char *step = NULL;
     char message[256], value[32];
@@ -1707,7 +1715,7 @@ static void make_forwarder( struct launcher *l, int bits )
     char message[192];
 
     if (!install_forwarder( l, bits, &id )) return;
-    snprintf( message, sizeof(message), "%s is on the home menu.", bits == 32 ? "Autorun 32-bit" : "Autorun" );
+    snprintf( message, sizeof(message), "%s is on the home menu.", forwarder_name( l, bits ) );
     ui_message( ui, "Installed", message );
     ui_start_screen( ui );
 }
@@ -1862,6 +1870,8 @@ static int start_program( struct launcher *l, struct program *p, char *target, s
 {
     struct ui *ui = &l->ui;
     char path[512], text[160];
+
+    if (wine_nx_startup_mark) wine_nx_startup_mark( "launch.request", 1 );
 
     if (!file_exists( p->path ) || l->options->machine_of( p->path, &p->machine ))
     {
@@ -3480,11 +3490,13 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
     }
     launcher_log( "[LAUNCHER] %s; %d icons shown, %d programs without one", ret ? "starting a program" : "closed",
                   added, missing );
+    if (ret && wine_nx_startup_mark) wine_nx_startup_mark( "launcher.cleanup.begin", 0 );
     stop_icons( l );
     for (i = 0; i < SYMBOL_COUNT; i++)
         if (l->symbols[i]) SDL_DestroyTexture( l->symbols[i] );
     if (l->logo) SDL_DestroyTexture( l->logo );
     ui_quit( &l->ui );
     launcher_platform_font_release();
+    if (ret && wine_nx_startup_mark) wine_nx_startup_mark( "launcher.cleanup.end", 0 );
     return ret;
 }

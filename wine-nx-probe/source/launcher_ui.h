@@ -110,6 +110,11 @@ struct ui
     int held;
     Uint32 held_since, held_last;
     int stick_x, stick_y;
+    /* Physical USB mouse in the Switch launcher. Its input bypasses SDL's
+     * touchscreen mouse emulation, which has no hardware pointer. */
+    int mouse_connected, mouse_x, mouse_y;
+    Uint64 mouse_sample;
+    Uint32 mouse_buttons;
     struct
     {
         int active, vertical;

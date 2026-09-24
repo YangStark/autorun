@@ -56,7 +56,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define CONFIG_FILE CONFIG_DIR "/settings.json"
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_BOX64_DYNAREC
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-218"
+#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-218-startup1"
 #else
 #define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
 #endif
@@ -186,6 +186,25 @@ static void runtime_alternate_clean(void)
  * kept there would be stuck in the same place and say nothing, which is what a
  * hang looked like until now. */
 static void log_line( const char *fmt, ... ) __attribute__((format(printf,1,2)));
+
+/* Diagnostic-only startup marks. Called on the launch/main thread only.
+ * Hardware ticks are retained for later clock correlation. Intervals include
+ * earlier logging overhead and must not be called exclusive CPU timings. */
+static u64 startup_timing_origin, startup_timing_previous;
+void wine_nx_startup_mark( const char *stage, int restart )
+{
+    u64 now = armGetSystemTick();
+    if (restart || !startup_timing_origin)
+        startup_timing_origin = startup_timing_previous = now;
+    log_line( "[STARTUP] stage=%s elapsed_us=%llu interval_us=%llu ticks=%llu guest_tick_ms=%u",
+              stage,
+              (unsigned long long)(armTicksToNs( now - startup_timing_origin ) / 1000),
+              (unsigned long long)(armTicksToNs( now - startup_timing_previous ) / 1000),
+              (unsigned long long)now, (unsigned int)(armTicksToNs( now ) / 1000000) );
+    startup_timing_previous = now;
+}
+
+
 
 static volatile int stall_watch_quit;
 static int stall_watch_running;
@@ -429,6 +448,7 @@ static struct pointer_cursor wine_nx_cursor =
     { .x = WINE_NX_FB_W / 2, .y = WINE_NX_FB_H / 2, .width = WINE_NX_FB_W, .height = WINE_NX_FB_H };
 static int wine_nx_cursor_moved;
 static int wine_nx_cursor_visible = 1;  /* 0 while the program hides the mouse cursor */
+static int wine_nx_physical_mouse_connected;
 static int wine_nx_gl_window;  /* an OpenGL window surface owns the screen's NWindow */
 /* Controller and touchscreen state, guarded by wine_nx_pointer_mutex. */
 static pthread_mutex_t wine_nx_pointer_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -662,6 +682,9 @@ static void wine_nx_cursor_move( int x, int y )
  * like OpenTTD, hide it; the arrow must not be drawn over theirs. */
 void wine_nx_cursor_show( int visible )
 {
+    /* The test build keeps an arrow visible for a physical mouse even when a
+     * game requests a hidden Windows cursor but does not draw its own. */
+    if (__atomic_load_n( &wine_nx_physical_mouse_connected, __ATOMIC_RELAXED )) visible = 1;
     pthread_mutex_lock( &wine_nx_fb_mutex );
     if (wine_nx_cursor_visible != !!visible)
     {
@@ -671,6 +694,20 @@ void wine_nx_cursor_show( int visible )
     int x = (int)wine_nx_cursor.x, y = (int)wine_nx_cursor.y;
     pthread_mutex_unlock( &wine_nx_fb_mutex );
     wine_nx_compositor_cursor( x, y, visible );
+}
+
+/* An OpenGL game owns the screen while the compositor is suspended. Its swap
+ * callback draws the physical mouse arrow over the game's back buffer. */
+int wine_nx_gl_cursor_snapshot( int *x, int *y )
+{
+    int connected = __atomic_load_n( &wine_nx_physical_mouse_connected, __ATOMIC_RELAXED );
+
+    if (!connected) return 0;
+    pthread_mutex_lock( &wine_nx_fb_mutex );
+    *x = (int)wine_nx_cursor.x;
+    *y = (int)wine_nx_cursor.y;
+    pthread_mutex_unlock( &wine_nx_fb_mutex );
+    return 1;
 }
 
 /* Buttons reported by wine_nx_pointer_poll(). */
@@ -755,15 +792,20 @@ void wine_nx_request_quit( const char *why );
 int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
 {
     HidTouchScreenState touch = {0};
+    HidMouseState mouse[17] = {{0}};
     HidAnalogStickState stick;
     unsigned int pressed = 0;
     u64 now, held, xinput_poll;
     int moved, gamepad, leave = 0;
+    size_t mouse_count, mouse_history, mouse_seen = 0;
+    static u64 mouse_sample;
+    static int mouse_connected;
 
     pthread_mutex_lock( &wine_nx_pointer_mutex );
     if (!wine_nx_pointer_ready)
     {
         hidInitializeTouchScreen();
+        hidInitializeMouse();
         padConfigureInput( 1, HidNpadStyleSet_NpadStandard );
         padInitializeDefault( &wine_nx_pad );
         wine_nx_pointer_tick = armGetSystemTick();
@@ -838,6 +880,49 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
     wine_nx_pointer_tick = now;
     if (!gamepad && (held & HidNpadButton_A) && !wine_nx_pad_keys[WINE_NX_KEY_A]) pressed |= WINE_NX_POINTER_LEFT;
     if (!gamepad && (held & HidNpadButton_B) && !wine_nx_pad_keys[WINE_NX_KEY_B]) pressed |= WINE_NX_POINTER_RIGHT;
+    mouse_count = hidGetMouseStates( mouse, sizeof(mouse) / sizeof(mouse[0]) );
+    if (mouse_count && (mouse[0].attributes & HidMouseAttribute_IsConnected))
+    {
+        if (!mouse_connected) log_line( "[NXINPUT] physical mouse connected" );
+        __atomic_store_n( &wine_nx_physical_mouse_connected, 1, __ATOMIC_RELAXED );
+        /* libnx returns newest first. Consume every unseen relative delta in
+         * chronological order: taking only the newest loses motion whenever
+         * USB samples arrive faster than the input thread polls. */
+        mouse_history = mouse_connected ? mouse_count : 1;
+        while (mouse_history)
+        {
+            HidMouseState *state = &mouse[--mouse_history];
+            unsigned int mouse_buttons = 0;
+
+            if (mouse_connected && state->sampling_number <= mouse_sample) continue;
+            mouse_sample = state->sampling_number;
+            if (!(state->attributes & HidMouseAttribute_IsConnected)) continue;
+            moved |= pointer_cursor_move_relative( &wine_nx_pointer, state->delta_x, state->delta_y );
+            if (state->buttons & HidMouseButton_Left) mouse_buttons |= WINE_NX_POINTER_LEFT;
+            if (state->buttons & HidMouseButton_Right) mouse_buttons |= WINE_NX_POINTER_RIGHT;
+            pointer_buttons_update( &wine_nx_pointer_buttons, pressed | mouse_buttons );
+            mouse_seen++;
+        }
+        if (mouse[0].buttons & HidMouseButton_Left) pressed |= WINE_NX_POINTER_LEFT;
+        if (mouse[0].buttons & HidMouseButton_Right) pressed |= WINE_NX_POINTER_RIGHT;
+        if (mouse_seen > 1)
+        {
+            static int logged_history;
+
+            if (!logged_history)
+            {
+                logged_history = 1;
+                log_line( "[NXINPUT] recovered %zu physical mouse samples in one poll", mouse_seen );
+            }
+        }
+        mouse_connected = 1;
+    }
+    else
+    {
+        if (mouse_connected) log_line( "[NXINPUT] physical mouse disconnected" );
+        __atomic_store_n( &wine_nx_physical_mouse_connected, 0, __ATOMIC_RELAXED );
+        mouse_connected = 0;
+    }
     {
         /* The left stick steers as well as the d-pad, past a dead zone. */
         HidAnalogStickState steer = padGetStickPos( &wine_nx_pad, 0 );
@@ -2173,22 +2258,32 @@ static NTSTATUS runtime_start_wow64( void *module, void *entry,
     log_line( "[WOW64] PEB32 status=%08x", status );
     if (status) return status;
     /* Both PEBs point at the one schema, so it goes after the 32-bit PEB. */
+    wine_nx_startup_mark( "apiset.begin", 0 );
     wine_nx_load_apiset_dll();
+    wine_nx_startup_mark( "apiset.end", 0 );
     log_line( "[WOW64] api set schema=%p", teb->Peb->ApiSetMap );
+    wine_nx_startup_mark( "native_loader_bootstrap.begin", 0 );
     status = wine_nx_loader_bootstrap( main_nt_name );
+    wine_nx_startup_mark( "native_loader_bootstrap.end", 0 );
     log_line( "[WOW64] native loader bootstrap status=%08x", status );
     if (status) return status;
+    wine_nx_startup_mark( "native_modules_prepare.begin", 0 );
     status = wine_nx_loader_prepare_wow64( &native, &initialize );
+    wine_nx_startup_mark( "native_modules_prepare.end", 0 );
     log_line( "[WOW64] native DLLs status=%08x", status );
     if (status) return status;
+    wine_nx_startup_mark( "guest_ntdll_map.begin", 0 );
     status = map_pe_image( WINE_DRIVE_C "/windows/syswow64/ntdll.dll", (void **)&guest, &size );
+    wine_nx_startup_mark( "guest_ntdll_map.end", 0 );
     if (status) return status;
     /* ntdll cannot relocate itself (cf. load_wow64_ntdll); the main image is
      * relocated by the x86 loader because it is the PEB's ImageBaseAddress. */
     if ((status = virtual_relocate_module( guest ))) return status;
     if ((ULONG_PTR)guest > 0xffffffff || size > 0x100000000ULL - (ULONG_PTR)guest)
         return STATUS_INVALID_ADDRESS;
+    wine_nx_startup_mark( "guest_ntdll_prepare.begin", 0 );
     status = wine_nx_prepare_wow64_ntdll( native, guest );
+    wine_nx_startup_mark( "guest_ntdll_prepare.end", 0 );
     log_line( "[WOW64] guest ntdll=%p init block status=%08x", guest, status );
     if (status) return status;
     status = init_thread_stack( teb, 0x7fffffff, main_image_info.MaximumStackSize,
@@ -2217,6 +2312,7 @@ static NTSTATUS runtime_start_wow64( void *module, void *entry,
          * It changes the saved x86 PC to LdrInitializeThunk and never returns. */
         log_line( "[WOW64] entering Wine's x86 LdrInitializeThunk via ARM64 wow64.dll" );
         wine_nx_thread_register( 'w', HandleToULong( teb->ClientId.UniqueThread ), teb );
+        wine_nx_startup_mark( "guest_loader.enter", 0 );
         call_pe_entry_point( initialize );
         return STATUS_UNSUCCESSFUL;
     }
@@ -3281,7 +3377,9 @@ int main( int argc, char **argv )
         wine_nx_console_active = 0;
         log_lent_memory( "the settings" );
         log_line( "[LAUNCHER] bringing the screen up: the launcher" );
+    wine_nx_startup_mark( "launcher.run.begin", 0 );
         chosen = wine_nx_launcher_run( &options, target, sizeof(target) );
+    wine_nx_startup_mark( "launcher.run.end", 0 );
         log_lent_memory( "the launcher" );
         /* The console stays off from here: after SDL's EGL surface let the
          * screen go, libnx's console was set up but could not dequeue a buffer,
@@ -3367,9 +3465,13 @@ int main( int argc, char **argv )
         park_forever();
     }
     main_image_info.Machine = target_machine;
+    wine_nx_startup_mark( "platform.begin", 0 );
     wine_nx_runtime_platform_init();
+    wine_nx_startup_mark( "platform.end", 0 );
     log_line( "[INIT] Wine paths/unix bridge ready" );
+    wine_nx_startup_mark( "virtual_memory.begin", 0 );
     virtual_init();
+    wine_nx_startup_mark( "virtual_memory.end", 0 );
     log_line( "[INIT] virtual memory ready" );
 
     /* TEMPORARY: verify __libnx_exception_handler wiring. Set to 0 to disable. */
@@ -3383,9 +3485,13 @@ int main( int argc, char **argv )
         log_line( "[TEST] NULL deref did NOT fault, value=%d (handler not wired correctly)", observed );
     }
 #endif
+    wine_nx_startup_mark( "environment.begin", 0 );
     wine_nx_runtime_environment_init();
+    wine_nx_startup_mark( "environment.end", 0 );
     log_line( "[INIT] Wine NLS/environment ready" );
+    wine_nx_startup_mark( "first_teb.begin", 0 );
     teb = virtual_alloc_first_teb();
+    wine_nx_startup_mark( "first_teb.end", 0 );
     if (!teb || NtCurrentTeb() != teb || !teb->Peb)
     {
         log_line( "[FAIL] virtual_alloc_first_teb" );
@@ -3416,19 +3522,27 @@ int main( int argc, char **argv )
         log_line( "[INIT] processors=%u memory=%llu MB used=%llu MB", (unsigned int)teb->Peb->NumberOfProcessors,
                   total >> 20, used >> 20 );
     }
+    wine_nx_startup_mark( "shared_clock.begin", 0 );
     wine_nx_start_user_shared_data_clock();
+    wine_nx_startup_mark( "shared_clock.end", 0 );
     log_line( "[INIT] shared data clock initialized" );
 
+    wine_nx_startup_mark( "server.begin", 0 );
     server_init_process();
+    wine_nx_startup_mark( "server.end", 0 );
     log_line( "[INIT] server process initialized" );
+    wine_nx_startup_mark( "process_ready.begin", 0 );
     status = runtime_init_process_done();
+    wine_nx_startup_mark( "process_ready.end", 0 );
     if (status)
     {
         log_line( "[FAIL] init_process_done status=%08x", status );
         park_forever();
     }
 
+    wine_nx_startup_mark( "main_image_map.begin", 0 );
     status = map_pe_image( target, &module, &view_size );
+    wine_nx_startup_mark( "main_image_map.end", 0 );
     if (status)
     {
         log_line( "[FAIL] map target status=%08x", status );
@@ -3437,7 +3551,9 @@ int main( int argc, char **argv )
 
     if (runtime_describe_image( module, view_size, &entry ))
     {
+    wine_nx_startup_mark( "process_parameters.begin", 0 );
         params = runtime_create_process_params( target, &main_nt_name, dos_path, sizeof(dos_path) );
+    wine_nx_startup_mark( "process_parameters.end", 0 );
         if (!params)
         {
             log_line( "[FAIL] process parameter allocation" );

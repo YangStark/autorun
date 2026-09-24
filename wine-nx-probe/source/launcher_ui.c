@@ -345,6 +345,9 @@ int ui_init( struct ui *ui, const void *font_data, size_t font_size, int animati
         snprintf( last_error, sizeof(last_error), "%s", SDL_GetError() );
         return 0;
     }
+#ifdef __SWITCH__
+    hidInitializeMouse();
+#endif
     ui_step( "TTF_Init" );
     if (TTF_Init()) goto fail;
 #ifdef __SWITCH__
@@ -995,6 +998,72 @@ static void repeat_held( struct ui *ui )
     push_button( ui, direction );
 }
 
+#ifdef __SWITCH__
+static void mouse_trace( const char *message )
+{
+    extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+
+    if (&wine_nx_runtime_trace) wine_nx_runtime_trace( message );
+}
+
+static void queue_mouse_left( struct ui *ui, int down )
+{
+    SDL_Event event = {0};
+
+    event.type = down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+    event.button.button = SDL_BUTTON_LEFT;
+    event.button.state = down ? SDL_PRESSED : SDL_RELEASED;
+    event.button.x = ui->mouse_x;
+    event.button.y = ui->mouse_y;
+    queue_event( ui, &event );
+}
+
+static void poll_hardware_mouse( struct ui *ui )
+{
+    HidMouseState mouse[17] = {{0}};
+    size_t count, history;
+    Uint32 changed;
+
+    count = hidGetMouseStates( mouse, sizeof(mouse) / sizeof(mouse[0]) );
+    if (!count || !(mouse[0].attributes & HidMouseAttribute_IsConnected))
+    {
+        if (ui->mouse_connected)
+        {
+            if (ui->mouse_buttons & HidMouseButton_Left) queue_mouse_left( ui, 0 );
+            mouse_trace( "[NXINPUT] physical mouse disconnected in launcher" );
+        }
+        ui->mouse_connected = 0;
+        ui->mouse_buttons = 0;
+        return;
+    }
+    if (!ui->mouse_connected)
+    {
+        ui->mouse_x = ui->width / 2;
+        ui->mouse_y = ui->height / 2;
+        ui->mouse_sample = mouse[0].sampling_number;
+        ui->mouse_buttons = mouse[0].buttons;
+        ui->mouse_connected = 1;
+        mouse_trace( "[NXINPUT] physical mouse connected in launcher" );
+        return;
+    }
+    /* libnx supplies the newest state first; replay unseen deltas oldest first. */
+    for (history = count; history; )
+    {
+        HidMouseState *state = &mouse[--history];
+
+        if (state->sampling_number <= ui->mouse_sample) continue;
+        ui->mouse_sample = state->sampling_number;
+        if (!(state->attributes & HidMouseAttribute_IsConnected)) continue;
+        ui->mouse_x = clampf( ui->mouse_x + state->delta_x, 0, ui->width - 1 );
+        ui->mouse_y = clampf( ui->mouse_y + state->delta_y, 0, ui->height - 1 );
+        changed = ui->mouse_buttons ^ state->buttons;
+        if (changed & HidMouseButton_Left) queue_mouse_left( ui, !!(state->buttons & HidMouseButton_Left) );
+        if ((changed & HidMouseButton_Right) && (state->buttons & HidMouseButton_Right)) push_button( ui, UI_B );
+        ui->mouse_buttons = state->buttons;
+    }
+}
+#endif
+
 int ui_begin_frame( struct ui *ui )
 {
     if (!ui->running || !platform_running()) return ui->running = 0;
@@ -1005,6 +1074,9 @@ int ui_begin_frame( struct ui *ui )
         ui->held = ui->stick_x = ui->stick_y = 0;
     }
     ui->scrolling_text = 0;
+#ifdef __SWITCH__
+    poll_hardware_mouse( ui );
+#endif
     repeat_held( ui );
     if (ui->screen) SDL_SetRenderTarget( ui->renderer, ui->screen );
     return 1;
@@ -1192,6 +1264,20 @@ void ui_present( struct ui *ui )
         SDL_SetRenderTarget( ui->renderer, NULL );
         SDL_RenderCopy( ui->renderer, ui->screen, NULL, NULL );
     }
+#ifdef __SWITCH__
+    if (ui->mouse_connected)
+    {
+        int x = ui->mouse_x, y = ui->mouse_y;
+        SDL_Point outline[] = { {x,y}, {x,y+17}, {x+4,y+13}, {x+8,y+19},
+                                {x+11,y+17}, {x+7,y+11}, {x+14,y+10}, {x,y} };
+        SDL_Point highlight[] = { {x+2,y+3}, {x+2,y+13}, {x+5,y+10}, {x+8,y+15} };
+
+        SDL_SetRenderDrawColor( ui->renderer, 0, 0, 0, 255 );
+        SDL_RenderDrawLines( ui->renderer, outline, sizeof(outline) / sizeof(outline[0]) );
+        SDL_SetRenderDrawColor( ui->renderer, 255, 255, 255, 255 );
+        SDL_RenderDrawLines( ui->renderer, highlight, sizeof(highlight) / sizeof(highlight[0]) );
+    }
+#endif
     if (ui_present_hook) ui_present_hook( ui->renderer );
     SDL_RenderPresent( ui->renderer );
 }
@@ -1203,7 +1289,7 @@ static int needs_animation( struct ui *ui )
 
     ui->last_highlight = ui->highlight;
     return ui_animated( ui ) || (ui->animations && now - ui->fx_start < FADE_MS) || moving ||
-           ui->scrolling_text || now < ui->busy_until || ui->held || ui->touch.active ||
+           ui->scrolling_text || now < ui->busy_until || ui->held || ui->touch.active || ui->mouse_connected ||
            (ui->toast[0] && now < ui->toast_until + 50);
 }
 
