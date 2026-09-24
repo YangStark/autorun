@@ -26,6 +26,8 @@
 #include <sys/stat.h>
 
 #include <png.h>
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 #ifdef __SWITCH__
 #include <switch.h>
@@ -1676,7 +1678,7 @@ enum program_row
     ROW_WINDOWS, ROW_D3D9, ROW_VKD3D_VERSION, ROW_DXVK_VERSION, ROW_DXVK_HUD, ROW_FRAME_LIMIT, ROW_VSYNC,
     ROW_LSFG, ROW_LSFG_DLL, ROW_LSFG_PERFORMANCE, ROW_LSFG_FLOW,
     ROW_UPSCALING, ROW_UPSCALING_SHARPNESS,
-    ROW_ADDRESS, ROW_OWN_CONTROLS, ROW_CONTROLS, ROW_BOX64,
+    ROW_ADDRESS, ROW_HOME_FORWARDER, ROW_OWN_CONTROLS, ROW_CONTROLS, ROW_BOX64,
     ROW_HIDE, ROW_LIBRARY, PROGRAM_ROWS
 };
 
@@ -1855,6 +1857,109 @@ static enum launcher_address_space program_address_space( struct program *p )
     if (p->settings.address_space >= 0)
         return p->settings.address_space ? LAUNCHER_ADDRESS_LOW : LAUNCHER_ADDRESS_ANY;
     return launcher_program_address_space( p->path );
+}
+
+struct home_icon_buffer { unsigned char *data; size_t size, capacity; int failed; };
+
+static void home_icon_write( void *context, void *data, int size )
+{
+    struct home_icon_buffer *out = context;
+    unsigned char *next;
+    size_t capacity;
+
+    if (out->failed || size <= 0) return;
+    if (out->size + (size_t)size > 512 * 1024) { out->failed = 1; return; }
+    if (out->size + (size_t)size > out->capacity)
+    {
+        capacity = out->capacity ? out->capacity * 2 : 4096;
+        while (capacity < out->size + (size_t)size) capacity *= 2;
+        if (!(next = realloc( out->data, capacity ))) { out->failed = 1; return; }
+        out->data = next;
+        out->capacity = capacity;
+    }
+    memcpy( out->data + out->size, data, size );
+    out->size += size;
+}
+
+/* HOME icons must be JPEG, while the library artwork and PE icons are PNG.
+ * Fit the image in a square so a portrait cover is not cropped. */
+static int game_home_icon( const struct program *p, struct home_icon_buffer *out )
+{
+    struct launcher_icon icon = {0};
+    unsigned char *rgb;
+    int x, y, width, height, left, top;
+
+    if (!(p->square_art[0] && read_cover( p->square_art, &icon )) &&
+        !(p->portrait_art[0] && read_cover( p->portrait_art, &icon )))
+    {
+        launcher_pe_describe( p->path, 256, &icon, NULL, 0 );
+        if (icon.kind == LAUNCHER_ICON_PNG && !decode_png( &icon ))
+            launcher_icon_free( &icon );
+    }
+    if (icon.kind != LAUNCHER_ICON_RGBA || !icon.width || !icon.height ||
+        !(rgb = malloc( 256 * 256 * 3 )))
+    {
+        launcher_icon_free( &icon );
+        return 0;
+    }
+    memset( rgb, 32, 256 * 256 * 3 );
+    width = icon.width >= icon.height ? 256 : icon.width * 256 / icon.height;
+    height = icon.height >= icon.width ? 256 : icon.height * 256 / icon.width;
+    if (width < 1) width = 1;
+    if (height < 1) height = 1;
+    left = (256 - width) / 2;
+    top = (256 - height) / 2;
+    for (y = 0; y < height; y++)
+        for (x = 0; x < width; x++)
+        {
+            const unsigned char *src = icon.data +
+                ((size_t)(y * icon.height / height) * icon.width + x * icon.width / width) * 4;
+            unsigned char *dst = rgb + ((top + y) * 256 + left + x) * 3;
+            int alpha = src[3];
+            for (int c = 0; c < 3; c++) dst[c] = (src[c] * alpha + 32 * (255 - alpha)) / 255;
+        }
+    stbi_write_jpg_to_func( home_icon_write, out, 256, 256, 3, rgb, 85 );
+    free( rgb );
+    launcher_icon_free( &icon );
+    if (out->failed || !out->size) { free( out->data ); memset( out, 0, sizeof(*out) ); return 0; }
+    return 1;
+}
+
+static void make_game_forwarder( struct launcher *l, struct program *p )
+{
+    struct ui *ui = &l->ui;
+    struct home_icon_buffer icon = {0};
+    const char *step = NULL;
+    unsigned long long id = 0;
+    unsigned int rc;
+    int bits = program_address_space( p ) == LAUNCHER_ADDRESS_LOW ? 32 : 39;
+    char message[320];
+
+    if (!l->options->install_game_forwarder) return;
+    if (p->missing) { ui_message( ui, "Game unavailable", "Locate the executable before creating its HOME icon." ); return; }
+    if (p->machine == 0x8664 && bits == 32)
+    {
+        ui_message( ui, "Address space", "64-bit Windows games require the 39-bit address space. Change this game's Address space setting first." );
+        return;
+    }
+    if (!confirm_forwarder( l, bits )) { ui_start_screen( ui ); return; }
+    game_home_icon( p, &icon );
+    ui_start_screen( ui );
+    ui_background( ui );
+    ui_header_back( ui, "Install game forwarder", p->title );
+    ui_text_centered( ui, ui->large, ui->width / 2, ui->height / 2 - 30, "Installing...", ui->value );
+    ui_present( ui );
+    rc = l->options->install_game_forwarder( bits, p->title, p->path, icon.data, icon.size, &id, &step );
+    free( icon.data );
+    ui_start_screen( ui );
+    if (rc)
+        snprintf( message, sizeof(message), "The console refused while %s.\n\nResult 0x%X.",
+                  step ? step : "working", rc );
+    else
+        snprintf( message, sizeof(message), "%s is on the HOME menu.%s\n\nThe game and Autorun files must stay at their current SD card paths.",
+                  p->title, icon.size ? "" : " Autorun's icon was used because no game artwork was available." );
+    ui_message( ui, rc ? "Could not install" : "Installed", message );
+    ui_start_screen( ui );
 }
 
 /* Whether this process can run it at all. Nothing here can widen or narrow the
@@ -2390,6 +2495,9 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
              snprintf( row->label, sizeof(row->label), "%s", (text) ); row->help = (help_text); } while (0)
 
         ADD_ROW( ROW_START, SECTION_GENERAL, "Start", "Runs the game." );
+        ADD_ROW( ROW_HOME_FORWARDER, SECTION_GENERAL, "Add to Switch HOME",
+                 "Installs a game icon that starts this executable directly. Autorun and the game stay on the SD card." );
+        row->disabled = !l->options->install_game_forwarder || p->missing;
         ADD_ROW( ROW_FAVORITE, SECTION_GENERAL, "Favorite", "Keeps the game in the Favorites filter of the library." );
         row->kind = UI_ROW_SWITCH;
         row->on = p->favorite;
@@ -2623,6 +2731,10 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
                 break;
             }
             return start_program( l, p, target, size );
+
+        case ROW_HOME_FORWARDER:
+            if (action == UI_ACTION_CHOOSE) make_game_forwarder( l, p );
+            break;
 
         case ROW_FAVORITE:
             if (action != UI_ACTION_CHOOSE) break;

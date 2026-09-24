@@ -55,6 +55,11 @@ struct wine_nx_launcher_options
     /* Build a forwarder for this program and install it. bits is 32 or 39;
      * returns 0, leaving step pointing at what failed otherwise. */
     unsigned int (*install_forwarder)( int bits, const char *name, unsigned long long *id, const char **step );
+    /* Install a HOME entry that passes one executable to this NRO. icon may be
+     * NULL to use Autorun's built-in icon; otherwise it is a 256x256 JPEG. */
+    unsigned int (*install_game_forwarder)( int bits, const char *name, const char *exe_path,
+                                            const unsigned char *icon, size_t icon_size,
+                                            unsigned long long *id, const char **step );
     /* The id install_forwarder gives the forwarder it makes with these bits,
      * to find one made before the launcher kept its id. May be NULL. */
     unsigned long long (*forwarder_id)( int bits );
