@@ -27,6 +27,7 @@
 #include "win32u_private.h"
 #include "wine/opengl_driver.h"
 #include "wine/debug.h"
+#include "../../wine-nx-probe/source/pointer_cursor.h"
 #include "../../wine-nx-probe/source/osk.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(wgl);
@@ -35,6 +36,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(wgl);
  * (wine-nx-probe/source/runtime.c). */
 extern void *wine_nx_gl_acquire_window( void );
 extern void wine_nx_gl_release_window( void );
+extern int wine_nx_gl_cursor_snapshot( int *x, int *y );
 extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 
 static const struct egl_platform *egl;
@@ -246,12 +248,75 @@ static void nx_osk_draw( struct opengl_drawable *base )
     funcs->p_glPixelStorei( GL_UNPACK_ALIGNMENT, alignment );
 }
 
+/* Draw the physical mouse arrow into an OpenGL game's back buffer. The
+ * compositor cannot present while the game's window owns the screen. */
+static void nx_gl_draw_mouse_cursor( struct opengl_drawable *base )
+{
+    EGLint width, height;
+    GLint draw_fb, box[4];
+    GLfloat clear_colour[4];
+    GLboolean scissor, colour_mask[4];
+    int x, y, row, col;
+    static int logged;
+
+    if (!impl_from_opengl_drawable( base )->screen ||
+        !wine_nx_gl_cursor_snapshot( &x, &y ) ||
+        !funcs->p_eglQuerySurface( egl->display, base->surface, EGL_WIDTH, &width ) ||
+        !funcs->p_eglQuerySurface( egl->display, base->surface, EGL_HEIGHT, &height ) ||
+        width <= 0 || height <= 0) return;
+
+    if (!logged)
+    {
+        logged = 1;
+        nx_log( "[NXCURSOR] drawing physical mouse over OpenGL %dx%d", width, height );
+    }
+    x = x * width / 1280;
+    y = y * height / 720;
+    funcs->p_glGetIntegerv( GL_DRAW_FRAMEBUFFER_BINDING, &draw_fb );
+    funcs->p_glGetIntegerv( GL_SCISSOR_BOX, box );
+    funcs->p_glGetFloatv( GL_COLOR_CLEAR_VALUE, clear_colour );
+    funcs->p_glGetBooleanv( GL_COLOR_WRITEMASK, colour_mask );
+    scissor = funcs->p_glIsEnabled( GL_SCISSOR_TEST );
+    funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, 0 );
+    funcs->p_glEnable( GL_SCISSOR_TEST );
+    funcs->p_glColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );
+
+    for (row = 0; row < POINTER_CURSOR_H; row++)
+    {
+        int top = y + row;
+
+        if (top < 0 || top >= height) continue;
+        for (col = 0; col < POINTER_CURSOR_W; )
+        {
+            char colour = pointer_cursor_shape[row][col];
+            int start = col;
+
+            while (col < POINTER_CURSOR_W && pointer_cursor_shape[row][col] == colour) col++;
+            if (colour != 'W' && colour != 'B') continue;
+            if (x + start >= width || x + col <= 0) continue;
+            funcs->p_glScissor( x + start < 0 ? 0 : x + start, height - top - 1,
+                                (x + col > width ? width : x + col) - (x + start < 0 ? 0 : x + start), 1 );
+            funcs->p_glClearColor( colour == 'W' ? 1.0f : 0.0f,
+                                   colour == 'W' ? 1.0f : 0.0f,
+                                   colour == 'W' ? 1.0f : 0.0f, 1.0f );
+            funcs->p_glClear( GL_COLOR_BUFFER_BIT );
+        }
+    }
+
+    funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, draw_fb );
+    funcs->p_glScissor( box[0], box[1], box[2], box[3] );
+    funcs->p_glClearColor( clear_colour[0], clear_colour[1], clear_colour[2], clear_colour[3] );
+    funcs->p_glColorMask( colour_mask[0], colour_mask[1], colour_mask[2], colour_mask[3] );
+    if (!scissor) funcs->p_glDisable( GL_SCISSOR_TEST );
+}
+
 static BOOL nx_drawable_swap( struct opengl_drawable *base )
 {
     unsigned long long start;
     BOOL ret;
 
     nx_osk_draw( base );
+    nx_gl_draw_mouse_cursor( base );
     start = horizon_interrupt_time();
     ret = funcs->p_eglSwapBuffers( egl->display, base->surface );
     __atomic_add_fetch( &wine_nx_gl_swap_time, horizon_interrupt_time() - start, __ATOMIC_RELAXED );

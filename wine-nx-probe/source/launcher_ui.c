@@ -1053,10 +1053,12 @@ static void queue_mouse_left( struct ui *ui, int down )
 
 static void poll_hardware_mouse( struct ui *ui )
 {
-    HidMouseState mouse = {0};
+    HidMouseState mouse[17] = {{0}};
+    size_t count, history;
     Uint32 changed;
 
-    if (!hidGetMouseStates( &mouse, 1 ) || !(mouse.attributes & HidMouseAttribute_IsConnected))
+    count = hidGetMouseStates( mouse, sizeof(mouse) / sizeof(mouse[0]) );
+    if (!count || !(mouse[0].attributes & HidMouseAttribute_IsConnected))
     {
         if (ui->mouse_connected)
         {
@@ -1071,22 +1073,27 @@ static void poll_hardware_mouse( struct ui *ui )
     {
         ui->mouse_x = ui->width / 2;
         ui->mouse_y = ui->height / 2;
-        ui->mouse_sample = mouse.sampling_number;
-        ui->mouse_buttons = mouse.buttons;
+        ui->mouse_sample = mouse[0].sampling_number;
+        ui->mouse_buttons = mouse[0].buttons;
         ui->mouse_connected = 1;
         mouse_trace( "[NXINPUT] physical mouse connected in launcher" );
         return;
     }
-    if (mouse.sampling_number != ui->mouse_sample)
+    /* libnx supplies newest first; replay unseen changes oldest first. */
+    for (history = count; history; )
     {
-        ui->mouse_sample = mouse.sampling_number;
-        ui->mouse_x = clampf( ui->mouse_x + mouse.delta_x, 0, ui->width - 1 );
-        ui->mouse_y = clampf( ui->mouse_y + mouse.delta_y, 0, ui->height - 1 );
+        HidMouseState *state = &mouse[--history];
+
+        if (state->sampling_number <= ui->mouse_sample) continue;
+        ui->mouse_sample = state->sampling_number;
+        if (!(state->attributes & HidMouseAttribute_IsConnected)) continue;
+        ui->mouse_x = clampf( ui->mouse_x + state->delta_x, 0, ui->width - 1 );
+        ui->mouse_y = clampf( ui->mouse_y + state->delta_y, 0, ui->height - 1 );
+        changed = ui->mouse_buttons ^ state->buttons;
+        if (changed & HidMouseButton_Left) queue_mouse_left( ui, !!(state->buttons & HidMouseButton_Left) );
+        if ((changed & HidMouseButton_Right) && (state->buttons & HidMouseButton_Right)) push_button( ui, UI_B );
+        ui->mouse_buttons = state->buttons;
     }
-    changed = ui->mouse_buttons ^ mouse.buttons;
-    if (changed & HidMouseButton_Left) queue_mouse_left( ui, !!(mouse.buttons & HidMouseButton_Left) );
-    if ((changed & HidMouseButton_Right) && (mouse.buttons & HidMouseButton_Right)) push_button( ui, UI_B );
-    ui->mouse_buttons = mouse.buttons;
 }
 #endif
 
