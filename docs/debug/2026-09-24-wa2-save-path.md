@@ -46,10 +46,24 @@ WantsForParsing = "" (REG_SZ)
 - 实机：官方 9b71705 NRO 加等效单项注册表修复，通过新建存档验证。
 - 主机：扩展现有 `registry_server.c` 测试，未修复基线在缺少 Documents key 的断言失败；修复后通过。覆盖默认空字符串、持久化已有值优先、已有 hive 缺少该项时重新补齐，以及既有注册表保存/恢复测试。
 - Clang 使用 `-Wall -Wextra -Werror`、ASan 和 UBSan；`ASAN_OPTIONS=detect_leaks=0`（此轮未做泄漏检查）。
-- 本分支源代码生成的 NRO 尚未实机验证；不要把手工注册表修复的实机结果称为新 NRO 已验证。
+- 后续独立 NRO 实机验证已完成，见下文；与此前手工注册表测试分别记录。
 
 ## 设备现状与恢复
 
 实际生效文件是 `sdmc:/switch/wine/registry/system.reg`；修复前的 hive 已在电脑备份，并在设备同目录保存为 `system-before-wantsparsing-20260924.reg`。根目录误改的 system.reg 已恢复。恢复前须退出游戏和 Autorun，保留当前 hive，再还原该备份。
 
 旧存档仍在 `C:\Leaf\WHITE ALBUM2` 且有备份，没有自动合并到新位置，以避免覆盖成功测试产生的新档位。仓库不包含设备完整注册表、游戏二进制或用户存档。
+
+
+## b843738 NRO 实机存读档验证
+
+用户确认新 NRO 的存档和读取均成功。测试前备份可用环境，仅从有效 `registry/system.reg` 移除手工 `WantsForParsing` 值，回读确认该值不存在，然后安装本分支编译的 NRO。
+
+- 测试提交：`b84373857658883ecb6fbb7957a4cb863ff57e3f`。
+- NRO SHA256：`7EB8D02A290C9B86501F606898B50E932F4E330CC16C28869BD23DE274B1003F`；测试后设备回读一致。
+- 最新日志没有 GUID 存档路径错误、MessageBox 错误或未处理异常；正常退出，最终记录为 0 个线程、0 个自身遗留的借用区域。
+- 有效注册表中重新出现 `WantsForParsing=""`，证明本次补项来自新运行时。
+- Documents 下的 `save_Q.sav` 相比上一轮测试哈希改变；普通存档仍存在。游戏内存档/读档成功由用户实测确认，不把文件存在单独当成读档成功的证据。
+- 日志仍有 `commdlg` activation context 错误 14001，此轮未阻止存读档；其原因没有在本次修复中调查。
+
+此结论覆盖当前设备、现有游戏 EXE 与本次存读档流程，不等同于所有游戏或所有升级路径的完整验证。
