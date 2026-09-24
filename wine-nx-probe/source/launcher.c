@@ -1701,10 +1701,16 @@ static int confirm_forwarder( struct launcher *l, int bits )
 }
 
 /* Build it, say where it went wrong if it did, and name it as the 32-bit one. */
+static const char *forwarder_name( struct launcher *l, int bits )
+{
+    if (l->options->nro_path && strstr( l->options->nro_path, "/autorun-usb-mouse-test/" ))
+        return bits == 32 ? "Autorun Mouse Test 32-bit" : "Autorun Mouse Test";
+    return bits == 32 ? "Autorun 32-bit" : "Autorun";
+}
+
 static int install_forwarder( struct launcher *l, int bits, unsigned long long *id )
 {
-    static const char *const names[] = { "Autorun 32-bit", "Autorun" };
-    const char *name = names[bits == 32 ? 0 : 1];
+    const char *name = forwarder_name( l, bits );
     struct ui *ui = &l->ui;
     const char *step = NULL;
     char message[256], value[32];
@@ -1750,7 +1756,7 @@ static void make_forwarder( struct launcher *l, int bits )
     char message[192];
 
     if (!install_forwarder( l, bits, &id )) return;
-    snprintf( message, sizeof(message), "%s is on the home menu.", bits == 32 ? "Autorun 32-bit" : "Autorun" );
+    snprintf( message, sizeof(message), "%s is on the home menu.", forwarder_name( l, bits ) );
     ui_message( ui, "Installed", message );
     ui_start_screen( ui );
 }

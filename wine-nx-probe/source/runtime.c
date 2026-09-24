@@ -839,31 +839,35 @@ void wine_nx_leave_process( const char *why );
 void wine_nx_request_quit( const char *why );
 
 /* One mouse for win32u, in native 1280x720 display coordinates: the right
- * analog stick moves the cursor, A holds the left button and B the right,
- * and a touchscreen contact puts the cursor under the finger with the left
- * button held.  Returns nonzero when the position changed. While the floating
- * keyboard is up (osk.c) the controller works it instead, and a finger on it
- * is not the program's. */
+ * analog stick or a physical mouse moves the cursor, A or the physical left
+ * button clicks, B or the physical right button right-clicks, and a touchscreen
+ * contact puts the cursor under the finger with the left button held. Returns
+ * nonzero when the position changed. While the floating keyboard is up (osk.c)
+ * input is kept away from the program. */
 int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
 {
     HidTouchScreenState touch = {0};
+    HidMouseState mouse = {0};
     HidAnalogStickState stick;
     unsigned int pressed = 0;
     u64 now, held, all_held, xinput_poll;
     int moved, gamepad, leave = 0, keyboard = 0, on_keyboard = 0;
     static int osk_combo;
     static u64 osk_swallowed;
+    static u64 mouse_sample;
+    static int mouse_connected;
 
     pthread_mutex_lock( &wine_nx_pointer_mutex );
     if (!wine_nx_pointer_ready)
     {
         hidInitializeTouchScreen();
+        hidInitializeMouse();
         padConfigureInput( 1, HidNpadStyleSet_NpadStandard );
         padInitializeDefault( &wine_nx_pad );
         wine_nx_pointer_tick = armGetSystemTick();
         wine_nx_pointer_ready = 1;
         if (wine_nx_runtime_verbose)
-            log_line( "[NXINPUT] pointer ready: touchscreen, right stick cursor, A left button, B right button" );
+            log_line( "[NXINPUT] pointer ready: touchscreen, controller, physical mouse" );
     }
     padUpdate( &wine_nx_pad );
     now = armGetSystemTick();
@@ -973,6 +977,29 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
     wine_nx_pointer_tick = now;
     if (!gamepad && (held & HidNpadButton_A) && !wine_nx_pad_keys[WINE_NX_KEY_A]) pressed |= WINE_NX_POINTER_LEFT;
     if (!gamepad && (held & HidNpadButton_B) && !wine_nx_pad_keys[WINE_NX_KEY_B]) pressed |= WINE_NX_POINTER_RIGHT;
+    if (hidGetMouseStates( &mouse, 1 ) && (mouse.attributes & HidMouseAttribute_IsConnected))
+    {
+        if (!mouse_connected) log_line( "[NXINPUT] physical mouse connected" );
+        /* Process each relative delta once: the input thread and ProcessEvents
+         * can both poll the same HID sample before the next one arrives. */
+        if (!mouse_connected || mouse.sampling_number != mouse_sample)
+        {
+            mouse_sample = mouse.sampling_number;
+            if (!keyboard)
+                moved |= pointer_cursor_move_relative( &wine_nx_pointer, mouse.delta_x, mouse.delta_y );
+        }
+        if (!keyboard)
+        {
+            if (mouse.buttons & HidMouseButton_Left) pressed |= WINE_NX_POINTER_LEFT;
+            if (mouse.buttons & HidMouseButton_Right) pressed |= WINE_NX_POINTER_RIGHT;
+        }
+        mouse_connected = 1;
+    }
+    else
+    {
+        if (mouse_connected) log_line( "[NXINPUT] physical mouse disconnected" );
+        mouse_connected = 0;
+    }
     {
         /* The left stick steers as well as the d-pad, past a dead zone. */
         HidAnalogStickState steer = padGetStickPos( &wine_nx_pad, 0 );
