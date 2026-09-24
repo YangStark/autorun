@@ -293,8 +293,13 @@ static unsigned int horizon_registry_init(void)
         return HORIZON_REG_NO_MEMORY;
     }
     {
+        /* shell32 normally registers this in set_folder_attributes(). Without
+         * it, My Documents parses as ::{GUID}, which games cannot use for saves.
+         * Seed before the hives so existing values still take precedence. */
         static const char machine_seed[] =
             "WINE REGISTRY Version 2\n"
+            "[Software\\\\Classes\\\\CLSID\\\\{450d8fba-ad25-11d0-98a8-0800361b1103}\\\\ShellFolder]\n"
+            "\"WantsForParsing\"=\"\"\n"
             "[Software\\\\Classes\\\\CLSID\\\\{BCDE0395-E52F-467C-8E3D-C4579291692E}\\\\InprocServer32]\n"
             "@=\"mmdevapi.dll\"\n"
             "\"ThreadingModel\"=\"Both\"\n";
