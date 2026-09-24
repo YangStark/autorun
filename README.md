@@ -73,6 +73,24 @@ Adding a game enables DXVK, which draws Direct3D games through the Switch's
 Vulkan driver. To keep new games on WineD3D, turn off **Settings -> Give a new
 game DXVK**.
 
+### A HOME icon for one game
+
+Open the game's options (**Y**) and choose **Add to Switch HOME**. Autorun
+installs a separate HOME icon with the game's title and square artwork (or its
+executable icon). Opening it starts that executable directly, without the
+Autorun library. The forwarder uses the game's **Address space** setting, or
+detects the address space when it is set to Auto. A 64-bit Windows game needs
+the 39-bit setting.
+
+This is a forwarder, not a self-contained game package. Keep Autorun's NRO and
+runtime files, the game's executable and its files at their SD-card paths. The
+HOME entry is installed directly by Autorun; it does not export an NSP file.
+Installing the same game again replaces its entry, including its title and icon.
+Moving the executable or changing its Address space creates a different entry;
+remove the old entry through the console's software management if it is no longer
+needed. The first run may restart once to set up Windows components, then start
+the game. When the game ends, this HOME entry returns to the Switch HOME menu.
+
 Before the first program on a card, Autorun sets up the Windows components a
 PC's Windows installation would have registered: DirectShow and the MP3 decoder,
 which game movies and music play through (Fallout: New Vegas, Fable, WarCraft

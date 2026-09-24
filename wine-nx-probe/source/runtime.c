@@ -3279,6 +3279,7 @@ static void release_thread_local_pages( void )
 #define COMPONENTS_SETUP   RUNTIME_DIR "/drive_c/windows/autorun-setup.exe"
 #define COMPONENTS_DONE    RUNTIME_DIR "/registry/components-1.done"
 static int runtime_components_run;
+static int runtime_game_forwarder;
 
 /* The exit code the program gave NtTerminateProcess (dlls/ntdll/unix/process.c);
  * ~0 while it has not ended by itself. */
@@ -3305,6 +3306,8 @@ static void run_components_first( char *target, size_t size )
         log_line( "[SETUP] could not write run-next.txt; the components setup waits for the next program" );
         return;
     }
+    if (runtime_game_forwarder)
+        write_line( RUNTIME_DIR "/run-next-game-forwarder.txt", "1" );
     log_line( "[SETUP] first program on this card: setting up Windows components before %s",
               name ? name + 1 : target );
     snprintf( target, size, "%s", COMPONENTS_SETUP );
@@ -3549,7 +3552,7 @@ static void log_line_plain( const char *line )
 }
 
 static unsigned int launcher_install_forwarder( int bits, const char *name, unsigned long long *id,
-                                                const char **step )
+                                                 const char **step )
 {
     struct wine_nx_forwarder request =
     {
@@ -3568,6 +3571,44 @@ static unsigned int launcher_install_forwarder( int bits, const char *name, unsi
     rc = wine_nx_forwarder_install( &request, step );
     log_line( "[LAUNCHER] %d-bit forwarder %016llx: rc=0x%x%s%s", bits,
               id ? *id : 0ull, rc, rc && step && *step ? " at " : "", rc && step && *step ? *step : "" );
+    return rc;
+}
+static unsigned int launcher_install_game_forwarder( int bits, const char *name, const char *exe_path,
+                                                      const unsigned char *icon, size_t icon_size,
+                                                      unsigned long long *id, const char **step )
+{
+    char quoted_path[520];
+    size_t i, path_length;
+    struct wine_nx_forwarder request =
+    {
+        .nro_path = own_nro,
+        .args = quoted_path,
+        .name = name,
+        .author = "ticoverse.com",
+        .address_space = bits == 32 ? WINE_NX_SPACE_32BIT_NO_ALIAS : WINE_NX_SPACE_39BIT,
+        .icon = icon ? icon : bits == 32 ? wine_nx_icon_32bit : wine_nx_icon_any,
+        .icon_size = icon ? icon_size : bits == 32 ? wine_nx_icon_32bit_size : wine_nx_icon_any_size,
+    };
+    unsigned int rc;
+
+    if (!exe_path || !(path_length = strlen( exe_path )) || path_length > sizeof(quoted_path) - 3 ||
+        strlen( own_nro ) + path_length + 4 >= 1024)
+    {
+        if (step) *step = "validating the game path";
+        return MAKERESULT( Module_Libnx, LibnxError_BadInput );
+    }
+    for (i = 0; i < path_length; i++)
+        if (exe_path[i] == '"' || (unsigned char)exe_path[i] < 0x20)
+        {
+            if (step) *step = "validating the game path";
+            return MAKERESULT( Module_Libnx, LibnxError_BadInput );
+        }
+    snprintf( quoted_path, sizeof(quoted_path), "\"%s\"", exe_path );
+    wine_nx_forwarder_report = log_line_plain;
+    if (id) *id = wine_nx_forwarder_title_id( own_nro, quoted_path, request.address_space );
+    rc = wine_nx_forwarder_install( &request, step );
+    log_line( "[LAUNCHER] game forwarder %016llx for %s: rc=0x%x", id ? *id : 0ull,
+              exe_path, rc );
     return rc;
 }
 
@@ -3798,22 +3839,40 @@ int main( int argc, char **argv )
      * address space this forwarder was made with and that one was not. It is
      * ours to start once: the file goes before the game does, so a game that
      * cannot start does not meet the same handoff on the way back. */
+    if (argc > 1 && argv[1] && argv[1][0])
+    {
+        /* A game-specific HOME entry takes precedence over a handoff left by
+         * an earlier run. First-run setup makes a fresh handoff below. */
+        remove( RUNTIME_DIR "/run-next.txt" );
+        remove( RUNTIME_DIR "/run-next-game-forwarder.txt" );
+        runtime_game_forwarder = 1;
+        runtime_reopen_launcher = 0;
+    }
+    else
     {
         char handoff[512];
 
         if (read_first_line( RUNTIME_DIR "/run-next.txt", handoff, sizeof(handoff) ) && handoff[0])
         {
             remove( RUNTIME_DIR "/run-next.txt" );
+            if (!access( RUNTIME_DIR "/run-next-game-forwarder.txt", F_OK ))
+            {
+                remove( RUNTIME_DIR "/run-next-game-forwarder.txt" );
+                runtime_game_forwarder = 1;
+                runtime_reopen_launcher = 0;
+            }
             snprintf( target, sizeof(target), "%s", handoff );
             autorun = handed_over = 1;
             log_line( "[LAUNCHER] handed over in run-next.txt: %s", target );
         }
+        else remove( RUNTIME_DIR "/run-next-game-forwarder.txt" );
     }
     if (handed_over || (argc > 1 && argv[1] && argv[1][0]))
     {
         const char *name;
 
         if (!handed_over) snprintf( target, sizeof(target), "%s", argv[1] );
+        autorun = 1;
         name = strrchr( target, '/' );
         /* The one thing the screen is told, before the game has it. */
         wine_nx_console_quiet = 0;
@@ -3840,6 +3899,7 @@ int main( int argc, char **argv )
             .launch_title = launcher_launch_title,
             .title_installed = launcher_title_installed,
             .install_forwarder = launcher_install_forwarder,
+            .install_game_forwarder = launcher_install_game_forwarder,
             .forwarder_id = launcher_forwarder_id,
             .schedule_restart = envHasNextLoad() ? launcher_schedule_restart : NULL,
 #ifdef WINE_NX_MESA_SWITCH
