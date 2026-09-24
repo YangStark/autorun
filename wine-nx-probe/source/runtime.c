@@ -466,6 +466,7 @@ static struct pointer_cursor wine_nx_cursor =
     { .x = WINE_NX_FB_W / 2, .y = WINE_NX_FB_H / 2, .width = WINE_NX_FB_W, .height = WINE_NX_FB_H };
 static int wine_nx_cursor_moved;
 static int wine_nx_cursor_visible = 1;  /* 0 while the program hides the mouse cursor */
+static int wine_nx_physical_mouse_connected;
 static int wine_nx_gl_window;  /* an OpenGL window surface owns the screen's NWindow */
 /* Controller and touchscreen state, guarded by wine_nx_pointer_mutex. */
 static pthread_mutex_t wine_nx_pointer_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -699,6 +700,9 @@ static void wine_nx_cursor_move( int x, int y )
  * like OpenTTD, hide it; the arrow must not be drawn over theirs. */
 void wine_nx_cursor_show( int visible )
 {
+    /* Keep the pointer visible for physical mice in games that hide the
+     * Windows cursor without drawing a replacement. */
+    if (__atomic_load_n( &wine_nx_physical_mouse_connected, __ATOMIC_RELAXED )) visible = 1;
     pthread_mutex_lock( &wine_nx_fb_mutex );
     if (wine_nx_cursor_visible != !!visible)
     {
@@ -708,6 +712,17 @@ void wine_nx_cursor_show( int visible )
     int x = (int)wine_nx_cursor.x, y = (int)wine_nx_cursor.y;
     pthread_mutex_unlock( &wine_nx_fb_mutex );
     wine_nx_compositor_cursor( x, y, visible );
+}
+
+/* The OpenGL surface owns the screen while the compositor is suspended. */
+int wine_nx_gl_cursor_snapshot( int *x, int *y )
+{
+    if (!__atomic_load_n( &wine_nx_physical_mouse_connected, __ATOMIC_RELAXED )) return 0;
+    pthread_mutex_lock( &wine_nx_fb_mutex );
+    *x = (int)wine_nx_cursor.x;
+    *y = (int)wine_nx_cursor.y;
+    pthread_mutex_unlock( &wine_nx_fb_mutex );
+    return 1;
 }
 
 /* The floating keyboard (osk.c) draws its labels with the console's own font,
@@ -847,7 +862,7 @@ void wine_nx_request_quit( const char *why );
 int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
 {
     HidTouchScreenState touch = {0};
-    HidMouseState mouse = {0};
+    HidMouseState mouse[17] = {{0}};
     HidAnalogStickState stick;
     unsigned int pressed = 0;
     u64 now, held, all_held, xinput_poll;
@@ -856,6 +871,7 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
     static u64 osk_swallowed;
     static u64 mouse_sample;
     static int mouse_connected;
+    size_t mouse_count, mouse_history, mouse_seen = 0;
 
     pthread_mutex_lock( &wine_nx_pointer_mutex );
     if (!wine_nx_pointer_ready)
@@ -977,27 +993,51 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
     wine_nx_pointer_tick = now;
     if (!gamepad && (held & HidNpadButton_A) && !wine_nx_pad_keys[WINE_NX_KEY_A]) pressed |= WINE_NX_POINTER_LEFT;
     if (!gamepad && (held & HidNpadButton_B) && !wine_nx_pad_keys[WINE_NX_KEY_B]) pressed |= WINE_NX_POINTER_RIGHT;
-    if (hidGetMouseStates( &mouse, 1 ) && (mouse.attributes & HidMouseAttribute_IsConnected))
+    mouse_count = hidGetMouseStates( mouse, sizeof(mouse) / sizeof(mouse[0]) );
+    if (mouse_count && (mouse[0].attributes & HidMouseAttribute_IsConnected))
     {
         if (!mouse_connected) log_line( "[NXINPUT] physical mouse connected" );
-        /* Process each relative delta once: the input thread and ProcessEvents
-         * can both poll the same HID sample before the next one arrives. */
-        if (!mouse_connected || mouse.sampling_number != mouse_sample)
+        __atomic_store_n( &wine_nx_physical_mouse_connected, 1, __ATOMIC_RELAXED );
+        /* libnx returns newest first. Replay unseen samples oldest first so
+         * movement and short clicks survive slower game input polls. */
+        mouse_history = mouse_connected ? mouse_count : 1;
+        while (mouse_history)
         {
-            mouse_sample = mouse.sampling_number;
+            HidMouseState *state = &mouse[--mouse_history];
+            unsigned int mouse_buttons = 0;
+
+            if (mouse_connected && state->sampling_number <= mouse_sample) continue;
+            mouse_sample = state->sampling_number;
+            if (!(state->attributes & HidMouseAttribute_IsConnected)) continue;
             if (!keyboard)
-                moved |= pointer_cursor_move_relative( &wine_nx_pointer, mouse.delta_x, mouse.delta_y );
+            {
+                moved |= pointer_cursor_move_relative( &wine_nx_pointer, state->delta_x, state->delta_y );
+                if (state->buttons & HidMouseButton_Left) mouse_buttons |= WINE_NX_POINTER_LEFT;
+                if (state->buttons & HidMouseButton_Right) mouse_buttons |= WINE_NX_POINTER_RIGHT;
+                pointer_buttons_update( &wine_nx_pointer_buttons, pressed | mouse_buttons );
+            }
+            mouse_seen++;
         }
         if (!keyboard)
         {
-            if (mouse.buttons & HidMouseButton_Left) pressed |= WINE_NX_POINTER_LEFT;
-            if (mouse.buttons & HidMouseButton_Right) pressed |= WINE_NX_POINTER_RIGHT;
+            if (mouse[0].buttons & HidMouseButton_Left) pressed |= WINE_NX_POINTER_LEFT;
+            if (mouse[0].buttons & HidMouseButton_Right) pressed |= WINE_NX_POINTER_RIGHT;
+        }
+        if (mouse_seen > 1)
+        {
+            static int logged_history;
+            if (!logged_history)
+            {
+                logged_history = 1;
+                log_line( "[NXINPUT] recovered %zu physical mouse samples in one poll", mouse_seen );
+            }
         }
         mouse_connected = 1;
     }
     else
     {
         if (mouse_connected) log_line( "[NXINPUT] physical mouse disconnected" );
+        __atomic_store_n( &wine_nx_physical_mouse_connected, 0, __ATOMIC_RELAXED );
         mouse_connected = 0;
     }
     {
