@@ -10,6 +10,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
+#include "../../include/wine/nx_root.h"
 
 static inline const char *launcher_machine_name( unsigned short machine )
 {
@@ -22,7 +23,7 @@ static inline const char *launcher_machine_name( unsigned short machine )
     }
 }
 #define LAUNCHER_MAX_ENTRIES 256
-#define LAUNCHER_DRIVE_C "sdmc:/switch/wine/drive_c"
+#define LAUNCHER_DRIVE_C WINE_NX_SD_ROOT "/drive_c"
 /* USB volumes ums0: to ums4: are D: to H:; programs are looked for in their Wine folder. */
 #define LAUNCHER_USB_DRIVES 5
 #define LAUNCHER_USB_PROGRAMS "Wine"

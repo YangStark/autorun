@@ -7,7 +7,7 @@
 /* The runtime's folder: system.reg and user.reg are in its registry/, the
  * classes the payload ships in config/. The host test uses a scratch folder. */
 #ifndef HORIZON_REGISTRY_DIR
-#define HORIZON_REGISTRY_DIR "sdmc:/switch/wine/"
+#define HORIZON_REGISTRY_DIR WINE_NX_SD_ROOT "/"
 #endif
 #include "horizon_registry_paths.h"
 
@@ -169,7 +169,7 @@ static void horizon_registry_changed( const struct horizon_reg_key *key )
 
 static int horizon_registry_write_snapshot( const char *name, const char *data, size_t size )
 {
-    char path[256], tmp[sizeof(path) + 4];
+    char path[sizeof(HORIZON_REGISTRY_DIR) + 64], tmp[sizeof(path) + 4];
     FILE *file;
     int error;
 
@@ -256,7 +256,7 @@ static int horizon_registry_load_file( struct horizon_reg_key *base, const char 
 
 static void horizon_registry_load_hive( struct horizon_reg_key *base, const char *name )
 {
-    char path[256];
+    char path[sizeof(HORIZON_REGISTRY_DIR) + 64];
 
     snprintf( path, sizeof(path), "%s%s", HORIZON_REGISTRY_DIR, name );
     if (horizon_registry_load_file( base, path )) return;

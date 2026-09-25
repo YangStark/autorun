@@ -127,6 +127,20 @@ static int sd_cache_open( struct _reent *r, void *fd, const char *path, int flag
 {
     int writable = (flags & O_ACCMODE) != O_RDONLY;
 
+
+#ifdef WINE_NX_PACKAGE_ASSET
+    {
+        size_t len = strlen(path);
+        if (len >= 4 && path[len-4] == '.' && (path[len-3] | 32) == 'p' && (path[len-2] | 32) == 'a' && (path[len-1] | 32) == 'k') {
+            static unsigned int count;
+            if (__atomic_fetch_add(&count, 1, __ATOMIC_RELAXED) < 128) {
+                int saved_errno = errno;
+                char line[640];snprintf(line,sizeof(line),"[PAK-SD-REQUEST] path=%s flags=%x",path,flags);
+                wine_nx_runtime_trace(line);errno=saved_errno;
+            }
+        }
+    }
+#endif
     if (sd_cache_base->open_r( r, fd, path, flags, mode ) == -1) return -1;
     pthread_mutex_lock( &sd_cache_mutex );
     if (!sd_cache_opened( &sd_cache_files, &sd_cache_pool, fd, path, writable ) && writable)

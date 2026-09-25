@@ -36,6 +36,9 @@
 #include "wine/exception.h"
 #include "wine/debug.h"
 #include "wine/list.h"
+#ifdef __SWITCH__
+#include "wine/nx_root.h"
+#endif
 #include "ntdll_misc.h"
 #include "ddk/ntddk.h"
 #include "ddk/wdm.h"
@@ -1457,7 +1460,7 @@ static BOOL wine_nx_nt_name_to_sdmc_path( const UNICODE_STRING *nt_name, char *p
         return wine_nx_copy_ascii_wstr( src, len, path, size, FALSE );
 
     if (len < 2 || src[1] != L':') return FALSE;
-    if (src[0] == L'c' || src[0] == L'C') root = "sdmc:/switch/wine/drive_c";
+    if (src[0] == L'c' || src[0] == L'C') root = WINE_NX_SD_ROOT "/drive_c";
     else if (src[0] == L'z' || src[0] == L'Z') root = "sdmc:";
     else return FALSE;
 
@@ -1512,9 +1515,9 @@ static FILE *wine_nx_file_exports_fopen( const UNICODE_STRING *nt_name, char *pa
 {
     static const char * const roots[] =
     {
-        "sdmc:/switch/wine/drive_c/windows/system32",
-        "sdmc:/switch/wine/drive_c",
-        "sdmc:/switch/wine"
+        WINE_NX_SD_ROOT "/drive_c/windows/system32",
+        WINE_NX_SD_ROOT "/drive_c",
+        WINE_NX_SD_ROOT
     };
     char name[128];
     FILE *file;
@@ -3807,7 +3810,7 @@ static BOOL wine_nx_dos_dir_to_sdmc( const WCHAR *dos_dir, ULONG len, char *unix
     ULONG i;
 
     if (len < 2 || dos_dir[1] != L':') return FALSE;
-    if (dos_dir[0] == L'c' || dos_dir[0] == L'C') root = "sdmc:/switch/wine/drive_c";
+    if (dos_dir[0] == L'c' || dos_dir[0] == L'C') root = WINE_NX_SD_ROOT "/drive_c";
     else if (dos_dir[0] == L'z' || dos_dir[0] == L'Z') root = "sdmc:";
     else return FALSE;
 
@@ -3994,9 +3997,9 @@ static NTSTATUS wine_nx_search_sdmc_dll_file( const WCHAR *paths, const WCHAR *s
     static const WCHAR dos_root[] = {'C',':','\\',0};
     static const char * const system_dirs[] =
     {
-        "sdmc:/switch/wine/drive_c/windows/system32",
-        "sdmc:/switch/wine/drive_c/windows",
-        "sdmc:/switch/wine/drive_c"
+        WINE_NX_SD_ROOT "/drive_c/windows/system32",
+        WINE_NX_SD_ROOT "/drive_c/windows",
+        WINE_NX_SD_ROOT "/drive_c"
     };
     char dll_name[256];
     NTSTATUS status = STATUS_DLL_NOT_FOUND;

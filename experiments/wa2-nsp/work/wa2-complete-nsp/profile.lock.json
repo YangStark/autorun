@@ -1,0 +1,12 @@
+{
+  "address_space": "32NoAlias",
+  "atmosphere": "1.6.1",
+  "game_directory": "drive_c/WA2",
+  "game_id": "autorun-games/wa2-full",
+  "id": "wa2-full",
+  "name": "White Album 2",
+  "root": "/switch/autorun-games/wa2-full",
+  "target": "drive_c/WA2/WA2_full_menu.exe",
+  "title_id": "0500A17E00070000",
+  "version": "0.3.1"
+}

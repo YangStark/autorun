@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 #include "lsfg.h"
+#include "../../include/wine/nx_root.h"
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
@@ -18,8 +19,8 @@ extern "C" void wine_nx_runtime_trace(const char *message);
 
 namespace {
 
-constexpr const char *shader_path = "sdmc:/switch/wine/lsfg/Lossless.dll";
-constexpr const char *cache_path = "sdmc:/switch/wine/cache/lsfg-vk.bin";
+constexpr const char *shader_path = WINE_NX_SD_ROOT "/lsfg/Lossless.dll";
+constexpr const char *cache_path = WINE_NX_SD_ROOT "/cache/lsfg-vk.bin";
 bool enabled, performance = true;
 float flow_scale = 0.25f;
 
@@ -227,7 +228,7 @@ extern "C" void wine_nx_lsfg_configure(int active, int perf, int flow)
     FILE *file = std::fopen(shader_path, "rb");
     if (!file)
     {
-        trace("disabled: copy your own Lossless.dll to sdmc:/switch/wine/lsfg/Lossless.dll");
+        trace("disabled: copy your own Lossless.dll to " WINE_NX_SD_ROOT "/lsfg/Lossless.dll");
         enabled = false;
         return;
     }

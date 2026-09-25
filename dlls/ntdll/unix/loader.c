@@ -102,6 +102,9 @@
 #include "wine/list.h"
 #include "ntsyscalls.h"
 #include "wine/debug.h"
+#ifdef __SWITCH__
+#include "wine/nx_root.h"
+#endif
 
 #ifdef __SWITCH__
 #define munmap horizon_munmap
@@ -110,13 +113,13 @@
 #define SYSTEMDLLPATH ""
 #endif
 #ifndef BINDIR
-#define BINDIR "/switch/wine/bin"
+#define BINDIR WINE_NX_ROOT "/bin"
 #endif
 #ifndef LIBDIR
-#define LIBDIR "/switch/wine/lib"
+#define LIBDIR WINE_NX_ROOT "/lib"
 #endif
 #ifndef DATADIR
-#define DATADIR "/switch/wine/share"
+#define DATADIR WINE_NX_ROOT "/share"
 #endif
 #endif
 
@@ -517,7 +520,7 @@ static void set_home_dir(void)
     const char *p;
 
 #ifdef __SWITCH__
-    if (!home) home = "/switch/wine";
+    if (!home) home = WINE_NX_ROOT;
     if (!name) name = "wine";
 #else
     if (!home || !name)
@@ -561,8 +564,8 @@ static void set_config_dir(void)
 static void init_paths(void)
 {
 #ifdef __SWITCH__
-    ntdll_dir = "/switch/wine/lib/wine/aarch64-unix";
-    dll_dir = "/switch/wine/lib/wine";
+    ntdll_dir = WINE_NX_ROOT "/lib/wine/aarch64-unix";
+    dll_dir = WINE_NX_ROOT "/lib/wine";
     bin_dir = BINDIR;
     data_dir = DATADIR "/wine";
     wineloader = build_path( ntdll_dir, "wine" );

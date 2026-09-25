@@ -49,6 +49,10 @@
 #ifdef __SWITCH__
 # include <sys/iosupport.h>
 # include <sys/statvfs.h>
+# include "wine/nx_root.h"
+# ifdef WINE_NX_PACKAGE_ASSET
+# include "wine/nx_package_assets.h"
+# endif
 #endif
 #ifdef HAVE_SYS_SYSCALL_H
 # include <sys/syscall.h>
@@ -4090,11 +4094,13 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
  *           nt_to_unix_file_name_no_root
  */
 static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *nt_name,
-                                              char **unix_name_ret, UINT disposition,
-                                              BOOL open_reparse, unsigned int reparse_count )
+                                               char **unix_name_ret, UINT disposition,
+                                               BOOL open_reparse, unsigned int reparse_count )
 {
     static const WCHAR unixW[] = {'u','n','i','x'};
     static const WCHAR invalid_charsW[] = { INVALID_NT_CHARS, 0 };
+#if defined(__SWITCH__) && defined(WINE_NX_PACKAGE_ASSET)
+#endif
 
     NTSTATUS status = STATUS_SUCCESS;
     unsigned int nt_pos;
@@ -4138,6 +4144,28 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
     prefix[prefix_len] = 0;
 
 #ifdef __SWITCH__
+    /* This one packaged WA2 file has no SD-card counterpart. Resolve it before
+     * lookup_unix_name() probes the SD card for the final component. */
+#if defined(WINE_NX_PACKAGE_ASSET)
+    if (prefix_len == 2 && prefix[0] == 'c' && prefix[1] == ':')
+    {
+        for (unsigned int i = 0; i < WA2_PACKAGE_COUNT; i++) {
+            size_t n = strlen(wa2_package_assets[i].dos), j;
+            if (name_len != 2 + n) continue;
+            for (j = 0; j < n; j++) {
+                WCHAR c = name[2+j]; if (c >= 'A' && c <= 'Z') c += 'a'-'A';
+                if (c != (unsigned char)wa2_package_assets[i].dos[j]) break;
+            }
+            if (j != n) continue;
+            if (disposition == FILE_CREATE) return STATUS_OBJECT_NAME_COLLISION;
+            if (disposition != FILE_OPEN && disposition != FILE_OPEN_IF) return STATUS_ACCESS_DENIED;
+            if (stat(wa2_package_assets[i].package, &st) == -1) return errno_to_status(errno);
+            if (!S_ISREG(st.st_mode)) return STATUS_OBJECT_TYPE_MISMATCH;
+            if (!(unix_name = strdup(wa2_package_assets[i].package))) return STATUS_NO_MEMORY;
+            *unix_name_ret = unix_name; return STATUS_SUCCESS;
+        }
+    }
+#endif
     if (is_unix && name_len > prefix_len + 1 && (name[prefix_len] == '/' || name[prefix_len] == '\\'))
     {
         static const WCHAR sdmcW[] = {'s','d','m','c',':'};
@@ -4198,7 +4226,7 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
         const char *drive_root = NULL;
         char usb_root[] = "ums0:";
 
-        if (prefix[0] == 'c') drive_root = "sdmc:/switch/wine/drive_c";
+        if (prefix[0] == 'c') drive_root = WINE_NX_SD_ROOT "/drive_c";
         else if (prefix[0] == 'z') drive_root = "sdmc:";
         else if (prefix[0] >= 'd' && prefix[0] <= 'h')
         {

@@ -58,7 +58,7 @@ static void launcher_draw( const char *build, int count, int selected, int first
 
     printf( CONSOLE_ESC(2J) CONSOLE_ESC(1;1H) );
     printf( CONSOLE_CYAN "Wine-NX" CONSOLE_RESET "  %s\n", build );
-    printf( "Choose a Windows program from sdmc:/switch/wine/drive_c\n\n" );
+    printf( "Choose a Windows program from %s\n\n", LAUNCHER_DRIVE_C );
     if (!count)
     {
         printf( CONSOLE_YELLOW "No registered games are available.\n" CONSOLE_RESET );

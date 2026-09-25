@@ -20,6 +20,7 @@
 #include "winnt.h"
 #include "winternl.h"
 #include "wine/server.h"
+#include "wine/nx_root.h"
 #include "unix_private.h"
 #include "horizon_private.h"
 #include "launcher.h"
@@ -56,7 +57,7 @@ uint64_t __nx_exception_stack_size = sizeof(__nx_exception_stack);
  * libnx's exception.s short-circuits to abort before calling our handler. */
 u32 __nx_exception_ignoredebug = 1;
 
-#define WINE_ROOT "sdmc:/switch/wine"
+#define WINE_ROOT WINE_NX_SD_ROOT
 #define WINE_DRIVE_C WINE_ROOT "/drive_c"
 #define WINE_SYSTEM_DIR WINE_DRIVE_C "/windows/system32"
 /* The profile shell32 resolves: it ignores %USERPROFILE% and builds every
@@ -3343,10 +3344,13 @@ static void release_thread_local_pages( void )
  * once before the first program on a card, and again when a build raises the
  * version. The mark is kept with the registry it wrote to, so a card whose
  * registry was reset runs it again. */
-#define COMPONENTS_VERSION 1
+#define COMPONENTS_VERSION 2
 #define COMPONENTS_SETUP   RUNTIME_DIR "/drive_c/windows/autorun-setup.exe"
-#define COMPONENTS_DONE    RUNTIME_DIR "/registry/components-1.done"
+#define COMPONENTS_DONE    RUNTIME_DIR "/registry/components-2.done"
+#define COMPONENTS_FAILED  RUNTIME_DIR "/registry/components-2.failed"
+#define COMPONENTS_HANDOFF RUNTIME_DIR "/run-next-components.txt"
 static int runtime_components_run;
+static int runtime_components_attempted;
 static int runtime_game_forwarder;
 
 /* The exit code the program gave NtTerminateProcess (dlls/ntdll/unix/process.c);
@@ -3361,7 +3365,7 @@ static void run_components_first( char *target, size_t size )
 {
     const char *name = strrchr( target, '/' );
 
-    if (!access( COMPONENTS_DONE, F_OK ) || access( COMPONENTS_SETUP, F_OK )) return;
+    if (runtime_components_attempted || !access( COMPONENTS_DONE, F_OK ) || access( COMPONENTS_SETUP, F_OK )) return;
     if (!strcasecmp( target, COMPONENTS_SETUP )) return;
     if (!envHasNextLoad() || !own_nro[0])
     {
@@ -3372,6 +3376,12 @@ static void run_components_first( char *target, size_t size )
     if (!write_line( RUNTIME_DIR "/run-next.txt", target ))
     {
         log_line( "[SETUP] could not write run-next.txt; the components setup waits for the next program" );
+        return;
+    }
+    if (!write_line( COMPONENTS_HANDOFF, "2" ))
+    {
+        remove( RUNTIME_DIR "/run-next.txt" );
+        log_line( "[SETUP] could not save setup handoff; leaving setup for next launch" );
         return;
     }
     if (runtime_game_forwarder)
@@ -3520,10 +3530,19 @@ static int return_to_launcher( void )
     {
         char done[64];
 
-        /* Marked whatever it answered, so a step that cannot work does not
-         * run before every program; the log and the mark say how it went. */
+        /* A failed setup is recorded separately and retried on a new launch.
+         * The one-shot handoff prevents an immediate setup/reload loop. */
         snprintf( done, sizeof(done), "version %d, exit code 0x%x", COMPONENTS_VERSION, wine_nx_program_exit_code );
-        write_line( COMPONENTS_DONE, done );
+        if (!wine_nx_program_exit_code)
+        {
+            write_line( COMPONENTS_DONE, done );
+            remove( COMPONENTS_FAILED );
+        }
+        else
+        {
+            remove( COMPONENTS_DONE );
+            write_line( COMPONENTS_FAILED, done );
+        }
         log_line( wine_nx_program_exit_code ? "[SETUP] Windows components set up, but a step failed (%s)"
                                             : "[SETUP] Windows components set up (%s)", done );
     }
@@ -3731,8 +3750,15 @@ static unsigned long long runtime_title_id( void )
     return id;
 }
 
+#ifdef WINE_NX_PACKAGE_ASSET
+#include "package_asset_mount.h"
+#endif
+
 int main( int argc, char **argv )
 {
+#ifdef WINE_NX_PACKAGE_ASSET
+    if (!wa2_package_mount()) return 1;
+#endif
     char target[512] = DEFAULT_TARGET;
     TEB *teb;
     void *module = NULL;
@@ -3760,7 +3786,22 @@ int main( int argc, char **argv )
     /* One empty frame, so the screen is this program's and blank from the start
      * rather than whatever was on it before. */
     consoleUpdate( NULL );
-    mkdir( "sdmc:/switch", 0777 );
+    /* A custom root can have more than one missing parent directory. */
+    {
+        char parent[sizeof(own_nro)];
+        size_t i, len = strlen( RUNTIME_DIR );
+        if (len < sizeof(parent))
+        {
+            memcpy( parent, RUNTIME_DIR, len + 1 );
+            for (i = strlen( "sdmc:" ) + 1; i < len; i++)
+                if (parent[i] == '/')
+                {
+                    parent[i] = 0;
+                    mkdir( parent, 0777 );
+                    parent[i] = '/';
+                }
+        }
+    }
     mkdir( RUNTIME_DIR, 0777 );
     mkdir( WINE_DRIVE_C, 0777 );
     mkdir( WINE_DRIVE_C "/windows", 0777 );
@@ -3807,7 +3848,8 @@ int main( int argc, char **argv )
         {
             wine_nx_console_quiet = 0;
             PadState pad;
-            log_line( "[UPDATE] Recovery failed. Restore switch/wine/updates/previous.nro before starting a game. Press + to close." );
+            log_line( "[UPDATE] Recovery failed. Restore " WINE_NX_SD_ROOT
+                      "/updates/previous.nro before starting a game. Press + to close." );
             padConfigureInput( 1, HidNpadStyleSet_NpadStandard );
             padInitializeDefault( &pad );
             while (appletMainLoop())
@@ -3913,6 +3955,7 @@ int main( int argc, char **argv )
          * an earlier run. First-run setup makes a fresh handoff below. */
         remove( RUNTIME_DIR "/run-next.txt" );
         remove( RUNTIME_DIR "/run-next-game-forwarder.txt" );
+        remove( COMPONENTS_HANDOFF );
         runtime_game_forwarder = 1;
         runtime_reopen_launcher = 0;
     }
@@ -3923,6 +3966,8 @@ int main( int argc, char **argv )
         if (read_first_line( RUNTIME_DIR "/run-next.txt", handoff, sizeof(handoff) ) && handoff[0])
         {
             remove( RUNTIME_DIR "/run-next.txt" );
+            runtime_components_attempted = !access( COMPONENTS_HANDOFF, F_OK );
+            remove( COMPONENTS_HANDOFF );
             if (!access( RUNTIME_DIR "/run-next-game-forwarder.txt", F_OK ))
             {
                 remove( RUNTIME_DIR "/run-next-game-forwarder.txt" );
@@ -4278,6 +4323,10 @@ int main( int argc, char **argv )
 #ifdef WINE_NX_BOX64_INTERPRETER
         if (target_machine == IMAGE_FILE_MACHINE_I386)
         {
+#ifdef WINE_NX_PACKAGE_ASSET
+            log_line("[PACKAGE-TIMING] verify_ms=%llu runtime_to_wow64_ms=%llu target=%s", (unsigned long long)wa2_package_check_ms,
+                (unsigned long long)(armTicksToNs(armGetSystemTick()-wa2_launch_started)/1000000-wa2_package_check_ms),target);
+#endif
             status = runtime_start_wow64( module, entry, params, &main_nt_name, autorun );
             log_line( "[WOW64] startup status=%08x", status );
             park_forever();

@@ -52,6 +52,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <switch/services/pl.h>
+#include "wine/nx_root.h"
 #endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(font);
@@ -6852,11 +6853,23 @@ static void load_file_system_fonts(void)
 #endif
 
 #ifdef __SWITCH__
-    load_switch_directory_fonts( "sdmc:/switch/wine/drive_c/windows/fonts",
+    char nt_font_prefix[512];
+    size_t i;
+    int len;
+
+    /* Z: exposes the SD card, so mirror the configured POSIX root there. */
+    len = snprintf( nt_font_prefix, sizeof(nt_font_prefix), "\\??\\Z:%s/share/wine/fonts/", WINE_NX_ROOT );
+    if (len > 0 && (size_t)len < sizeof(nt_font_prefix))
+    {
+        for (i = 6; i < (size_t)len; i++)
+            if (nt_font_prefix[i] == '/') nt_font_prefix[i] = '\\';
+    }
+
+    load_switch_directory_fonts( WINE_NX_SD_ROOT "/drive_c/windows/fonts",
                                  "\\??\\C:\\windows\\fonts\\", 0 );
-    load_switch_directory_fonts( "sdmc:/switch/wine/share/wine/fonts",
-                                 "\\??\\Z:\\switch\\wine\\share\\wine\\fonts\\",
-                                 ADDFONT_EXTERNAL_FONT );
+    if (len > 0 && (size_t)len < sizeof(nt_font_prefix))
+        load_switch_directory_fonts( WINE_NX_SD_ROOT "/share/wine/fonts",
+                                     nt_font_prefix, ADDFONT_EXTERNAL_FONT );
 #else
     /* Windows directory */
     get_fonts_win_dir_path( NULL, path );

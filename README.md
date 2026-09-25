@@ -19,6 +19,9 @@ copies to the SD card and start them from Autorun's library.
 > **Autorun is experimental.** Some games run well, many start and then stop on
 > something that isn't done yet. Every run writes a log that says where.
 
+The [WA2 NSP experiment](documentation/wa2-nsp-experiment.md) documents the
+per-game runtime and direct-read packaging workflow in this branch.
+
 ![The Autorun launcher](documentation/launcher.jpg)
 
 ## What runs

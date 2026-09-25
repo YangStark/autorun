@@ -2,8 +2,29 @@ cmake_minimum_required(VERSION 3.18)
 
 project(wine_nx_probe LANGUAGES C CXX ASM)
 
+set(WINE_NX_ROOT "/switch/wine" CACHE STRING "Absolute SD-card path for this Wine-NX runtime")
+if(NOT WINE_NX_ROOT MATCHES "^/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
+    message(FATAL_ERROR "WINE_NX_ROOT must be an absolute SD-card path without empty components, spaces, or a trailing slash")
+endif()
+string(REPLACE "/" ";" WINE_NX_ROOT_PARTS "${WINE_NX_ROOT}")
+foreach(WINE_NX_ROOT_PART IN LISTS WINE_NX_ROOT_PARTS)
+    if(WINE_NX_ROOT_PART STREQUAL "." OR WINE_NX_ROOT_PART STREQUAL "..")
+        message(FATAL_ERROR "WINE_NX_ROOT must not contain . or .. path components")
+    endif()
+endforeach()
+string(LENGTH "${WINE_NX_ROOT}" WINE_NX_ROOT_LENGTH)
+if(WINE_NX_ROOT_LENGTH GREATER 128)
+    message(FATAL_ERROR "WINE_NX_ROOT is too long for runtime paths (maximum 128 characters)")
+endif()
+add_compile_definitions("WINE_NX_ROOT=\"${WINE_NX_ROOT}\"")
+
 set(WINE_NX_PE_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build-wine-arm64-pe-clean"
     CACHE PATH "Wine PE build supplying generated COM headers")
+
+option(WINE_NX_PACKAGE_ASSET "Experimental WA2 package asset mapping" OFF)
+if(WINE_NX_PACKAGE_ASSET)
+    add_compile_definitions(WINE_NX_PACKAGE_ASSET=1)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

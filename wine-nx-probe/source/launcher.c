@@ -2625,7 +2625,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
                   !lsfg_installed ? "Unavailable" : p->settings.lsfg_enabled ? "Enabled" : "Disabled" );
 
         ADD_ROW( ROW_LSFG_DLL, SECTION_FRAME_GENERATION, "Lossless.dll",
-                 "Copy Lossless.dll to sdmc:/switch/wine/lsfg/Lossless.dll." );
+                 "Copy Lossless.dll to " WINE_NX_SD_ROOT "/lsfg/Lossless.dll." );
         row->kind = UI_ROW_INFO;
         row->disabled = 1;
         if (lsfg_installed)

@@ -121,7 +121,8 @@ void __stdcall start(void)
     /* devenum's filter mapper first, then what registers filters through it. */
     static const WCHAR *const dlls[] =
     {
-        L"devenum.dll", L"quartz.dll", L"msdmo.dll", L"qasf.dll", L"qcap.dll", L"qedit.dll",
+        /* msdmo implements DMO APIs, but has no DllRegisterServer export. */
+        L"devenum.dll", L"quartz.dll", L"qasf.dll", L"qcap.dll", L"qedit.dll",
         L"amstream.dll", L"dsdmo.dll", L"mciqtz32.dll",
     };
     static const WCHAR drivers32[] = L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Drivers32";
@@ -129,11 +130,12 @@ void __stdcall start(void)
     HRESULT hr;
     unsigned int i;
 
-    report( "start", NULL, "version", 1 );
+    report( "start", NULL, "version", 2 );
     ok &= set_string( HKEY_LOCAL_MACHINE, drivers32, L"msacm.l3acm", L"l3codeca.acm" );
 
     hr = OleInitialize( NULL );
     report( "OleInitialize", NULL, SUCCEEDED(hr) ? "ok, hr" : "failed, hr", (DWORD)hr );
+    ok &= SUCCEEDED(hr);
     for (i = 0; i < sizeof(dlls) / sizeof(dlls[0]); i++) ok &= register_dll( dlls[i] );
     if (SUCCEEDED(hr)) OleUninitialize();
 

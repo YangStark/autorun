@@ -17,6 +17,17 @@
 
 #ifdef __SWITCH__
 
+#include "../../../include/wine/nx_root.h"
+#ifdef WINE_NX_PACKAGE_ASSET
+#include "../../../include/wine/nx_package_assets.h"
+static int wa2_is_package_path(const char *path) {
+    /* Keep this above Wine includes without relying on string prototypes. */
+    for (unsigned i=0;i<WA2_PACKAGE_COUNT;i++) { const char *a=path, *b=wa2_package_assets[i].package; while (*a && *a==*b) {a++;b++;} if (!*a && !*b) return 1; }
+    return 0;
+}
+#endif
+
+
 #ifdef HORIZON_STANDALONE_SYNTAX
 #include "horizon_syntax_shim.h"
 #else
@@ -4883,14 +4894,14 @@ static unsigned int horizon_server_find_atom_locked( const unsigned char *name, 
 
 static unsigned int horizon_server_ensure_session_locked(void)
 {
-    char path[128];
+    char path[sizeof(WINE_NX_SD_ROOT) + 64];
     int fd;
 
     if (horizon_session_fd != -1) return HORIZON_STATUS_SUCCESS;
     if (!(horizon_session_data = calloc( 1, HORIZON_SESSION_MAPPING_SIZE )))
         return HORIZON_STATUS_NO_MEMORY;
 
-    snprintf( path, sizeof(path), "sdmc:/switch/wine/wine-nx-session-%u.shm", (unsigned int)getpid() );
+    snprintf( path, sizeof(path), WINE_NX_SD_ROOT "/wine-nx-session-%u.shm", (unsigned int)getpid() );
     fd = open( path, O_RDWR | O_CREAT | O_TRUNC, 0600 );
     if (fd == -1)
     {
@@ -9395,6 +9406,20 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
             is_dir = !!(request->options & HORIZON_FILE_DIRECTORY_FILE);
             if (is_dir && (request->options & HORIZON_FILE_NON_DIRECTORY_FILE))
                 reply.header.error = HORIZON_STATUS_INVALID_PARAMETER;
+#if defined(__SWITCH__) && defined(WINE_NX_PACKAGE_ASSET)
+            if (!reply.header.error && wa2_is_package_path(filename))
+            {
+                const unsigned int forbidden_access = 0x000d0116u; /* write/append, write EA/attrs, delete, DAC/owner */
+
+                if (request->create == FILE_CREATE)
+                    reply.header.error = HORIZON_STATUS_OBJECT_NAME_COLLISION;
+                else if ((request->create != FILE_OPEN && request->create != FILE_OPEN_IF) || is_dir ||
+                         (request->options & 0x00001000u) ||
+                         (horizon_file_map_access( request->access ) & forbidden_access))
+                    reply.header.error = HORIZON_STATUS_ACCESS_DENIED;
+                else flags = O_RDONLY; /* FILE_OPEN_IF must not send O_CREAT to RomFS. */
+            }
+#endif
         }
     }
 
@@ -9439,6 +9464,24 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
     if (!reply.header.error && !is_dir)
     {
         fd = open( filename, flags, 0666 );
+#if defined(__SWITCH__) && defined(WINE_NX_PACKAGE_ASSET)
+        {
+            size_t len = strlen(filename);
+            if (len >= 4 && filename[len-4] == '.' &&
+                (filename[len-3] | 32) == 'p' && (filename[len-2] | 32) == 'a' && (filename[len-1] | 32) == 'k')
+            {
+                static unsigned int pak_trace_count;
+                int saved_errno = errno;
+                if (__atomic_fetch_add(&pak_trace_count, 1, __ATOMIC_RELAXED) < 128) {
+                    char line[640];
+                    snprintf(line, sizeof(line), "[PAK-OPEN] path=%s fd=%d errno=%d flags=%x", filename, fd, fd < 0 ? saved_errno : 0, flags);
+                    wine_nx_runtime_trace(line);
+                }
+                errno = saved_errno;
+            }
+        }
+#endif
+
         if (fd == -1)
         {
             int open_errno = errno;
@@ -9463,6 +9506,14 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
             else reply.header.error = horizon_server_errno_status( open_errno );
         }
         else if (!(stored_name = strdup( filename ))) reply.header.error = HORIZON_STATUS_NO_MEMORY;
+#if defined(__SWITCH__) && defined(WINE_NX_PACKAGE_ASSET)
+        else if (wa2_is_package_path(filename))
+        {
+            static unsigned int package_open_log_count;
+            if (__atomic_fetch_add( &package_open_log_count, 1, __ATOMIC_RELAXED ) < 8)
+                { char line[256]; snprintf(line, sizeof(line), "[PACKAGE] opened %s", filename); wine_nx_runtime_trace(line); }
+        }
+#endif
     }
 
     if (!reply.header.error)
@@ -11907,7 +11958,7 @@ void horizon_trace( const char *fmt, ... )
     /* Each verbose line reopens the separate trace file on the SD card. */
     if (!&wine_nx_runtime_verbose || !wine_nx_runtime_verbose) return;
     pthread_mutex_lock( &lock );
-    if ((f = fopen( "sdmc:/switch/wine/logs/horizon-trace.log", "a" )))
+    if ((f = fopen( WINE_NX_SD_ROOT "/logs/horizon-trace.log", "a" )))
     {
         __builtin_va_start( args, fmt );
         vfprintf( f, fmt, args );
