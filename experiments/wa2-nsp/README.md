@@ -6,8 +6,10 @@ White Album 2 homebrew NSP. It belongs to the existing
 based on `integration/9b71705-all` at
 `25623410b163fbdde540594a098a898ca226c2a2`; the Wine changes live in the
 normal source tree, and the NSP loader, bundle builder, packager, and host
-checks live here. The earlier `feature/game-home-forwarder` work is the
-related forwarder experiment, not a prerequisite checkout for this branch.
+checks live here. The earlier
+[`feature/game-home-forwarder`](https://github.com/YangStark/autorun/tree/feature/game-home-forwarder)
+work is the related forwarder experiment, not a prerequisite checkout for
+this branch.
 
 ## What can be reused
 
